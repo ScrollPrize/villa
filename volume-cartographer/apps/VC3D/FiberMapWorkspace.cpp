@@ -1377,6 +1377,25 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
     // A changed approval layer (the approval window closed with changes)
     // solves again; while a solve runs, once more when it has finished.
     if (_controller) {
+        // The approval window chooses its "nearest stretch" from this list.
+        _controller->setApprovalStretchProvider([this](uint64_t fiberId) {
+            std::vector<std::pair<double, double>> out;
+            if (!_approvalPanel || !_solveController) return out;
+            std::string uuid;
+            for (const auto& [candidate, id] : _fiberIdByUuid)
+                if (id == fiberId) { uuid = candidate; break; }
+            if (uuid.empty()) return out;
+            double runLength = 0.0;
+            const auto spans = _solveController->approvals().find(uuid);
+            if (spans != _solveController->approvals().end() && !spans->second.controlArcs.empty())
+                runLength = spans->second.controlArcs.back();
+            for (const auto& [arcFrom, arcTo] : _approvalPanel->stretchArcs(uuid)) {
+                const auto first = _controller->storedLineIndexAtArc(fiberId, arcFrom, runLength);
+                const auto last = _controller->storedLineIndexAtArc(fiberId, arcTo, runLength);
+                if (first && last && *last > *first) out.emplace_back(double(*first), double(*last));
+            }
+            return out;
+        });
         connect(_controller, &LineAnnotationController::fiberApprovalChanged, this, [this](const QString&) {
             if (!_solveController || !_solverPanel) return;
             if (_solveController->busy()) {

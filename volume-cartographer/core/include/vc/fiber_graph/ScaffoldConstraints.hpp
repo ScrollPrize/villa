@@ -321,6 +321,48 @@ struct ScaffoldNormalFlipReport {
     // across the connector, which is a flip whatever the link states.
     std::int64_t opposed = 0;
 };
+// The stretches to look at for a violated sign constraint.
+//
+// A sign constraint states which of two crossing fibers lies outside, from
+// their normals. One the solve had to break says a normal is wrong at that
+// crossing, on one of the two fibers. An annotation states a normal without a
+// facing, so approving the normals at the crossing alone says nothing: the
+// stretch has to tie the crossing to another one of the same fiber.
+//
+// Per violated sign constraint and per fiber of it: the stretch from the
+// crossing to the nearest other crossing of that fiber (always), extended
+// over further crossings no farther than `joinVx` from it while it stays
+// within `maxStretchVx`. Stretches of one fiber that overlap are one, and
+// their costs add up. A stretch that lies in one stretch approved for normals
+// is not offered: that fiber's normals are settled there, and the other fiber
+// carries the suspicion. A fiber (a part of a fiber with broken geometry)
+// with no other crossing has no stretch, which is counted.
+struct ScaffoldSignSuspect {
+    std::int64_t fiber = 0;
+    // The violated sign constraints on the stretch and their summed cost.
+    std::int64_t violations = 0;
+    double cost = 0;
+    // The first of them: its crossing on this fiber, and the other fiber.
+    double arc = 0, otherArc = 0;
+    std::int64_t other = 0;
+    // The fiber's crossings on the stretch, its two ends included.
+    std::int64_t crossings = 0;
+    ScaffoldPiece piece;
+};
+struct ScaffoldSignSuspectOptions {
+    double joinVx = 300.0, maxStretchVx = 2000.0;
+};
+struct ScaffoldSignSuspectReport {
+    std::int64_t violations = 0, suspects = 0;
+    // Fiber sides of a violation without another crossing, and those whose
+    // stretch is approved for normals.
+    std::int64_t withoutCrossing = 0, approved = 0;
+};
+// Highest cost first.
+std::vector<ScaffoldSignSuspect> scaffoldSignSuspects(const ScaffoldGraph&, const ScaffoldGeometry&,
+                                                      const ScaffoldSolveResult&, const ScaffoldSignSuspectOptions&,
+                                                      ScaffoldSignSuspectReport&);
+
 // `constraints` are a solve's; only its map links are compared. Ordered with
 // the bracketed stretches first, the shortest before the longer.
 std::vector<ScaffoldNormalFlip> scaffoldLinkNormalFlips(const ScaffoldGraph&, const ScaffoldGeometry&,

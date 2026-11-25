@@ -1142,3 +1142,69 @@ TEST_CASE("the neighbour normals face a fiber whose normals are approved, and an
         CHECK(dot(*solved, tilted(polar(300., 45., 0.))) > 0.999);
     }
 }
+
+TEST_CASE("a violated sign constraint is tied to at least one other crossing of each fiber")
+{
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 110., 0., 90));
+    std::vector<std::size_t> verticals;
+    for (const double degrees : {35., 65., 95.})
+        verticals.push_back(scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., degrees, -150., 150., 30)));
+    const ScaffoldGeometry geometry(scaffold.graph);
+    std::vector<double> arcs;
+    for (const double degrees : {35., 65., 95.}) arcs.push_back(geometry.project(horizontal, polar(300., degrees, 0.)).arc);
+    // The H fiber crosses three V fibers; the first two crossings are close.
+    REQUIRE(arcs[1] - arcs[0] < arcs[2] - arcs[1] + 1.);
+    ScaffoldSolveResult result;
+    for (std::size_t i = 0; i < 3; ++i) {
+        ScaffoldConstraint constraint;
+        constraint.kind = i == 2 ? ScaffoldConstraintKind::SignAtLeast : ScaffoldConstraintKind::Perpendicular;
+        constraint.a = std::int64_t(horizontal);
+        constraint.b = std::int64_t(verticals[i]);
+        constraint.arcA = arcs[i];
+        constraint.arcB = 150.;
+        constraint.weight = 50.;
+        result.constraints.push_back(constraint);
+    }
+    // The sign constraint of the third crossing is violated.
+    ScaffoldResidual residual;
+    residual.constraint = 2;
+    residual.residual = 1;
+    residual.cost = 50.;
+    result.residuals.push_back(residual);
+
+    ScaffoldSignSuspectOptions narrow;
+    narrow.joinVx = 0.;
+    ScaffoldSignSuspectReport report;
+    auto suspects = scaffoldSignSuspects(scaffold.graph, geometry, result, narrow, report);
+    CHECK(report.violations == 1);
+    // The V fiber has no other crossing: nothing ties its normal there.
+    CHECK(report.withoutCrossing == 1);
+    REQUIRE(suspects.size() == 1);
+    CHECK(suspects[0].fiber == std::int64_t(horizontal));
+    CHECK(suspects[0].other == std::int64_t(verticals[2]));
+    CHECK(suspects[0].cost == doctest::Approx(50.));
+    CHECK(suspects[0].arc == doctest::Approx(arcs[2]));
+    // The nearest other crossing is taken however far it is.
+    CHECK(suspects[0].piece.arcFrom == doctest::Approx(arcs[1]));
+    CHECK(suspects[0].piece.arcTo == doctest::Approx(arcs[2]));
+    CHECK(suspects[0].crossings == 2);
+    CHECK(suspects[0].piece.controlTo > suspects[0].piece.controlFrom);
+
+    // Close crossings join the stretch.
+    ScaffoldSignSuspectOptions wide;
+    wide.joinVx = 1000.;
+    wide.maxStretchVx = 5000.;
+    suspects = scaffoldSignSuspects(scaffold.graph, geometry, result, wide, report);
+    REQUIRE(suspects.size() == 1);
+    CHECK(suspects[0].piece.arcFrom == doctest::Approx(arcs[0]));
+    CHECK(suspects[0].crossings == 3);
+
+    // Normals approved over the whole stretch: this fiber is settled there.
+    const double from = double(geometry.lineIndexAt(horizontal, arcs[1])) - 1.;
+    const double to = double(geometry.lineIndexAt(horizontal, arcs[2])) + 1.;
+    scaffold.graph.fibers[horizontal].approval.approvedNormals = {{from, to}};
+    suspects = scaffoldSignSuspects(scaffold.graph, geometry, result, narrow, report);
+    CHECK(suspects.empty());
+    CHECK(report.approved == 1);
+}

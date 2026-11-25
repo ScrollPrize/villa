@@ -103,6 +103,9 @@ struct ScaffoldRunView {
     // Normal flip suspects: a map link whose inside/outside order the solved
     // normals contradict, one row per accused fiber (ScaffoldSolveRuns.hpp).
     std::vector<vc::fiber_graph::ScaffoldStoredResidual> flips;
+    // Sign suspects: per violated sign constraint and fiber, the stretch from
+    // that crossing to other crossings of the fiber (ScaffoldConstraints.hpp).
+    std::vector<vc::fiber_graph::ScaffoldStoredResidual> signSuspects;
     std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding> windings;
     // The accused stretches, highest score first (rankScaffoldPieces).
     std::vector<ScaffoldRankedPiece> pieces;
@@ -357,6 +360,8 @@ public:
 public:
     // What a row names on the map: the stretches drawn, or why one cannot be.
     [[nodiscard]] ScaffoldHighlight highlightOf(const QTreeWidgetItem*) const;
+    // The listed stretches of one fiber, as arc ranges of the selected solve.
+    [[nodiscard]] std::vector<std::pair<double, double>> stretchArcs(const std::string& fiberUuid) const;
 
 signals:
     void highlightRequested(const ScaffoldHighlight& highlight);

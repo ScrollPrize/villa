@@ -650,26 +650,39 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   component was solved on its own, so its violations can only be explained by
   its own annotation.
 
-  The stretch rows are not the run's stored stretches. Every fiber the run
-  solved is cut into stretches over all of its unapproved geometry, accused
-  or not - in the end all of it has to be approved, and the run only says
-  where to start. Stretches end on control points: each run of unapproved
-  control spans is cut into the fewest stretches of at most 2,000 voxels (a
-  single longer span is a stretch of its own), and among those cuttings the
-  one whose cuts split the least accused weight is taken, so a stretch a
-  cycle accuses stays whole where it can. An accusation only adds cost to
-  the stretches it lies in, by length; one of no length (two constraints of
-  a cycle meeting the fiber at one point) adds its cost to the stretch
-  holding that point and is never a row. A stretch nothing accuses costs
-  nothing and sorts last. Approved geometry is not offered again; a stretch
-  continuing an approved piece reaches 50 voxels back into it (*extends
-  approved*). A segment's *cost* is the sum of the shares of every
-  constraint accusing it and *cost/kvx* that cost per 1000 voxels of the
-  stretch; *cost per voxel* is the default order. The stretches are computed
-  from the run's rows and the current approvals, so approving one removes it
-  without a new solve. What a run accuses outside a fiber's present control
-  points stays a row without a control range, and selecting it is an error
-  that says the run is older than the annotation.
+  A stretch says something to a solve only where it reaches from one
+  constraint to another, so the stretch rows run from constraint to
+  constraint; their ends are not control points.
+
+  **Geometry** rows are the stretches the cycles of the violated constraints
+  run along. A violated constraint's cost is split over its cycle's stretches
+  in proportion to 1 / length, among those whose geometry is not approved
+  from end to end: an approved stretch cannot be the error, so the cost
+  gathers on what is left. Stretches of one fiber that overlap or lie within
+  300 voxels of each other are one row (their shares add up) while the whole
+  stays within 2,000 voxels, so one look covers several constraints. *cost*
+  is the summed share, *cost/kvx* that cost per 1000 voxels; *cost per voxel*
+  is the default order. The rows are computed from the run's rows and the
+  current approvals, so an approval moves the cost without a new solve. A
+  fiber nothing accuses has no row.
+
+  **Normals** rows come from the violated sign constraints
+  (`scaffoldSignSuspects`). A sign constraint the solve had to break says a
+  normal is wrong at that crossing, on one of its two fibers. An annotation
+  states a normal without a facing, so the row always reaches from that
+  crossing to at least one other crossing of the same fiber (the nearest,
+  however far), and over further crossings within 300 voxels (at most 2,000
+  voxels): approving the normals there ties those crossings to one facing.
+  One row per fiber of the constraint; overlapping rows of a fiber are one.
+  *cost* is the summed cost of the violated sign constraints on the row,
+  *state* their number and *paths* the fiber's crossings on it. A row whose
+  stretch is approved for normals from end to end is not offered, which
+  leaves the other fiber. A fiber with no other crossing has no row; the run
+  counts those (`sign_suspects_without_crossing`).
+
+  What a run accuses outside a fiber's present control points stays a row
+  without a control range, and selecting it is an error that says the run is
+  older than the annotation.
 
   A row only ever shows a stretch: selection, hover and opening have no
   whole-fiber form, and a stretch that cannot be resolved reports why in the

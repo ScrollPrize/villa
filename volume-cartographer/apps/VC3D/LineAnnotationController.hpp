@@ -401,6 +401,11 @@ public:
         std::vector<cv::Vec3f> points, normals;
     };
     void setSolverLineNormals(uint64_t fiberId, std::shared_ptr<const SolverLineNormals> normals);
+    // The stretches the fiber map's approval list holds for a fiber, as ranges
+    // of its stored line points: what "select nearest stretch" in the
+    // approval window chooses from.
+    using ApprovalStretchProvider = std::function<std::vector<std::pair<double, double>>(uint64_t fiberId)>;
+    void setApprovalStretchProvider(ApprovalStretchProvider provider);
     // The stored fiber's control points as (index, stable id); empty when
     // the fiber is not stored.
     struct StoredControlSummary { size_t index = 0; int64_t storeId = -1; };
@@ -1279,6 +1284,7 @@ private:
     // scroll center (umbilicus when available, volume XY center otherwise);
     // NaN entries mark invalid samples.
     std::map<uint64_t, std::shared_ptr<const SolverLineNormals>> _solverLineNormals;
+    ApprovalStretchProvider _approvalStretchProvider;
     [[nodiscard]] std::vector<cv::Vec3f> orientedLineNormalsForSession(
         const LineAnnotationSession& session);
     [[nodiscard]] vc::fiber_tracer::FiberDisplayField displayFieldForSession(

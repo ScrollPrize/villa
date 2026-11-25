@@ -358,8 +358,8 @@ signals:
     void fiberFollowConfidenceChanged();
     void fiberTagChangeRequested(const QString& tag, bool enabled);
     // Approval window. bound: 0 the stretch starts, 1 ends at the line
-    // position; 2 selects the whole annotated line; 3 / 4 the stretch of the
-    // same length after / before the selected one.
+    // position; 2 selects the whole annotated line; 3 the stretch of the
+    // fiber map's approval list nearest the line position.
     void approvalSelectionBoundRequested(int bound, double linePosition);
     // aspect: 0 geometry, 1 normals; state: 0 undefined, 1 approved, 2 broken.
     void approvalStateRequested(int aspect, int state);

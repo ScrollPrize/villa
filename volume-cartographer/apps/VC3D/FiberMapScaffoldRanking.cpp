@@ -168,157 +168,80 @@ std::vector<ScaffoldSegment> scaffoldApprovalSegments(
         std::size_t residual = 0;
         std::int64_t cycle = 0, hops = -1;
     };
+    // A cycle stretch whose geometry is approved from end to end cannot be
+    // the error: it takes no share, and the others take more.
+    const auto approved = [&](const std::string& uuid, double from, double to) {
+        const auto found = fibers.find(uuid);
+        if (found == fibers.end()) return false;
+        for (const auto& [first, last] : found->second.approvedArcs[0])
+            if (from >= first - 1e-6 && to <= last + 1e-6) return true;
+        return false;
+    };
     const auto cycles = scaffoldCycleNumbers(residuals);
     std::map<std::string, std::vector<Accusation>> accused;
     for (std::size_t index = 0; index < residuals.size(); ++index) {
         const auto& residual = residuals[index];
         const double cost = residual.weight * residual.residual;
+        std::vector<Accusation> open;
+        std::vector<const std::string*> owners;
         double total = 0;
-        for (const auto& piece : residual.pieces) total += 1. / std::max(std::abs(piece.arcTo - piece.arcFrom), 1.);
         for (const auto& piece : residual.pieces) {
-            const double from = std::min(piece.arcFrom, piece.arcTo), to = std::max(piece.arcFrom, piece.arcTo);
             Accusation entry;
-            entry.from = from;
-            entry.to = to;
-            entry.share = cost * (1. / std::max(to - from, 1.)) / std::max(total, 1e-300);
+            entry.from = std::min(piece.arcFrom, piece.arcTo);
+            entry.to = std::max(piece.arcFrom, piece.arcTo);
+            if (approved(piece.fiberUuid, entry.from, entry.to)) continue;
+            entry.share = 1. / std::max(entry.to - entry.from, 1.);
             entry.residual = index;
             entry.cycle = cycles[index];
             entry.hops = residual.cycleHops.value_or(-1);
-            accused[piece.fiberUuid].push_back(entry);
+            total += entry.share;
+            open.push_back(entry);
+            owners.push_back(&piece.fiberUuid);
+        }
+        for (std::size_t at = 0; at < open.size(); ++at) {
+            open[at].share = cost * open[at].share / std::max(total, 1e-300);
+            accused[*owners[at]].push_back(open[at]);
         }
     }
-    // The share of an accusation that lies in [from, to]: by length, or the
-    // whole share of a point when the range holds it (`closed`: its upper
-    // end included).
-    const auto within = [](const Accusation& item, double from, double to, bool closed) {
-        if (!(item.to > item.from)) return item.from >= from && (item.from < to || (closed && item.from <= to)) ? 1. : 0.;
-        return std::max(0., std::min(item.to, to) - std::max(item.from, from)) / (item.to - item.from);
-    };
-    struct Building {
-        double from = 0, to = 0, cost = 0;
-        std::int64_t hops = -1;
-        std::set<std::size_t> residuals;
-        std::set<std::int64_t> cycles;
-        bool extendsApproved = false, placed = true;
-    };
-    const auto credit = [](Building& segment, const Accusation& item, double share) {
-        if (!(share > 0)) return;
-        segment.cost += item.share * share;
-        segment.residuals.insert(item.residual);
-        if (item.cycle > 0) segment.cycles.insert(item.cycle);
-        if (item.hops > 0 && (segment.hops < 0 || item.hops < segment.hops)) segment.hops = item.hops;
-    };
     std::vector<ScaffoldSegment> out;
-    const auto add = [&](const std::string& uuid, const std::vector<double>& arcs, const Building& segment) {
-        ScaffoldSegment entry;
-        entry.fiberUuid = uuid;
-        entry.arcFrom = segment.from;
-        entry.arcTo = segment.to;
-        entry.controlFrom = segment.placed ? scaffoldControlPosition(arcs, segment.from) : -1;
-        entry.controlTo = segment.placed ? scaffoldControlPosition(arcs, segment.to) : -1;
-        entry.cost = segment.cost;
-        entry.density = segment.cost / std::max(segment.to - segment.from, 1.);
-        entry.cycleHops = segment.hops;
-        entry.constraints = std::int64_t(segment.residuals.size());
-        entry.cycles.assign(segment.cycles.begin(), segment.cycles.end());
-        entry.extendsApproved = segment.extendsApproved;
-        out.push_back(std::move(entry));
-    };
-    static const std::vector<Accusation> none;
-    // Every fiber whose controls are known is cut, accused or not.
-    for (const auto& [uuid, spans] : fibers) {
-        const auto& arcs = spans.controlArcs;
-        if (arcs.size() < 2) continue;
-        const auto found = accused.find(uuid);
-        const auto& list = found != accused.end() ? found->second : none;
-        const auto& flags = spans.approved[0];
-        const auto approvedSpan = [&](std::size_t span) { return span < flags.size() && flags[span] != 0; };
-        const std::size_t count = arcs.size() - 1;
-        // The accused weight a cut at each control point would split.
-        std::vector<double> crossing(arcs.size(), 0.);
-        for (std::size_t control = 1; control + 1 < arcs.size(); ++control)
-            for (const auto& item : list)
-                if (item.from < arcs[control] && arcs[control] < item.to) crossing[control] += item.share;
-        for (std::size_t first = 0; first < count;) {
-            if (approvedSpan(first)) { ++first; continue; }
-            std::size_t last = first;
-            while (last < count && !approvedSpan(last)) ++last;
-            // The unapproved run [first, last] of control points: the fewest
-            // stretches no longer than the limit (a single longer span is a
-            // stretch of its own), and among those the cuts that split the
-            // least accused weight.
-            struct Best { std::int64_t stretches = 0; double split = 0; std::size_t from = 0; };
-            std::vector<Best> best(last - first + 1);
-            for (std::size_t to = first + 1; to <= last; ++to) {
-                Best chosen{std::numeric_limits<std::int64_t>::max(), 0., first};
-                for (std::size_t from = to; from-- > first;) {
-                    if (from + 1 < to && arcs[to] - arcs[from] > options.maxSegmentVx) break;
-                    const auto& before = best[from - first];
-                    const Best candidate{before.stretches + 1, before.split + (from > first ? crossing[from] : 0.), from};
-                    if (candidate.stretches < chosen.stretches ||
-                        (candidate.stretches == chosen.stretches && candidate.split < chosen.split))
-                        chosen = candidate;
-                }
-                best[to - first] = chosen;
-            }
-            std::vector<std::pair<std::size_t, std::size_t>> cut;
-            for (std::size_t to = last; to > first; to = best[to - first].from) cut.emplace_back(best[to - first].from, to);
-            std::reverse(cut.begin(), cut.end());
-            for (const auto [from, to] : cut) {
-                Building segment;
-                segment.from = arcs[from];
-                segment.to = arcs[to];
-                for (const auto& item : list) credit(segment, item, within(item, segment.from, segment.to, to == last));
-                // A stretch that continues approved geometry reaches a little
-                // back into it, so the two are judged as one piece of fiber.
-                if (from == first && first > 0) {
-                    segment.from = std::max(arcs[first - 1], segment.from - options.approvedOverlapVx);
-                    segment.extendsApproved = true;
-                }
-                if (to == last && last < count) {
-                    segment.to = std::min(arcs[last + 1], segment.to + options.approvedOverlapVx);
-                    segment.extendsApproved = true;
-                }
-                add(uuid, arcs, segment);
-            }
-            first = last;
-        }
-        // What a run accuses outside the fiber's control points is fiber the
-        // annotation no longer has: it stays a row, unplaced, and says so.
-        for (const auto& item : list) {
-            const auto outside = [&](double from, double to, double share) {
-                Building segment;
-                segment.from = from;
-                segment.to = to;
-                segment.placed = false;
-                credit(segment, item, share);
-                add(uuid, arcs, segment);
-            };
-            if (!(item.to > item.from)) {
-                if (item.from < arcs.front() || item.from > arcs.back()) outside(item.from, item.to, 1.);
-                continue;
-            }
-            if (item.from < arcs.front())
-                outside(item.from, std::min(item.to, arcs.front()),
-                        (std::min(item.to, arcs.front()) - item.from) / (item.to - item.from));
-            if (item.to > arcs.back())
-                outside(std::max(item.from, arcs.back()), item.to,
-                        (item.to - std::max(item.from, arcs.back())) / (item.to - item.from));
-        }
-    }
-    // A fiber the run accuses whose controls are unknown: its stretches as
-    // the run states them, unplaced.
-    for (const auto& [uuid, list] : accused) {
-        const auto known = fibers.find(uuid);
-        if (known != fibers.end() && known->second.controlArcs.size() >= 2) continue;
+    for (auto& [uuid, list] : accused) {
+        std::stable_sort(list.begin(), list.end(), [](const Accusation& x, const Accusation& y) {
+            return x.from != y.from ? x.from < y.from : x.to < y.to;
+        });
         static const std::vector<double> noArcs;
-        for (const auto& item : list) {
-            Building segment;
-            segment.from = item.from;
-            segment.to = item.to;
-            segment.placed = false;
-            credit(segment, item, 1.);
-            add(uuid, noArcs, segment);
+        const auto known = fibers.find(uuid);
+        const auto& arcs = known != fibers.end() ? known->second.controlArcs : noArcs;
+        for (std::size_t first = 0; first < list.size();) {
+            ScaffoldSegment entry;
+            entry.fiberUuid = uuid;
+            entry.arcFrom = list[first].from;
+            entry.arcTo = list[first].to;
+            std::set<std::size_t> constraints;
+            std::set<std::int64_t> loops;
+            std::size_t next = first;
+            for (; next < list.size(); ++next) {
+                const auto& item = list[next];
+                // The next stretch joins when it overlaps this one or starts
+                // close behind it, while the whole stays within the limit.
+                if (next > first && (item.from > entry.arcTo + options.joinVx ||
+                                     std::max(entry.arcTo, item.to) - entry.arcFrom > options.maxSegmentVx))
+                    break;
+                entry.arcTo = std::max(entry.arcTo, item.to);
+                entry.cost += item.share;
+                constraints.insert(item.residual);
+                if (item.cycle > 0) loops.insert(item.cycle);
+                if (item.hops > 0 && (entry.cycleHops < 0 || item.hops < entry.cycleHops)) entry.cycleHops = item.hops;
+            }
+            first = next;
+            // A stretch outside the fiber's control points is fiber the
+            // annotation no longer has: it stays a row without positions.
+            const bool placed = arcs.size() >= 2 && entry.arcFrom >= arcs.front() - 1e-6 && entry.arcTo <= arcs.back() + 1e-6;
+            entry.controlFrom = placed ? scaffoldControlPosition(arcs, entry.arcFrom) : -1;
+            entry.controlTo = placed ? scaffoldControlPosition(arcs, entry.arcTo) : -1;
+            entry.density = entry.cost / std::max(entry.length(), 1.);
+            entry.constraints = std::int64_t(constraints.size());
+            entry.cycles.assign(loops.begin(), loops.end());
+            out.push_back(std::move(entry));
         }
     }
     std::stable_sort(out.begin(), out.end(), [](const ScaffoldSegment& x, const ScaffoldSegment& y) {

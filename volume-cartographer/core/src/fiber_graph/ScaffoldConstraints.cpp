@@ -456,6 +456,126 @@ ScaffoldSignResult scaffoldNormalSigns(const ScaffoldGraph& graph, const Scaffol
     return result;
 }
 
+namespace {
+ScaffoldConstraint constraintOfArc(const geometry::winding_graph_detail::Arc& arc, const ScaffoldEvent& event,
+                                   std::int64_t index, std::int64_t transport, ScaffoldConstraintKind kind)
+{
+    ScaffoldConstraint constraint;
+    constraint.kind = kind;
+    constraint.a = arc.a;
+    constraint.b = arc.b;
+    const bool forward = arc.a == event.a;
+    constraint.arcA = forward ? event.arcA : event.arcB;
+    constraint.arcB = forward ? event.arcB : event.arcA;
+    constraint.target = arc.target;
+    constraint.step = arc.target - (forward ? transport : -transport);
+    constraint.weight = arc.weight;
+    constraint.event = index;
+    constraint.windingDistance = event.distance;
+    return constraint;
+}
+
+geometry::WindingConstraintOptions sharedConstraintOptions(const ScaffoldMeasuredOptions& options)
+{
+    geometry::WindingConstraintOptions shared;
+    shared.windingScale = options.windingScale;
+    shared.perpendicularOffset = options.perpendicularOffset;
+    shared.perpendicularWeight = options.perpendicularWeight;
+    shared.parallelWeight = options.parallelWeight;
+    shared.signWeight = options.signWeight;
+    shared.crossingFilter = options.crossingFilter;
+    shared.enclosures = options.enclosures && options.enclosureWeight > 0;
+    // The crossing's evidence, exactly as the sign stage weights it.
+    shared.dotWeightPower = options.crossingConfidence ? options.confidence.dotWeightPower : 0.;
+    shared.dampByWindingDistance =
+        options.crossingConfidence && options.confidence.distanceWeight == fiber_tracer::FiberSignDistanceWeight::InverseSquare;
+    return shared;
+}
+
+// Whether a crossing states a relation at all; `report` counts why not.
+bool eventStatesRelation(const ScaffoldGraph& graph, const ScaffoldEvent& event, ScaffoldMeasuredReport* report)
+{
+    if (event.a == event.b) { if (report) ++report->skippedSelf; return false; }
+    if (!event.validA || !event.validB || !event.validConnector) { if (report) ++report->skippedInvalid; return false; }
+    const auto familyA = graph.fibers[std::size_t(event.a)].family;
+    const auto familyB = graph.fibers[std::size_t(event.b)].family;
+    if (familyA == ScaffoldFamily::Untagged || familyB == ScaffoldFamily::Untagged) {
+        if (report) ++report->skippedUntagged;
+        return false;
+    }
+    if (event.parallel != (familyA == familyB)) { if (report) ++report->skippedFamilyMismatch; return false; }
+    return true;
+}
+
+// The same per-crossing constraints the traced volume's winding stage builds
+// (vc_object_store geometry/FiberWindingGraph.hpp), under the two whole-fiber
+// normal signs given.
+geometry::WindingEventConstraints eventConstraints(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                                   const ScaffoldEvent& event, std::int64_t signA, std::int64_t signB,
+                                                   std::int64_t fallingSign,
+                                                   const geometry::WindingConstraintOptions& shared)
+{
+    geometry::WindingEvent input;
+    input.a = event.a;
+    input.b = event.b;
+    input.familyA = familyIndex(graph.fibers[std::size_t(event.a)].family);
+    input.familyB = familyIndex(graph.fibers[std::size_t(event.b)].family);
+    // The relation orders two fibers by the direction their winding falls in.
+    input.signA = signA * fallingSign;
+    input.signB = signB * fallingSign;
+    input.arcA = event.arcA;
+    input.arcB = event.arcB;
+    input.distance = event.distance;
+    input.parallel = event.parallel;
+    input.connector = {event.pointB[0] - event.pointA[0], event.pointB[1] - event.pointA[1],
+                       event.pointB[2] - event.pointA[2]};
+    input.normalA = event.normalA;
+    input.normalB = event.normalB;
+    input.crossingFindings = event.crossingFindings;
+    input.crossingAlternative = event.crossingAlternative;
+    return geometry::windingEventConstraints(geometry.packed(), input, shared);
+}
+
+// The constraints one crossing states on its own (its sign bound and its
+// separation); an enclosure is a statement about a pair and is not among them.
+void appendEventConstraints(std::vector<ScaffoldConstraint>& constraints, const geometry::WindingEventConstraints& built,
+                            const ScaffoldEvent& event, std::int64_t index, const ScaffoldMeasuredOptions& options,
+                            ScaffoldMeasuredReport* report)
+{
+    const auto& relation = built.relation;
+    if (report && relation.withoutDistance) ++report->withoutDistance;
+    if (built.hasSign) {
+        const geometry::winding_graph_detail::Arc arc{built.sign.a, built.sign.b, built.sign.target, built.sign.weight};
+        constraints.push_back(constraintOfArc(
+            arc, event, index, relation.transport,
+            built.sign.side > 0 ? ScaffoldConstraintKind::SignAtLeast : ScaffoldConstraintKind::SignAtMost));
+        if (report) ++report->signConstraints;
+    }
+    if (!relation.usable) return;
+    const auto kind = event.parallel ? ScaffoldConstraintKind::Parallel : ScaffoldConstraintKind::Perpendicular;
+    if (report && relation.hasUpper) ++report->fractional;
+    if (options.separations == ScaffoldSeparationMode::Rounded) {
+        // The nearer integer with the event's whole weight.
+        auto nearer = relation.hasUpper && relation.upper.weight > relation.lower.weight ? relation.upper
+                                                                                        : relation.lower;
+        nearer.weight = built.weight;
+        constraints.push_back(constraintOfArc(nearer, event, index, relation.transport, kind));
+        if (report) ++report->expanded;
+    } else {
+        constraints.push_back(constraintOfArc(relation.lower, event, index, relation.transport, kind));
+        if (report) ++report->expanded;
+        if (relation.hasUpper) {
+            constraints.push_back(constraintOfArc(relation.upper, event, index, relation.transport, kind));
+            if (report) ++report->expanded;
+        }
+    }
+    if (report) {
+        ++report->used;
+        if (event.parallel) ++report->parallel; else ++report->perpendicular;
+    }
+}
+} // namespace
+
 std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph& graph,
                                                            const ScaffoldGeometry& geometry,
                                                            std::span<const ScaffoldEvent> events,
@@ -487,101 +607,22 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
     };
     std::vector<Bound> bounds;
 
-    const auto append = [&](const geometry::winding_graph_detail::Arc& arc, const ScaffoldEvent& event,
-                            std::int64_t index, std::int64_t transport, ScaffoldConstraintKind kind) {
-        ScaffoldConstraint constraint;
-        constraint.kind = kind;
-        constraint.a = arc.a;
-        constraint.b = arc.b;
-        const bool forward = arc.a == event.a;
-        constraint.arcA = forward ? event.arcA : event.arcB;
-        constraint.arcB = forward ? event.arcB : event.arcA;
-        constraint.target = arc.target;
-        constraint.step = arc.target - (forward ? transport : -transport);
-        constraint.weight = arc.weight;
-        constraint.event = index;
-        constraint.windingDistance = event.distance;
-        constraints.push_back(constraint);
-    };
-
-    geometry::WindingConstraintOptions shared;
-    shared.windingScale = options.windingScale;
-    shared.perpendicularOffset = options.perpendicularOffset;
-    shared.perpendicularWeight = options.perpendicularWeight;
-    shared.parallelWeight = options.parallelWeight;
-    shared.signWeight = options.signWeight;
-    shared.crossingFilter = options.crossingFilter;
-    shared.enclosures = options.enclosures && options.enclosureWeight > 0;
-    // The crossing's evidence, exactly as the sign stage weights it.
-    shared.dotWeightPower = options.crossingConfidence ? options.confidence.dotWeightPower : 0.;
-    shared.dampByWindingDistance =
-        options.crossingConfidence && options.confidence.distanceWeight == fiber_tracer::FiberSignDistanceWeight::InverseSquare;
-
+    const auto shared = sharedConstraintOptions(options);
     for (std::size_t index = 0; index < events.size(); ++index) {
         const auto& event = events[index];
-        if (event.a == event.b) { ++report.skippedSelf; continue; }
-        if (!event.validA || !event.validB || !event.validConnector) { ++report.skippedInvalid; continue; }
-        const auto familyA = graph.fibers[std::size_t(event.a)].family;
-        const auto familyB = graph.fibers[std::size_t(event.b)].family;
-        if (familyA == ScaffoldFamily::Untagged || familyB == ScaffoldFamily::Untagged) {
-            ++report.skippedUntagged;
-            continue;
-        }
-        if (event.parallel != (familyA == familyB)) { ++report.skippedFamilyMismatch; continue; }
-
-        geometry::WindingEvent input;
-        input.a = event.a;
-        input.b = event.b;
-        input.familyA = familyIndex(familyA);
-        input.familyB = familyIndex(familyB);
-        // The relation orders two fibers by the direction their winding falls in.
-        input.signA = normalSign[std::size_t(event.a)] * fallingSign;
-        input.signB = normalSign[std::size_t(event.b)] * fallingSign;
-        input.arcA = event.arcA;
-        input.arcB = event.arcB;
-        input.distance = event.distance;
-        input.parallel = event.parallel;
-        input.connector = {event.pointB[0] - event.pointA[0], event.pointB[1] - event.pointA[1],
-                           event.pointB[2] - event.pointA[2]};
-        input.normalA = event.normalA;
-        input.normalB = event.normalB;
-        input.crossingFindings = event.crossingFindings;
-        input.crossingAlternative = event.crossingAlternative;
-        // The same per-crossing constraints the traced volume's winding stage
-        // builds (vc_object_store geometry/FiberWindingGraph.hpp).
-        const auto built = geometry::windingEventConstraints(geometry.packed(), input, shared);
+        if (!eventStatesRelation(graph, event, &report)) continue;
+        const auto built = eventConstraints(graph, geometry, event, normalSign[std::size_t(event.a)],
+                                            normalSign[std::size_t(event.b)], fallingSign, shared);
         if (built.filtered) { ++report.crossingFiltered; continue; }
-        const auto& relation = built.relation;
-        if (relation.withoutDistance) ++report.withoutDistance;
-        if (relation.hasEnclosure && shared.enclosures)
-            bounds.push_back({relation.enclosure, std::int64_t(index), relation.transport});
-        if (built.hasSign) {
-            const geometry::winding_graph_detail::Arc arc{built.sign.a, built.sign.b, built.sign.target, built.sign.weight};
-            append(arc, event, std::int64_t(index), relation.transport,
-                   built.sign.side > 0 ? ScaffoldConstraintKind::SignAtLeast : ScaffoldConstraintKind::SignAtMost);
-            ++report.signConstraints;
-        }
-        if (!relation.usable) continue;
-        const auto kind = event.parallel ? ScaffoldConstraintKind::Parallel : ScaffoldConstraintKind::Perpendicular;
-        if (relation.hasUpper) ++report.fractional;
-        if (options.separations == ScaffoldSeparationMode::Rounded) {
-            // The nearer integer with the event's whole weight.
-            auto nearer = relation.hasUpper && relation.upper.weight > relation.lower.weight ? relation.upper
-                                                                                            : relation.lower;
-            nearer.weight = built.weight;
-            append(nearer, event, std::int64_t(index), relation.transport, kind);
-            ++report.expanded;
-        } else {
-            append(relation.lower, event, std::int64_t(index), relation.transport, kind);
-            ++report.expanded;
-            if (relation.hasUpper) {
-                append(relation.upper, event, std::int64_t(index), relation.transport, kind);
-                ++report.expanded;
-            }
-        }
-        ++report.used;
-        if (event.parallel) ++report.parallel; else ++report.perpendicular;
+        if (built.relation.hasEnclosure && shared.enclosures)
+            bounds.push_back({built.relation.enclosure, std::int64_t(index), built.relation.transport});
+        appendEventConstraints(constraints, built, event, std::int64_t(index), options, &report);
     }
+
+    const auto append = [&](const geometry::winding_graph_detail::Arc& arc, const ScaffoldEvent& event,
+                            std::int64_t index, std::int64_t transport, ScaffoldConstraintKind kind) {
+        constraints.push_back(constraintOfArc(arc, event, index, transport, kind));
+    };
 
     // Exact enclosure relations, accepted by the shared rule. An accepted
     // pair keeps the anchors of the crossing that set its lower bound.
@@ -750,6 +791,128 @@ void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const Scaffold
     for (std::size_t i = 0; i < live.size(); ++i)
         if (!matched[i]) ++report.unmatched;
     report.stale = report.live - report.unmatched - report.approved;
+}
+
+std::vector<ScaffoldSignSuspect> scaffoldSignSuspects(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                                      const ScaffoldSolveResult& result,
+                                                      const ScaffoldSignSuspectOptions& options,
+                                                      ScaffoldSignSuspectReport& report)
+{
+    const auto fibers = graph.fibers.size();
+    if (!(options.joinVx >= 0) || !(options.maxStretchVx > 0))
+        throw std::invalid_argument("scaffold sign suspects: invalid stretch lengths");
+    report = ScaffoldSignSuspectReport{};
+    // A fiber with broken geometry is its parts: a stretch stays in one.
+    std::vector<std::vector<double>> cuts(fibers);
+    for (std::size_t i = 0; i < fibers; ++i) cuts[i] = geometry.splitArcs(i);
+    const auto partAt = [&](std::int64_t fiber, double arc) {
+        const auto& list = cuts[std::size_t(fiber)];
+        return std::int64_t(std::upper_bound(list.begin(), list.end(), arc) - list.begin());
+    };
+    // Every crossing of every fiber part: the anchors of the solve's constraints.
+    std::map<std::pair<std::int64_t, std::int64_t>, std::vector<double>> crossings;
+    for (const auto& constraint : result.constraints) {
+        crossings[{constraint.a, partAt(constraint.a, constraint.arcA)}].push_back(constraint.arcA);
+        crossings[{constraint.b, partAt(constraint.b, constraint.arcB)}].push_back(constraint.arcB);
+    }
+    // One crossing states several constraints at one arc; crossings less than
+    // a voxel apart are one place of the fiber.
+    for (auto& [key, arcs] : crossings) {
+        std::sort(arcs.begin(), arcs.end());
+        std::vector<double> distinct;
+        for (const double arc : arcs)
+            if (distinct.empty() || arc - distinct.back() >= 1.) distinct.push_back(arc);
+        arcs = std::move(distinct);
+    }
+    struct Stretch {
+        std::size_t from = 0, to = 0;  // indices into the part's crossings
+        double cost = 0, arc = 0, otherArc = 0;
+        std::int64_t other = 0, violations = 0;
+    };
+    std::map<std::pair<std::int64_t, std::int64_t>, std::vector<Stretch>> stretches;
+    for (const auto& residual : result.residuals) {
+        const auto& constraint = result.constraints.at(std::size_t(residual.constraint));
+        if (scaffoldConstraintSide(constraint.kind) == 0) continue;
+        ++report.violations;
+        for (int side = 0; side < 2; ++side) {
+            const auto fiber = side == 0 ? constraint.a : constraint.b;
+            const double arc = side == 0 ? constraint.arcA : constraint.arcB;
+            const std::pair<std::int64_t, std::int64_t> key{fiber, partAt(fiber, arc)};
+            const auto& arcs = crossings[key];
+            if (arcs.size() < 2) { ++report.withoutCrossing; continue; }
+            // The crossing's own place among the part's crossings.
+            auto at = std::size_t(std::lower_bound(arcs.begin(), arcs.end(), arc) - arcs.begin());
+            if (at >= arcs.size() || (at > 0 && arc - arcs[at - 1] < arcs[at] - arc)) --at;
+            // Another crossing is mandatory: the nearer neighbour, whatever
+            // its distance. Further ones join while they are close.
+            std::size_t from = at, to = at;
+            if (at == 0) to = 1;
+            else if (at + 1 == arcs.size()) from = at - 1;
+            else if (arcs[at] - arcs[at - 1] <= arcs[at + 1] - arcs[at]) from = at - 1;
+            else to = at + 1;
+            for (bool grown = true; grown;) {
+                grown = false;
+                if (from > 0 && arcs[from] - arcs[from - 1] <= options.joinVx &&
+                    arcs[to] - arcs[from - 1] <= options.maxStretchVx) { --from; grown = true; }
+                if (to + 1 < arcs.size() && arcs[to + 1] - arcs[to] <= options.joinVx &&
+                    arcs[to + 1] - arcs[from] <= options.maxStretchVx) { ++to; grown = true; }
+            }
+            Stretch stretch;
+            stretch.from = from;
+            stretch.to = to;
+            stretch.cost = residual.cost;
+            stretch.arc = arc;
+            stretch.other = side == 0 ? constraint.b : constraint.a;
+            stretch.otherArc = side == 0 ? constraint.arcB : constraint.arcA;
+            stretch.violations = 1;
+            stretches[key].push_back(stretch);
+        }
+    }
+    std::vector<ScaffoldSignSuspect> out;
+    for (auto& [key, list] : stretches) {
+        const auto fiber = std::size_t(key.first);
+        const auto& arcs = crossings[key];
+        std::vector<std::pair<double, double>> approved;
+        for (const auto& [from, to] : graph.fibers[fiber].approval.approvedNormals)
+            approved.emplace_back(geometry.arcAtLineIndex(fiber, from), geometry.arcAtLineIndex(fiber, to));
+        // Overlapping stretches are one; the first (worst) names the row.
+        std::stable_sort(list.begin(), list.end(), [](const Stretch& x, const Stretch& y) { return x.from < y.from; });
+        std::vector<Stretch> merged;
+        for (const auto& stretch : list) {
+            if (!merged.empty() && stretch.from <= merged.back().to) {
+                auto& last = merged.back();
+                last.to = std::max(last.to, stretch.to);
+                if (stretch.cost > last.cost) { last.arc = stretch.arc; last.other = stretch.other; last.otherArc = stretch.otherArc; }
+                last.cost += stretch.cost;
+                last.violations += stretch.violations;
+            } else {
+                merged.push_back(stretch);
+            }
+        }
+        for (const auto& stretch : merged) {
+            if (ScaffoldApproval::covers(approved, arcs[stretch.from], arcs[stretch.to])) {
+                report.approved += stretch.violations;
+                continue;
+            }
+            ScaffoldSignSuspect suspect;
+            suspect.fiber = key.first;
+            suspect.violations = stretch.violations;
+            suspect.cost = stretch.cost;
+            suspect.arc = stretch.arc;
+            suspect.other = stretch.other;
+            suspect.otherArc = stretch.otherArc;
+            suspect.crossings = std::int64_t(stretch.to - stretch.from + 1);
+            suspect.piece.fiber = key.first;
+            suspect.piece.arcFrom = arcs[stretch.from];
+            suspect.piece.arcTo = arcs[stretch.to];
+            scaffoldPieceControls(graph, geometry, suspect.piece);
+            out.push_back(suspect);
+        }
+    }
+    std::stable_sort(out.begin(), out.end(),
+                     [](const ScaffoldSignSuspect& x, const ScaffoldSignSuspect& y) { return x.cost > y.cost; });
+    report.suspects = std::int64_t(out.size());
+    return out;
 }
 
 std::vector<ScaffoldNormalFlip> scaffoldLinkNormalFlips(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,

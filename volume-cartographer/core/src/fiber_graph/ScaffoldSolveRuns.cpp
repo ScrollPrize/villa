@@ -254,6 +254,12 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("links_with_crossing", result.linkReport.linksWithCrossing, "links");
     count("crossings_replaced_by_links", result.linkReport.deduplicatedCrossings, "crossings");
     metric("link_refinement_max_shift", result.linkReport.maxRefinementShift, "voxels");
+    if (stages.signSuspectReport) {
+        count("sign_violations", stages.signSuspectReport->violations, "constraints");
+        count("sign_suspects", stages.signSuspectReport->suspects, "stretches");
+        count("sign_suspects_without_crossing", stages.signSuspectReport->withoutCrossing, "fiber sides");
+        count("sign_suspects_approved", stages.signSuspectReport->approved, "fiber sides");
+    }
     if (stages.flipReport) {
         count("normal_order_links_checked", stages.flipReport->checked, "links");
         count("normal_order_links_agreed", stages.flipReport->agreed, "links");
@@ -426,6 +432,39 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
                  {"score", nullValue()}}).values);
         }
     }
+    if (stages.signSuspects) {
+        const auto first = std::int64_t(result.residuals.size() + (stages.flips ? stages.flips->size() : 0));
+        for (std::size_t at = 0; at < stages.signSuspects->size(); ++at) {
+            const auto& suspect = (*stages.signSuspects)[at];
+            const auto rank = first + std::int64_t(at);
+            const auto fiber = uuidValue(graph.fibers[std::size_t(suspect.fiber)].uuid);
+            residuals.push_back(objects::fiberGraphSolveRow(FiberGraphTable::Residuals,
+                {{"run_uuid", uuidValue(record.runUuid)},
+                 {"residual_index", rank},
+                 {"kind", kScaffoldSignSuspectRowKind},
+                 {"fiber_a", fiber},
+                 {"fiber_b", uuidValue(graph.fibers[std::size_t(suspect.other)].uuid)},
+                 {"target", suspect.violations},
+                 {"weight", double(suspect.crossings)},
+                 {"residual", suspect.cost},
+                 {"edge_uuid", nullValue()},
+                 {"arc_a", suspect.arc},
+                 {"arc_b", suspect.otherArc},
+                 {"cycle_hops", nullValue()},
+                 {"cycle_piece_length", nullValue()},
+                 {"redundancy", nullValue()}}).values);
+            pieces.push_back(objects::fiberGraphSolveRow(FiberGraphTable::ResidualPieces,
+                {{"run_uuid", uuidValue(record.runUuid)},
+                 {"residual_index", rank},
+                 {"member_index", std::int64_t{0}},
+                 {"fiber_uuid", fiber},
+                 {"arc_from", std::min(suspect.piece.arcFrom, suspect.piece.arcTo)},
+                 {"arc_to", std::max(suspect.piece.arcFrom, suspect.piece.arcTo)},
+                 {"control_from", suspect.piece.controlFrom >= 0 ? ExtensionValue{suspect.piece.controlFrom} : nullValue()},
+                 {"control_to", suspect.piece.controlTo >= 0 ? ExtensionValue{suspect.piece.controlTo} : nullValue()},
+                 {"score", nullValue()}}).values);
+        }
+    }
     add(FiberGraphTable::Residuals, std::move(residuals));
     add(FiberGraphTable::ResidualPieces, std::move(pieces));
     return out;
@@ -484,32 +523,40 @@ std::vector<ScaffoldStoredRun> readScaffoldRuns(const objects::StoreReader& read
         if (found != entry.counts.end()) entry.fibers = found->second;
         const Columns residuals(FiberGraphTable::Residuals);
         scanRun(reader, FiberGraphTable::Residuals, entry.runUuid, [&](const ExtensionRow& row) {
-            if (residuals.integer(row, "kind") != kScaffoldNormalFlipRowKind) ++entry.residuals;
+            const auto kind = residuals.integer(row, "kind");
+            if (kind != kScaffoldNormalFlipRowKind && kind != kScaffoldSignSuspectRowKind) ++entry.residuals;
         });
     }
     return out;
 }
 
 namespace {
+// `suspects`: 0 the violated constraints, otherwise the rows of that suspect kind.
 std::vector<ScaffoldStoredResidual> readResidualRows(const objects::StoreReader& reader, const std::string& runUuid,
-                                                     bool flips);
+                                                     std::int64_t suspects);
 }
 
 std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreReader& reader,
                                                           const std::string& runUuid)
 {
-    return readResidualRows(reader, runUuid, false);
+    return readResidualRows(reader, runUuid, 0);
 }
 
 std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::StoreReader& reader,
                                                             const std::string& runUuid)
 {
-    return readResidualRows(reader, runUuid, true);
+    return readResidualRows(reader, runUuid, kScaffoldNormalFlipRowKind);
+}
+
+std::vector<ScaffoldStoredResidual> readScaffoldSignSuspects(const objects::StoreReader& reader,
+                                                            const std::string& runUuid)
+{
+    return readResidualRows(reader, runUuid, kScaffoldSignSuspectRowKind);
 }
 
 namespace {
 std::vector<ScaffoldStoredResidual> readResidualRows(const objects::StoreReader& reader, const std::string& runUuid,
-                                                     bool flips)
+                                                     std::int64_t suspects)
 {
     if (runUuid.empty()) throw std::invalid_argument("scaffold run: a run UUID is required");
     const Columns columns(FiberGraphTable::Residuals);
@@ -519,7 +566,8 @@ std::vector<ScaffoldStoredResidual> readResidualRows(const objects::StoreReader&
         ScaffoldStoredResidual entry;
         entry.index = columns.integer(row, "residual_index");
         entry.kind = columns.integer(row, "kind");
-        if ((entry.kind == kScaffoldNormalFlipRowKind) != flips) return;
+        const bool suspect = entry.kind == kScaffoldNormalFlipRowKind || entry.kind == kScaffoldSignSuspectRowKind;
+        if (suspects == 0 ? suspect : entry.kind != suspects) return;
         entry.target = columns.integer(row, "target");
         entry.fiberA = columns.uuid(row, "fiber_a");
         entry.fiberB = columns.uuid(row, "fiber_b");

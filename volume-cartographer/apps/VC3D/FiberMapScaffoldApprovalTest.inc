@@ -87,9 +87,8 @@
     require(spanA.controlFrom == 3 && spanA.controlTo == 4, "arc 35 lies between controls 3 and 4");
     require(!spanA.geometryApproved && !spanB.geometryApproved, "nothing is approved yet");
 
-    // The dock's stretches end on control points: the accused stretch lies in
-    // one that covers it, and opening it hands the annotation the line points
-    // of those controls.
+    // The dock's stretches run from constraint to constraint: the accused
+    // stretch is offered as the run states it.
     {
         ScaffoldStoredResidual accusing = residual;
         vc::fiber_graph::ScaffoldStoredPiece stretch;
@@ -103,12 +102,8 @@
             return segment.fiberUuid == horizontal.uuid && segment.cost > 0;
         });
         require(found != segments.end(), "the accused stretch lies in one of the fiber's stretches");
-        require(found->arcFrom <= 12.4 && found->arcTo >= 27.6, "that stretch covers the whole accusation");
-        require(found->controlFrom == std::round(found->controlFrom) && found->controlTo == std::round(found->controlTo),
-                "its ends are control points");
-        const auto onControl = controller.storedLineIndexAtArc(horizontal.id, found->arcFrom);
-        require(onControl && *onControl == std::int64_t(std::llround(found->arcFrom)),
-                "a stretch's end is an existing control's line point");
+        require(found->arcFrom == 12.4 && found->arcTo == 27.6, "that stretch is the accusation, end to end");
+        require(found->controlFrom > 0 && found->controlTo > found->controlFrom, "it is placed among the controls");
         const auto controls = controller.storedControlSummaries(horizontal.id);
         require(controls.size() == 8, "the fiber's controls are untouched");
     }

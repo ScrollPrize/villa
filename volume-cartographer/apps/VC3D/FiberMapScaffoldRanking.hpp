@@ -14,6 +14,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace vc3d::fiber_map
@@ -113,6 +114,9 @@ struct ScaffoldApprovalSpans {
     // (voxels), so an anchor arc can be mapped to the span covering it. Same
     // length as controlIds; empty for a fiber with fewer than two controls.
     std::vector<double> controlArcs;
+    // The approved stretches themselves, per aspect, as arc ranges: their
+    // ends are arbitrary positions of the line, not control points.
+    std::array<std::vector<std::pair<double, double>>, 2> approvedArcs;
 };
 
 // The span of a fiber covering an anchor, with its approval states. `known`
@@ -124,47 +128,40 @@ struct ScaffoldAnchorSpan {
     bool geometryApproved = false, normalsApproved = false;
 };
 
-// The stretches of fiber the dock asks to be looked at.
+// The stretches of fiber the dock asks to be looked at for their geometry.
 //
-// Every fiber's unapproved geometry is cut into stretches, whether a run
-// accuses it or not: in the end all of it has to be approved, and the run
-// only says where to start.
-//   1. Stretches end on control points. Each run of unapproved control spans
-//      is cut into the fewest stretches no longer than `maxSegmentVx` (a
-//      single span longer than that is a stretch of its own).
-//   2. Among the cuttings with that fewest number, the one whose cuts split
-//      the least accused weight is taken: a stretch a cycle accuses stays in
-//      one piece where it can.
-//   3. A run stores, per violated constraint, the stretches its cycle runs
-//      along. Each carries a share of its constraint's cost (cost split over
-//      the cycle's stretches in proportion to 1 / length, as the solve ranks
-//      them) and gives it to the stretches it lies in, by length; an
-//      accusation of no length gives its whole share to the stretch holding
-//      that point. A stretch nothing accuses costs nothing and sorts last.
-//   4. Approved geometry is never offered again; a stretch that continues an
-//      approved piece reaches `approvedOverlapVx` back into it.
-//   5. What a run accuses outside a fiber's control points, or on a fiber
-//      whose controls are unknown, stays a row without control positions.
+// A stretch says something to a solve only where it reaches from one
+// constraint to another, so the stretches are the ones the cycles of the
+// violated constraints run along: each from the constraint where the cycle
+// enters the fiber to the one where it leaves it.
+//   1. A violated constraint's cost is split over the stretches of its
+//      shortest cycle in proportion to 1 / length. A stretch whose geometry
+//      is approved from end to end takes no share - it cannot be the error -
+//      so the cost gathers on what is left, and a cycle with one unapproved
+//      stretch puts all of it there.
+//   2. Stretches of one fiber that overlap, or lie within `joinVx` of each
+//      other, are one stretch (their shares add up) while the whole stays
+//      within `maxSegmentVx`: one look then covers several constraints.
+//   3. Ends are constraint positions, not control points. A stretch outside
+//      the fiber's control points, or on a fiber whose controls are unknown,
+//      stays a row without control positions.
 struct ScaffoldSegmentOptions {
     double maxSegmentVx = 2000.0;
-    double approvedOverlapVx = 50.0;
+    double joinVx = 300.0;
 };
 
 struct ScaffoldSegment {
     std::string fiberUuid;
     double arcFrom = 0, arcTo = 0;
     // The ends as control positions: 3.0 is control point 3, 3.42 is 42 % of
-    // the way from it to control point 4. -1 when the fiber's controls are
-    // unknown.
+    // the way from it to control point 4. -1 when the stretch is not placed.
     double controlFrom = -1, controlTo = -1;
-    // The summed shares of every constraint accusing the segment, and that
-    // cost per voxel of the segment.
+    // The summed shares of every constraint accusing the stretch, and that
+    // cost per voxel of it.
     double cost = 0, density = 0;
     std::int64_t cycleHops = -1;
     std::int64_t constraints = 0;
     std::vector<std::int64_t> cycles;
-    // The segment continues a piece whose geometry is already approved.
-    bool extendsApproved = false;
     double length() const { return arcTo - arcFrom; }
 };
 
@@ -173,8 +170,8 @@ struct ScaffoldSegment {
 // the first or past the last control clamp to them.
 [[nodiscard]] double scaffoldControlPosition(const std::vector<double>& controlArcs, double arc);
 
-// The stretches of every fiber of `fibers` (its control arcs and approved
-// spans), densest first, with what the residuals accuse added to them.
+// The accused stretches, densest first. `fibers` gives the control arcs and
+// the approved geometry of the fibers that have any.
 [[nodiscard]] std::vector<ScaffoldSegment> scaffoldApprovalSegments(
     const std::vector<vc::fiber_graph::ScaffoldStoredResidual>& residuals,
     const std::map<std::string, ScaffoldApprovalSpans>& fibers, const ScaffoldSegmentOptions& options = {});

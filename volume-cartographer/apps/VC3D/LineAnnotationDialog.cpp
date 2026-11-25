@@ -3560,12 +3560,9 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.mergeWithCandidateLabel = mergeCandidateState.label;
     options.newLinkedToCandidateLabel = newLinkedToCandidateState.label;
     if (_approvalMode) {
-        // Moving on along the fiber: the stretch after (or before) the selected one.
-        options.windowActions.emplace_back(tr("Next stretch"), [this]() {
-            emit approvalSelectionBoundRequested(3, _currentLinePosition);
-        });
-        options.windowActions.emplace_back(tr("Previous stretch"), [this]() {
-            emit approvalSelectionBoundRequested(4, _currentLinePosition);
+        // The stretch of the fiber map's approval list nearest the click.
+        options.windowActions.emplace_back(tr("Select nearest stretch of the approval list"), [this, linePosition]() {
+            emit approvalSelectionBoundRequested(3, linePosition);
         });
     }
     options.fiberDisplayNameForId = std::move(fiberDisplayNameForId);

@@ -42,3 +42,7 @@ Store format: `vc_object_store/docs/fiber-approval.md`. Solver: [fiber_map_scaff
 - The solve list is sorted newest on top. Selecting a solve shows it and updates the map.
 - A solve that finishes is selected.
 - Closing the approval window with changes solves again; while a solve runs, once it has finished.
+- The approval list offers stretches that reach from one constraint to another (an approval ties what lies on
+  it): geometry stretches along the cycles of violated constraints, normals stretches from the crossing of a
+  violated sign constraint to at least one other crossing of that fiber. Close constraints are covered by one
+  stretch.

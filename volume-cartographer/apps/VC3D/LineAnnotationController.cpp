@@ -18767,6 +18767,11 @@ void LineAnnotationController::approvalDeleteNormalPoint(const std::string& surf
     pushApprovalDisplay(session);
 }
 
+void LineAnnotationController::setApprovalStretchProvider(ApprovalStretchProvider provider)
+{
+    _approvalStretchProvider = std::move(provider);
+}
+
 void LineAnnotationController::approvalSetSelectionBound(const std::string& surfaceName, int bound,
                                                          double linePosition)
 {
@@ -18782,22 +18787,30 @@ void LineAnnotationController::approvalSetSelectionBound(const std::string& surf
             if (!la::isNormalPoint(control)) { from = control.linePosition; break; }
         for (auto it = session.controlPoints.rbegin(); it != session.controlPoints.rend(); ++it)
             if (!la::isNormalPoint(*it)) { to = it->linePosition; break; }
-    } else if (bound == 3 || bound == 4) {
-        // The stretch of the same length after (3) or before (4) the selected
-        // one, cut at the line's ends; the views move to its start.
-        if (!session.approvalSelection) {
-            showError(tr("There is no next stretch: no stretch is selected."), session.suppressErrorDialogs);
-            return;
-        }
-        const auto [oldFrom, oldTo] = *session.approvalSelection;
-        const double length = oldTo - oldFrom;
-        from = bound == 3 ? oldTo : std::max(0.0, oldFrom - length);
-        to = bound == 3 ? std::min(last, oldTo + length) : oldFrom;
-        if (!(to > from)) {
-            showError(bound == 3 ? tr("There is no next stretch: the selected one ends at the end of the line.")
-                                 : tr("There is no previous stretch: the selected one starts at the start of the line."),
+    } else if (bound == 3) {
+        // The stretch of the fiber map's approval list nearest the position;
+        // the views move to its start.
+        const auto listed = _approvalStretchProvider && session.fiberId
+            ? _approvalStretchProvider(session.fiberId) : std::vector<std::pair<double, double>>{};
+        if (listed.empty()) {
+            showError(tr("No stretch was selected: the fiber map's approval list has no stretch on this fiber."),
                       session.suppressErrorDialogs);
             return;
+        }
+        if (!std::isfinite(linePosition)) {
+            showError(tr("No stretch was selected: the click is not on the line."), session.suppressErrorDialogs);
+            return;
+        }
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto& [first, second] : listed) {
+            const double distance = linePosition < first ? first - linePosition
+                                    : linePosition > second ? linePosition - second : 0.0;
+            // Among stretches holding the click, the shorter one.
+            if (distance < best || (distance == best && second - first < to - from)) {
+                best = distance;
+                from = std::max(0.0, first);
+                to = std::min(last, second);
+            }
         }
         if (pane->dialog) pane->dialog->showLinePosition(from);
     } else {

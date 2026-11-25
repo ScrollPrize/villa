@@ -567,6 +567,9 @@ int run(const std::string& configPath)
     std::vector<ScaffoldNormalFlip> flips;
     ScaffoldNormalFlipReport flipReport;
     if (normals) flips = scaffoldLinkNormalFlips(graph, geometry, *normals, signs.sign, result.constraints, flipReport);
+    // The stretches to look at for the violated sign constraints.
+    ScaffoldSignSuspectReport signSuspectReport;
+    const auto signSuspects = scaffoldSignSuspects(graph, geometry, result, {}, signSuspectReport);
 
     Json summary{
         {"store", cfg.at("store")},
@@ -750,6 +753,8 @@ int run(const std::string& configPath)
             stages.approvals = &approvalReport;
             stages.flips = &flips;
             stages.flipReport = &flipReport;
+            stages.signSuspects = &signSuspects;
+            stages.signSuspectReport = &signSuspectReport;
         }
         const auto rows = scaffoldSolveRunRows(graph, result, options, record, stages);
         auto txn = store.write();
@@ -812,12 +817,46 @@ int run(const std::string& configPath)
                             {"control_from", flip.piece.controlFrom},
                             {"control_to", flip.piece.controlTo}});
         }
+        Json suspectRows = Json::array();
+        for (const auto& suspect : signSuspects)
+            suspectRows.push_back({{"fiber", graph.fibers[std::size_t(suspect.fiber)].uuid},
+                                   {"other", graph.fibers[std::size_t(suspect.other)].uuid},
+                                   {"arc", suspect.arc},
+                                   {"cost", suspect.cost},
+                                   {"violations", suspect.violations},
+                                   {"crossings", suspect.crossings},
+                                   {"arc_from", suspect.piece.arcFrom},
+                                   {"arc_to", suspect.piece.arcTo},
+                                   {"control_from", suspect.piece.controlFrom},
+                                   {"control_to", suspect.piece.controlTo}});
+        summary["sign_suspects"] = Json{{"violations", signSuspectReport.violations},
+                                        {"without_crossing", signSuspectReport.withoutCrossing},
+                                        {"approved", signSuspectReport.approved},
+                                        {"suspects", std::move(suspectRows)}};
         summary["normal_flips"] = Json{{"links_checked", flipReport.checked},
                                        {"agreed", flipReport.agreed},
                                        {"disagreed", flipReport.disagreed},
                                        {"undetermined", flipReport.undetermined},
                                        {"opposed_normals", flipReport.opposed},
                                        {"suspects", std::move(rows)}};
+    }
+    // The approval layers the run read, as arc ranges of their fibers.
+    {
+        Json rows = Json::array();
+        for (std::size_t i = 0; i < graph.fibers.size(); ++i) {
+            const auto& approval = graph.fibers[i].approval;
+            const auto add = [&](const ScaffoldApproval::Ranges& ranges, const char* aspect, const char* state) {
+                for (const auto& [from, to] : ranges)
+                    rows.push_back({{"fiber", graph.fibers[i].uuid}, {"aspect", aspect}, {"state", state},
+                                    {"arc_from", geometry.arcAtLineIndex(i, from)},
+                                    {"arc_to", geometry.arcAtLineIndex(i, to)}});
+            };
+            add(approval.approvedGeometry, "geometry", "approved");
+            add(approval.approvedNormals, "normals", "approved");
+            add(approval.brokenGeometry, "geometry", "broken");
+            add(approval.brokenNormals, "normals", "broken");
+        }
+        summary["approval_stretches"] = std::move(rows);
     }
     if (cfg.contains("windings_output")) {
         Json windings{{"ids", Json::array()}, {"family", Json::array()}, {"selected_winding", Json::array()},

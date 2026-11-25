@@ -161,102 +161,82 @@ private slots:
         QVERIFY(scaffoldApprovalRowBefore(row(1.0, 2, 1.0), row(2.0, 4, 1.0), order));
     }
 
-    // Every fiber's unapproved geometry is cut into stretches, accused or
-    // not: the fewest stretches within the length limit, on control points.
-    void unaccusedFiberIsCutIntoTheFewestStretches()
-    {
-        std::map<std::string, ScaffoldApprovalSpans> fibers;
-        fibers["f"].controlArcs = {0., 800., 1500., 1900., 3000., 3900.};
-        fibers["f"].approved[0] = {0, 0, 0, 0, 0};
-        auto segments = scaffoldApprovalSegments({}, fibers);
-        std::sort(segments.begin(), segments.end(), [](const auto& x, const auto& y) { return x.arcFrom < y.arcFrom; });
-        // 3900 voxels with a 2000 voxel limit: two stretches, both on control points.
-        QCOMPARE(segments.size(), std::size_t(2));
-        QCOMPARE(segments[0].arcFrom, 0.);
-        QCOMPARE(segments[0].arcTo, segments[1].arcFrom);
-        QCOMPARE(segments[1].arcTo, 3900.);
-        for (const auto& segment : segments) {
-            QVERIFY(segment.arcTo - segment.arcFrom <= 2000.);
-            QCOMPARE(segment.controlFrom, std::round(segment.controlFrom));
-            QCOMPARE(segment.controlTo, std::round(segment.controlTo));
-            QCOMPARE(segment.cost, 0.);
-            QCOMPARE(segment.constraints, std::int64_t(0));
-            QCOMPARE(segment.cycleHops, std::int64_t(-1));
-        }
-        // A single span longer than the limit is a stretch of its own.
-        fibers["f"].controlArcs = {0., 5000., 5400.};
-        fibers["f"].approved[0] = {0, 0};
-        segments = scaffoldApprovalSegments({}, fibers);
-        QCOMPARE(segments.size(), std::size_t(2));
-    }
-
-    // Among the cuttings with the fewest stretches, the cut that splits the
-    // least accused weight is taken.
-    void cutsKeepAccusedStretchesWhole()
+    // A stretch runs from constraint to constraint, as the cycle states it:
+    // its ends are not moved onto control points, and a fiber nothing
+    // accuses asks for nothing.
+    void stretchesRunFromConstraintToConstraint()
     {
         std::map<std::string, ScaffoldApprovalSpans> fibers;
         fibers["f"].controlArcs = {0., 1000., 2000., 3000.};
-        fibers["f"].approved[0] = {0, 0, 0};
-        // Two stretches either way (cut at 1000 or at 2000). The accusation
-        // runs across control point 1, so the cut goes to control point 2.
+        fibers["g"].controlArcs = {0., 1000.};
         const std::vector<ScaffoldStoredResidual> residuals{residual(0, 4.0, 2, {piece("f", 600., 1400., 0.)})};
-        auto segments = scaffoldApprovalSegments(residuals, fibers);
-        std::sort(segments.begin(), segments.end(), [](const auto& x, const auto& y) { return x.arcFrom < y.arcFrom; });
-        QCOMPARE(segments.size(), std::size_t(2));
-        QCOMPARE(segments[0].arcTo, 2000.);
+        const auto segments = scaffoldApprovalSegments(residuals, fibers);
+        QCOMPARE(segments.size(), std::size_t(1));
+        QCOMPARE(segments[0].fiberUuid, std::string("f"));
+        QCOMPARE(segments[0].arcFrom, 600.);
+        QCOMPARE(segments[0].arcTo, 1400.);
+        QVERIFY(std::abs(segments[0].controlFrom - 0.6) < 1e-12);
+        QVERIFY(std::abs(segments[0].controlTo - 1.4) < 1e-12);
         QVERIFY(std::abs(segments[0].cost - 4.0) < 1e-9);
+        QVERIFY(std::abs(segments[0].density - 4.0 / 800.) < 1e-12);
         QCOMPARE(segments[0].constraints, std::int64_t(1));
         QCOMPARE(segments[0].cycleHops, std::int64_t(2));
-        QVERIFY(std::abs(segments[0].density - 4.0 / 2000.) < 1e-12);
-        QCOMPARE(segments[1].cost, 0.);
-        // And across control point 2 it goes to control point 1.
-        const std::vector<ScaffoldStoredResidual> other{residual(0, 4.0, 2, {piece("f", 1600., 2400., 0.)})};
-        segments = scaffoldApprovalSegments(other, fibers);
-        std::sort(segments.begin(), segments.end(), [](const auto& x, const auto& y) { return x.arcFrom < y.arcFrom; });
-        QCOMPARE(segments[0].arcTo, 1000.);
-        QVERIFY(std::abs(segments[1].cost - 4.0) < 1e-9);
     }
 
-    // An accusation is shared by length between the stretches it lies in; one
-    // of no length belongs to the stretch holding that point and is never a
-    // row of its own.
-    void accusationsOnlyAddCost()
+    // Stretches of one fiber that overlap or lie close together are one
+    // stretch covering their constraints; far apart, or too long together,
+    // they stay apart.
+    void closeStretchesAreJoined()
     {
         std::map<std::string, ScaffoldApprovalSpans> fibers;
-        fibers["f"].controlArcs = {0., 1500., 3000., 4500.};
-        fibers["f"].approved[0] = {0, 0, 0};
+        fibers["f"].controlArcs = {0., 9000.};
         const std::vector<ScaffoldStoredResidual> residuals{
-            residual(0, 2.0, 2, {piece("f", 1000., 2000., 0.)}),  // half in each of the first two stretches
-            residual(1, 5.0, 2, {piece("f", 3600., 3600., 0.)}),  // a point in the third
+            residual(0, 2.0, 2, {piece("f", 100., 500., 0.)}),
+            residual(1, 3.0, 3, {piece("f", 400., 700., 0.)}),    // overlaps the first
+            residual(2, 1.0, 2, {piece("f", 900., 900., 0.)}),    // a point 200 voxels behind
+            residual(3, 5.0, 2, {piece("f", 1300., 1500., 0.)}),  // 400 voxels behind: its own
+            residual(4, 7.0, 2, {piece("f", 1700., 3400., 0.)}),  // close, but 2100 voxels together
         };
         auto segments = scaffoldApprovalSegments(residuals, fibers);
         std::sort(segments.begin(), segments.end(), [](const auto& x, const auto& y) { return x.arcFrom < y.arcFrom; });
         QCOMPARE(segments.size(), std::size_t(3));
-        QVERIFY(std::abs(segments[0].cost - 1.0) < 1e-9);
-        QVERIFY(std::abs(segments[1].cost - 1.0) < 1e-9);
-        QVERIFY(std::abs(segments[2].cost - 5.0) < 1e-9);
-        for (const auto& segment : segments) QVERIFY(segment.arcTo > segment.arcFrom);
+        QCOMPARE(segments[0].arcFrom, 100.);
+        QCOMPARE(segments[0].arcTo, 900.);
+        QVERIFY(std::abs(segments[0].cost - 6.0) < 1e-9);
+        QCOMPARE(segments[0].constraints, std::int64_t(3));
+        QCOMPARE(segments[0].cycleHops, std::int64_t(2));
+        QCOMPARE(segments[1].arcFrom, 1300.);
+        QCOMPARE(segments[1].arcTo, 1500.);
+        QCOMPARE(segments[2].arcFrom, 1700.);
+        QCOMPARE(segments[2].arcTo, 3400.);
     }
 
-    // Approved geometry is not offered again: only what is unapproved,
-    // reaching a little back into the piece it continues.
-    void approvedGeometryIsSubtracted()
+    // A cycle's cost is split over its stretches by 1 / length, among the
+    // ones whose geometry is not approved: an approved stretch cannot be the
+    // error, and with one stretch left all of the cost is there.
+    void approvedStretchesTakeNoShare()
     {
-        const std::vector<ScaffoldStoredResidual> residuals{residual(0, 2.0, 2, {piece("f", 500., 1500., 0.)})};
+        const std::vector<ScaffoldStoredResidual> residuals{
+            residual(0, 3.0, 3, {piece("f", 500., 1500., 0.), piece("g", 100., 600., 0.)})};
         std::map<std::string, ScaffoldApprovalSpans> fibers;
-        fibers["f"].controlArcs = {0., 1000., 2000., 3000.};
-        fibers["f"].approved[0] = {1, 0, 0};
-        const auto segments = scaffoldApprovalSegments(residuals, fibers);
+        fibers["f"].controlArcs = {0., 3000.};
+        fibers["g"].controlArcs = {0., 3000.};
+        auto segments = scaffoldApprovalSegments(residuals, fibers);
+        QCOMPARE(segments.size(), std::size_t(2));
+        // 1/1000 against 1/500: one third and two thirds.
+        QCOMPARE(segments[0].fiberUuid, std::string("g"));
+        QVERIFY(std::abs(segments[0].cost - 2.0) < 1e-9);
+        QVERIFY(std::abs(segments[1].cost - 1.0) < 1e-9);
+        // An approval that does not reach both constraints changes nothing.
+        fibers["g"].approvedArcs[0] = {{50., 400.}};
+        segments = scaffoldApprovalSegments(residuals, fibers);
+        QCOMPARE(segments.size(), std::size_t(2));
+        fibers["g"].approvedArcs[0] = {{50., 700.}};
+        segments = scaffoldApprovalSegments(residuals, fibers);
         QCOMPARE(segments.size(), std::size_t(1));
-        QCOMPARE(segments[0].arcFrom, 950.);  // 50 voxels back into the approved piece
-        QCOMPARE(segments[0].arcTo, 3000.);
-        QVERIFY(segments[0].extendsApproved);
-        QVERIFY(std::abs(segments[0].controlFrom - 0.95) < 1e-12);
-        QCOMPARE(segments[0].controlTo, 3.);
-        // Only the accusation's unapproved half counts.
-        QVERIFY(std::abs(segments[0].cost - 1.0) < 1e-9);
-        // A fiber approved throughout asks for nothing.
-        fibers["f"].approved[0] = {1, 1, 1};
+        QCOMPARE(segments[0].fiberUuid, std::string("f"));
+        QVERIFY(std::abs(segments[0].cost - 3.0) < 1e-9);
+        fibers["f"].approvedArcs[0] = {{0., 3000.}};
         QVERIFY(scaffoldApprovalSegments(residuals, fibers).empty());
     }
 
@@ -266,20 +246,17 @@ private slots:
     {
         std::map<std::string, ScaffoldApprovalSpans> fibers;
         fibers["f"].controlArcs = {0., 1000.};
-        fibers["f"].approved[0] = {0};
         const std::vector<ScaffoldStoredResidual> residuals{
             residual(0, 2.0, 2, {piece("f", 800., 1200., 0.)}),
             residual(1, 1.0, 2, {piece("g", 10., 20., 0.)}),
+            residual(2, 1.0, 2, {piece("f", 100., 200., 0.)}),
         };
         const auto segments = scaffoldApprovalSegments(residuals, fibers);
         QCOMPARE(segments.size(), std::size_t(3));
         std::size_t unplaced = 0;
         for (const auto& segment : segments)
-            if (segment.controlFrom < 0) {
-                ++unplaced;
-                QVERIFY(segment.cost > 0.);
-            }
-        QCOMPARE(unplaced, std::size_t(2));  // 1000-1200 of f, and all of g
+            if (segment.controlFrom < 0) ++unplaced;
+        QCOMPARE(unplaced, std::size_t(2));  // 800-1200 of f, and all of g
     }
 
     void densityOrderPrefersTheHighestCostPerVoxel()

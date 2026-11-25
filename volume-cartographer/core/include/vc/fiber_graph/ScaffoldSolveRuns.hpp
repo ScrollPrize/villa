@@ -61,6 +61,10 @@ struct ScaffoldRunStages {
     // the solve's own constraints.
     const std::vector<ScaffoldNormalFlip>* flips = nullptr;
     const ScaffoldNormalFlipReport* flipReport = nullptr;
+    // The stretches to look at for the violated sign constraints
+    // (scaffoldSignSuspects).
+    const std::vector<ScaffoldSignSuspect>* signSuspects = nullptr;
+    const ScaffoldSignSuspectReport* signSuspectReport = nullptr;
 };
 
 // A normal flip suspect is stored beside the residuals, as a row of this kind
@@ -69,6 +73,13 @@ struct ScaffoldRunStages {
 // `residual` and `weight` the suspected fiber's disagreeing and agreeing
 // links, and one piece row for the stretch to look at.
 inline constexpr std::int64_t kScaffoldNormalFlipRowKind = 16;
+// A sign suspect, stored the same way after the flips: fiber_a the suspected
+// fiber and arc_a its crossing of the (worst) violated sign constraint,
+// fiber_b / arc_b that constraint's other fiber, `residual` the summed cost of
+// the violated sign constraints on the stretch, `weight` the fiber's crossings
+// on it, `target` the number of those violations, and one piece row for the
+// stretch to look at.
+inline constexpr std::int64_t kScaffoldSignSuspectRowKind = 17;
 
 // The rows of one solve. `method` names the backend the result came from.
 ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph&, const ScaffoldSolveResult&, const ScaffoldSolveOptions&,
@@ -113,6 +124,8 @@ struct ScaffoldStoredResidual {
 std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreReader&, const std::string& runUuid);
 // The run's normal flip suspects (kScaffoldNormalFlipRowKind), in stored order.
 std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::StoreReader&, const std::string& runUuid);
+// The run's sign suspects (kScaffoldSignSuspectRowKind), highest cost first.
+std::vector<ScaffoldStoredResidual> readScaffoldSignSuspects(const objects::StoreReader&, const std::string& runUuid);
 
 // The strip normals a run used for one fiber (XYZ per annotated line point),
 // by the run's own reference to its normals row - never a search among a
