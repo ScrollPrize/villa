@@ -455,7 +455,10 @@ fs::path selectedVc3dCacheRoot()
 
 fs::path decodedCachePath(const fs::path& cacheDir, const std::string& input)
 {
-    auto url = catalog::openDataS3Url(input).value_or(input);
+    auto url = input;
+    // Caches made through other https:// spellings keep their folders.
+    if (auto s3 = catalog::openDataS3Url(input); s3 && catalog::resolveOpenDataUrl(*s3) == catalog::resolveOpenDataUrl(input))
+        url = std::move(*s3);
     while (!url.empty() && url.back() == '/')
         url.pop_back();
     const auto scheme = url.find("://");
