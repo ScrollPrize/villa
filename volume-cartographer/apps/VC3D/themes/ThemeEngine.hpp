@@ -188,13 +188,17 @@ QString templateText();
 // followed by each extra style sheet. `iconKey` is the value of @name@.
 // `classicScheme` stands in for @scheme@ when the theme follows classic's
 // detection. Unknown placeholders are errors, and so are user style sheets
-// that do not parse, set widget properties (qproperty-*), or load images from
-// outside their theme's folder.
+// that do not parse (by VC3D's checks or by Qt's own parser), set widget
+// properties (qproperty-*), or load images from outside their theme's folder.
 QString renderStyleSheet(const ResolvedTheme& theme, const QString& iconKey,
                          const QString& classicScheme, ThemeProblems* problems);
 // Renders the style sheet the way ThemeManager applies the theme and appends
 // the problems; true when none is an error.
 bool checkRendering(const ResolvedTheme& theme, ThemeProblems* problems);
+// Whether Qt's own parser accepts the style sheet: Qt drops a sheet it
+// cannot parse whole, with only a log line. Checked on a hidden probe widget,
+// so it needs a QApplication on the calling thread; nullopt without one.
+std::optional<bool> qtParsesStyleSheet(const QString& qss);
 
 struct ThemeIconSpec
 {

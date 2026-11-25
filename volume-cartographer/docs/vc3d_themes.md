@@ -98,7 +98,9 @@ and show images from its own folder. It cannot run code or change what
 controls do: VC3D refuses a theme whose style sheet sets widget properties
 (`qproperty-*`), loads images from outside the theme's folder, links or
 special files, does not parse, or is larger than the limits (64 KiB per theme
-file or style sheet, 4 MiB per image). Anyone who can write to a
+file or style sheet, 4 MiB per image). Importing a single theme file checks
+each file's size, and that its style sheet resolves to a file inside the
+theme file's folder, before anything is copied. Anyone who can write to a
 `VC3D_THEME_PATH` folder decides the look for everyone who uses it.
 
 If a theme makes VC3D hard to use, start it with Classic for one run and then
@@ -357,13 +359,17 @@ A theme can add its own Qt style sheet, from a file (`stylesheet`) or inline
   drawn icons, but nothing else. For power users.
 
 Extra style sheets of base themes are kept, in order, so a theme based on
-yours looks like yours plus its own changes. Qt ignores a whole style sheet
-that does not parse, so VC3D checks that braces, comments and strings are
-closed and names the line of the first problem. An unknown placeholder is an
-error; text inside comments is not checked. A style sheet may only style
-widgets: `qproperty-*` is refused, and `url()` may only name the drawn icons
-(`vc3dtheme:`), Qt resources (`:/`) or regular files inside the theme's
-folder, written as `url(@themedir@/name.png)`. A style sheet that uses
+yours looks like yours plus its own changes. Qt ignores a style sheet from
+the first error it cannot recover from, so VC3D checks that braces, comments
+and strings are closed and names the line of the first problem, then has Qt's
+own parser read the sheet (on a hidden widget) and refuses it if Qt stops
+early, for example at a selector list that ends in a comma. An import, a
+theme switch and a live reload all refuse such a sheet and keep the working
+one. An unknown placeholder is an error; text inside comments is not
+checked. A style sheet may only style widgets: `qproperty-*` is refused, and
+`url()` may only name the drawn icons (`vc3dtheme:`), Qt resources (`:/`) or
+regular files inside the theme's folder, written as
+`url(@themedir@/name.png)`. A style sheet that uses
 `@themedir@` images needs a folder theme, so the images travel with it;
 importing a single file that uses them is refused.
 

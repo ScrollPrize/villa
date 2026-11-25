@@ -845,6 +845,12 @@ private slots:
                                 QStringLiteral("line 1: a string is never closed"), false));
         // Text in a comment is not a placeholder.
         QVERIFY(errors("/* mail me@host@ */ QLabel { color: @text@; }").isEmpty());
+        // Qt's own parser has the last word: it drops a whole sheet whose
+        // selector list ends in a comma, which the checks above let through.
+        QVERIFY(containsMessage(errors("QLabel, { color: blue; }"), QStringLiteral("Qt cannot parse"), false));
+        QVERIFY(containsMessage(errors("QLabel { color: blue; }\nQPushButton,\n{ color: red; }"),
+                                QStringLiteral("Qt cannot parse"), false));
+        QVERIFY(errors("QLabel, QPushButton { color: blue; }").isEmpty());
 
         // Images come from the theme's own folder.
         writeFile(QDir(folder).filePath("grain.png"), "png");
@@ -959,6 +965,116 @@ private slots:
         QVERIFY2(result.ok, qPrintable(formatProblems(result.problems)));
         QCOMPARE(result.installedPath, user.filePath("ocean.vc3dtheme"));
         QCOMPARE(entriesIn(user.path()), QStringList{"ocean.vc3dtheme"});
+    }
+
+    void importRefusesWhatQtCannotParse()
+    {
+        QTemporaryDir source;
+        QTemporaryDir user;
+        ThemeRegistry registry;
+        writeFile(source.filePath("comma.vc3dtheme"),
+                  themeJson("Comma", "modern-dark", "'qss': 'QLabel, { color: #445566; }'"));
+        ImportResult result = importTheme(source.filePath("comma.vc3dtheme"), user.path(), false, registry);
+        QVERIFY(!result.ok);
+        QVERIFY(containsMessage(result.problems, QStringLiteral("Qt cannot parse"), false));
+        QVERIFY(entriesIn(user.path()).isEmpty());
+
+        // Nor does it replace a working installed version.
+        writeFile(source.filePath("good/comma.vc3dtheme"),
+                  themeJson("Comma", "modern-dark", "'qss': 'QLabel { color: #445566; }'"));
+        result = importTheme(source.filePath("good/comma.vc3dtheme"), user.path(), false, registry);
+        QVERIFY2(result.ok, qPrintable(formatProblems(result.problems)));
+        const QByteArray installed = [&] {
+            QFile file(user.filePath("comma.vc3dtheme"));
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+        }();
+        QVERIFY(installed.contains("#445566"));
+        result = importTheme(source.filePath("comma.vc3dtheme"), user.path(), true, registry);
+        QVERIFY(!result.ok);
+        QCOMPARE(entriesIn(user.path()), QStringList{"comma.vc3dtheme"});
+        QFile file(user.filePath("comma.vc3dtheme"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(file.readAll(), installed);
+    }
+
+    void importChecksFilesBeforeCopying()
+    {
+        QTemporaryDir source;
+        QTemporaryDir outside;
+        QTemporaryDir user;
+        ThemeRegistry registry;
+        ImportResult result;
+
+        // Too large: refused from the source, before any copy.
+        writeFile(source.filePath("big.vc3dtheme"),
+                  themeJson("Big", {}, QStringLiteral("'qss': '%1'").arg(QString(70 * 1024, QLatin1Char(' ')))));
+        result = importTheme(source.filePath("big.vc3dtheme"), user.path(), false, registry);
+        QVERIFY(!result.ok);
+        QVERIFY(containsMessage(result.problems, QStringLiteral("larger than 64 KiB"), false));
+        QVERIFY(entriesIn(user.path()).isEmpty());
+
+        writeFile(source.filePath("bigsheet.vc3dtheme"), themeJson("Big sheet", {}, "'stylesheet': 'bigsheet.qss'"));
+        writeFile(source.filePath("bigsheet.qss"), QByteArray(70 * 1024, ' '));
+        result = importTheme(source.filePath("bigsheet.vc3dtheme"), user.path(), false, registry);
+        QVERIFY(!result.ok);
+        QVERIFY(containsMessage(result.problems, QStringLiteral("larger than 64 KiB"), false));
+        QVERIFY(entriesIn(user.path()).isEmpty());
+
+        // An ordinary nested style sheet path travels with the theme.
+        writeFile(source.filePath("nest.vc3dtheme"),
+                  themeJson("Nest", "modern-dark", "'stylesheet': 'styles/deep/extra.qss'"));
+        writeFile(source.filePath("styles/deep/extra.qss"), "QLabel { color: #102030; }");
+        result = importTheme(source.filePath("nest.vc3dtheme"), user.path(), false, registry);
+        QVERIFY2(result.ok, qPrintable(formatProblems(result.problems)));
+        QCOMPARE(result.installedPath, user.filePath("nest"));
+        QVERIFY(QFileInfo(user.filePath("nest/styles/deep/extra.qss")).isFile());
+        QVERIFY(QDir(user.filePath("nest")).removeRecursively());
+
+#ifdef Q_OS_UNIX
+        // A relative path through a linked folder may not lead outside the
+        // theme's folder, even though the file itself is a regular file.
+        writeFile(outside.filePath("private/extra.qss"), "QLabel { color: #102030; } /* SECRET */");
+        writeFile(source.filePath("via.vc3dtheme"), themeJson("Via", {}, "'stylesheet': 'linked/extra.qss'"));
+        QVERIFY(QFile::link(outside.filePath("private"), source.filePath("linked")));
+        result = importTheme(source.filePath("via.vc3dtheme"), user.path(), false, registry);
+        QVERIFY(!result.ok);
+        QVERIFY(containsMessage(result.problems, QStringLiteral("leads outside"), false));
+        QVERIFY(entriesIn(user.path()).isEmpty());
+
+        // A linked folder that stays inside is fine.
+        writeFile(source.filePath("real/extra.qss"), "QLabel { color: #102030; }");
+        QVERIFY(QFile::link(source.filePath("real"), source.filePath("alias")));
+        writeFile(source.filePath("alias-theme.vc3dtheme"),
+                  themeJson("Alias", "modern-dark", "'stylesheet': 'alias/extra.qss'"));
+        result = importTheme(source.filePath("alias-theme.vc3dtheme"), user.path(), false, registry);
+        QVERIFY2(result.ok, qPrintable(formatProblems(result.problems)));
+#endif
+    }
+
+    void liveReloadKeepsAStyleSheetQtCannotParse()
+    {
+        QTemporaryDir user;
+        QTemporaryDir cache;
+        const QString file = user.filePath("live.vc3dtheme");
+        writeFile(file, themeJson("Live", "modern-dark", "'qss': 'QLabel { color: #112233; }'"));
+        ThemeManager manager;
+        manager.setUserThemesDirectory(user.path());
+        manager.setIconCacheDirectory(cache.path());
+        manager.reloadThemes();
+        QString error;
+        QVERIFY2(manager.setTheme(QStringLiteral("live"), false, &error), qPrintable(error));
+        const QString good = qApp->styleSheet();
+        QVERIFY(good.contains(QStringLiteral("#112233")));
+
+        QSignalSpy changed(&manager, &ThemeManager::themeChanged);
+        QSignalSpy failed(&manager, &ThemeManager::liveReloadFailed);
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression("keeping the last good version"));
+        writeFile(file, themeJson("Live", "modern-dark", "'qss': 'QLabel, { color: #445566; }'"));
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
+        QVERIFY(failed.at(0).at(0).toString().contains(QStringLiteral("Qt cannot parse")));
+        QCOMPARE(qApp->styleSheet(), good);
+        QCOMPARE(changed.count(), 0);
+        manager.setTheme(QStringLiteral("classic"), false);
     }
 
     void limitsKeepThemesSmall()

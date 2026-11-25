@@ -1,5 +1,6 @@
 #include "themes/ThemeEngine.hpp"
 
+#include <QApplication>
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -19,6 +20,8 @@
 #include <QPolygonF>
 #include <QRegularExpression>
 #include <QScopeGuard>
+#include <QThread>
+#include <QWidget>
 #include <QtGlobal>
 
 #include <algorithm>
@@ -544,6 +547,50 @@ void checkUserStyleSheet(const QString& qss, const ThemeStylesheetPart& part, Th
     }
 }
 
+constexpr auto kStyleSheetProbeName = "vc3dStyleSheetProbe";
+
+QtMessageHandler gPreviousMessageHandler = nullptr;
+
+// Qt reports a style sheet it cannot parse only with a log line naming the
+// widget; the probe's line is the expected outcome of a failed check.
+void probeMessageHandler(QtMsgType type, const QMessageLogContext& context, const QString& message)
+{
+    if (message.contains(QLatin1String(kStyleSheetProbeName)))
+        return;
+    if (gPreviousMessageHandler)
+        gPreviousMessageHandler(type, context, message);
+}
+
+}  // namespace
+
+// Qt stops at the first error its parser cannot recover from (a selector
+// list ending in a comma, say): the rest of the sheet is lost, or all of it,
+// with at most a log line. So the sheet is applied to a hidden probe widget
+// with a marker rule after it: the marker takes effect only when Qt parsed
+// the sheet to its end. Its id selector outranks any rule a theme could
+// write for the probe.
+std::optional<bool> qtParsesStyleSheet(const QString& qss)
+{
+    auto* app = qobject_cast<QApplication*>(QCoreApplication::instance());
+    if (!app || QThread::currentThread() != app->thread())
+        return std::nullopt;
+    static const QColor marker(0x12, 0x34, 0x56);
+    gPreviousMessageHandler = qInstallMessageHandler(probeMessageHandler);
+    const auto restore = qScopeGuard([] {
+        qInstallMessageHandler(gPreviousMessageHandler);
+        gPreviousMessageHandler = nullptr;
+    });
+    QWidget probe;
+    probe.setObjectName(QLatin1String(kStyleSheetProbeName));
+    probe.setAttribute(Qt::WA_DontShowOnScreen);
+    probe.setStyleSheet(qss + QStringLiteral("\n#%1 { color: %2; }\n")
+                                  .arg(QLatin1String(kStyleSheetProbeName), marker.name()));
+    probe.ensurePolished();
+    return probe.palette().color(QPalette::WindowText) == marker;
+}
+
+namespace {
+
 // Copies a theme folder file by file. Links and special files are refused:
 // a link could pull private files into the themes folder, and reading a FIFO
 // would block.
@@ -589,6 +636,15 @@ bool copyThemeFolder(const QString& source, const QString& destination, QString*
         }
     }
     return true;
+}
+
+// Writes `contents` to a file that must not exist yet.
+bool writeNewFile(const QString& path, const QByteArray& contents)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::NewOnly))
+        return false;
+    return file.write(contents) == contents.size() && file.flush();
 }
 
 void removeInstalled(const QString& path)
@@ -1151,6 +1207,11 @@ QString renderStyleSheet(const ResolvedTheme& theme, const QString& iconKey,
                                   .arg(unknown.join(QStringLiteral("@, @")))});
         }
     }
+    bool anyUntrusted = false;
+    bool rejectedPart = false;
+    static const QString kQtRejectsStyleSheet =
+        QStringLiteral("Qt cannot parse the style sheet and would drop it whole; check each selector "
+                       "and declaration, for example for a selector list that ends in a comma");
     for (const auto& part : theme.stylesheets) {
         QString text = part.text;
         if (!part.trusted) {
@@ -1168,11 +1229,21 @@ QString renderStyleSheet(const ResolvedTheme& theme, const QString& iconKey,
             problems->append({part.file, QStringLiteral("the style sheet uses unknown tokens: @%1@")
                                              .arg(unknown.join(QStringLiteral("@, @")))});
         }
-        if (!part.trusted)
+        if (!part.trusted) {
             checkUserStyleSheet(rendered, part, problems);
+            anyUntrusted = true;
+            if (qtParsesStyleSheet(rendered) == false) {
+                problems->append({part.file, kQtRejectsStyleSheet});
+                rejectedPart = true;
+            }
+        }
         parts << rendered;
     }
     const QString styleSheet = parts.join(QStringLiteral("\n\n"));
+    // Each part may parse alone and still not together; a built-in sheet
+    // alone is trusted and not checked again.
+    if (anyUntrusted && !rejectedPart && qtParsesStyleSheet(styleSheet) == false)
+        problems->append({theme.filePath, kQtRejectsStyleSheet});
     if (styleSheet.size() > kMaxStyleSheetChars) {
         problems->append({theme.filePath, QStringLiteral("the rendered style sheet is larger than %1 KiB")
                                               .arg(kMaxStyleSheetChars / 1024)});
@@ -1762,25 +1833,38 @@ ImportResult importTheme(const QString& location, const QString& userFolder,
         if (!copyThemeFolder(sourcePath, staging, &error))
             return fail(sourcePath, error);
     } else {
-        if (!QDir().mkpath(staging) || !QFile::copy(sourcePath, stagedTheme))
+        // Each file is read once, within its size limit, and the bytes that
+        // were read are what gets staged and checked: nothing is copied
+        // before its limit and location are known.
+        QByteArray json;
+        if (!readFile(sourcePath, &json, &error))
+            return fail(sourcePath, error);
+        if (!QDir().mkpath(staging) || !writeNewFile(stagedTheme, json))
             return fail(sourcePath, QStringLiteral("cannot copy the theme into %1").arg(userFolder));
         // A separate style sheet travels with the theme file. A bad path, a
         // missing file or broken JSON is reported by the check below.
-        QByteArray json;
-        if (readFile(stagedTheme, &json, &error)) {
-            const QJsonValue sheet = QJsonDocument::fromJson(json).object().value(QStringLiteral("stylesheet"));
-            const QString relative = sheet.toString().trimmed();
-            const QString from = QDir::cleanPath(QDir(sourceFolder).filePath(relative));
-            const QString to = QDir::cleanPath(QDir(staging).filePath(relative));
-            const QFileInfo fromInfo(from);
-            if (sheet.isString() && !relative.isEmpty() && !QDir::isAbsolutePath(relative) &&
-                isInside(from, sourceFolder) && isInside(to, staging) &&
-                (fromInfo.exists() || fromInfo.isSymLink())) {
-                if (fromInfo.isSymLink() || !fromInfo.isFile())
-                    return fail(from, QStringLiteral("the style sheet must be a regular file, not a link"));
-                if (!QDir().mkpath(QFileInfo(to).absolutePath()) || !QFile::copy(from, to))
-                    return fail(from, QStringLiteral("cannot copy the style sheet into %1").arg(userFolder));
+        const QJsonValue sheet = QJsonDocument::fromJson(json).object().value(QStringLiteral("stylesheet"));
+        const QString relative = sheet.toString().trimmed();
+        const QString from = QDir::cleanPath(QDir(sourceFolder).filePath(relative));
+        const QString to = QDir::cleanPath(QDir(staging).filePath(relative));
+        const QFileInfo fromInfo(from);
+        if (sheet.isString() && !relative.isEmpty() && !QDir::isAbsolutePath(relative) &&
+            isInside(from, sourceFolder) && isInside(to, staging) &&
+            (fromInfo.exists() || fromInfo.isSymLink())) {
+            if (fromInfo.isSymLink() || !fromInfo.isFile())
+                return fail(from, QStringLiteral("the style sheet must be a regular file, not a link"));
+            // A linked folder on the way can lead anywhere, so the resolved
+            // file must lie in the resolved folder of the theme file.
+            const QString resolvedFolder = QFileInfo(sourceFolder).canonicalFilePath();
+            if (!isInside(fromInfo.canonicalFilePath(), resolvedFolder)) {
+                return fail(from, QStringLiteral("the style sheet %1 leads outside the theme's folder")
+                                      .arg(quoted(relative)));
             }
+            QByteArray qss;
+            if (!readFile(from, &qss, &error))
+                return fail(from, error);
+            if (!QDir().mkpath(QFileInfo(to).absolutePath()) || !writeNewFile(to, qss))
+                return fail(from, QStringLiteral("cannot copy the style sheet into %1").arg(userFolder));
         }
     }
 
