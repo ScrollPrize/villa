@@ -64,6 +64,7 @@ struct LasagnaResolutionSnapshot {
     std::shared_ptr<const vcr::catalog::OpenDataManifest> catalog;
     std::optional<vcr::catalog::OpenDataVolumeView> view;
     std::optional<std::array<int, 3>> workingShape;
+    std::vector<vc::project::Entry> fiberEntries;  // fiber predictions: never normals
 };
 [[nodiscard]] LasagnaResolutionSnapshot snapshotLasagnaForVolume(const VolumePkg&, const std::string& volumeId);
 [[nodiscard]] std::optional<ResolvedOpenDataLasagna> resolveLasagnaSnapshot(const LasagnaResolutionSnapshot&);
