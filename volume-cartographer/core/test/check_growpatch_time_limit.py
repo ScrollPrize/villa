@@ -12,8 +12,8 @@ Checks:
     default min_area_cm;
   - explicit cutoff: with --segment-name naming an existing surface, snapshots
     every generation and a min_area_cm the result cannot reach, the run rejects
-    the new surface and leaves the existing one byte for byte, with no staging
-    directory left behind.
+    the new surface and leaves the existing one and an existing
+    "<name>.tracing" sibling untouched, with no staging directory left behind.
 """
 
 import argparse
@@ -72,6 +72,9 @@ def main():
     existing = args.output / "existing"
     (args.output / "timed").rename(existing)
     before = digest(existing)
+    sibling = args.output / "existing.tracing"
+    sibling.mkdir()
+    (sibling / "keep.txt").write_text("not this run's\n")
     params = dict(BASE, min_area_cm=1000.0)
     params["snapshot-interval"] = 1
     code, log, log_path = run(args.binary, args.output, "existing", params)
@@ -79,7 +82,8 @@ def main():
     assert "saved snapshot in" in log, f"no snapshot was written, see {log_path}"
     assert existing.is_dir(), "existing surface was deleted"
     assert digest(existing) == before, "existing surface was changed"
-    leftovers = [p.name for p in args.output.iterdir() if p.name.endswith(".tracing")]
+    assert (sibling / "keep.txt").is_file(), "an existing sibling directory was deleted"
+    leftovers = [p.name for p in args.output.iterdir() if p.name.startswith("existing.tracing-")]
     assert not leftovers, f"staging directories left behind: {leftovers}"
     print("existing surface kept unchanged after an explicit cutoff rejected the new trace")
     print("PASS")

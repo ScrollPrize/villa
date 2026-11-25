@@ -1524,10 +1524,12 @@ static int run_main(int argc, char *argv[])
         if (base.filename().empty()) {
             base = base.parent_path();
         }
-        staging_dir = base;
-        staging_dir += ".tracing";
-        std::error_code ec;
-        std::filesystem::remove_all(staging_dir, ec);
+        // Claim a new directory so siblings and other runs' snapshots are never overwritten or removed.
+        std::random_device rd;
+        do {
+            staging_dir = base;
+            staging_dir += ".tracing-" + std::to_string(rd());
+        } while (!std::filesystem::create_directory(staging_dir));
         std::cout << "snapshots go to " << staging_dir << " until the trace is accepted" << std::endl;
     }
     auto remove_staging = [&] {
@@ -1548,7 +1550,9 @@ static int run_main(int argc, char *argv[])
         // GUI runner report a non-zero exit + this stderr line cleanly.
         std::cerr << "ERROR: vc_grow_seg_from_seed: segment growth failed: "
                   << e.what() << std::endl;
-        remove_staging();
+        if (!staging_dir.empty()) {
+            std::cerr << "snapshots of the failed trace are in " << staging_dir.string() << std::endl;
+        }
         return EXIT_FAILURE;
     }
 
