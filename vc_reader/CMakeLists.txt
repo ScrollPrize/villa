@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 project(vc_reader_extensions LANGUAGES C CXX)
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -42,6 +43,8 @@ if(VC_READER_ENABLE_HIP)
 elseif(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    set(VC_READER_GPU_RUNTIME CUDA::cudart)
+    set(VC_READER_GPU_FFT CUDA::cufft)
 endif()
 
 

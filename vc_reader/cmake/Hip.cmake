@@ -2,8 +2,7 @@
 #
 # The .cu sources are reused as written. src/cpp/hip_compat maps the CUDA
 # runtime, cuFFT, CUB and libcu++ names they use to HIP, hipFFT, hipCUB and
-# rocPRIM, and the CUDA::cudart / CUDA::cufft targets the build links are
-# stood in for by HIP equivalents, so the CUDA build description is unchanged.
+# rocPRIM.
 #
 # Warp-level kernels assume 32-lane warps, so only wave32 GPUs (RDNA: gfx10xx,
 # gfx11xx, gfx12xx) are accepted.
@@ -57,14 +56,22 @@ find_package(hip REQUIRED CONFIG)
 find_package(hipfft REQUIRED CONFIG)
 find_package(hipcub REQUIRED CONFIG)
 
-# Stand-ins for the CUDA toolkit targets. Imported, so the install export refers
-# to them by name like the real CUDA targets.
-add_library(CUDA::cudart INTERFACE IMPORTED GLOBAL)
-target_include_directories(CUDA::cudart INTERFACE "${VC_READER_HIP_COMPAT_DIR}")
-target_compile_definitions(CUDA::cudart INTERFACE VC_READER_HIP=1)
-target_link_libraries(CUDA::cudart INTERFACE hip::host)
-add_library(CUDA::cufft INTERFACE IMPORTED GLOBAL)
-target_link_libraries(CUDA::cufft INTERFACE CUDA::cudart hip::hipfft)
+# Export the HIP dependencies under vc_reader names so consumers can also
+# discover the NVIDIA toolkit in the same CMake project.
+add_library(vc_reader_hip_runtime INTERFACE)
+set_target_properties(vc_reader_hip_runtime PROPERTIES EXPORT_NAME hip_runtime)
+target_include_directories(vc_reader_hip_runtime INTERFACE
+    "$<BUILD_INTERFACE:${VC_READER_HIP_COMPAT_DIR}>"
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/hip_compat>")
+target_compile_definitions(vc_reader_hip_runtime INTERFACE VC_READER_HIP=1)
+target_link_libraries(vc_reader_hip_runtime INTERFACE hip::host)
+
+add_library(vc_reader_hip_fft INTERFACE)
+set_target_properties(vc_reader_hip_fft PROPERTIES EXPORT_NAME hip_fft)
+target_link_libraries(vc_reader_hip_fft INTERFACE vc_reader_hip_runtime hip::hipfft)
+
+set(VC_READER_GPU_RUNTIME vc_reader_hip_runtime)
+set(VC_READER_GPU_FFT vc_reader_hip_fft)
 
 # Called once the GPU targets exist: compile their .cu sources as HIP and
 # translate the per-file nvcc options.

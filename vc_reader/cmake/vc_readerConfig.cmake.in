@@ -1,6 +1,4 @@
 @PACKAGE_INIT@
-# Dependency configs may overwrite PACKAGE_PREFIX_DIR.
-set(_vc_reader_hip_compat_dir "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@/vc_reader/native/hip_compat")
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
 find_dependency(Boost)
@@ -28,14 +26,5 @@ if(@VC_READER_BUILD_READER@)
     find_dependency(JPEG)
     find_dependency(nlohmann_json CONFIG)
     find_dependency(vc_delta3d 0.3.2 CONFIG)
-endif()
-# Only once every lookup succeeded, so that a source-build fallback can define these.
-if(@VC_READER_ENABLE_HIP@ AND NOT TARGET CUDA::cudart)
-    add_library(CUDA::cudart INTERFACE IMPORTED)
-    target_include_directories(CUDA::cudart INTERFACE "${_vc_reader_hip_compat_dir}")
-    target_compile_definitions(CUDA::cudart INTERFACE VC_READER_HIP=1)
-    target_link_libraries(CUDA::cudart INTERFACE hip::host)
-    add_library(CUDA::cufft INTERFACE IMPORTED)
-    target_link_libraries(CUDA::cufft INTERFACE CUDA::cudart hip::hipfft)
 endif()
 include("${CMAKE_CURRENT_LIST_DIR}/vc_readerTargets.cmake")

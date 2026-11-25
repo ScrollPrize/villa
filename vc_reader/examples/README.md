@@ -54,8 +54,11 @@ for example ROCm 7.2, in place of any PyTorch already installed, so that
 python -m pip uninstall -y torch
 python -m pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
 python -m pip install -e '.[all]' \
-  --config-settings=cmake.define.VC_READER_ENABLE_HIP=ON
+  --config-settings=cmake.define.VC_READER_ENABLE_HIP=ON \
+  --config-settings=cmake.define.VC_READER_ENABLE_CUDA=OFF
 ```
+
+Setting CUDA to `OFF` also clears any previous CUDA selection in the build cache.
 
 CMake looks for ROCm at its usual location, `/opt/rocm`. If ROCm is installed
 elsewhere, give it the path with `ROCM_PATH`. CMake detects the GPU by itself;
