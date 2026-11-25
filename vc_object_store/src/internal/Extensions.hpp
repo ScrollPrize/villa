@@ -11,6 +11,7 @@ std::optional<ExtensionTableInfo> resolvedExtensionTable(sqlite3*, const std::st
 std::vector<ExtensionTableInfo> extensionTables(sqlite3*);
 std::optional<ExtensionTableInfo> extensionTable(sqlite3*, const std::string&, bool includeMetadata = true);
 void createExtensionTable(sqlite3*, const ExtensionTable&);
+void dropExtensionTable(sqlite3*, const std::string& name);
 void appendExtensionRows(sqlite3*, const std::string&, std::span<const ExtensionRow>);
 void replaceCurrentExtensionRows(sqlite3*, const std::string&, const std::string& ownerUuid, std::span<const ExtensionRow>);
 void appendInitialExtensions(sqlite3*, std::span<const InitialExtensionRow* const>,std::span<const std::string> staged = {});

@@ -235,9 +235,8 @@ private:
     QJsonObject handleFiberSave(const QJsonValue& params);
     QJsonObject handleFiberDelete(const QJsonValue& params);
     QJsonObject handleFiberSetTag(const QJsonValue& params);
-    QJsonObject handleFiberOpenPiece(const QJsonValue& params);
-    QJsonObject handleFiberApprovePiece(const QJsonValue& params);
-    QJsonObject handleFiberLockControlPoint(const QJsonValue& params);
+    QJsonObject handleFiberOpenApproval(const QJsonValue& params);
+    QJsonObject handleFiberApprovalEdit(const QJsonValue& params);
     QJsonObject handleFiberExport(const QJsonValue& params);
     // Object stores (AgentBridgeHandlers_stores.cpp): importing source files
     // into a project store and exporting one object as native files, as jobs.

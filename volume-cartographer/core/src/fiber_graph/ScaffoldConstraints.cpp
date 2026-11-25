@@ -689,15 +689,15 @@ objects::FiberConstraintApproval approveScaffoldConstraint(const ScaffoldGraph& 
 bool scaffoldConstraintPiecesApproved(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
                                       const ScaffoldConstraint& constraint)
 {
-    const auto spans = scaffoldConstraintSpans(graph, geometry, constraint);
-    if (!spans) return false;
-    const auto approved = [&](std::int64_t fiber, std::size_t span) {
+    // Approved geometry at the anchor itself: the stretch of the fiber's
+    // approval layer that covers it.
+    const auto approved = [&](std::int64_t fiber, double arc) {
         if (fiber < 0 || std::size_t(fiber) >= graph.fibers.size()) return false;
-        const auto& list =
-            graph.fibers[std::size_t(fiber)].approvals.approvedSpans[std::size_t(objects::FiberPieceAspect::Geometry)];
-        return std::find(list.begin(), list.end(), span) != list.end();
+        const auto line = geometry.lineIndexAt(std::size_t(fiber), arc);
+        return line >= 0 &&
+               ScaffoldApproval::touches(graph.fibers[std::size_t(fiber)].approval.approvedGeometry, double(line));
     };
-    return approved(constraint.a, spans->spanA) && approved(constraint.b, spans->spanB);
+    return approved(constraint.a, constraint.arcA) && approved(constraint.b, constraint.arcB);
 }
 
 void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
@@ -738,7 +738,7 @@ void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const Scaffold
                                                      ordered ? spans->spanA : spans->spanB, contentB,
                                                      ordered ? spans->spanB : spans->spanA))
             continue;
-        // The piece approvals can be revoked after the constraint was
+        // The geometry approvals can be revoked after the constraint was
         // approved; the constraint then asserts nothing rigid either.
         if (!scaffoldConstraintPiecesApproved(graph, geometry, constraint)) {
             ++report.withoutPieces;

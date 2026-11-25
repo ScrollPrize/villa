@@ -103,7 +103,8 @@ struct ScaffoldRunDiff {
     const std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding>& first,
     const std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding>& second);
 
-// Per fiber, which spans carry a live and current piece approval, by aspect
+// Per fiber, which spans a current approved stretch of its approval layer
+// covers, by aspect
 // (0 geometry, 1 normals). Spans are indexed by their lower control point.
 struct ScaffoldApprovalSpans {
     std::vector<std::int64_t> controlIds;

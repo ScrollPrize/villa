@@ -2,7 +2,7 @@
 // The manually annotated scaffold of one vcobj store, read for a winding solve.
 //
 // A scaffold is a set of fiber objects with H/V families, their annotation
-// links (`fiber_branch` edges), their piece approvals and the volume's
+// links (`fiber_branch` edges), their approval layers and the volume's
 // umbilicus. This header reads that state into plain structs through any
 // StoreReader, so the same loader serves VC3D and the command line. Nothing
 // here samples a volume or solves anything; the winding solve itself lives in
@@ -15,7 +15,8 @@
 #include "vc/fiber_graph/ScaffoldRunMonitor.hpp"
 
 #include "vc_object_store/geometry/FiberWinding.hpp"
-#include "vc_object_store/objects/FiberPieceApprovalExtension.hpp"
+#include "vc_object_store/objects/FiberApprovalExtension.hpp"
+#include "vc_object_store/objects/FiberContent.hpp"
 #include "vc_object_store/objects/StoreReader.hpp"
 
 #include <cstdint>
@@ -36,6 +37,29 @@ enum class ScaffoldFamily : int { Horizontal = 0, Vertical = 1, Untagged = 2 };
 // Which stored family labels a load accepts (the store's `manual_family` flag).
 enum class ScaffoldFamilySource { Any, Manual, Automatic };
 
+// A fiber's approval layer as a run reads it: the current stretches as index
+// ranges of the fiber's annotated line points (a stale stretch is not in
+// them). Broken geometry splits the fiber there: its parts take their own
+// winding. Broken in either aspect removes the stretch from every relation.
+struct ScaffoldApproval {
+    using Ranges = std::vector<std::pair<double, double>>;
+    std::int64_t generation = 0; // 0: the fiber has no layer
+    Ranges approvedGeometry, approvedNormals, brokenGeometry, brokenNormals;
+    std::int64_t staleStretches = 0, staleNormalPoints = 0, normalPoints = 0;
+    static bool covers(const Ranges& ranges, double from, double to)
+    {
+        for (const auto& [first, last] : ranges)
+            if (from >= first - 1e-9 && to <= last + 1e-9) return true;
+        return false;
+    }
+    static bool touches(const Ranges& ranges, double index)
+    {
+        for (const auto& [first, last] : ranges)
+            if (index >= first && index <= last) return true;
+        return false;
+    }
+};
+
 struct ScaffoldFiber {
     std::string uuid, name;
     ScaffoldFamily family = ScaffoldFamily::Untagged;
@@ -44,14 +68,15 @@ struct ScaffoldFiber {
     // This fiber's line points in ScaffoldGraph::linePoints.
     std::int64_t pointFirst = 0, pointCount = 0;
     // Control point ids, coordinates, annotations and their line indices, as
-    // the piece-approval extension reads them. Its `linePoints` are cleared
+    // FiberContent.hpp reads them. Its `linePoints` are cleared
     // after loading: the polylines live once, in ScaffoldGraph::linePoints.
     objects::FiberPieceContent content;
-    // The live piece-approval rows and the spans they currently cover.
-    objects::FiberPieceApprovalStates approvals;
-    // The normal approved at each of this fiber's line points: the stored
-    // axis on the spans approved for the normals aspect, zero elsewhere.
-    // Empty when no span is approved.
+    // The fiber's approval layer (FiberApprovalExtension.hpp), on this
+    // fiber's annotated line.
+    ScaffoldApproval approval;
+    // The normal approved at each of this fiber's line points: the saved
+    // axis on the stretches approved for normals and at the normal points,
+    // zero elsewhere. Empty when there is none.
     std::vector<geometry::Point> approvedLineNormals;
 };
 
@@ -77,7 +102,8 @@ enum class ScaffoldHandednessSource { Option, Store, Fallback };
 
 struct ScaffoldLoadReport {
     std::int64_t fiberRecords = 0, fibers = 0, untagged = 0, manualFamily = 0, automaticFamily = 0,
-                 filteredFamily = 0, shortFibers = 0, links = 0, linkRecords = 0, pieceApprovalRows = 0;
+                 filteredFamily = 0, shortFibers = 0, links = 0, linkRecords = 0, approvalLayers = 0,
+                 approvedStretches = 0, brokenStretches = 0, staleApprovalItems = 0;
     // Fiber records the load's `fiberSubset` left out.
     std::int64_t filteredSubset = 0;
     ScaffoldHandednessSource handednessSource = ScaffoldHandednessSource::Store;
@@ -122,7 +148,7 @@ struct ScaffoldLoadOptions {
     // Load untagged fibers too (they carry no winding relation; the winding
     // solve leaves them out).
     bool includeUntagged = false;
-    bool readPieceApprovals = true;
+    bool readApprovals = true;
     // Load only these fibers (by UUID), empty for all of them. This is how a
     // run is restricted to one part of the annotation - the map's selected
     // network: the other fibers are not loaded at all, so no link, crossing
@@ -167,6 +193,11 @@ public:
     double controlArc(std::size_t fiber, std::size_t control) const;
     // The fiber's own index of the line point nearest an arc position.
     std::int64_t lineIndexAt(std::size_t fiber, double arc) const;
+    // Arc length at a (fractional) index of the fiber's own line points.
+    double arcAtLineIndex(std::size_t fiber, double index) const;
+    // Where broken geometry splits the fiber: one arc inside each broken
+    // stretch, ascending. The parts between them take their own winding.
+    std::vector<double> splitArcs(std::size_t fiber) const;
     double arcLength(std::size_t fiber) const { return packed_.arcLength(std::int64_t(fiber)); }
     // The fiber's gap spans as arc ranges: a span whose two controls are
     // tagged `break` (the span's own `gap` tag). A gap is a bridge across

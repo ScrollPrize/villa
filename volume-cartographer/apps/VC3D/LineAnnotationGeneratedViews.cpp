@@ -530,11 +530,6 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                 style.brushColor = Qt::transparent;
             }
         }
-        if (control.isLock && !control.isLinkCandidate) {
-            // Light grey ring: a lock control point of an approval piece.
-            style.penColor = QColor(235, 235, 235, 245);
-            style.penWidth = 2.5;
-        }
         return style;
     };
 
@@ -1094,22 +1089,6 @@ std::function<bool(QAction*)> appendGeneratedSpanContextActions(
         damagedAction->setEnabled(!blocked);
     }
 
-    // Piece approval: a new piece whose one end is a lock control inserted at
-    // the clicked line position, the other a lock control or a fiber end.
-    std::vector<std::pair<QAction*, GeneratedPieceEnd>> pieceActions;
-    if (options.openPiece && std::isfinite(options.linePosition)) {
-        QMenu* pieceMenu = menu.addMenu(QWidget::tr("New piece from here to"));
-        for (const auto* control : sortedControls) {
-            if (!control->isLock) continue;
-            GeneratedPieceEnd end; end.controlIndex = control->controlIndex;
-            pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("lock CP %1").arg(control->controlIndex)), end);
-        }
-        GeneratedPieceEnd start; start.fiberStart = true;
-        pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("the fiber start")), start);
-        GeneratedPieceEnd finish; finish.fiberEnd = true;
-        pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("the fiber end")), finish);
-    }
-
     QAction* splitAction = nullptr;
     QAction* splitAndLinkAction = nullptr;
     if (options.splitSpan) {
@@ -1149,12 +1128,6 @@ std::function<bool(QAction*)> appendGeneratedSpanContextActions(
         }
         if (splitAndLinkAction && selected == splitAndLinkAction && splitAndLinkAction->isEnabled()) {
             options.splitSpan(owner.controlIndex, next.controlIndex, true);
-            return true;
-        }
-        for (const auto& [action, end] : pieceActions) {
-            if (selected != action) continue;
-            GeneratedPieceEnd here; here.linePosition = options.linePosition;
-            options.openPiece(here, end);
             return true;
         }
         return false;
@@ -1729,28 +1702,6 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
         breakAction->setEnabled(enabled);
     }
 
-    // Piece approval: the lock tag, and opening a piece from this point.
-    QAction* lockAction = nullptr;
-    std::vector<std::pair<QAction*, GeneratedPieceEnd>> pieceActions;
-    if (options.setLock) {
-        lockAction = menu.addAction(QWidget::tr("Lock control point"));
-        lockAction->setCheckable(true);
-        lockAction->setChecked(selectedControl.isLock);
-        lockAction->setEnabled(haveControlIndex);
-    }
-    if (options.openPiece && haveControlIndex) {
-        QMenu* pieceMenu = menu.addMenu(QWidget::tr("Open piece from this control point to"));
-        for (const auto& other : options.controlPoints) {
-            if (!other.isLock || other.controlIndex == selectedControlIndex) continue;
-            GeneratedPieceEnd end; end.controlIndex = other.controlIndex;
-            pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("lock CP %1").arg(other.controlIndex)), end);
-        }
-        GeneratedPieceEnd start; start.fiberStart = true;
-        pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("the fiber start")), start);
-        GeneratedPieceEnd finish; finish.fiberEnd = true;
-        pieceActions.emplace_back(pieceMenu->addAction(QWidget::tr("the fiber end")), finish);
-    }
-
     // Section 3: new annotations at the clicked location (not the point).
     menu.addSeparator();
     clickActions.addNewAnnotations(menu, options);
@@ -1786,16 +1737,6 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
     }
     if (breakAction && selected == breakAction && breakAction->isEnabled()) {
         options.setBreak(selectedControlIndex, !selectedControl.isBreak);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    if (lockAction && selected == lockAction && lockAction->isEnabled()) {
-        options.setLock(selectedControlIndex, !selectedControl.isLock);
-        return GeneratedControlPointContextResult::Handled;
-    }
-    for (const auto& [action, end] : pieceActions) {
-        if (selected != action) continue;
-        GeneratedPieceEnd here; here.controlIndex = selectedControlIndex;
-        options.openPiece(here, end);
         return GeneratedControlPointContextResult::Handled;
     }
     for (const auto& [action, branch] : openBranchActions) {

@@ -227,6 +227,12 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("violated_arcs", result.violatedArcs, "arcs");
     count("violated_constraints", result.violatedConstraints, "constraints");
     count("approved_subgraphs", result.approvedSubgraphs, "subgraphs");
+    count("approval_layers", graph.report.approvalLayers, "fibers");
+    count("approved_stretches", graph.report.approvedStretches, "stretches");
+    count("broken_stretches", graph.report.brokenStretches, "stretches");
+    count("stale_approval_items", graph.report.staleApprovalItems, "items");
+    count("split_fibers", result.splitFibers, "fibers");
+    count("split_parts", std::int64_t(result.parts.size()), "parts");
     std::int64_t approvedConstraints = 0;
     for (const auto& constraint : result.constraints) approvedConstraints += constraint.approved ? 1 : 0;
     count("approved_constraints", approvedConstraints, "constraints");

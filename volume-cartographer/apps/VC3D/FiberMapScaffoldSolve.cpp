@@ -232,8 +232,8 @@ ScaffoldAnchorSpan ScaffoldSolveController::anchorSpan(const std::string& fiberU
         const auto& flags = found->second.approved[aspect];
         return std::size_t(answer.span) < flags.size() && flags[std::size_t(answer.span)] != 0;
     };
-    answer.geometryApproved = approvedAt(std::size_t(vc::objects::FiberPieceAspect::Geometry));
-    answer.normalsApproved = approvedAt(std::size_t(vc::objects::FiberPieceAspect::Normals));
+    answer.geometryApproved = approvedAt(std::size_t(vc::objects::FiberApprovalAspect::Geometry));
+    answer.normalsApproved = approvedAt(std::size_t(vc::objects::FiberApprovalAspect::Normals));
     return answer;
 }
 
@@ -263,8 +263,11 @@ void ScaffoldSolveController::reloadRuns()
     } catch (const std::exception& problem) {
         error = tr("The saved solves could not be read: %1").arg(QString::fromUtf8(problem.what()));
     }
-    // Newest last in commit order; the list shows them newest first.
+    // Newest last in commit order; the list shows them newest first, by
+    // the time each run recorded.
     std::reverse(_runs.begin(), _runs.end());
+    std::stable_sort(_runs.begin(), _runs.end(),
+                     [](const auto& a, const auto& b) { return a.createdAtUnix > b.createdAtUnix; });
     if (!error.isEmpty()) {
         _lastError = error;
         emit statusMessage(error);
@@ -406,6 +409,34 @@ std::optional<ScaffoldSolveController::RunFiberNormals> ScaffoldSolveController:
     return out;
 }
 
+namespace {
+// Per span between two control points and per aspect: whether a current
+// approved stretch of the fiber's approval layer covers the whole span.
+// `content` holds the fiber as stored (its line points untransformed).
+std::array<std::vector<std::uint8_t>, 2> approvedSpansOfLayer(const vc::objects::StoreReader& reader,
+                                                             const std::string& fiberUuid,
+                                                             const vc::objects::FiberPieceContent& content)
+{
+    using namespace vc::objects;
+    const auto spans = content.controlIds.empty() ? 0 : content.controlIds.size() - 1;
+    std::array<std::vector<std::uint8_t>, 2> approved;
+    for (auto& flags : approved) flags.assign(spans, 0);
+    const auto layer = readFiberApproval(reader, fiberUuid);
+    if (!layer || layer->empty()) return approved;
+    const auto status = fiberApprovalStatus(*layer, content.linePoints);
+    for (std::size_t aspect = 0; aspect < 2; ++aspect) {
+        const auto ranges = fiberStretchRanges(*layer, status, FiberApprovalAspect(aspect), FiberStretchState::Approved);
+        for (std::size_t span = 0; span < spans && span + 1 < content.controlLineIndex.size(); ++span) {
+            const double from = double(content.controlLineIndex[span]), to = double(content.controlLineIndex[span + 1]);
+            if (from < 0 || to < from) continue;
+            for (const auto& [first, last] : ranges)
+                if (from >= first - 1e-9 && to <= last + 1e-9) { approved[aspect][span] = 1; break; }
+        }
+    }
+    return approved;
+}
+} // namespace
+
 void ScaffoldSolveController::loadApprovals()
 {
     const auto store = attachment();
@@ -421,6 +452,9 @@ void ScaffoldSolveController::loadApprovals()
                 const auto revision = reader.currentObject(record.uuid);
                 if (!revision) continue;
                 auto content = vc::objects::fiberPieceContent(reader, *revision);
+                ScaffoldApprovalSpans entry;
+                // Taken over the stored line, before it is mapped below.
+                entry.approved = approvedSpansOfLayer(reader, record.uuid, content);
                 // The line in the runs' frame, read as the solve reads it:
                 // the arcs below are then the arcs a run states.
                 if (!_frameVolume.empty() && !content.linePoints.empty()) {
@@ -428,22 +462,13 @@ void ScaffoldSolveController::loadApprovals()
                     content.linePoints = view.points("line_points", 0, content.linePoints.size());
                     content.controlPoints = view.points("control_points", 0, content.controlPoints.size());
                 }
-                const auto rows = vc::objects::readFiberPieceApprovals(reader, record.uuid);
-                const auto states = vc::objects::fiberPieceApprovalStates(content, rows);
-                ScaffoldApprovalSpans entry;
                 entry.controlIds = content.controlIds;
                 entry.controlArcs = scaffoldControlArcs(content);
-                const auto spans = content.controlIds.empty() ? 0 : content.controlIds.size() - 1;
-                for (std::size_t aspect = 0; aspect < 2; ++aspect) {
-                    entry.approved[aspect].assign(spans, 0);
-                    for (const auto span : states.approvedSpans[aspect])
-                        if (span < spans) entry.approved[aspect][span] = 1;
-                }
                 loaded.emplace(record.uuid, std::move(entry));
             }
         });
     } catch (const std::exception& problem) {
-        _lastError = tr("The piece approvals could not be read: %1").arg(QString::fromUtf8(problem.what()));
+        _lastError = tr("The fiber approvals could not be read: %1").arg(QString::fromUtf8(problem.what()));
         emit statusMessage(_lastError);
         return;
     }
@@ -899,9 +924,8 @@ QString ScaffoldSolveController::setConstraintApproval(const ScaffoldStoredResid
                 // A constraint is a statement about two pieces of geometry.
                 // Approving it before those pieces are approved would pin a
                 // solve to geometry nobody has reviewed.
-                const auto states = fiberPieceApprovalStates(contents[side], readFiberPieceApprovals(reader, uuids[side]));
-                const auto& approvedSpans = states.approvedSpans[std::size_t(FiberPieceAspect::Geometry)];
-                if (std::find(approvedSpans.begin(), approvedSpans.end(), spans[side]) == approvedSpans.end()) {
+                const auto approvedSpans = approvedSpansOfLayer(reader, uuids[side], contents[side])[0];
+                if (spans[side] >= approvedSpans.size() || approvedSpans[spans[side]] == 0) {
                     error = tr("Approve the geometry of both pieces this crossing lies on first.");
                     return;
                 }
@@ -935,141 +959,18 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     layout->setContentsMargins(4, 4, 4, 4);
     layout->setSpacing(4);
 
+    // No settings: a run is one of the solver profiles.
     auto* form = new QFormLayout();
     form->setContentsMargins(0, 0, 0, 0);
     form->setSpacing(2);
-
-    auto* states = new QWidget(this);
-    auto* statesLayout = new QHBoxLayout(states);
-    statesLayout->setContentsMargins(0, 0, 0, 0);
-    _approvedCheck = new QCheckBox(tr("approved"), states);
-    _approvedCheck->setObjectName(QStringLiteral("fiberMapSolveApprovedLinks"));
-    // The scaffold workflow's default run uses no links: the crossings alone.
-    _approvedCheck->setChecked(false);
-    _pendingCheck = new QCheckBox(tr("pending"), states);
-    _pendingCheck->setObjectName(QStringLiteral("fiberMapSolvePendingLinks"));
-    _pendingCheck->setChecked(false);
-    statesLayout->addWidget(_approvedCheck);
-    statesLayout->addWidget(_pendingCheck);
-    statesLayout->addStretch(1);
-    states->setToolTip(tr("Which links the solve uses, by their review state.\n"
-                          "A rejected link is never used. With neither checked the run uses no\n"
-                          "link at all and solves on the measured crossings alone, which it then\n"
-                          "has to be measuring."));
-    form->addRow(tr("Links"), states);
-
-    _autoCheck = new QCheckBox(tr("Use automatic links"), this);
-    _autoCheck->setObjectName(QStringLiteral("fiberMapSolveAutoLinks"));
-    _autoCheck->setToolTip(tr("Also use links the automatic linker proposed and nobody reviewed."));
-    form->addRow(QString(), _autoCheck);
-
-    _manualWeightSpin = new QDoubleSpinBox(this);
-    _manualWeightSpin->setObjectName(QStringLiteral("fiberMapSolveManualWeight"));
-    _manualWeightSpin->setRange(0.0, 1000.0);
-    _manualWeightSpin->setDecimals(2);
-    _manualWeightSpin->setSingleStep(0.25);
-    _manualWeightSpin->setValue(1.0);
-    _manualWeightSpin->setToolTip(tr("Cost of one winding of error on a link. Only relative weights\n"
-                                     "matter while links are the only constraints."));
-    form->addRow(tr("Link weight"), _manualWeightSpin);
-
-    _fixApprovedCheck = new QCheckBox(tr("Fix approved subgraphs"), this);
-    _fixApprovedCheck->setObjectName(QStringLiteral("fiberMapSolveFixApproved"));
-    _fixApprovedCheck->setChecked(true);
-    _fixApprovedCheck->setToolTip(tr("Solve the approved constraints alone first and hold their relative\n"
-                                     "windings fixed, so an approved relation is never traded away.\n"
-                                     "Approved constraints that contradict each other stop the run."));
-    form->addRow(QString(), _fixApprovedCheck);
-
-    _backendCombo = new QComboBox(this);
-    _backendCombo->setObjectName(QStringLiteral("fiberMapSolveBackend"));
-    _backendCombo->addItem(tr("cost scaling"), QStringLiteral("cost_scaling"));
-    _backendCombo->addItem(tr("network simplex"), QStringLiteral("network_simplex"));
-    _backendCombo->setToolTip(tr("The min-cost-flow backend. Both solve the same problem exactly."));
-    form->addRow(tr("Backend"), _backendCombo);
-
-    _scopeCombo = new QComboBox(this);
-    _scopeCombo->setObjectName(QStringLiteral("fiberMapSolveScope"));
-    _scopeCombo->addItem(tr("the whole scaffold"), false);
-    _scopeCombo->addItem(tr("the selected network"), true);
-    _scopeCombo->setToolTip(tr("Which fibers the run reads. The selected network is the group the map\n"
-                               "currently has selected: its fibers alone are loaded, so the links,\n"
-                               "crossings and components of the run are those of that part of the\n"
-                               "annotation. A run with nothing selected is refused rather than run on\n"
-                               "everything."));
-    form->addRow(tr("Scope"), _scopeCombo);
-
-    _crossingsCheck = new QCheckBox(tr("Measure the fibers' crossings"), this);
-    _crossingsCheck->setObjectName(QStringLiteral("fiberMapSolveCrossings"));
-    _crossingsCheck->setToolTip(tr("Also use the crossings of the annotated fibers themselves: their strip\n"
-                                   "normals, the signs those crossings decide, and the perpendicular,\n"
-                                   "parallel and enclosure relations they assert. This reads the volume and\n"
-                                   "takes seconds rather than milliseconds."));
-    _crossingsCheck->setChecked(true);
-    form->addRow(tr("Crossings"), _crossingsCheck);
-
-    _windingDistanceCheck = new QCheckBox(tr("Measure winding separations"), this);
-    _windingDistanceCheck->setObjectName(QStringLiteral("fiberMapSolveWindingDistances"));
-    _windingDistanceCheck->setChecked(true);
-    _windingDistanceCheck->setToolTip(tr("Measure how many windings apart each crossing is, on the bound\n"
-                                         "Lasagna normal dataset's winding density. Without it a crossing\n"
-                                         "asserts no step and only witnesses an enclosure."));
-    form->addRow(QString(), _windingDistanceCheck);
-
-    const auto weightSpin = [this](const char* name, const QString& tip) {
-        auto* spin = new QDoubleSpinBox(this);
-        spin->setObjectName(QString::fromLatin1(name));
-        spin->setRange(0.0, 1000.0);
-        spin->setDecimals(2);
-        spin->setSingleStep(0.25);
-        spin->setValue(1.0);
-        spin->setToolTip(tip);
-        return spin;
-    };
-    _perpendicularWeightSpin = weightSpin("fiberMapSolvePerpendicularWeight",
-        tr("Cost of one winding of error on a measured perpendicular crossing."));
-    form->addRow(tr("Perpendicular weight"), _perpendicularWeightSpin);
-    _parallelWeightSpin = weightSpin("fiberMapSolveParallelWeight",
-        tr("Cost of one winding of error on a measured parallel relation."));
-    form->addRow(tr("Parallel weight"), _parallelWeightSpin);
-    _enclosureWeightSpin = weightSpin("fiberMapSolveEnclosureWeight",
-        tr("Cost of one winding of error on an enclosure relation: the exact step a pair's\n"
-           "crossings bound from both sides. Zero leaves enclosures out."));
-    form->addRow(tr("Enclosure weight"), _enclosureWeightSpin);
-    _signWeightSpin = weightSpin("fiberMapSolveSignWeight",
-        tr("Cost of one winding past the bound a signed perpendicular crossing states on its\n"
-           "own: the V fiber lies outside the H fiber there, or inside. Every such crossing\n"
-           "bounds its pair's step from one side and costs only when the solve breaks the\n"
-           "bound (an enclosure is a pair bounded from both sides). It needs no winding\n"
-           "separation. Zero states none."));
-    _signWeightSpin->setValue(100.0);
-    _parallelWeightSpin->setValue(0.0);
-    _enclosureWeightSpin->setValue(0.0);
-    form->addRow(tr("Sign weight"), _signWeightSpin);
-
-    _normalSourceCombo = new QComboBox(this);
-    _normalSourceCombo->setObjectName(QStringLiteral("fiberMapSolveNormalSource"));
-    _normalSourceCombo->addItem(tr("full-volume neighbours"), QStringLiteral("neighbours"));
-    _normalSourceCombo->addItem(tr("fiber geometry"), QStringLiteral("geometry"));
-    _normalSourceCombo->addItem(tr("fused prediction"), QStringLiteral("fused"));
-    _normalSourceCombo->setToolTip(tr("Where the fibers' normals come from. The geometry alone gives every\n"
-                                      "fiber a strip normal; the fused source also pulls each node towards\n"
-                                      "the sheet axis the package's fiber-inference prediction states there,\n"
-                                      "weighted by its presence. Fused reads the prediction volume along\n"
-                                      "every fiber, which takes a minute on a large scaffold.\n"
-                                      "Full-volume neighbours pulls each fiber towards the signed normals of\n"
-                                      "the automatic fibers around it, as the whole-volume sign resolution\n"
-                                      "left them, and faces the fiber by them. It reads the file\n"
-                                      "<fiber store>.neighbour_normals.vcstrip next to the fiber store."));
-    form->addRow(tr("Normals"), _normalSourceCombo);
-
-    _signBackendCombo = new QComboBox(this);
-    _signBackendCombo->setObjectName(QStringLiteral("fiberMapSolveSignBackend"));
-    _signBackendCombo->addItem(tr("IRLS"), QStringLiteral("irls"));
-    _signBackendCombo->addItem(tr("Ceres"), QStringLiteral("ceres"));
-    _signBackendCombo->setToolTip(tr("Which backend decides the normal signs of the fibers no anchor fixed.\n"
-                                     "Both descend the same objective."));
-    form->addRow(tr("Sign backend"), _signBackendCombo);
+    _profileCombo = new QComboBox(this);
+    _profileCombo->setObjectName(QStringLiteral("fiberMapSolveProfile"));
+    _profileCombo->addItem(tr("default scaffold"), QStringLiteral("default_scaffold"));
+    _profileCombo->setToolTip(tr("The solver profile of the run.\n"
+                                 "default scaffold: the whole scaffold, no links, measured crossings with\n"
+                                 "winding separations, perpendicular weight 1, sign weight 100, normals\n"
+                                 "from the full-volume neighbours, approved subgraphs held fixed."));
+    form->addRow(tr("Profile"), _profileCombo);
     layout->addLayout(form);
 
     auto* buttons = new QWidget(this);
@@ -1122,9 +1023,6 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     _progressTimer = new QTimer(this);
     _progressTimer->setInterval(250);
     connect(_progressTimer, &QTimer::timeout, this, [this]() { showProgress(); });
-    for (auto* box : {_approvedCheck, _pendingCheck, _crossingsCheck}) {
-        connect(box, &QCheckBox::toggled, this, [this]() { updateEnabled(); });
-    }
     if (_controller) {
         connect(_controller, &ScaffoldSolveController::busyChanged, this, [this](bool busy) {
             updateEnabled();
@@ -1143,26 +1041,6 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
                 [this](const QString& message) { _statusLabel->setText(message); });
     }
     updateEnabled();
-}
-
-void ScaffoldSolverPanel::setScopeAvailable(bool available)
-{
-    if (!_scopeCombo) return;
-    const auto at = _scopeCombo->findData(true);
-    if (at < 0) return;
-    if (!available && _scopeCombo->currentIndex() == at) _scopeCombo->setCurrentIndex(0);
-    if (auto* model = qobject_cast<QStandardItemModel*>(_scopeCombo->model()))
-        if (auto* item = model->item(at)) item->setEnabled(available);
-    _scopeCombo->setItemData(at,
-                             available ? QString()
-                                       : tr("The map has no layout yet, so it has no selected network; press "
-                                            "Update to restrict a run to one."),
-                             Qt::ToolTipRole);
-}
-
-void ScaffoldSolverPanel::setScopeResolver(ScopeResolver resolver)
-{
-    _scope = std::move(resolver);
 }
 
 void ScaffoldSolverPanel::showProgress()
@@ -1220,52 +1098,38 @@ void ScaffoldSolverPanel::setFrame(const std::string& volume, std::optional<int>
 
 void ScaffoldSolverPanel::updateEnabled()
 {
-    const bool states = _approvedCheck->isChecked() || _pendingCheck->isChecked();
-    const bool crossings = _crossingsCheck->isChecked();
     const bool busy = _controller && _controller->busy();
-    // No link state selected is a measured-only run, which needs the
-    // crossings: without either the solve would have nothing to constrain.
-    _runButton->setEnabled((states || crossings) && !busy && !_volume.empty());
+    _runButton->setEnabled(!busy && !_volume.empty());
     _cancelButton->setEnabled(busy);
-    if (_volume.empty())
-        _runButton->setToolTip(tr("The map has no annotation volume to solve in."));
-    else if (!states && !crossings)
-        _runButton->setToolTip(tr("Nothing would constrain the windings: select a link state, or measure the\n"
-                                  "fibers' crossings."));
-    for (auto* widget : std::initializer_list<QWidget*>{_windingDistanceCheck, _perpendicularWeightSpin,
-                                                        _parallelWeightSpin, _enclosureWeightSpin, _signWeightSpin,
-                                                        _normalSourceCombo, _signBackendCombo})
-        widget->setEnabled(crossings);
+    if (_volume.empty()) _runButton->setToolTip(tr("The map has no annotation volume to solve in."));
 }
 
 ScaffoldSolveRequest ScaffoldSolverPanel::request() const
 {
+    // The one profile, "default scaffold".
     ScaffoldSolveRequest request;
     request.approvalStates.clear();
-    if (_approvedCheck->isChecked()) request.approvalStates.push_back("approved");
-    if (_pendingCheck->isChecked()) request.approvalStates.push_back("pending");
-    request.useLinks = !request.approvalStates.empty();
-    request.includeAuto = _autoCheck->isChecked();
-    request.manualWeight = _manualWeightSpin->value();
-    request.fixApprovedSubgraphs = _fixApprovedCheck->isChecked();
-    request.lemonBackend = _backendCombo->currentData().toString().toStdString();
+    request.useLinks = false;
+    request.includeAuto = false;
+    request.manualWeight = 1.0;
+    request.fixApprovedSubgraphs = true;
+    request.lemonBackend = "cost_scaling";
     request.volume = _volume;
     request.fallbackHandedness = _fallbackHandedness;
-    request.measureCrossings = _crossingsCheck->isChecked();
-    request.measureWindingDistances = _windingDistanceCheck->isChecked();
-    request.perpendicularWeight = _perpendicularWeightSpin->value();
-    request.parallelWeight = _parallelWeightSpin->value();
-    request.enclosureWeight = _enclosureWeightSpin->value();
-    request.signWeight = _signWeightSpin->value();
-    request.normalSource = _normalSourceCombo->currentData().toString().toStdString();
-    request.signBackend = _signBackendCombo->currentData().toString().toStdString();
+    request.measureCrossings = true;
+    request.measureWindingDistances = true;
+    request.perpendicularWeight = 1.0;
+    request.parallelWeight = 0.0;
+    request.enclosureWeight = 0.0;
+    request.signWeight = 100.0;
+    request.normalSource = "neighbours";
+    request.signBackend = "irls";
     request.workers = std::size_t(std::max(1, QThread::idealThreadCount()));
-    request.restricted = _scopeCombo->currentData().toBool();
-    if (request.restricted && _scope) request.fiberSubset = _scope();
+    request.restricted = false;
     return request;
 }
 
-bool ScaffoldSolverPanel::fixApprovedSubgraphs() const { return _fixApprovedCheck->isChecked(); }
+bool ScaffoldSolverPanel::fixApprovedSubgraphs() const { return true; }
 
 ScaffoldRunsPanel::ScaffoldRunsPanel(ScaffoldSolveController* controller, QWidget* parent)
     : QWidget(parent)
@@ -1302,23 +1166,31 @@ ScaffoldRunsPanel::ScaffoldRunsPanel(ScaffoldSolveController* controller, QWidge
                               "counted are those that moved against the neighbours they share a\n"
                               "component with in both runs."));
     layout->addWidget(_diffLabel);
-    _followCheck = new QCheckBox(tr("Lay the map out from this solve"), this);
-    _followCheck->setObjectName(QStringLiteral("fiberMapFollowSolve"));
-    _followCheck->setToolTip(tr("Walk exactly the links the selected solve walked: the links it did\n"
-                                "not use carry no constraint here, and the ones it could not satisfy\n"
-                                "are drawn suspect. The map's own crossing evidence still places the\n"
-                                "fibers it says nothing about."));
-    layout->addWidget(_followCheck);
-
     if (_controller) {
         connect(_controller, &ScaffoldSolveController::runsChanged, this, [this]() { rebuild(); });
         connect(_tree, &QTreeWidget::itemSelectionChanged, this, [this]() { applySelection(); });
+        // A solve selected elsewhere (the one that just finished) is the selected row.
+        connect(_controller, &ScaffoldSolveController::selectionChanged, this, [this]() {
+            const auto wanted = _controller->selected() ? _controller->selected()->run.runUuid : std::string();
+            const auto items = _tree->selectedItems();
+            const auto shown = items.isEmpty()
+                ? std::string() : items.front()->data(kRunMethodColumn, Qt::UserRole).toString().toStdString();
+            if (shown == wanted) return;
+            _rebuilding = true;
+            _tree->clearSelection();
+            for (int row = 0; row < _tree->topLevelItemCount(); ++row) {
+                auto* item = _tree->topLevelItem(row);
+                if (item->data(kRunMethodColumn, Qt::UserRole).toString().toStdString() != wanted) continue;
+                item->setSelected(true);
+                _tree->scrollToItem(item);
+            }
+            _rebuilding = false;
+            showDiff();
+        });
     }
-    connect(_followCheck, &QCheckBox::toggled, this, [this]() { emit followChanged(); });
     rebuild();
 }
 
-bool ScaffoldRunsPanel::follow() const { return _followCheck && _followCheck->isChecked(); }
 
 void ScaffoldRunsPanel::rebuild()
 {

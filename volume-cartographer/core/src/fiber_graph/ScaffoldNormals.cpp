@@ -50,16 +50,6 @@ double radialAgreementOf(const ScaffoldGraph& graph, const ScaffoldGeometry& geo
 cv::Vec3d vectorOf(const geometry::Point& point) { return {point[0], point[1], point[2]}; }
 geometry::Point pointOf(const cv::Vec3d& value) { return {value[0], value[1], value[2]}; }
 
-// The spans approved for one aspect, as a membership test per span.
-std::vector<char> approvedSpanFlags(const ScaffoldFiber& fiber, objects::FiberPieceAspect aspect)
-{
-    const auto controls = fiber.content.controlIds.size();
-    std::vector<char> flags(controls == 0 ? 0 : controls - 1, 0);
-    for (const auto span : fiber.approvals.approvedSpans[std::size_t(aspect)])
-        if (span < flags.size()) flags[span] = 1;
-    return flags;
-}
-
 // The H and V fiber of an adjacent link, or nullopt when the pair is not one
 // of each (an annotation error that fixes no normal).
 std::optional<std::pair<std::int64_t, std::int64_t>> adjacentPair(const ScaffoldGraph& graph, const ScaffoldLink& link)
@@ -137,26 +127,24 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
     solved_.assign(fibers, 0);
     normals_.assign(graph.linePoints.size(), 0.);
 
-    // Normals approvals that approve nothing as they stand.
+    // Stretches and normal points of an approval layer whose line was edited:
+    // they approve nothing as they stand.
     for (const auto& fiber : graph.fibers)
-        for (std::size_t r = 0; r < fiber.approvals.live.size(); ++r)
-            if (fiber.approvals.live[r].aspect == objects::FiberPieceAspect::Normals &&
-                (r >= fiber.approvals.rowCurrent.size() || !fiber.approvals.rowCurrent[r]))
-                ++report_.staleNormalApprovals;
+        report_.staleNormalApprovals += fiber.approval.staleStretches + fiber.approval.staleNormalPoints;
     // Manual display normals: an axis on the one chain node at the control
     // point. Inside an approved stretch the stretch's stored normals say what
     // was shown there, the manual normal included.
     if (options.manualDisplayNormals) {
         for (std::size_t i = 0; i < fibers; ++i) {
             const auto& fiber = graph.fibers[i];
-            const auto approved = options.approvedNormalPieces
-                ? approvedSpanFlags(fiber, objects::FiberPieceAspect::Normals) : std::vector<char>{};
             for (std::size_t control = 0; control < fiber.content.annotations.size(); ++control) {
                 const auto& annotation = fiber.content.annotations[control];
                 const auto normal = fiber_tracer::displayNormalFromJson(annotation);
                 if (!normal || fiber_tracer::displayNormalSourceFromJson(annotation) != "manual") continue;
-                if ((control > 0 && control - 1 < approved.size() && approved[control - 1] != 0) ||
-                    (control < approved.size() && approved[control] != 0))
+                const auto index = control < fiber.content.controlLineIndex.size()
+                    ? fiber.content.controlLineIndex[control] : std::int64_t(-1);
+                if (options.approvedNormalPieces && index >= 0 &&
+                    ScaffoldApproval::touches(fiber.approval.approvedNormals, double(index)))
                     continue;
                 ScaffoldNormalAnchor anchor;
                 anchor.fiber = std::int64_t(i);
@@ -364,16 +352,13 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
                                         scaffoldSignSourceName(anchor.source) + " axis");
         }
     }
-    // An approval is not part of the fiber's version: the rows whose normals
-    // a fiber is solved from are named with the spans they cover.
+    // An approval layer is not part of the fiber's version: the generation
+    // whose normals a fiber is solved from is named.
     if (options.approvedNormalPieces)
-        for (std::size_t i = 0; i < fibers; ++i) {
-            const auto& approvals = graph.fibers[i].approvals;
-            const auto aspect = std::size_t(objects::FiberPieceAspect::Normals);
-            for (const auto span : approvals.approvedSpans[aspect])
-                anchoredBy[i].push_back("approved normals span " + std::to_string(span) + " row " +
-                                        approvals.live.at(*approvals.spans[aspect].at(span).row).rowUuid);
-        }
+        for (std::size_t i = 0; i < fibers; ++i)
+            if (!graph.fibers[i].approvedLineNormals.empty())
+                anchoredBy[i].push_back("approval layer generation " +
+                                        std::to_string(graph.fibers[i].approval.generation));
     std::vector<std::string> inputs(fibers);
     const auto frame = graph.volume + "@" + std::to_string(graph.scale);
     for (std::size_t i = 0; i < fibers; ++i)

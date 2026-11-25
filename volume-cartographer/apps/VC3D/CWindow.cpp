@@ -910,10 +910,12 @@ CWindow::CWindow(size_t cacheSizeGB) :
         tabBar->setTabButton(fiberMapIndex, QTabBar::RightSide, nullptr);
     }
     connect(_fiberMapWorkspace, &FiberMapWorkspace::dockLayoutChanged, this, &CWindow::scheduleWindowStateSave);
-    connect(_fiberMapWorkspace, &FiberMapWorkspace::openFiberPieceRequested,
-            this, [this](uint64_t fiberId, vc3d::line_annotation::PiecePlan plan) {
+    connect(_fiberMapWorkspace, &FiberMapWorkspace::openFiberApprovalRequested,
+            this, [this](uint64_t fiberId, QString runUuid, int lineFrom, int lineTo, int controlFrom, int controlTo) {
                 if (_fiberWidget) _fiberWidget->selectFiber(fiberId);
-                if (_lineAnnotationController) _lineAnnotationController->openFiberPiece(fiberId, plan);
+                if (_lineAnnotationController)
+                    _lineAnnotationController->openFiberApproval(fiberId, runUuid.toStdString(), lineFrom, lineTo,
+                                                                 controlFrom, controlTo);
             });
     connect(_fiberMapWorkspace, &FiberMapWorkspace::openFiberAtControlPointRequested,
             this, [this](uint64_t fiberId, int controlPointIndex) {

@@ -447,9 +447,7 @@ int replaceOpenTails(
     int firstControl,
     int lastControl,
     OpenTailPolicy policy,
-    FiberModeOptimizationResult& output,
-    const std::vector<cv::Vec3d>* keepLeftTail = nullptr,
-    const std::vector<cv::Vec3d>* keepRightTail = nullptr)
+    FiberModeOptimizationResult& output)
 {
     std::vector<cv::Vec3d> finalPoints;
     finalPoints.reserve(output.optimization.line.points.size());
@@ -473,9 +471,8 @@ int replaceOpenTails(
     const auto actionFor = [traceMode](bool ray) {
         return ray ? TailAction::Ray : (traceMode ? TailAction::Trace : TailAction::Keep);
     };
-    // A retained side keeps the base line's tail: no ray, no trace.
-    const TailAction leftAction = keepLeftTail ? TailAction::Keep : actionFor(policy.headRay);
-    const TailAction rightAction = keepRightTail ? TailAction::Keep : actionFor(policy.tailRay);
+    const TailAction leftAction = actionFor(policy.headRay);
+    const TailAction rightAction = actionFor(policy.tailRay);
 
     // Keep: the solver's own tails.
     std::vector<cv::Vec3d> leftTail(
@@ -626,14 +623,6 @@ int replaceOpenTails(
 
     // A trace may have set the flag; the rebuild below samples normals for
     // the whole line and must not run for a superseded solve.
-    if (keepLeftTail && !keepLeftTail->empty()) {
-        leftTail = *keepLeftTail;
-        leftTail.back() = finalPoints[static_cast<size_t>(firstControl)];
-    }
-    if (keepRightTail && !keepRightTail->empty()) {
-        rightTail = *keepRightTail;
-        rightTail.front() = finalPoints[static_cast<size_t>(lastControl)];
-    }
     throwIfCancelled();
     std::vector<cv::Vec3d> combined;
     combined.reserve(leftTail.size() + finalPoints.size() + rightTail.size());
@@ -731,7 +720,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     // Lasagna mode keeps the solver's own tails unless a side is a ray; the
     // native mode always replaces both (trace or ray).
     const bool replaceTails = request.retainOpenTails &&
-        (traceGlobalMode || tailPolicy.any() || request.retainLeftTail || request.retainRightTail);
+        (traceGlobalMode || tailPolicy.any());
 
     const vc::fiber_tracer::FiberTraceCoordinateAdapter coordinates(
         request.traceToBaseScale);
@@ -880,13 +869,6 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             for (size_t index = begin; index <= end; ++index)
                 attempt[index] = true;
         }
-    }
-    // Piece approvals: a locked span keeps its base geometry whatever the
-    // dirty set, a spline run or a whole-line pass asked for.
-    for (const size_t locked : request.lockedSpans) {
-        if (locked >= spans.size())
-            throw std::invalid_argument("locked interpolation segment is out of range");
-        attempt[locked] = false;
     }
     const SegmentInterpolationCutoffs cutoffs = segmentInterpolationCutoffs(
         request.traceConfig, request.lasagnaConfig, request.traceToBaseScale);
@@ -1278,16 +1260,8 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
             static_cast<double>(reinitialized.fixedPointIndices[index]);
     }
     if (replaceTails) {
-        std::optional<std::vector<cv::Vec3d>> keepLeft, keepRight;
-        if (request.retainLeftTail && !originalControlIndices.empty())
-            keepLeft.emplace(request.linePointsBase.begin(),
-                             request.linePointsBase.begin() + static_cast<std::ptrdiff_t>(originalControlIndices.front()) + 1);
-        if (request.retainRightTail && !originalControlIndices.empty())
-            keepRight.emplace(request.linePointsBase.begin() + static_cast<std::ptrdiff_t>(originalControlIndices.back()),
-                              request.linePointsBase.end());
         const int shift = replaceOpenTails(
-            request, coordinates, firstControl, lastControl, tailPolicy, output,
-            keepLeft ? &*keepLeft : nullptr, keepRight ? &*keepRight : nullptr);
+            request, coordinates, firstControl, lastControl, tailPolicy, output);
         for (auto& control : request.controlPoints) {
             control.optimizedIndex += shift;
             control.linePosition += static_cast<double>(shift);

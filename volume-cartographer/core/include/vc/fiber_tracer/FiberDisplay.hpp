@@ -223,7 +223,11 @@ inline FiberDisplayField fiberDisplayField(
     const std::vector<cv::Vec3f>& points, const std::vector<cv::Vec3f>& normals,
     const std::vector<double>& positions,
     const std::vector<std::optional<cv::Vec3d>>& manualNormals,
-    const std::vector<std::optional<cv::Vec3d>>& controlDirections = {})
+    const std::vector<std::optional<cv::Vec3d>>& controlDirections = {},
+    // Which controls the correction is interpolated between; empty: all of
+    // them. A control that is no knot neither carries a correction nor ends
+    // one (its baseline, tangent and a zero offset are still reported).
+    const std::vector<char>& knots = {})
 {
     FiberDisplayField out;
     out.normals = normals;
@@ -248,6 +252,8 @@ inline FiberDisplayField fiberDisplayField(
             cv::Vec3d(references[i-1]), cv::Vec3d(tangents[i-1]), cv::Vec3d(tangents[i])));
     std::vector<double> targetAngles;
     std::vector<bool> corrected;
+    const bool allKnots = knots.size() != positions.size();
+    std::vector<double> knotArcs;
     for (size_t i = 0; i < positions.size(); ++i) {
         const double p = std::clamp(positions[i], 0.0, double(points.size() - 1));
         const size_t k = size_t(p), j = std::min(k + 1, points.size() - 1);
@@ -263,7 +269,8 @@ inline FiberDisplayField fiberDisplayField(
         double angle = 0.0;
         auto target = baseline;
         bool hasCorrection = false;
-        if (manualNormals[i]) {
+        const bool knot = allKnots || knots[i] != 0;
+        if (manualNormals[i] && knot) {
             const auto projected = projectDisplayNormal(*manualNormals[i], tangent.value_or(cv::Vec3d{}));
             if (!projected) out.resetControls.push_back(i);
             else {
@@ -273,10 +280,13 @@ inline FiberDisplayField fiberDisplayField(
             }
         }
         out.controlOffsets.push_back(angle);
+        if (!knot) continue;
+        knotArcs.push_back(controlArcs.back());
         corrected.push_back(hasCorrection);
         targetAngles.push_back(target && tangent ? displayNormalOffset(
             displayVectorAt(references,p), *target, *tangent).value_or(0.0) : 0.0);
     }
+    controlArcs = std::move(knotArcs);
     for (size_t i = 0; i < points.size(); ++i) {
         const auto tangent = displayUnit(cv::Vec3d(tangents[i]));
         const auto baseline = projectDisplayNormal(cv::Vec3d(normals[i]), tangent.value_or(cv::Vec3d{}));

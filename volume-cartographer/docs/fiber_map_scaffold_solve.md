@@ -9,7 +9,7 @@ Qt, and nothing in it is Python: one solve, two callers.
 ## What a scaffold is here
 
 The annotated fibers of one vcobj store, their `fiber_branch` links, their
-piece approvals, and the volume's umbilicus:
+approval layers, and the volume's umbilicus:
 
 - fibers come from the store's `fiber` objects in UUID order, which is the
   solve's node order. A fiber's family is its record's `family`
@@ -17,8 +17,13 @@ piece approvals, and the volume's umbilicus:
   fibers carry no winding relation and are left out;
 - links carry their two anchor positions, `meta.adjacent`, `meta.auto` and
   their record approval state;
-- piece approvals come from `ext_fiber_piece_approval`, as the live rows and
-  the spans they currently cover (per geometry/normals aspect);
+- approvals come from each fiber's approval layer (`ext_fiber_approval*`,
+  `vc_object_store/docs/fiber-approval.md`): its current approved and broken
+  stretches per geometry/normals aspect, its normal points and the normals
+  shown when it was saved. A stretch marked broken in either aspect is
+  removed from every relation, like a gap. Broken geometry also splits the
+  fiber there: each part takes its own winding, and the per-fiber result
+  columns hold the longest part;
 - the umbilicus is the one mapping to the frame the fibers are annotated in,
   and the scroll's winding handedness is read from its `winding_handedness`
   meta. A store that states the handedness nowhere is an error: a mirrored
@@ -140,12 +145,14 @@ library states those exactly as the automatic pipeline does
   annotator approves the cross-section they see and cannot know which of its
   two sides faces outward.
   A stretch approved for the normals aspect carries the normals that were
-  shown at its line points when it was approved (stored with the approval,
-  `vc_object_store/docs/fiber-piece-approval.md`). Every chain node on the
+  shown at its line points when it was approved (stored with the layer,
+  `vc_object_store/docs/fiber-approval.md`). Every chain node on the
   stretch is held on that axis (the principal axis of the stored normals of
   the line points nearest to it), and the stretch's line points come out with
   the stored normals themselves. This holds for a stretch nobody corrected
   too: approving it approves what was shown.
+  A normal point of the layer outside an approved stretch holds the chain
+  node at its position on the normal point's axis.
   A control point's `display_normal` with source `manual` outside an approved
   stretch holds the one chain node at that control point on its axis; without
   an approval nothing says how far it reaches.
@@ -156,8 +163,8 @@ library states those exactly as the automatic pipeline does
   below the H fiber) and with it the outward normal of both fibers; by the
   neighbour normals; or by the sign solve. A link that lands on a held node
   keeps the annotated axis and only says which way it faces.
-  A normals approval that no longer matches its stretch (the line moved, or
-  the approval predates stored normals) is not used. The run counts those
+  A stretch or normal point that no longer matches its line points (the line
+  moved) is not used. The run counts those
   (`normal_approvals_stale`) and the dock's summary names them: approve the
   stretch again.
   With a prediction bound (*variant B*) every chain node is also pulled
@@ -570,7 +577,7 @@ live approval row whose pieces have since been revoked is reported as
 record's review state. A measured crossing has no record, so
 its approval is a row of `ext_fiber_constraint_approval`, keyed by the two
 fibers, the kind and the two anchors quantized to 64 base voxels, and carrying
-the piece-approval fingerprints of the two covering spans. `applyScaffoldConstraintApprovals`
+the span fingerprints (`fiberSpanHash`) of the two covering spans. `applyScaffoldConstraintApprovals`
 marks the constraints a live row covers, and skips a row whose spans have been
 edited since: the annotation moved under it, so the decision is no longer
 about what is there now. Re-running the extraction does not lose an approval -
@@ -670,8 +677,9 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
 
   Each constraint row carries the two pieces its anchors lie on as child
   rows, with their approval state: those are what has to be approved before
-  the constraint can be, and a double-click on one opens it as an approval
-  piece between the control points that bracket it. The same goes for a
+  the constraint can be, and a double-click on one opens its fiber in the
+  approval window on that stretch
+  ([fiber_approval_workflow.md](fiber_approval_workflow.md)). The same goes for a
   stretch row. Selecting any row selects its fibers on the map and draws the
   spans it names - for a constraint, both covering pieces, which is how a
   crossing is found on the map at all - and brings them into view, zooming out
@@ -711,9 +719,8 @@ dock's - so what the map says about a fiber's own geometry stays what it always
 said. One path per layer covers the whole map, which is what keeps panning with
 the fade on as cheap as panning without it.
 
-A piece opened from the dock also shades the strip view outside the opened
-range, so the part that can be edited and approved is the part that stayed
-bright.
+A stretch opened from the dock is the approval window's selected stretch: the
+views dim the line outside it.
 
 ### Laying the map out from a solve
 

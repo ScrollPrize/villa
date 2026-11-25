@@ -1,3 +1,4 @@
+#include <vc_object_store/objects/FiberApprovalExtension.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
@@ -30,7 +31,6 @@
 #include "FiberMapAutoLink.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
-#include "LineAnnotationPieceLock.hpp"
 #include "LineAnnotationFiberNaming.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
@@ -165,6 +165,17 @@ struct LineAnnotationController::LineAnnotationSession {
     bool readOnly = false;
     // The store is writable and the fiber decodes, so editing can be enabled.
     bool editingAvailable = false;
+    // Approval window: the fiber is never changed. Normal points are session
+    // control points tagged kNormalPointTag; stretch states and normal points
+    // are stored in the fiber's approval layer on every change.
+    bool approvalMode = false;
+    bool approvalChanged = false;
+    std::string approvalRun;
+    int64_t approvalGeneration = 0;
+    std::vector<vc::geometry::Point> approvalLine;  // the stored line points, as stored
+    std::vector<vc::objects::FiberStretch> approvalStretches;
+    std::vector<char> approvalStretchCurrent;
+    std::optional<std::pair<double, double>> approvalSelection;
     std::shared_ptr<vc::lasagna::LasagnaDataset> fiberInferenceDataset;
     std::shared_ptr<vc::fiber_tracer::FiberPredictionField> fiberPredictionField;
     std::string traceNormalDatasetLocation;
@@ -342,8 +353,6 @@ struct LineAnnotationController::LineAnnotationSession {
     bool disableInitialGeneratedHoverFollow = false;
     std::function<void(LineAnnotationSession&)> optimizationSucceededCallback;
     bool fiberMetricsMatchStoredFiber = false;
-    // Piece approvals: what this session may edit (LineAnnotationPieceLock.hpp).
-    vc3d::line_annotation::PieceLockState pieceLock;
 };
 
 struct LineAnnotationController::FiberMetricsTaskResult {
@@ -1055,7 +1064,6 @@ generatedControlMarkers(
         marker.isSeed = control.isSeed;
         marker.isKollesisTermination = vc3d::line_annotation::hasControlPointTag(
             control.tags, vc3d::line_annotation::kKollesisTerminationTag);
-        marker.isLock = vc3d::line_annotation::isLockControl(control);
         marker.isBreak = vc3d::line_annotation::hasControlPointTag(
             control.tags, vc3d::line_annotation::kBreakTag);
         marker.hasGapToNext = vc3d::line_annotation::spanIsGap(control.segmentToNext);
@@ -2177,9 +2185,22 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         // linking or optimization requests are connected, and the window
         // closes without finalization.
         dialog->setCloseAfterFinalizationAllowed(true);
-        dialog->setFiberDisplayName(fiberDisplayNameFromFileName(session->fiberFileName) + tr(" · read only"));
+        dialog->setFiberDisplayName(fiberDisplayNameFromFileName(session->fiberFileName) +
+                                    (session->approvalMode ? tr(" · approval") : tr(" · read only")));
         dialog->setReadOnly(true, session->editingAvailable);
+        if (session->approvalMode) {
+            dialog->setApprovalMode(true);
+            connectApprovalEditing(dialog, surfaceName);
+        }
         connect(dialog, &LineAnnotationDialog::editingRequested, this, [this, surfaceName]() {
+            // Editing changes the base the approval layer lies on.
+            auto* pane = paneForSurface(surfaceName);
+            if (pane && pane->session && fiberHasApproval(pane->session->fiberUuid) &&
+                QMessageBox::warning(pane->dialog, tr("Enable editing"),
+                                     tr("This fiber carries approvals (stretch states or normal points). Editing it "
+                                        "invalidates them where the fiber changes.\n\nEnable editing anyway?"),
+                                     QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes)
+                return;
             enableSessionEditing(surfaceName);
         });
     } else {
@@ -2197,9 +2218,15 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         // Emitted from the widget's destructor, after the dialog's own
         // members are gone: the cleanup installs a running save and applies
         // queued edits, none of which may reach the dialog any more.
+        QString changedApproval;
         for (auto& pane : _panes)
-            if (pane.dialog.data() == dialog) pane.dialog = nullptr;
+            if (pane.dialog.data() == dialog) {
+                pane.dialog = nullptr;
+                if (pane.session && pane.session->approvalMode && pane.session->approvalChanged)
+                    changedApproval = QString::fromStdString(pane.session->fiberUuid);
+            }
         closeWindowlessPane(surfaceName);
+        if (!changedApproval.isEmpty()) emit fiberApprovalChanged(changedApproval);
     });
 
     refreshSessionOptimizationStatus(*session);
@@ -2208,8 +2235,10 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         setSessionOptimizationState(*session, SessionOptimizationState::Optimized);
         materializeGeneratedViews(*session);
     }
+    if (session->approvalMode) pushApprovalDisplay(*session);
     if (!session->deferShowUntilGenerated || !session->optimizedLine.points.empty()) {
-        emit lineAnnotationWorkspaceRequested(dialog, tr("Line Annotation"));
+        emit lineAnnotationWorkspaceRequested(dialog, session->approvalMode ? tr("Fiber Approval")
+                                                                           : tr("Line Annotation"));
         dialog->showWithSavedGeometry();
         dialog->raise();
         dialog->activateWindow();
@@ -2344,13 +2373,6 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
                       session.suppressErrorDialogs);
             return;
         }
-        {
-            std::vector<size_t> dirty;
-            if (index > 0) dirty.push_back(index - 1);
-            if (index + 1 < session.controlPoints.size()) dirty.push_back(index);
-            const std::array<size_t, 1> touched{index};
-            if (refuseLockedEdit(session, dirty, touched, vc3d::line_annotation::FiberPieceAspect::Normals)) return;
-        }
         const std::optional<cv::Vec3d> normal = degrees == 0 ? std::nullopt :
             std::optional<cv::Vec3d>(vc::fiber_tracer::rotateDisplayNormal(*baseline, *tangent, degrees * std::acos(-1.0) / 180.0));
         const cv::Vec3d position = session.controlPoints[index].volumePoint;
@@ -2384,18 +2406,6 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
         }
         std::sort(dirty.begin(), dirty.end());
         dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
-        {
-            std::vector<size_t> touched, normalDirty;
-            for (size_t i=0; i<session.controlPoints.size(); ++i) {
-                if (index && i != *index) continue;
-                if (!session.controlPoints[i].direction && !session.controlPoints[i].displayNormal) continue;
-                touched.push_back(i);
-                if (i>0) normalDirty.push_back(i-1);
-                if (i+1<session.controlPoints.size()) normalDirty.push_back(i);
-            }
-            if (refuseLockedEdit(session, dirty, touched) ||
-                refuseLockedEdit(session, normalDirty, touched, vc3d::line_annotation::FiberPieceAspect::Normals)) return;
-        }
         for (auto& other : _panes) {
             if (!other.session || (other.session!=pane->session &&
                 (!session.fiberId || other.session->fiberId!=session.fiberId))) continue;
@@ -2437,13 +2447,6 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
         auto& session=*pane->session;
         const auto axis=vc::fiber_tracer::displayUnit(cv::Vec3d(value));
         if (!axis || index>=session.controlPoints.size()) return;
-        {
-            std::vector<size_t> dirty;
-            if (index > 0) dirty.push_back(index - 1);
-            if (index + 1 < session.controlPoints.size()) dirty.push_back(index);
-            const std::array<size_t, 1> touched{index};
-            if (refuseLockedEdit(session, dirty, touched)) return;
-        }
         const auto point=session.controlPoints[index].volumePoint;
         for (auto& other : _panes) {
             if (!other.session || (other.session!=pane->session &&
@@ -2481,17 +2484,6 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
                     return;
                 }
                 setFiberTag(pane->session->fiberId, tag, enabled);
-            });
-    connect(dialog, &LineAnnotationDialog::pieceApprovalChangeRequested, this,
-            [this, surfaceName](int aspect, bool approved) {
-                auto* pane = paneForSurface(surfaceName);
-                if (!pane || !pane->session || pane->session->fiberId == 0) return;
-                const auto error = setFiberPieceApproval(pane->session->fiberId,
-                    aspect == 1 ? vc3d::line_annotation::FiberPieceAspect::Normals
-                                : vc3d::line_annotation::FiberPieceAspect::Geometry, approved);
-                if (error) showError(*error, pane->session->suppressErrorDialogs);
-                if (auto* refreshed = paneForSurface(surfaceName); refreshed && refreshed->session)
-                    pushPieceDisplayToDialog(*refreshed->session);
             });
     connect(dialog,
             &LineAnnotationDialog::crossSectionDragFinished,
@@ -2574,15 +2566,6 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
             this,
             [this](const std::string& name, size_t first, size_t second, bool enabled) {
                 handleGeneratedSpanSetGap(name, first, second, enabled);
-            });
-    connect(dialog, &LineAnnotationDialog::generatedControlPointLockChangeRequested, this,
-            [this](const std::string& name, size_t index, bool enabled) {
-                handleGeneratedControlPointSetLock(name, index, enabled);
-            });
-    connect(dialog, &LineAnnotationDialog::generatedPieceOpenRequested, this,
-            [this](const std::string& name, vc3d::line_annotation::GeneratedPieceEnd a,
-                   vc3d::line_annotation::GeneratedPieceEnd b) {
-                handleGeneratedPieceOpen(name, a, b);
             });
     connect(dialog,
             &LineAnnotationDialog::generatedSpanDamagedChangeRequested,
@@ -4067,7 +4050,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
                                                          std::optional<int> linePointIndex,
                                                          std::optional<std::pair<int, int>> spanControlIndices,
                                                          bool collectionInspection,
-                                                         const vc3d::line_annotation::PiecePlan* piecePlan)
+                                                         const ApprovalOpen* approval)
 {
     // A debounced autosave of this fiber's still-open session must reach the
     // store first, or the replacement session would carry (and later re-save)
@@ -4131,7 +4114,8 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
     // The user's opens may start editable; agent-driven (suppressed) opens
     // and collection inspections stay read-only until editing is requested.
     const bool openEditable = [&] {
-        if (fiber.readOnly || collectionInspection || _errorDialogsSuppressed || !_applyOpenFibersEditable) {
+        if (fiber.readOnly || collectionInspection || _errorDialogsSuppressed || !_applyOpenFibersEditable ||
+            approval) {
             return false;
         }
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -4307,11 +4291,10 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
         }
     }
     setSessionOptimizationState(*session, SessionOptimizationState::Optimized);
-    refreshPieceLockState(*session, true);
-    if (piecePlan) {
-        QString planError;
-        if (!applyPiecePlan(*session, *piecePlan, &planError)) {
-            showError(planError);
+    if (approval) {
+        QString approvalError;
+        if (!loadApprovalLayer(*session, *approval, &approvalError)) {
+            showError(tr("The fiber was not opened for approval: %1").arg(approvalError));
             return;
         }
     }
@@ -6098,37 +6081,6 @@ LineAnnotationController::applyGeometricControlPointEdit(
     const std::vector<double>& controlLinePositions,
     GeometricControlPointEdit edit)
 {
-    // Piece approvals: an edit that dirties a locked span or touches a lock
-    // control is refused before anything is prepared.
-    {
-        namespace la = vc3d::line_annotation;
-        const size_t count = session.controlPoints.size();
-        std::vector<size_t> oldDirty;
-        const auto& touched = edit.nearbyControlIndices;
-        if (touched.empty()) {
-            for (size_t i = 0; i + 1 < count; ++i) {
-                if (session.controlPoints[i].linePosition <= edit.linePosition &&
-                    edit.linePosition <= session.controlPoints[i + 1].linePosition) {
-                    oldDirty.push_back(i);
-                    break;
-                }
-            }
-            if (oldDirty.empty() && session.pieceLock.pieceOpen() && count > 0) {
-                const bool beyondLeft = edit.linePosition < session.controlPoints.front().linePosition;
-                const auto [leftLocked, rightLocked] = la::pieceTailRetention(session.pieceLock, session.controlPoints);
-                if (beyondLeft ? leftLocked : rightLocked)
-                    throw std::runtime_error("the fiber beyond its end control point lies outside the open piece");
-            }
-        } else {
-            for (const size_t index : touched) {
-                if (index > 0) oldDirty.push_back(index - 1);
-                if (index + 1 < count) oldDirty.push_back(index);
-            }
-        }
-        if (const auto why = la::pieceLockRefusal(session.pieceLock, oldDirty, touched))
-            throw std::runtime_error(*why);
-        if (session.pieceLock.plan) session.pieceLock.firstEditDone = true;
-    }
     // Display-normal inheritance: a new control inside a region of corrected
     // normals takes the interpolated normal, with its provenance recorded.
     // Captured before inserting a zero-offset CP or splicing the line, on
@@ -6207,7 +6159,6 @@ LineAnnotationController::applyGeometricControlPointEdit(
     session.optimizedLine = std::move(preparedLine);
     ++session.lineRevision;
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
-    refreshPieceLockState(session, false);
     return prepared;
 }
 
@@ -7165,10 +7116,6 @@ void LineAnnotationController::handleGeneratedControlPointLinkCandidate(
         return;
     }
     auto& session = *pane->session;
-    {
-        const std::array<size_t, 1> touched{controlPointIndex};
-        if (refuseLockedEdit(session, {}, touched)) return;
-    }
     if (session.fiberDeleted) {
         // The fiber was deleted underneath this session; a structural edit
         // would be persisted as a new file under the deleted name.
@@ -8146,10 +8093,6 @@ void LineAnnotationController::handleGeneratedSpanSplit(
         return;
     }
     auto& session = *pane->session;
-    {
-        const std::array<size_t, 1> dirty{std::min(firstControlPointIndex, secondControlPointIndex)};
-        if (refuseLockedEdit(session, dirty, {})) return;
-    }
     if (session.fiberDeleted) {
         showError(tr("This fiber was deleted; it can no longer be edited."),
                   session.suppressErrorDialogs);
@@ -8574,22 +8517,6 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
 
     const int deletedControlIndex =
         static_cast<int>(std::distance(session.controlPoints.begin(), selected));
-    {
-        std::vector<size_t> dirty;
-        if (deletedControlIndex > 0) dirty.push_back(size_t(deletedControlIndex - 1));
-        if (size_t(deletedControlIndex) + 1 < session.controlPoints.size()) dirty.push_back(size_t(deletedControlIndex));
-        const std::array<size_t, 1> touched{size_t(deletedControlIndex)};
-        if (refuseLockedEdit(session, dirty, touched)) return;
-        // A free lock control can be corrected, but the open piece is defined by its two ends.
-        if (session.pieceLock.openedControls &&
-            (session.pieceLock.openedControls->first == size_t(deletedControlIndex) ||
-             session.pieceLock.openedControls->second == size_t(deletedControlIndex)) &&
-            vc3d::line_annotation::isLockControl(*selected)) {
-            showError(tr("This edit is refused: control point %1 bounds the open piece; it can be moved but not deleted.")
-                          .arg(deletedControlIndex + 1), session.suppressErrorDialogs);
-            return;
-        }
-    }
     if (!confirmLinkedControlPointEdit(session,
                                        deletedControlIndex,
                                        tr("Deleting it"))) {
@@ -8613,7 +8540,6 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
         session.controlPoints, static_cast<size_t>(deletedControlIndex));
     // Deleting a point can part two breaks or make two others neighbours.
     vc3d::line_annotation::applyGapSpanPolicy(session.controlPoints);
-    refreshPieceLockState(session, false);
     // The session's geometry changed (no solve is in flight - this handler
     // refuses while one runs): bump the epoch so the side-strip fingerprint
     // and the session snapshot cache see the deletion immediately instead of
@@ -9320,13 +9246,6 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
     }
     if (controlPointIndex >= session.controlPoints.size()) {
         return false;
-    }
-    {
-        std::vector<size_t> dirty;
-        if (controlPointIndex > 0) dirty.push_back(controlPointIndex - 1);
-        if (controlPointIndex + 1 < session.controlPoints.size()) dirty.push_back(controlPointIndex);
-        const std::array<size_t, 1> touched{controlPointIndex};
-        if (refuseLockedEdit(session, dirty, touched)) return false;
     }
     const cv::Vec3d editedPoint = session.controlPoints[controlPointIndex].volumePoint;
     // Whole-list snapshot: the gap sync below may change neighbouring spans
@@ -10048,92 +9967,6 @@ void LineAnnotationController::handleGeneratedControlPointSetKollesisTermination
            "changing the kollesis termination."));
 }
 
-void LineAnnotationController::handleGeneratedControlPointSetLock(
-    const std::string& surfaceName,
-    size_t controlPointIndex,
-    bool enabled)
-{
-    namespace la = vc3d::line_annotation;
-    auto* pane = paneForSurface(surfaceName);
-    if (!pane || !pane->session) return;
-    auto& session = *pane->session;
-    if (controlPointIndex >= session.controlPoints.size()) return;
-    if (session.readOnly) {
-        showError(tr("Enable editing to change lock control points."), session.suppressErrorDialogs);
-        return;
-    }
-    if (session.taskState == LineAnnotationSession::TaskState::Running) {
-        showError(tr("Line optimization is already running."), session.suppressErrorDialogs);
-        return;
-    }
-    const auto& control = session.controlPoints[controlPointIndex];
-    if (!enabled) {
-        if (control.storeId >= 0 && session.pieceLock.states.lockCpIds.count(control.storeId)) {
-            showError(tr("This lock control point is referenced by an approval; revoke that approval first."),
-                      session.suppressErrorDialogs);
-            return;
-        }
-        if (session.pieceLock.plan && control.identity != 0 &&
-            (session.pieceLock.plan->a.identity == control.identity || session.pieceLock.plan->b.identity == control.identity)) {
-            showError(tr("This lock control point bounds the open piece."), session.suppressErrorDialogs);
-            return;
-        }
-    }
-    const cv::Vec3d point = control.volumePoint;
-    for (auto& other : _panes) {
-        if (!other.session || (other.session != pane->session &&
-            (!session.fiberId || other.session->fiberId != session.fiberId))) continue;
-        std::vector<cv::Vec3d> line;
-        line.reserve(other.session->optimizedLine.points.size());
-        for (const auto& p : other.session->optimizedLine.points) line.push_back(p.position);
-        for (auto& cp : other.session->controlPoints) {
-            if (!pointsApproximatelyEqual(cp.volumePoint, point)) continue;
-            if (enabled) la::lockControl(cp, line);
-            else la::setControlPointTag(cp.tags, vc::objects::kFiberLockControlPointTag, false);
-        }
-        refreshPieceLockState(*other.session, false);
-        materializeGeneratedViews(*other.session);
-    }
-    saveFiberDisplayAnnotations(session);
-}
-
-void LineAnnotationController::handleGeneratedPieceOpen(
-    const std::string& surfaceName,
-    vc3d::line_annotation::GeneratedPieceEnd a,
-    vc3d::line_annotation::GeneratedPieceEnd b)
-{
-    namespace la = vc3d::line_annotation;
-    auto* pane = paneForSurface(surfaceName);
-    if (!pane || !pane->session) return;
-    auto& session = *pane->session;
-    if (session.fiberId == 0 || !session.storePin || !session.storePin->stored()) {
-        showError(tr("Save the fiber before opening a piece of it."), session.suppressErrorDialogs);
-        return;
-    }
-    if (b.fiberStart || a.fiberEnd) std::swap(a, b);
-    la::PiecePlan plan;
-    const auto convert = [&](const la::GeneratedPieceEnd& end, la::PiecePlanEnd& out) {
-        if (end.fiberStart || end.fiberEnd) { out.fiberEnd = true; return true; }
-        if (end.controlIndex) {
-            if (*end.controlIndex >= session.controlPoints.size()) return false;
-            const auto& cp = session.controlPoints[*end.controlIndex];
-            if (cp.storeId < 0) return false;
-            out.storeId = cp.storeId;
-            return true;
-        }
-        if (end.linePosition && std::isfinite(*end.linePosition)) {
-            out.lineIndex = int(std::llround(*end.linePosition));
-            return true;
-        }
-        return false;
-    };
-    if (!convert(a, plan.a) || !convert(b, plan.b)) {
-        showError(tr("Save the fiber before opening a piece at an unsaved control point."), session.suppressErrorDialogs);
-        return;
-    }
-    openFiberPiece(session.fiberId, plan);
-}
-
 std::vector<LineAnnotationController::StoredControlSummary> LineAnnotationController::storedControlSummaries(uint64_t fiberId) const
 {
     std::vector<StoredControlSummary> result;
@@ -10141,8 +9974,7 @@ std::vector<LineAnnotationController::StoredControlSummary> LineAnnotationContro
     if (!stored) return result;
     for (size_t i = 0; i < stored->controlPoints.size(); ++i) {
         const auto& cp = stored->controlPoints[i];
-        result.push_back({i, cp.storeId,
-            std::find(cp.tags.begin(), cp.tags.end(), vc::objects::kFiberLockControlPointTag) != cp.tags.end()});
+        result.push_back({i, cp.storeId});
     }
     return result;
 }
@@ -10178,18 +10010,6 @@ std::optional<int> LineAnnotationController::storedLineIndexAtArc(uint64_t fiber
     // Past the last control point (beyond rounding): refused, never clamped.
     if (arc <= walked + 1e-6 * std::max(1.0, walked)) return int(range.end - 1);
     return std::nullopt;
-}
-
-std::optional<QString> LineAnnotationController::setFiberControlLock(uint64_t fiberId, size_t controlPointIndex, bool enabled)
-{
-    for (auto it = _panes.rbegin(); it != _panes.rend(); ++it) {
-        if (!it->session || it->session->fiberId != fiberId) continue;
-        if (controlPointIndex >= it->session->controlPoints.size()) return tr("Control point index out of range.");
-        if (it->session->readOnly) return tr("Enable editing before changing lock control points.");
-        handleGeneratedControlPointSetLock(it->surfaceName, controlPointIndex, enabled);
-        return std::nullopt;
-    }
-    return tr("No open pane of this fiber.");
 }
 
 void LineAnnotationController::handleGeneratedControlPointSetBreak(
@@ -10248,10 +10068,6 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
         showError(tr("Interpolation goal received an invalid CP span."),
                   session.suppressErrorDialogs);
         return;
-    }
-    {
-        const std::array<size_t, 1> dirty{std::min(firstControlPointIndex, secondControlPointIndex)};
-        if (refuseLockedEdit(session, dirty, {})) return;
     }
 
     vc3d::line_annotation::SegmentInterpolationGoal goal;
@@ -11132,13 +10948,6 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
     if ((session.modelOnly || fiberFollowEnabled()) && FiberFollowService::instance().isRunning()) {
         installFiberFollowTracer(request, session.fiberId != 0 ? fiberHvDirectionTag(session.fiberId)
                                                                : QString::fromStdString(session.fiberManualHvTag));
-    }
-    for (size_t span = 0; span < session.pieceLock.lockedSpans.size(); ++span)
-        if (session.pieceLock.lockedSpans[span]) request.lockedSpans.push_back(span);
-    {
-        const auto [left, right] = vc3d::line_annotation::pieceTailRetention(session.pieceLock, session.controlPoints);
-        request.retainLeftTail = left;
-        request.retainRightTail = right;
     }
     if (session.modelOnly) {
         const double baseUm = request.traceConfig.baseVoxelSizeUm.value_or(0.0);
@@ -12406,17 +12215,29 @@ vc::fiber_tracer::FiberDisplayField LineAnnotationController::displayFieldForSes
     for (const auto& control : session.controlPoints) {
         displayControlPositions.push_back(control.linePosition);
         manualNormals.push_back(control.displayNormal);
+        // A normal point states an axis: it is taken facing as the baseline
+        // does there, so a solve that faces the other way turns nothing over.
+        if (session.approvalMode && control.displayNormal && !orientedNormals.empty()) {
+            const auto baseline = vc::fiber_tracer::displayVectorAt(orientedNormals, control.linePosition);
+            if (baseline.dot(*control.displayNormal) < 0) manualNormals.back() = -*control.displayNormal;
+        }
         controlDirections.push_back(control.direction);
     }
+    // In the approval window the correction is interpolated between the
+    // normal points alone: the fiber's own control points neither carry one
+    // (their manual normals are in the solve's normals already) nor end one.
+    std::vector<char> knots;
+    if (session.approvalMode)
+        for (const auto& control : session.controlPoints)
+            knots.push_back(vc3d::line_annotation::isNormalPoint(control) ? 1 : 0);
     return vc::fiber_tracer::fiberDisplayField(
-        displayPoints, orientedNormals, displayControlPositions, manualNormals, controlDirections);
+        displayPoints, orientedNormals, displayControlPositions, manualNormals, controlDirections, knots);
 }
 
 bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session,
                                                          const std::function<bool()>& stillValid)
 {
     const QPointer<LineAnnotationController> alive(this);
-    pushPieceDisplayToDialog(session);
     if (session.normalSamplesStale && !ensureDatasetForSession(session, false, stillValid))
         return false;
     session.inspectionFrameOnly = std::any_of(
@@ -12511,6 +12332,12 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         // it past its neighbours.
         for (size_t i = 0; i < session.controlPoints.size(); ++i) {
             if (!session.controlPoints[i].displayNormal) continue;
+            if (session.approvalMode) {
+                // Only the normal points shape the correction there.
+                if (vc3d::line_annotation::isNormalPoint(session.controlPoints[i]))
+                    viewConfig.pinnedNormalLinePositions.push_back(session.controlPoints[i].linePosition);
+                continue;
+            }
             if (i > 0) viewConfig.pinnedNormalLinePositions.push_back(session.controlPoints[i - 1].linePosition);
             viewConfig.pinnedNormalLinePositions.push_back(session.controlPoints[i].linePosition);
             if (i + 1 < session.controlPoints.size())
@@ -16741,11 +16568,6 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
     if (session.readOnly) {
         return;
     }
-    // A piece opened and not yet edited has written nothing and writes
-    // nothing: its planned lock controls live in the session only.
-    if (session.pieceLock.savesHeld()) {
-        return;
-    }
     // A session whose fiber was deleted underneath it is not saved through
     // here - the close with a final optimization included - or it would
     // recreate the deleted file (or overwrite an import under that name).
@@ -16815,9 +16637,6 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         // linked fiber needs no write (each link is one shared edge).
         std::vector<FiberSaveSnapshot> snapshots;
         snapshots.push_back(makeFiberSaveSnapshot(fiber));
-        if (session.pieceLock.pieceOpen() || session.pieceLock.anyLocked())
-            snapshots.back().pieceCheck = vc3d::line_annotation::pieceSaveCheck(
-                session.pieceLock, session.controlPoints, sessionSnapshot.storedIndexForSessionIndex);
         for (const uint64_t linkedFiberId : branchSync.affectedFiberIds) {
             if (linkedFiberId == savedFiberId) {
                 continue;
@@ -16978,12 +16797,6 @@ void LineAnnotationController::applyCommittedFibers(const std::vector<FiberSaveS
         session.graphCommit = saved->graphCommit;
         session.coordinateIdentity = saved->coordinateIdentity;
         session.frame = saved->frame;
-        // Piece approvals: once the ids below are reconciled, the lock set
-        // follows the saved revision (crop rows included).
-        const auto refreshPieces = qScopeGuard([this, &session] {
-            session.pieceLock.pendingFirstEdit = false;
-            refreshPieceLockState(session, true);
-        });
         const auto ordering = storedIndexMapForSessionControls(session.controlPoints);
         const auto matches = [&](size_t i) {
             return ordering[i] >= 0 && size_t(ordering[i]) < saved->controlPoints.size() &&
@@ -18346,11 +18159,6 @@ void LineAnnotationController::buildFiberCommitOperations(FiberCommitJob& job, c
         selection.endpointUuids = present;
         for (const auto& edge : reader.selectEdges(selection, std::vector<std::string>{})) live.insert(edge.uuid);
     }
-    // Piece approvals of retired fibers (a split or merge) follow their
-    // control points into the new fibers: pre- and post-assignment ids and
-    // the saved content of every edit, used after the loop.
-    struct PieceCarry { std::vector<int64_t> before, after; std::optional<vc::objects::FiberPieceContent> content; };
-    std::map<std::string, PieceCarry> pieceCarry;
     for (auto& snapshot : edits) {
         auto& fiber = snapshot.fiber;
         const auto head = headOf(fiber.uuid);
@@ -18370,38 +18178,10 @@ void LineAnnotationController::buildFiberCommitOperations(FiberCommitJob& job, c
         vc::geometry::Fiber geometry;
         // IDs are allocated on the working copy; positions are the stored frame's.
         for (const auto& cp : fiber.controlPoints) geometry.controlPointIds.push_back(cp.storeId);
-        auto& carry = pieceCarry[fiber.uuid];
-        carry.before = geometry.controlPointIds;
         geometry.controlPointIds = reader.assignGeometryPointIds(fiber.uuid, "control_points", std::move(geometry.controlPointIds));
-        carry.after = geometry.controlPointIds;
         for (size_t i = 0; i < fiber.controlPoints.size(); ++i) fiber.controlPoints[i].storeId = geometry.controlPointIds[i];
         for (const auto& cp : stored.controlPoints) geometry.controlPoints.push_back({cp[0], cp[1], cp[2]});
         for (const auto& point : stored.linePoints) geometry.linePoints.push_back({point[0], point[1], point[2]});
-        if (!retired.empty())
-            pieceCarry[fiber.uuid].content = fiberPieceContent(geometry, source.at("control_points_attributes"));
-        if (snapshot.pieceCheck) {
-            // Piece approvals: the save must leave every locked span (or, with
-            // a piece open, everything outside it) as it was, and the first
-            // save of an open piece crops the approvals it takes over.
-            namespace la = vc3d::line_annotation;
-            const auto content = fiberPieceContent(geometry, source.at("control_points_attributes"));
-            const auto rows = readFiberPieceApprovals(reader, fiber.uuid);
-            if (const auto violation = la::pieceSaveViolation(content, *snapshot.pieceCheck, rows))
-                throw FiberCommitRefused("The fiber's approved pieces refuse this save: " + *violation);
-            if (snapshot.pieceCheck->pieceOpen && snapshot.pieceCheck->openedStored) {
-                const auto crops = cropFiberPieceApprovals(content, liveFiberPieceApprovals(rows),
-                    snapshot.pieceCheck->openedStored->first, snapshot.pieceCheck->openedStored->second,
-                    request.author, QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString());
-                if (!crops.empty()) {
-                    auto values = fiberPieceApprovalRows(crops);
-                    operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(values.approvals)});
-                    if (!values.normals.empty()) {
-                        operations.push_back(CreateExtensionTableOp{fiberPieceNormalsTable()});
-                        operations.push_back(AppendExtensionRowsOp{kFiberPieceNormalsTable, std::move(values.normals)});
-                    }
-                }
-            }
-        }
         source.erase("next_control_point_id"); // allocation belongs to the geometry store, not restorable metadata
         FiberDetail detail;
         detail.controlPointCount = geometry.controlPoints.size(); detail.linePointCount = geometry.linePoints.size();
@@ -18423,63 +18203,6 @@ void LineAnnotationController::buildFiberCommitOperations(FiberCommitJob& job, c
             source.erase("control_points_attributes");
             meta["source"] = source; record.meta = meta.dump();
             operations.push_back(UpdateObjectOp{objectRecordJson(record)});
-        }
-    }
-    // Piece approvals of a retired fiber are copied, re-fingerprinted over the
-    // new fiber that received all of the piece's control points (the slice is
-    // geometrically identical at this commit); a piece cut by a split is lost.
-    if (!retired.empty()) {
-        std::vector<FiberPieceApproval> copies;
-        const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
-        for (const auto& old : retired) {
-            const auto rows = liveFiberPieceApprovals(readFiberPieceApprovals(reader, old.uuid));
-            if (rows.empty()) continue;
-            const auto head = reader.currentObject(old.uuid);
-            if (!head) continue;
-            const auto oldContent = fiberPieceContent(reader, *head);
-            for (const auto& row : rows) {
-                const auto range = fiberPieceRange(oldContent, row);
-                if (!range) continue;
-                std::vector<int64_t> ids;
-                for (size_t k = 0; k <= range->spanCount(); ++k) ids.push_back(oldContent.controlIds[range->at(k)]);
-                for (const auto& [childUuid, carry] : pieceCarry) {
-                    if (!carry.content) continue;
-                    std::map<int64_t, int64_t> remap;
-                    bool contained = true;
-                    for (const int64_t id : ids) {
-                        const auto found = std::find(carry.before.begin(), carry.before.end(), id);
-                        if (found == carry.before.end()) { contained = false; break; }
-                        remap[id] = carry.after[size_t(found - carry.before.begin())];
-                    }
-                    if (!contained) continue;
-                    const auto childRange = fiberPieceRange(*carry.content, remap.at(row.lockCpA),
-                        row.lockCpB ? std::optional<int64_t>(remap.at(*row.lockCpB)) : std::nullopt, remap.at(row.insideCp));
-                    if (!childRange) continue;
-                    // A normals approval takes its stored normals along; one
-                    // that has none (or whose spans no longer match) approved
-                    // nothing and is not copied.
-                    std::vector<vc::geometry::Point> lineNormals;
-                    if (row.aspect == FiberPieceAspect::Normals) {
-                        lineNormals = fiberPieceLineNormals(*carry.content, row, remap);
-                        if (lineNormals.empty()) break;
-                    }
-                    auto copy = approveFiberPiece(*carry.content, childUuid, *childRange, row.aspect, 1,
-                                                  row.author, row.approvedAt, row.host, lineNormals);
-                    copy.approvalUuid = row.approvalUuid;
-                    copy.changedBy = request.author;
-                    copy.changedAt = now;
-                    copies.push_back(std::move(copy));
-                    break;
-                }
-            }
-        }
-        if (!copies.empty()) {
-            auto values = fiberPieceApprovalRows(copies);
-            operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(values.approvals)});
-            if (!values.normals.empty()) {
-                operations.push_back(CreateExtensionTableOp{fiberPieceNormalsTable()});
-                operations.push_back(AppendExtensionRowsOp{kFiberPieceNormalsTable, std::move(values.normals)});
-            }
         }
     }
     std::set<std::string> retiredUuids;
@@ -18651,262 +18374,590 @@ void LineAnnotationController::readSavedFiberHeads(const FiberCommitJob& job, vc
     result.saved = std::move(revisions);
 }
 
-// ---- Piece approvals (LineAnnotationPieceLock.hpp) -------------------------
-
-void LineAnnotationController::refreshPieceLockState(LineAnnotationSession& session, bool rereadStore)
+// ---------------------------------------------------------------------------
+// Approval window (docs/fiber_approval_workflow.md)
+//
+// A read-only session of a stored fiber whose baseline normals are a scaffold
+// solve's. Normal points are session control points tagged kNormalPointTag;
+// they and the stretch states make up the fiber's approval layer
+// (vc_object_store FiberApprovalExtension.hpp), written whole on every change
+// together with the normals the views show. The fiber is never saved.
+// ---------------------------------------------------------------------------
+void LineAnnotationController::openFiberApproval(uint64_t fiberId, const std::string& runUuid, int lineFrom,
+                                                 int lineTo, int controlFrom, int controlTo)
 {
-    namespace la = vc3d::line_annotation;
-    std::vector<la::FiberPieceApproval> rows = session.pieceLock.rows;
-    std::optional<la::FiberPieceContent> stored = session.pieceLock.storedContent;
-    if (rereadStore && _state && session.storePin && session.storePin->stored()) {
-        try {
-            const auto connection = _state->objectStoreSession();
-            connection->readStore(session.storePin->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
-                rows = vc::objects::readFiberPieceApprovals(reader, session.fiberUuid);
-                const auto revisions = reader.objectsAtVersions({session.storePin->reference()});
-                if (!revisions.empty() && revisions.front() && !revisions.front()->deleted)
-                    stored = vc::objects::fiberPieceContent(reader, *revisions.front());
+    if (!_solverLineNormals.contains(fiberId)) {
+        showError(tr("The fiber was not opened for approval: no scaffold solve's normals were handed over for it. "
+                     "Select a solve that covers this fiber."));
+        return;
+    }
+    ApprovalOpen open;
+    open.runUuid = runUuid;
+    open.lineFrom = lineFrom;
+    open.lineTo = lineTo;
+    open.controlFrom = controlFrom;
+    open.controlTo = controlTo;
+    std::optional<int> lineIndex;
+    if (lineFrom >= 0) lineIndex = lineFrom;
+    std::optional<int> controlIndex;
+    if (!lineIndex && controlFrom >= 0) controlIndex = controlFrom;
+    openFiberWithControlPoint(fiberId, controlIndex, lineIndex, std::nullopt, false, &open);
+}
+
+bool LineAnnotationController::fiberHasApproval(const std::string& fiberUuid) const
+{
+    const auto connection = _state ? _state->objectStoreSession() : nullptr;
+    if (!connection || fiberUuid.empty()) return false;
+    bool found = false;
+    try {
+        for (const auto& attachment : connection->attachments()) {
+            connection->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                if (!reader.currentObject(fiberUuid)) return;
+                const auto layer = vc::objects::readFiberApproval(reader, fiberUuid);
+                found = found || (layer && !layer->empty());
             });
-        } catch (const std::exception& error) {
-            Logger()->warn("Line annotation piece approvals of {} unavailable: {}", session.fiberUuid, error.what());
         }
+    } catch (const std::exception& ex) {
+        Logger()->error("Line annotation: the approval layer of fiber {} could not be read: {}", fiberUuid, ex.what());
     }
-    session.pieceLock = la::computePieceLockState(session.controlPoints, std::move(rows), std::move(stored),
-                                                  session.pieceLock.plan, &session.pieceLock);
-    // Lock release: a lock control no live approval references any more
-    // (every row naming it was revoked or cropped away) becomes an ordinary
-    // control again at the next save; its direction stays.
-    if (!session.readOnly && !session.pieceLock.states.releasableLockCpIds.empty()) {
-        bool released = false;
-        for (auto& control : session.controlPoints) {
-            if (control.storeId < 0 || !session.pieceLock.states.releasableLockCpIds.count(control.storeId)) continue;
-            const bool boundsPiece = session.pieceLock.plan && control.identity != 0 &&
-                (session.pieceLock.plan->a.identity == control.identity || session.pieceLock.plan->b.identity == control.identity);
-            if (la::isLockControl(control) && !boundsPiece) {
-                la::setControlPointTag(control.tags, vc::objects::kFiberLockControlPointTag, false);
-                released = true;
-            }
-        }
-        if (released)
-            session.pieceLock = la::computePieceLockState(session.controlPoints, session.pieceLock.rows,
-                                                          session.pieceLock.storedContent, session.pieceLock.plan,
-                                                          &session.pieceLock);
-    }
-    pushPieceDisplayToDialog(session);
+    return found;
 }
 
-void LineAnnotationController::applyLockControlInsertion(LineAnnotationSession& session,
-                                                         const vc3d::line_annotation::LockControlInsertion& insertion)
+bool LineAnnotationController::setFiberApprovalNormalPoint(uint64_t fiberId, double linePosition,
+                                                           std::optional<cv::Vec3d> normal, bool remove)
 {
-    session.controlPoints = insertion.controls;
-    remapCollapsedBranchControlPointIndices(insertion.oldToNewIndices, session.branches);
-    const size_t spanCount = session.controlPoints.size() > 1 ? session.controlPoints.size() - 1 : 0;
-    session.solveQueue.remapPendingDirty(insertion.oldToNewIndices, spanCount);
-    if (!vc3d::line_annotation::OptimizationCoalescingQueue::remapDirtySpans(
-            session.runningSolveDirtySegments, insertion.oldToNewIndices, spanCount)) {
-        session.runningSolveFullLine = true;
-        session.runningSolveDirtySegments.clear();
+    for (auto it = _panes.rbegin(); it != _panes.rend(); ++it) {
+        if (!it->session || it->session->fiberId != fiberId || !it->session->approvalMode) continue;
+        const auto session = it->session;
+        const auto before = session->approvalGeneration;
+        const std::string surface = it->surfaceName;
+        if (remove) approvalDeleteNormalPoint(surface, linePosition);
+        else approvalPlaceNormalPoint(surface, linePosition, normal);
+        return session->approvalGeneration != before;
     }
-    session.runningSolveControlMap.reset();
-    session.runningSolveEditedSpans.clear();
-}
-
-bool LineAnnotationController::applyPiecePlan(LineAnnotationSession& session,
-                                              const vc3d::line_annotation::PiecePlan& input, QString* error)
-{
-    namespace la = vc3d::line_annotation;
-    const auto fail = [&](const QString& message) { if (error) *error = message; return false; };
-    if (session.controlPoints.size() < 2 || session.optimizedLine.points.size() < 2)
-        return fail(tr("A piece needs a fiber with at least two control points."));
-    std::vector<cv::Vec3d> line;
-    line.reserve(session.optimizedLine.points.size());
-    for (const auto& point : session.optimizedLine.points) line.push_back(point.position);
-    la::PiecePlan plan = input;
-    bool changed = false;
-    const auto resolve = [&](la::PiecePlanEnd& end) -> bool {
-        if (end.fiberEnd) { end.identity = 0; return true; }
-        std::optional<size_t> index;
-        if (end.storeId) {
-            for (size_t i = 0; i < session.controlPoints.size(); ++i)
-                if (session.controlPoints[i].storeId == *end.storeId) { index = i; break; }
-            if (!index) return fail(tr("Control point id %1 is not in the fiber.").arg(*end.storeId));
-        } else if (end.lineIndex) {
-            for (size_t i = 0; i < session.controlPoints.size(); ++i)
-                if (session.controlPoints[i].optimizedIndex == *end.lineIndex) { index = i; break; }
-            if (!index) {
-                try {
-                    const auto insertion = la::insertLockControl(session.controlPoints, line, *end.lineIndex);
-                    applyLockControlInsertion(session, insertion);
-                    index = insertion.index;
-                    changed = true;
-                } catch (const std::exception& ex) {
-                    return fail(tr("Cannot place a lock control point: %1").arg(QString::fromUtf8(ex.what())));
-                }
-            }
-        } else {
-            return fail(tr("A piece end names a control point, a line point or the fiber end."));
-        }
-        auto& control = session.controlPoints[*index];
-        if (!la::isLockControl(control)) { la::lockControl(control, line); changed = true; }
-        if (control.identity == 0) control.identity = _nextControlIdentity++;
-        end.identity = control.identity;
-        return true;
-    };
-    if (!resolve(plan.a) || !resolve(plan.b)) return false;
-    if (plan.a.fiberEnd && plan.b.fiberEnd) return fail(tr("A piece needs at least one lock control point."));
-    const auto indexOf = [&](const la::PiecePlanEnd& end, size_t fallback) {
-        for (size_t i = 0; i < session.controlPoints.size(); ++i)
-            if (end.identity != 0 && session.controlPoints[i].identity == end.identity) return i;
-        return fallback;
-    };
-    const size_t ia = plan.a.fiberEnd ? 0 : indexOf(plan.a, 0);
-    const size_t ib = plan.b.fiberEnd ? session.controlPoints.size() - 1 : indexOf(plan.b, session.controlPoints.size() - 1);
-    if (ia > ib) std::swap(plan.a, plan.b);
-    if (ia == ib) return fail(tr("The piece has no extent."));
-    session.pieceLock.plan = plan;
-    session.pieceLock.pendingFirstEdit = changed;
-    session.pieceLock.firstEditDone = false;
-    refreshPieceLockState(session, false);
-    if (session.pieceLock.openedControls) {
-        const auto [first, last] = *session.pieceLock.openedControls;
-        session.initialStripLinePositionRange = {session.controlPoints[first].linePosition,
-                                                 session.controlPoints[last].linePosition};
-        session.focusedLinePosition = session.controlPoints[first].linePosition;
-        session.focusedControlPoint = session.controlPoints[first].volumePoint;
-    }
-    return true;
-}
-
-bool LineAnnotationController::refuseLockedEdit(LineAnnotationSession& session, std::span<const size_t> dirtySpans,
-                                                std::span<const size_t> touchedControls,
-                                                vc3d::line_annotation::FiberPieceAspect aspect)
-{
-    if (const auto why = vc3d::line_annotation::pieceLockRefusal(session.pieceLock, dirtySpans, touchedControls, aspect)) {
-        showError(tr("This edit is refused: %1.").arg(QString::fromStdString(*why)), session.suppressErrorDialogs);
-        return true;
-    }
-    if (session.pieceLock.plan) session.pieceLock.firstEditDone = true;
+    showError(tr("Fiber %1 is not open in an approval window.").arg(fiberId), _errorDialogsSuppressed);
     return false;
 }
 
-void LineAnnotationController::pushPieceDisplayToDialog(LineAnnotationSession& session)
+bool LineAnnotationController::setFiberApprovalState(uint64_t fiberId, double from, double to, int aspect, int state)
+{
+    for (auto it = _panes.rbegin(); it != _panes.rend(); ++it) {
+        if (!it->session || it->session->fiberId != fiberId || !it->session->approvalMode) continue;
+        const auto session = it->session;
+        const auto before = session->approvalGeneration;
+        const std::string surface = it->surfaceName;
+        if (!(to > from)) {
+            showError(tr("The state was NOT set: the stretch needs a start before its end."), session->suppressErrorDialogs);
+            return false;
+        }
+        session->approvalSelection = std::pair{from, to};
+        approvalSetState(surface, aspect, state);
+        return session->approvalGeneration != before;
+    }
+    showError(tr("Fiber %1 is not open in an approval window.").arg(fiberId), _errorDialogsSuppressed);
+    return false;
+}
+
+bool LineAnnotationController::loadApprovalLayer(LineAnnotationSession& session, const ApprovalOpen& open,
+                                                 QString* error)
 {
     namespace la = vc3d::line_annotation;
-    for (auto& pane : _panes) {
-        if (pane.session.get() != &session || !pane.dialog) continue;
-        std::vector<size_t> lockControls;
-        // Every lock-tagged control is marked, held by an approval or not.
-        for (size_t i = 0; i < session.controlPoints.size(); ++i)
-            if (la::isLockControl(session.controlPoints[i])) lockControls.push_back(i);
-        pane.dialog->setPieceLockDisplay(
-            la::pieceDisplayRanges(session.pieceLock, session.controlPoints, session.optimizedLine.points.size()),
-            lockControls, la::pieceApprovalBoxState(session.pieceLock),
-            !session.readOnly && session.taskState != LineAnnotationSession::TaskState::Running);
+    const auto fail = [&](const QString& message) { if (error) *error = message; return false; };
+    if (!session.storePin || !session.storePin->stored()) return fail(tr("the fiber is not stored"));
+    const auto connection = _state->objectStoreSession();
+    std::optional<vc::objects::FiberApprovalLayer> layer;
+    QString problem;
+    try {
+        connection->readStore(session.storePin->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            const auto revisions = reader.objectsAtVersions({session.storePin->reference()});
+            if (revisions.empty() || !revisions.front() || revisions.front()->deleted) {
+                problem = tr("the fiber's saved version cannot be read");
+                return;
+            }
+            const vc::objects::GeometrySnapshot snapshot(reader);
+            session.approvalLine = snapshot.fiber(*revisions.front()).load().linePoints;
+            layer = vc::objects::readFiberApproval(reader, session.fiberUuid);
+        });
+    } catch (const std::exception& ex) {
+        return fail(tr("the approval layer cannot be read: %1").arg(QString::fromUtf8(ex.what())));
     }
+    if (!problem.isEmpty()) return fail(problem);
+    const auto linePoints = session.optimizedLine.points.size();
+    if (session.approvalLine.size() != linePoints)
+        return fail(tr("the fiber has %1 stored line points, the window shows %2")
+                        .arg(session.approvalLine.size()).arg(linePoints));
+    session.approvalMode = true;
+    session.approvalRun = open.runUuid;
+    session.approvalStretches.clear();
+    session.approvalStretchCurrent.clear();
+    session.approvalGeneration = 0;
+    qsizetype staleItems = 0;
+    if (layer) {
+        session.approvalGeneration = layer->generation;
+        const auto status = vc::objects::fiberApprovalStatus(*layer, session.approvalLine);
+        session.approvalStretches = layer->stretches;
+        session.approvalStretchCurrent = status.stretchCurrent;
+        staleItems = status.staleStretches + status.staleNormalPoints;
+        // The layer's normal points become control points of this session.
+        const auto line = linePointPositions(session.optimizedLine);
+        for (size_t i = 0; i < layer->normalPoints.size(); ++i) {
+            if (!status.normalPointCurrent[i]) continue;
+            const auto& point = layer->normalPoints[i];
+            la::LineControlPoint control;
+            control.linePosition = point.position;
+            control.optimizedIndex = int(std::llround(point.position));
+            control.volumePoint = interpolatedPointAtLinePosition(line, point.position);
+            control.displayNormal = cv::Vec3d(point.normal[0], point.normal[1], point.normal[2]);
+            control.displayNormalSource = "manual";
+            control.tags = {la::kNormalPointTag};
+            const auto at = std::upper_bound(session.controlPoints.begin(), session.controlPoints.end(), point.position,
+                [](double position, const auto& other) { return position < other.linePosition; });
+            const auto index = size_t(at - session.controlPoints.begin());
+            std::vector<size_t> oldToNew(session.controlPoints.size());
+            for (size_t k = 0; k < oldToNew.size(); ++k) oldToNew[k] = k < index ? k : k + 1;
+            session.controlPoints.insert(at, control);
+            remapCollapsedBranchControlPointIndices(oldToNew, session.branches);
+        }
+    }
+    // The stretch to work on: the one asked for, else the annotated line.
+    const double last = double(linePoints - 1);
+    double from = 0, to = last;
+    for (const auto& control : session.controlPoints) {
+        if (la::isNormalPoint(control)) continue;
+        from = control.linePosition;
+        break;
+    }
+    for (auto it = session.controlPoints.rbegin(); it != session.controlPoints.rend(); ++it) {
+        if (la::isNormalPoint(*it)) continue;
+        to = it->linePosition;
+        break;
+    }
+    if (open.lineFrom >= 0 && open.lineTo > open.lineFrom) {
+        from = double(open.lineFrom);
+        to = double(open.lineTo);
+    } else if (open.controlFrom >= 0 && open.controlTo > open.controlFrom) {
+        std::vector<double> stored;
+        for (const auto& control : session.controlPoints)
+            if (!la::isNormalPoint(control)) stored.push_back(control.linePosition);
+        if (size_t(open.controlTo) >= stored.size())
+            return fail(tr("control points %1 to %2 are not in the fiber (it has %3)")
+                            .arg(open.controlFrom).arg(open.controlTo).arg(stored.size()));
+        from = stored[size_t(open.controlFrom)];
+        to = stored[size_t(open.controlTo)];
+    }
+    from = std::clamp(from, 0.0, last);
+    to = std::clamp(to, 0.0, last);
+    if (to > from) session.approvalSelection = std::pair{from, to};
+    if (staleItems > 0)
+        showError(tr("%1 stretch states or normal points of this fiber's approval layer are stale: the fiber was "
+                     "edited where they lie. They are shown as undefined and are dropped with the next change.")
+                      .arg(staleItems), session.suppressErrorDialogs);
+    return true;
 }
 
-void LineAnnotationController::openFiberPiece(uint64_t fiberId, const vc3d::line_annotation::PiecePlan& plan)
+void LineAnnotationController::connectApprovalEditing(LineAnnotationDialog* dialog, const std::string& surfaceName)
 {
-    std::optional<int> controlIndex, lineIndex;
-    const auto& lead = plan.a.fiberEnd ? plan.b : plan.a;
-    if (lead.lineIndex) {
-        lineIndex = lead.lineIndex;
-    } else if (lead.storeId) {
-        if (const auto stored = readStoredFiber(fiberId, true))
-            for (size_t i = 0; i < stored->controlPoints.size(); ++i)
-                if (stored->controlPoints[i].storeId == *lead.storeId) { controlIndex = int(i); break; }
-    }
-    openFiberWithControlPoint(fiberId, controlIndex, lineIndex, std::nullopt, false, &plan);
+    const QPointer<LineAnnotationDialog> window(dialog);
+    connect(dialog, &LineAnnotationDialog::crossSectionDragFinished, this,
+            [this, window](const std::string& name, cv::Vec3f, double position, cv::Vec3f, cv::Vec3f normal,
+                           bool normalChanged) {
+                if (window) window->acknowledgeEditCommit();
+                approvalPlaceNormalPoint(name, position,
+                                         normalChanged ? std::optional<cv::Vec3d>(toVec3d(normal)) : std::nullopt);
+            });
+    connect(dialog, &LineAnnotationDialog::generatedControlPointRequested, this,
+            [this](const std::string& name, cv::Vec3f, double linePosition, cv::Vec3f) {
+                approvalPlaceNormalPoint(name, linePosition, std::nullopt);
+            });
+    connect(dialog, &LineAnnotationDialog::generatedControlPointDeleteRequested, this,
+            [this](const std::string& name, double linePosition, cv::Vec3f) {
+                approvalDeleteNormalPoint(name, linePosition);
+            });
+    connect(dialog, &LineAnnotationDialog::controlDisplayAngleChanged, this,
+            [this, surfaceName](size_t index, double degrees) {
+                auto* pane = paneForSurface(surfaceName);
+                if (!pane || !pane->session) return;
+                auto& session = *pane->session;
+                if (index >= session.controlPoints.size()) return;
+                if (!vc3d::line_annotation::isNormalPoint(session.controlPoints[index])) {
+                    showError(tr("The normal was NOT changed: control point %1 belongs to the fiber. The approval "
+                                 "window changes normal points only; add one here.").arg(index + 1),
+                              session.suppressErrorDialogs);
+                    return;
+                }
+                if (index >= session.displayField.controlBaselines.size()) {
+                    showError(tr("The normal was NOT changed: the views have no normals for this line."),
+                              session.suppressErrorDialogs);
+                    return;
+                }
+                const auto baseline = vc::fiber_tracer::displayUnit(session.displayField.controlBaselines[index]);
+                const auto tangent = vc::fiber_tracer::displayUnit(session.displayField.controlTangents[index]);
+                if (!baseline || !tangent) {
+                    showError(tr("The normal was NOT changed: there is no baseline normal or tangent at this point."),
+                              session.suppressErrorDialogs);
+                    return;
+                }
+                approvalPlaceNormalPoint(surfaceName, session.controlPoints[index].linePosition,
+                    vc::fiber_tracer::rotateDisplayNormal(*baseline, *tangent, degrees * std::acos(-1.0) / 180.0));
+            });
+    // Shown only: the width belongs to the fiber and is not saved from here.
+    connect(dialog, &LineAnnotationDialog::fiberWidthChanged, this, [this, surfaceName](double width) {
+        auto* pane = paneForSurface(surfaceName);
+        if (!pane || !pane->session) return;
+        pane->session->fiberWidth = width;
+        if (pane->dialog) pane->dialog->setFiberWidth(width, pane->session->fiberWidthGapFraction);
+    });
+    connect(dialog, &LineAnnotationDialog::approvalSelectionBoundRequested, this,
+            [this, surfaceName](int bound, double linePosition) {
+                approvalSetSelectionBound(surfaceName, bound, linePosition);
+            });
+    connect(dialog, &LineAnnotationDialog::approvalStateRequested, this,
+            [this, surfaceName](int aspect, int state) { approvalSetState(surfaceName, aspect, state); });
 }
 
-std::optional<QString> LineAnnotationController::setFiberPieceApproval(uint64_t fiberId,
-                                                                       vc3d::line_annotation::FiberPieceAspect aspect,
-                                                                       bool approved)
+// The views of an approval session after a change of its normal points. A
+// session without views (no window) shows its display field itself.
+bool LineAnnotationController::refreshApprovalViews(LineAnnotationSession& session)
+{
+    if (!session.suppressGeneratedViews) return materializeGeneratedViews(session);
+    try {
+        session.displayField = displayFieldForSession(session, orientedLineNormalsForSession(session));
+    } catch (const std::exception& ex) {
+        session.error = ex.what();
+        return false;
+    }
+    session.shownLineNormals = session.displayField.normals;
+    session.shownLineNormalsRevision = session.lineRevision;
+    return true;
+}
+
+void LineAnnotationController::approvalPlaceNormalPoint(const std::string& surfaceName, double linePosition,
+                                                        std::optional<cv::Vec3d> normal)
+{
+    namespace la = vc3d::line_annotation;
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        showError(tr("The normal point was NOT set: no approval window owns the surface '%1'.")
+                      .arg(QString::fromStdString(surfaceName)), false);
+        return;
+    }
+    const std::shared_ptr<LineAnnotationSession> owned = pane->session;
+    auto& session = *owned;
+    const auto refuse = [&](const QString& reason) {
+        showError(tr("The normal point was NOT set: %1.").arg(reason), session.suppressErrorDialogs);
+    };
+    if (!session.approvalMode) return refuse(tr("this window is not an approval window"));
+    const auto linePoints = session.optimizedLine.points.size();
+    if (linePoints < 2 || !std::isfinite(linePosition)) return refuse(tr("the fiber has no line there"));
+    linePosition = std::clamp(linePosition, 0.0, double(linePoints - 1));
+    if (session.shownLineNormalsRevision != session.lineRevision || session.shownLineNormals.size() != linePoints)
+        return refuse(tr("the views show no normals for this line (%1 normals, %2 line points)")
+                          .arg(session.shownLineNormals.size()).arg(linePoints));
+    // Without a normal of its own the point holds what is shown there now.
+    const auto wanted = vc::fiber_tracer::displayUnit(
+        normal ? *normal : vc::fiber_tracer::displayVectorAt(session.shownLineNormals, linePosition));
+    if (!wanted) return refuse(tr("there is no normal at line position %1").arg(linePosition));
+    // An existing normal point at this place is changed. A control point of
+    // the fiber there is left alone: the normal point lies on top of it.
+    std::optional<size_t> existing;
+    for (size_t i = 0; i < session.controlPoints.size(); ++i)
+        if (la::isNormalPoint(session.controlPoints[i]) &&
+            std::abs(session.controlPoints[i].linePosition - linePosition) <= 0.5) { existing = i; break; }
+    const auto before = session.controlPoints;
+    const auto branchesBefore = session.branches;
+    if (existing) {
+        session.controlPoints[*existing].displayNormal = *wanted;
+        linePosition = session.controlPoints[*existing].linePosition;
+    } else {
+        la::LineControlPoint control;
+        control.linePosition = linePosition;
+        control.optimizedIndex = int(std::llround(linePosition));
+        control.volumePoint = interpolatedPointAtLinePosition(linePointPositions(session.optimizedLine), linePosition);
+        control.displayNormal = *wanted;
+        control.displayNormalSource = "manual";
+        control.tags = {la::kNormalPointTag};
+        const auto at = std::upper_bound(session.controlPoints.begin(), session.controlPoints.end(), linePosition,
+            [](double position, const auto& other) { return position < other.linePosition; });
+        const auto index = size_t(at - session.controlPoints.begin());
+        std::vector<size_t> oldToNew(session.controlPoints.size());
+        for (size_t k = 0; k < oldToNew.size(); ++k) oldToNew[k] = k < index ? k : k + 1;
+        session.controlPoints.insert(at, control);
+        remapCollapsedBranchControlPointIndices(oldToNew, session.branches);
+    }
+    const auto restore = [&]() {
+        session.controlPoints = before;
+        session.branches = branchesBefore;
+        refreshApprovalViews(session);
+        pushApprovalDisplay(session);
+    };
+    if (!refreshApprovalViews(session)) {
+        restore();
+        return refuse(tr("the views could not be rebuilt with it: %1").arg(QString::fromStdString(session.error)));
+    }
+    // What is stored is what is shown: the views must show the normal there.
+    const auto shown = vc::fiber_tracer::displayUnit(
+        vc::fiber_tracer::displayVectorAt(session.shownLineNormals, linePosition));
+    const double off = shown
+        ? std::acos(std::clamp(std::abs(shown->dot(*wanted)), 0.0, 1.0)) * 180.0 / std::acos(-1.0) : 180.0;
+    Logger()->info("Fiber approval: normal point at line position {} set to {}; the views show {} ({} degrees off)",
+                   linePosition, vectorText(*wanted).toStdString(),
+                   shown ? vectorText(*shown).toStdString() : std::string("nothing"), off);
+    if (off > 3.0) {
+        restore();
+        return refuse(tr("the views show %1 at line position %2 instead of the wanted %3 (%4 degrees off)")
+                          .arg(shown ? vectorText(*shown) : tr("no normal")).arg(linePosition)
+                          .arg(vectorText(*wanted)).arg(off, 0, 'f', 1));
+    }
+    if (!saveApprovalLayer(session)) restore();
+    pushApprovalDisplay(session);
+}
+
+void LineAnnotationController::approvalDeleteNormalPoint(const std::string& surfaceName, double linePosition)
+{
+    namespace la = vc3d::line_annotation;
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session || !pane->session->approvalMode) return;
+    const std::shared_ptr<LineAnnotationSession> owned = pane->session;
+    auto& session = *owned;
+    std::optional<size_t> nearest;
+    for (size_t i = 0; i < session.controlPoints.size(); ++i) {
+        if (!la::isNormalPoint(session.controlPoints[i])) continue;
+        if (!nearest || std::abs(session.controlPoints[i].linePosition - linePosition) <
+                            std::abs(session.controlPoints[*nearest].linePosition - linePosition))
+            nearest = i;
+    }
+    // The delete gesture picks the nearest control point; a fiber's own is refused.
+    std::optional<double> fiberControl;
+    for (const auto& control : session.controlPoints)
+        if (!la::isNormalPoint(control) &&
+            (!fiberControl || std::abs(control.linePosition - linePosition) < *fiberControl))
+            fiberControl = std::abs(control.linePosition - linePosition);
+    if (!nearest || (fiberControl && *fiberControl < std::abs(session.controlPoints[*nearest].linePosition - linePosition))) {
+        showError(tr("Nothing was deleted: the nearest control point belongs to the fiber. The approval window "
+                     "deletes normal points only."), session.suppressErrorDialogs);
+        return;
+    }
+    const auto before = session.controlPoints;
+    const auto branchesBefore = session.branches;
+    std::vector<size_t> oldToNew(session.controlPoints.size());
+    for (size_t k = 0; k < oldToNew.size(); ++k) oldToNew[k] = k <= *nearest ? (k == 0 ? 0 : (k < *nearest ? k : k - 1)) : k - 1;
+    session.controlPoints.erase(session.controlPoints.begin() + std::ptrdiff_t(*nearest));
+    remapCollapsedBranchControlPointIndices(oldToNew, session.branches);
+    if (!refreshApprovalViews(session) || !saveApprovalLayer(session)) {
+        session.controlPoints = before;
+        session.branches = branchesBefore;
+        refreshApprovalViews(session);
+        showError(tr("The normal point was NOT deleted: %1").arg(QString::fromStdString(session.error)),
+                  session.suppressErrorDialogs);
+    }
+    pushApprovalDisplay(session);
+}
+
+void LineAnnotationController::approvalSetSelectionBound(const std::string& surfaceName, int bound,
+                                                         double linePosition)
+{
+    namespace la = vc3d::line_annotation;
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session || !pane->session->approvalMode) return;
+    auto& session = *pane->session;
+    const double last = double(session.optimizedLine.points.size() - 1);
+    double from = 0, to = last;
+    if (bound == 2) {
+        // The annotated line: first to last control point of the fiber.
+        for (const auto& control : session.controlPoints)
+            if (!la::isNormalPoint(control)) { from = control.linePosition; break; }
+        for (auto it = session.controlPoints.rbegin(); it != session.controlPoints.rend(); ++it)
+            if (!la::isNormalPoint(*it)) { to = it->linePosition; break; }
+    } else {
+        if (session.approvalSelection) std::tie(from, to) = *session.approvalSelection;
+        linePosition = std::clamp(linePosition, 0.0, last);
+        (bound == 0 ? from : to) = linePosition;
+        // A start past the end (or an end before the start) moves the other bound out of the way.
+        if (bound == 0 && to <= from) to = last;
+        if (bound == 1 && from >= to) from = 0;
+    }
+    if (!(to > from)) {
+        showError(tr("The stretch was NOT changed: it would have no length."), session.suppressErrorDialogs);
+        return;
+    }
+    session.approvalSelection = std::pair{from, to};
+    pushApprovalDisplay(session);
+}
+
+void LineAnnotationController::approvalSetState(const std::string& surfaceName, int aspect, int state)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session || !pane->session->approvalMode) return;
+    const std::shared_ptr<LineAnnotationSession> owned = pane->session;
+    auto& session = *owned;
+    const auto refuse = [&](const QString& reason) {
+        showError(tr("The state was NOT set: %1.").arg(reason), session.suppressErrorDialogs);
+        pushApprovalDisplay(session);
+    };
+    if (!session.approvalSelection) return refuse(tr("no stretch is selected; set its start and end first"));
+    if (aspect < 0 || aspect > 1 || state < 0 || state > 2) return refuse(tr("unknown aspect or state"));
+    const auto before = session.approvalStretches;
+    const auto beforeCurrent = session.approvalStretchCurrent;
+    // Stale stretches are dropped with the first change: they describe a line that is gone.
+    std::vector<vc::objects::FiberStretch> stretches;
+    for (size_t i = 0; i < session.approvalStretches.size(); ++i)
+        if (i >= session.approvalStretchCurrent.size() || session.approvalStretchCurrent[i])
+            stretches.push_back(session.approvalStretches[i]);
+    try {
+        vc::objects::setFiberStretchState(stretches, vc::objects::FiberApprovalAspect(aspect),
+                                          session.approvalSelection->first, session.approvalSelection->second,
+                                          vc::objects::FiberStretchState(state), session.approvalLine);
+    } catch (const std::exception& ex) {
+        return refuse(QString::fromUtf8(ex.what()));
+    }
+    session.approvalStretches = stretches;
+    session.approvalStretchCurrent.assign(stretches.size(), 1);
+    if (!saveApprovalLayer(session)) {
+        session.approvalStretches = before;
+        session.approvalStretchCurrent = beforeCurrent;
+    }
+    pushApprovalDisplay(session);
+}
+
+bool LineAnnotationController::saveApprovalLayer(LineAnnotationSession& session)
 {
     namespace la = vc3d::line_annotation;
     using namespace vc::objects;
-    std::shared_ptr<LineAnnotationSession> owned;
-    for (auto it = _panes.rbegin(); it != _panes.rend(); ++it)
-        if (it->session && it->session->fiberId == fiberId && it->session->pieceLock.pieceOpen()) { owned = it->session; break; }
-    if (!owned) return tr("No open piece of this fiber.");
-    auto& session = *owned;
-    if (session.readOnly) return tr("Enable editing before approving.");
-    if (session.taskState == LineAnnotationSession::TaskState::Running) return tr("Line optimization is still running.");
-    if (!_state || !_state->objectStoreSession()) return tr("No object store is attached.");
-    // Approving fixes the range like an edit: the planned lock controls and
-    // the crop of neighbouring approvals are committed first.
-    if (session.pieceLock.savesHeld()) session.pieceLock.firstEditDone = true;
-    const auto failures = _fiberSaveFailureCount;
-    saveSessionAsFiber(session, true, false);
-    if (!joinPublication() || _fiberSaveFailureCount != failures) return tr("The fiber could not be saved.");
-    if (!session.storePin || !session.storePin->stored()) return tr("The fiber is not stored yet.");
+    const auto fail = [&](const QString& reason) {
+        session.error = reason.toStdString();
+        showError(tr("The approval was NOT stored: %1.").arg(reason), session.suppressErrorDialogs);
+        return false;
+    };
+    if (!session.storePin || !session.storePin->stored()) return fail(tr("the fiber is not stored"));
+    const auto linePoints = session.optimizedLine.points.size();
+    if (session.approvalLine.size() != linePoints) return fail(tr("the window's line is not the stored line"));
+    // The normals the views show right now are what is approved.
+    if (session.shownLineNormalsRevision != session.lineRevision || session.shownLineNormals.size() != linePoints)
+        return fail(tr("the views do not show the normals of this line (%1 normals, %2 line points)")
+                        .arg(session.shownLineNormals.size()).arg(linePoints));
+    FiberApprovalLayer layer;
+    layer.fiberUuid = session.fiberUuid;
+    layer.baselineRun = session.approvalRun;
+    layer.savedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
+    layer.host = QSysInfo::machineHostName().toStdString();
+    for (size_t i = 0; i < session.approvalStretches.size(); ++i)
+        if (i >= session.approvalStretchCurrent.size() || session.approvalStretchCurrent[i])
+            layer.stretches.push_back(session.approvalStretches[i]);
+    try {
+        for (const auto& control : session.controlPoints) {
+            if (!la::isNormalPoint(control) || !control.displayNormal) continue;
+            const auto& n = *control.displayNormal;
+            setFiberNormalPoint(layer.normalPoints, control.linePosition, {n[0], n[1], n[2]}, session.approvalLine, 1e-6);
+        }
+    } catch (const std::exception& ex) {
+        return fail(QString::fromUtf8(ex.what()));
+    }
+    layer.lineNormals.reserve(linePoints);
+    for (const auto& normal : session.shownLineNormals) layer.lineNormals.push_back({normal[0], normal[1], normal[2]});
     const auto connection = _state->objectStoreSession();
     const auto attachment = session.storePin->attachment;
     auto request = connection->newRequest(attachment);
-    const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
-    const std::string host = QSysInfo::machineHostName().toStdString();
-    std::vector<FiberPieceApproval> approvalRows;
-    std::optional<ObjectRevision> revision;
-    QString error;
-    // Approving normals stores the normals the views show right now, one per
-    // line point of the saved fiber.
-    std::vector<vc::geometry::Point> shownNormals;
-    if (approved && aspect == FiberPieceAspect::Normals) {
-        if (session.shownLineNormalsRevision != session.lineRevision ||
-            session.shownLineNormals.size() != session.optimizedLine.points.size())
-            return tr("The views do not show the normals of the line as it is now; wait for them to rebuild and approve again.");
-        shownNormals.reserve(session.shownLineNormals.size());
-        for (const auto& normal : session.shownLineNormals) shownNormals.push_back({normal[0], normal[1], normal[2]});
-    }
-    connection->readStore(attachment, [&](const StoreReader& reader, const auto&) {
-        const auto revisions = reader.objectsAtVersions({session.storePin->reference()});
-        if (revisions.empty() || !revisions.front() || revisions.front()->deleted) { error = tr("The fiber's saved version cannot be read."); return; }
-        revision = revisions.front();
-        const auto content = fiberPieceContent(reader, *revision);
-        const auto live = liveFiberPieceApprovals(readFiberPieceApprovals(reader, session.fiberUuid));
-        const auto range = la::openedPieceRange(session.pieceLock, session.controlPoints, content);
-        if (!range) { error = tr("The piece's lock control points are not in the saved fiber."); return; }
-        if (approved) {
-            if (aspect == FiberPieceAspect::Normals && shownNormals.size() != content.linePoints.size()) {
-                error = tr("The saved fiber has %1 line points, the views show normals for %2.")
-                            .arg(content.linePoints.size()).arg(shownNormals.size());
+    layer.author = request.author;
+    QString problem;
+    try {
+        connection->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            const auto revisions = reader.objectsAtVersions({session.storePin->reference()});
+            if (revisions.empty() || !revisions.front() || revisions.front()->deleted) {
+                problem = tr("the fiber's saved version cannot be read");
                 return;
             }
-            try {
-                auto row = approveFiberPiece(content, session.fiberUuid, *range, aspect, revision->version,
-                                             request.author, now, host, shownNormals);
-                for (auto& crop : cropFiberPieceApprovals(content, live, range->first, range->last, request.author, now))
-                    approvalRows.push_back(std::move(crop));
-                approvalRows.push_back(std::move(row));
-            } catch (const std::invalid_argument& ex) {
-                error = tr("The piece cannot be approved: %1").arg(QString::fromUtf8(ex.what()));
+            const auto current = reader.currentObject(session.fiberUuid);
+            if (!current || current->version != revisions.front()->version) {
+                problem = tr("the fiber was edited since this window opened (version %1, now %2); close and reopen it")
+                              .arg(revisions.front()->version).arg(current ? current->version : -1);
+                return;
             }
-        } else {
-            for (const auto& row : live) {
-                if (row.aspect != aspect) continue;
-                const auto covered = fiberPieceRange(content, row);
-                if (covered && covered->first <= range->first && covered->last >= range->last)
-                    approvalRows.push_back(revokeFiberPieceApproval(row, request.author, now));
-            }
-            if (approvalRows.empty()) error = tr("The piece carries no approval to revoke.");
-        }
-    });
-    if (!error.isEmpty()) return error;
-    expectObject(request, *revision);
-    auto values = fiberPieceApprovalRows(approvalRows);
-    request.operations.push_back(CreateExtensionTableOp{fiberPieceApprovalTable()});
-    request.operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(values.approvals)});
-    if (!values.normals.empty()) {
-        request.operations.push_back(CreateExtensionTableOp{fiberPieceNormalsTable()});
-        request.operations.push_back(AppendExtensionRowsOp{kFiberPieceNormalsTable, std::move(values.normals)});
+            layer.fiberVersion = revisions.front()->version;
+            const auto stored = readFiberApproval(reader, session.fiberUuid);
+            layer.generation = (stored ? stored->generation : 0) + 1;
+        });
+    } catch (const std::exception& ex) {
+        return fail(QString::fromUtf8(ex.what()));
     }
+    if (!problem.isEmpty()) return fail(problem);
+    auto rows = fiberApprovalRows(layer);
+    for (const auto& table : fiberApprovalTables()) request.operations.push_back(CreateExtensionTableOp{table});
+    request.operations.push_back(AppendExtensionRowsOp{kFiberApprovalTable, {std::move(rows.header)}});
+    if (!rows.stretches.empty())
+        request.operations.push_back(AppendExtensionRowsOp{kFiberApprovalStretchTable, std::move(rows.stretches)});
+    if (!rows.normalPoints.empty())
+        request.operations.push_back(
+            AppendExtensionRowsOp{kFiberApprovalNormalPointTable, std::move(rows.normalPoints)});
     try {
         connection->submitDurably(attachment, request);
     } catch (const std::exception& ex) {
-        return tr("The approval could not be stored: %1").arg(QString::fromUtf8(ex.what()));
+        return fail(QString::fromUtf8(ex.what()));
     }
-    refreshPieceLockState(session, true);
-    return std::nullopt;
+    // Read back: what the store holds is what was written.
+    try {
+        connection->readStore(attachment, [&](const StoreReader& reader, const auto&) {
+            const auto stored = readFiberApproval(reader, session.fiberUuid);
+            if (!stored || stored->generation != layer.generation || stored->stretches != layer.stretches ||
+                stored->normalPoints != layer.normalPoints || stored->lineNormals.size() != layer.lineNormals.size())
+                problem = tr("the store returns generation %1 with %2 stretches and %3 normal points; written was "
+                             "generation %4 with %5 and %6")
+                              .arg(stored ? stored->generation : -1).arg(stored ? stored->stretches.size() : 0)
+                              .arg(stored ? stored->normalPoints.size() : 0).arg(layer.generation)
+                              .arg(layer.stretches.size()).arg(layer.normalPoints.size());
+        });
+    } catch (const std::exception& ex) {
+        return fail(QString::fromUtf8(ex.what()));
+    }
+    if (!problem.isEmpty()) return fail(problem);
+    session.approvalGeneration = layer.generation;
+    session.approvalChanged = true;
+    Logger()->info("Fiber approval: layer generation {} of fiber {} stored ({} stretches, {} normal points)",
+                   layer.generation, session.fiberUuid, layer.stretches.size(), layer.normalPoints.size());
+    return true;
+}
+
+void LineAnnotationController::pushApprovalDisplay(LineAnnotationSession& session)
+{
+    namespace la = vc3d::line_annotation;
+    using namespace vc::objects;
+    LineAnnotationDialog::ApprovalDisplay display;
+    display.selection = session.approvalSelection;
+    for (size_t i = 0; i < session.approvalStretches.size(); ++i) {
+        const auto& stretch = session.approvalStretches[i];
+        const bool current = i >= session.approvalStretchCurrent.size() || session.approvalStretchCurrent[i];
+        auto& list = !current ? display.stale
+                   : stretch.state == FiberStretchState::Broken ? display.broken
+                   : stretch.aspect == FiberApprovalAspect::Geometry ? display.approvedGeometry
+                   : display.approvedNormals;
+        list.emplace_back(stretch.from, stretch.to);
+    }
+    // The state of the selection per aspect: one state over all of it, or mixed (-1).
+    for (int aspect = 0; aspect < 2; ++aspect) {
+        int state = 0;
+        if (session.approvalSelection) {
+            const auto [from, to] = *session.approvalSelection;
+            double covered = 0;
+            std::optional<int> only;
+            bool mixed = false;
+            for (size_t i = 0; i < session.approvalStretches.size(); ++i) {
+                const auto& stretch = session.approvalStretches[i];
+                if (int(stretch.aspect) != aspect) continue;
+                if (i < session.approvalStretchCurrent.size() && !session.approvalStretchCurrent[i]) continue;
+                const double overlap = std::min(to, stretch.to) - std::max(from, stretch.from);
+                if (overlap <= 1e-9) continue;
+                covered += overlap;
+                if (only && *only != int(stretch.state)) mixed = true;
+                only = int(stretch.state);
+            }
+            if (mixed || (only && covered < to - from - 1e-6)) state = -1;
+            else if (only) state = *only;
+        }
+        (aspect == 0 ? display.geometryState : display.normalsState) = state;
+    }
+    for (const auto& control : session.controlPoints)
+        if (la::isNormalPoint(control)) ++display.normalPoints;
+    for (auto& pane : _panes)
+        if (pane.session.get() == &session && pane.dialog) pane.dialog->setApprovalDisplay(display);
 }
 
 void LineAnnotationController::installFiberCommit(FiberCommitJob& job, const FiberCommitResult& result)

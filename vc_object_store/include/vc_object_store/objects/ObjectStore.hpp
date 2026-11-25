@@ -512,6 +512,11 @@ public:
     // The extension owns its SQL layout and semantics; core owns registration,
     // transactions and commit stamps. No automatic history of extension rows.
     void createExtensionTable(WriteTxn&, const ExtensionTable&);
+    // Remove a table of this store with all its rows and its registration.
+    // For retired extensions only (the vc_object_extensions tool): nothing
+    // records what was in it. Throws std::invalid_argument when this store
+    // registers no such table.
+    void dropExtensionTable(WriteTxn&, const std::string& name);
     std::vector<ExtensionTableInfo> extensionTables(const Txn&) const;
     void appendExtensionRows(WriteTxn&, const std::string& table, std::span<const ExtensionRow>);
     // Stream in primary-key order; optional equality prefix uses the PK index.

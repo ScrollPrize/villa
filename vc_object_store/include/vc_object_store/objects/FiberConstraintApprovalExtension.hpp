@@ -12,10 +12,10 @@
 // anchors quantized to a fixed arc step. A re-extraction places the same
 // crossing within one step of where it was, so the approval survives it,
 // while a different crossing of the same pair keeps its own identity. The two
-// span fingerprints are the piece-approval ones (docs/fiber-piece-approval.md):
-// editing either covering span invalidates the approval, exactly as it
-// invalidates a piece approval.
-#include "vc_object_store/objects/FiberPieceApprovalExtension.hpp"
+// span fingerprints are fiberSpanHash (FiberContent.hpp): editing either
+// covering span invalidates the approval.
+#include "vc_object_store/objects/Extensions.hpp"
+#include "vc_object_store/objects/FiberContent.hpp"
 
 #include <optional>
 #include <span>

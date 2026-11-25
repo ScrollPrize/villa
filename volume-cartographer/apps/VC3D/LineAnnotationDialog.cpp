@@ -522,9 +522,9 @@ public:
     // map the dialog's line positions (the current-position marker, clicks
     // on the bar) to fractions (see GeneratedOverviewAnchor); empty means the
     // plain proportional layout.
-    // Piece approval: fractions outside the open piece (drawn dimmed) and the
-    // approved / stale stretches (a thin underline).
-    struct PieceFractions {
+    // Line ranges as fractions: drawn dimmed, and the approved / stale
+    // stretches (a thin underline).
+    struct RangeFractions {
         std::vector<std::pair<double, double>> dimmed, approved, stale;
     };
 
@@ -535,13 +535,13 @@ public:
                      std::vector<vc3d::line_annotation::GeneratedOverviewAnchor> positionAnchors,
                      std::vector<double> cumulativeArcLength,
                      double totalArcLength,
-                     PieceFractions pieces = {})
+                     RangeFractions ranges = {})
     {
         _linePointCount = linePointCount;
         _dots = std::move(dots);
         _gapFractionRanges = std::move(gapFractionRanges);
         _damagedFractionRanges = std::move(damagedFractionRanges);
-        _pieces = std::move(pieces);
+        _ranges = std::move(ranges);
         _anchors = std::move(positionAnchors);
         _cumulativeArcLength = std::move(cumulativeArcLength);
         _totalArcLength = totalArcLength;
@@ -633,10 +633,10 @@ protected:
             painter.setPen(basePen);
             painter.drawLine(QPointF(cursorX, midY), QPointF(lineEndX, midY));
         }
-        // Outside the open piece: the baseline at half intensity over
-        // whatever piece style lies there.
+        // Dimmed ranges: the baseline at half intensity over whatever
+        // style lies there.
         painter.setPen(QPen(QColor(0, 0, 0, 140), 3.0));
-        for (const auto& [first, second] : _pieces.dimmed) {
+        for (const auto& [first, second] : _ranges.dimmed) {
             if (std::isfinite(first) && std::isfinite(second) && second > first)
                 painter.drawLine(QPointF(xForFraction(first), midY), QPointF(xForFraction(second), midY));
         }
@@ -648,8 +648,8 @@ protected:
                     painter.drawLine(QPointF(xForFraction(first), midY + 5.0), QPointF(xForFraction(second), midY + 5.0));
             }
         };
-        underline(_pieces.approved, QColor(60, 220, 110));
-        underline(_pieces.stale, QColor(255, 180, 40));
+        underline(_ranges.approved, QColor(60, 220, 110));
+        underline(_ranges.stale, QColor(255, 180, 40));
 
         if (std::isfinite(_currentPosition)) {
             painter.setPen(QPen(_currentColor, 2.0));
@@ -729,7 +729,7 @@ private:
     double _totalArcLength = 0.0;
     std::vector<std::pair<double, double>> _gapFractionRanges;
     std::vector<std::pair<double, double>> _damagedFractionRanges;
-    PieceFractions _pieces;
+    RangeFractions _ranges;
     double _currentPosition = std::numeric_limits<double>::quiet_NaN();
     QColor _currentColor{0, 245, 255};
 };
@@ -1223,20 +1223,49 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _enableEditingButton->hide();
     buttonLayout->addWidget(_enableEditingButton);
     connect(_enableEditingButton, &QPushButton::clicked, this, &LineAnnotationDialog::editingRequested);
-    // Piece approval: two checkboxes, shown while a piece is open.
-    const auto makeApprovalBox = [&](const QString& text, const char* objectName, int aspect) {
-        auto* box = new QCheckBox(text, buttonRow);
-        box->setObjectName(QLatin1String(objectName));
-        box->setToolTip(tr("Approval of the open piece of this fiber (stored with your name and the time)."));
-        box->hide();
-        buttonLayout->addWidget(box);
-        connect(box, &QCheckBox::clicked, this, [this, aspect](bool checked) {
-            emit pieceApprovalChangeRequested(aspect, checked);
-        });
-        return box;
-    };
-    _pieceApprovedBox = makeApprovalBox(tr("Approved"), "lineAnnotationPieceApproved", 0);
-    _pieceNormalApprovedBox = makeApprovalBox(tr("Normal approved"), "lineAnnotationPieceNormalApproved", 1);
+    // Approval window: a stretch between two arbitrary points of the line and
+    // its state, once for the geometry and once for the normals.
+    _approvalPanel = new QWidget(buttonRow);
+    _approvalPanel->setObjectName(QStringLiteral("lineAnnotationApprovalPanel"));
+    {
+        auto* layout = new QHBoxLayout(_approvalPanel);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->setSpacing(4);
+        const auto bound = [&](const QString& text, const QString& tip, const char* name, int which) {
+            auto* button = new QPushButton(text, _approvalPanel);
+            button->setObjectName(QLatin1String(name));
+            button->setToolTip(tip);
+            layout->addWidget(button);
+            connect(button, &QPushButton::clicked, this, [this, which]() {
+                emit approvalSelectionBoundRequested(which, _currentLinePosition);
+            });
+        };
+        bound(tr("Start here"), tr("The stretch starts at the current position of the line."),
+              "lineAnnotationApprovalStart", 0);
+        bound(tr("End here"), tr("The stretch ends at the current position of the line."),
+              "lineAnnotationApprovalEnd", 1);
+        bound(tr("Whole fiber"), tr("The stretch is the whole annotated line."), "lineAnnotationApprovalWhole", 2);
+        const auto state = [&](const QString& label, const char* name, int aspect) {
+            layout->addWidget(new QLabel(label, _approvalPanel));
+            auto* combo = new QComboBox(_approvalPanel);
+            combo->setObjectName(QLatin1String(name));
+            combo->addItems({tr("undefined"), tr("approved"), tr("broken")});
+            combo->setToolTip(tr("State of the selected stretch. Approved: the solver uses it as shown. Broken: the "
+                                 "solver removes it. Stored at once."));
+            layout->addWidget(combo);
+            connect(combo, qOverload<int>(&QComboBox::activated), this, [this, aspect](int index) {
+                emit approvalStateRequested(aspect, index);
+            });
+            return combo;
+        };
+        _approvalGeometryCombo = state(tr("Geometry:"), "lineAnnotationApprovalGeometry", 0);
+        _approvalNormalsCombo = state(tr("Normals:"), "lineAnnotationApprovalNormals", 1);
+        _approvalLabel = new QLabel(_approvalPanel);
+        _approvalLabel->setObjectName(QStringLiteral("lineAnnotationApprovalLabel"));
+        layout->addWidget(_approvalLabel);
+    }
+    _approvalPanel->hide();
+    buttonLayout->addWidget(_approvalPanel);
     _fiberNameLabel = new QLabel(buttonRow);
     _fiberNameLabel->setObjectName(QStringLiteral("lineAnnotationFiberNameLabel"));
     _fiberNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -2257,27 +2286,13 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
     _tagRowLayout->addWidget(addButton);
 }
 
-void LineAnnotationDialog::setPieceLockDisplay(const vc3d::line_annotation::PieceDisplayRanges& ranges,
-                                               const std::vector<size_t>& lockControls,
-                                               const vc3d::line_annotation::PieceApprovalBoxState& boxes,
-                                               bool editable)
+void LineAnnotationDialog::setLineRangeDisplay(const LineRangeDisplay& ranges)
 {
-    const bool changedRanges = ranges.dimmed != _pieceRanges.dimmed || ranges.approved != _pieceRanges.approved ||
-                               ranges.stale != _pieceRanges.stale || lockControls != _pieceLockControls;
-    _pieceRanges = ranges;
-    _pieceLockControls = lockControls;
+    const bool changed = ranges.dimmed != _lineRanges.dimmed || ranges.approved != _lineRanges.approved ||
+                         ranges.stale != _lineRanges.stale;
+    _lineRanges = ranges;
     _generatedViews.dimmedLineRanges = ranges.dimmed;
-    const auto apply = [&](QCheckBox* box, int aspect, const QString& text) {
-        if (!box) return;
-        const QSignalBlocker blocker(box);
-        box->setVisible(boxes.pieceOpen);
-        box->setEnabled(boxes.pieceOpen && editable);
-        box->setChecked(boxes.approved[size_t(aspect)]);
-        box->setText(boxes.stale[size_t(aspect)] ? text + tr(" (stale)") : text);
-    };
-    apply(_pieceApprovedBox, 0, tr("Approved"));
-    apply(_pieceNormalApprovedBox, 1, tr("Normal approved"));
-    if (changedRanges && _hasGeneratedViews) {
+    if (changed && _hasGeneratedViews) {
         rebuildGeneratedOverlays();
         _overviewLayoutDirty = true;
         updateOverviewBar();
@@ -2301,6 +2316,48 @@ void LineAnnotationDialog::setReadOnly(bool readOnly, bool canEdit)
     }
     _fiberWidthSpin->setEnabled(!readOnly);
     if (_controlAngleSpin && readOnly) _controlAngleSpin->setEnabled(false);
+}
+
+void LineAnnotationDialog::setApprovalMode(bool approval)
+{
+    _approvalMode = approval;
+    _approvalPanel->setVisible(approval);
+    if (!approval) return;
+    // No way from here into editing the fiber; the width is shown only (the
+    // cross view's edge handles need one).
+    _enableEditingButton->hide();
+    _fiberWidthSpin->setEnabled(true);
+    _fiberWidthSpin->setToolTip(tr("Shown width in this window only; it is not saved to the fiber."));
+}
+
+void LineAnnotationDialog::setApprovalDisplay(const ApprovalDisplay& display)
+{
+    _approvalDisplay = display;
+    const auto show = [](QComboBox* combo, int state) {
+        const QSignalBlocker blocker(combo);
+        combo->setCurrentIndex(state);  // -1: mixed, shown empty
+    };
+    show(_approvalGeometryCombo, display.geometryState);
+    show(_approvalNormalsCombo, display.normalsState);
+    _approvalGeometryCombo->setEnabled(display.selection.has_value());
+    _approvalNormalsCombo->setEnabled(display.selection.has_value());
+    QString text = display.selection
+        ? tr("stretch %1 to %2").arg(display.selection->first, 0, 'f', 0).arg(display.selection->second, 0, 'f', 0)
+        : tr("no stretch selected");
+    text += tr(" · %1 normal points").arg(display.normalPoints);
+    if (!display.stale.empty()) text += tr(" · %1 stale").arg(display.stale.size());
+    _approvalLabel->setText(text);
+    // On the overview bar: approved geometry, broken (as stale is drawn) and
+    // everything outside the selected stretch dimmed.
+    LineRangeDisplay ranges;
+    ranges.approved = display.approvedGeometry;
+    ranges.stale = display.broken;
+    if (display.selection && !_generatedViews.linePoints.empty()) {
+        const double last = double(_generatedViews.linePoints.size() - 1);
+        if (display.selection->first > 0) ranges.dimmed.emplace_back(0.0, display.selection->first);
+        if (display.selection->second < last) ranges.dimmed.emplace_back(display.selection->second, last);
+    }
+    setLineRangeDisplay(ranges);
 }
 
 void LineAnnotationDialog::setWorkspaceEmbedded(bool embedded)
@@ -2717,7 +2774,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         const double previousLinePosition = _currentLinePosition;
         const float previousDisplayTangentSign = _displayTangentSign;
         _generatedViews = std::move(views);
-        _generatedViews.dimmedLineRanges = _pieceRanges.dimmed;
+        _generatedViews.dimmedLineRanges = _lineRanges.dimmed;
         invalidateStripContextIndex();
         noteDisplayedLineControls();
         _displayTangentSign = vc3d::line_annotation::generatedDisplayTangentSign(
@@ -2778,7 +2835,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             !updateSidePlaneSurface(_generatedViews.sideCutSurface.get(),
                                     _currentLinePosition)) {
             _generatedViews = _heldGeneratedViews;
-            _generatedViews.dimmedLineRanges = _pieceRanges.dimmed;
+            _generatedViews.dimmedLineRanges = _lineRanges.dimmed;
             invalidateStripContextIndex();
             // The held controls may be a provisional publish; the line-space
             // bookkeeping is restored from its own snapshot.
@@ -2988,7 +3045,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     _generatedTopWidget = nullptr;
 
     _generatedViews = views;
-    _generatedViews.dimmedLineRanges = _pieceRanges.dimmed;
+    _generatedViews.dimmedLineRanges = _lineRanges.dimmed;
     invalidateStripContextIndex();
     // Freshly built views (a new fiber, or panes rebuilt from scratch): the
     // settled layout, if any, belonged to the previous geometry.
@@ -3586,13 +3643,6 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     };
     options.setBreak = [this, surfaceName](size_t controlPointIndex, bool enabled) {
         emit generatedControlPointBreakChangeRequested(surfaceName, controlPointIndex, enabled);
-    };
-    options.setLock = [this, surfaceName](size_t controlPointIndex, bool enabled) {
-        emit generatedControlPointLockChangeRequested(surfaceName, controlPointIndex, enabled);
-    };
-    options.openPiece = [this, surfaceName](vc3d::line_annotation::GeneratedPieceEnd a,
-                                            vc3d::line_annotation::GeneratedPieceEnd b) {
-        emit generatedPieceOpenRequested(surfaceName, a, b);
     };
     const auto result = vc3d::line_annotation::showGeneratedControlPointContextMenu(options);
     if (!self) {
@@ -6446,8 +6496,10 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
         // A read-only window has none of its edit signals connected.
         if (_readOnly) {
             emit editGestureRefused(tr("The direction drag in the strip"),
-                                    tr("this fiber is open read only; click \"Enable editing\" first (or check "
-                                       "\"Open fibers editable\" in the menu)"));
+                                    _approvalMode
+                                        ? tr("the approval window changes normals only, never the fiber's geometry")
+                                        : tr("this fiber is open read only; click \"Enable editing\" first (or check "
+                                             "\"Open fibers editable\" in the menu)"));
             return true;
         }
         if (_optimizationInputBlocked || !_hasGeneratedViews) return true;
@@ -6565,7 +6617,7 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
             return _crossSectionDrag.has_value();
         // A read-only window has none of its edit signals connected: the
         // gesture would preview and then go nowhere.
-        if (_readOnly) {
+        if (_readOnly && !_approvalMode) {
             emit editGestureRefused(tr("The Shift-drag in the cross view"), tr("this fiber is open read only; click \"Enable editing\" first (or check "
                                             "\"Open fibers editable\" in the menu)"));
             return true;
@@ -6907,15 +6959,10 @@ void LineAnnotationDialog::rebuildOverviewBarLayout()
             dot.dottedEdge = true;
             dot.radius += 1.0;
         }
-        if (control.isLock && !control.isLinkCandidate) {
-            // A lock control point of an approval piece: light grey ring.
-            dot.edge = QColor(235, 235, 235);
-            dot.radius += 1.0;
-        }
         dots.push_back(dot);
     }
-    // Piece approval ranges, in the same fractions as the current marker.
-    LineAnnotationOverviewBar::PieceFractions pieceFractions;
+    // The displayed line ranges, in the same fractions as the current marker.
+    LineAnnotationOverviewBar::RangeFractions rangeFractions;
     const auto toFractions = [&](const std::vector<std::pair<double, double>>& ranges) {
         std::vector<std::pair<double, double>> result;
         for (const auto& [first, second] : ranges) {
@@ -6928,9 +6975,9 @@ void LineAnnotationDialog::rebuildOverviewBarLayout()
         }
         return result;
     };
-    pieceFractions.dimmed = toFractions(_pieceRanges.dimmed);
-    pieceFractions.approved = toFractions(_pieceRanges.approved);
-    pieceFractions.stale = toFractions(_pieceRanges.stale);
+    rangeFractions.dimmed = toFractions(_lineRanges.dimmed);
+    rangeFractions.approved = toFractions(_lineRanges.approved);
+    rangeFractions.stale = toFractions(_lineRanges.stale);
     bar->setLineData(_generatedViews.linePoints.size(),
                      std::move(dots),
                      std::move(gapPieces),
@@ -6938,7 +6985,7 @@ void LineAnnotationDialog::rebuildOverviewBarLayout()
                      positionAnchors,
                      cumulativeArcLength,
                      totalArcLength,
-                     std::move(pieceFractions));
+                     std::move(rangeFractions));
 }
 
 void LineAnnotationDialog::updateOverviewBar()

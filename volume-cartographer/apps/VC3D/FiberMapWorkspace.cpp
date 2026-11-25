@@ -1346,23 +1346,6 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
         }
         };
     });
-    // The restricted scope: the map's selection grown to the networks it
-    // touches. A run over part of the annotation has to carry every link of
-    // that part, and a network is exactly the group the layout linked.
-    _solverPanel->setScopeResolver([this]() -> std::vector<std::string> {
-        std::set<int> networks;
-        std::set<uint64_t> wanted(_selectedFibers.begin(), _selectedFibers.end());
-        for (const uint64_t id : _selectedFibers) {
-            const auto entry = _entries.find(id);
-            if (entry != _entries.end() && entry->networkId >= 0) networks.insert(entry->networkId);
-        }
-        for (auto entry = _entries.begin(); entry != _entries.end(); ++entry)
-            if (entry->networkId >= 0 && networks.count(entry->networkId) != 0) wanted.insert(entry.key());
-        std::vector<std::string> uuids;
-        for (const auto& [uuid, id] : _fiberIdByUuid)
-            if (wanted.count(id) != 0) uuids.push_back(uuid);
-        return uuids;
-    });
     connect(_solverPanel, &vc3d::fiber_map::ScaffoldSolverPanel::solveRequested, this, [this]() {
         if (!_solveController || !_solverPanel) return;
         _solveController->startSolve(_solverPanel->request());
@@ -1391,8 +1374,27 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
             });
     connect(_approvalPanel, &vc3d::fiber_map::ScaffoldApprovalPanel::highlightModeChanged, this,
             [this]() { rebuildApprovalOverlay(); });
-    connect(_runsPanel, &vc3d::fiber_map::ScaffoldRunsPanel::followChanged, this,
-            [this]() { updateFollowedSolve(); });
+    // A changed approval layer (the approval window closed with changes)
+    // solves again; while a solve runs, once more when it has finished.
+    if (_controller) {
+        connect(_controller, &LineAnnotationController::fiberApprovalChanged, this, [this](const QString&) {
+            if (!_solveController || !_solverPanel) return;
+            if (_solveController->busy()) {
+                _solveAgainWhenIdle = true;
+                setOperationStatus(tr("Approval changed - solving again when the running solve has finished"));
+                return;
+            }
+            setOperationStatus(tr("Approval changed - solving again"));
+            _solveController->startSolve(_solverPanel->request());
+        });
+        connect(_solveController, &vc3d::fiber_map::ScaffoldSolveController::busyChanged, this, [this](bool busy) {
+            if (busy || !_solveAgainWhenIdle || !_solverPanel) return;
+            _solveAgainWhenIdle = false;
+            QTimer::singleShot(0, this, [this]() {
+                if (_solveController && !_solveController->busy()) _solveController->startSolve(_solverPanel->request());
+            });
+        });
+    }
     connect(_solveController, &vc3d::fiber_map::ScaffoldSolveController::selectionChanged, this,
             [this]() { updateFollowedSolve(); });
 
@@ -4274,7 +4276,6 @@ void FiberMapWorkspace::updateSolveFrame()
     _solverPanel->setFrame(volume, handedness);
     _solveController->setFrame(volume);
     // Without a layout there is no selection to restrict a run to.
-    _solverPanel->setScopeAvailable(_layoutBuilt && !_layout.fibers.empty());
     // The runs live in the fiber store, so the list follows it: attaching a
     // store after the map was first shown must not leave an empty list.
     const auto store = _state ? _state->storeFor("fiber") : std::nullopt;
@@ -4366,7 +4367,7 @@ void FiberMapWorkspace::updateFollowedSolve()
 {
     vc3d::fiber_map::FollowedSolve followed;
     const auto* view = _solveController ? _solveController->selected() : nullptr;
-    if (_runsPanel && _runsPanel->follow() && view) {
+    if (view) {
         bool approved = true, pending = false, automatic = false;
         const auto settings = nlohmann::json::parse(view->run.settingsJson, nullptr, false);
         if (settings.is_object()) {
@@ -4404,7 +4405,9 @@ void FiberMapWorkspace::updateFollowedSolve()
         followed.windings == _followedSolve.windings && followed.chirality == _followedSolve.chirality)
         return;
     _followedSolve = std::move(followed);
-    if (_layoutBuilt) {
+    // A selected solve is shown at once: the map is updated from it, also
+    // when it has no layout yet.
+    if (_layoutBuilt || !_followedSolve.empty()) {
         setOperationStatus(_followedSolve.empty()
                                ? tr("Following the map's own evidence again — rebuilding")
                                : tr("Laying the map out from the selected solve: %1 fibers placed at its "
@@ -4537,24 +4540,9 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
         return;
     }
     const auto fiberId = found->second;
-    const auto controls = _controller->storedControlSummaries(fiberId);
-    if (std::size_t(controlTo) >= controls.size() || controlFrom < 0 || controlTo <= controlFrom) {
-        setOperationStatus(tr("The solve's control range is no longer in that fiber; press Update"));
-        return;
-    }
-    const auto& a = controls[std::size_t(controlFrom)];
-    const auto& b = controls[std::size_t(controlTo)];
-    if (a.storeId < 0 || b.storeId < 0) {
-        setOperationStatus(tr("That stretch's control points are not saved yet"));
-        return;
-    }
-    // Ends in line order; both become lock control points when the piece opens.
-    vc3d::line_annotation::PiecePlan plan;
-    plan.a.storeId = a.storeId;
-    plan.b.storeId = b.storeId;
-    // The stretch's own ends, when it states them: the lock controls are
-    // placed there (inserted if the fiber carries none), so the piece is the
-    // accused stretch and not the wider span its controls bracket.
+    // The stretch as a range of the fiber's stored line points; without the
+    // stretch's own ends, the control points that bracket it.
+    int lineFrom = -1, lineTo = -1;
     if (std::isfinite(arcFrom) && std::isfinite(arcTo) && arcTo > arcFrom) {
         // The solve's arcs are in its own frame: the fiber's annotated length
         // there (its last control's arc) brings them into the open volume's.
@@ -4571,12 +4559,7 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
             setOperationStatus(tr("That stretch reaches past the fiber's control points; solve again"));
             return;
         }
-        if (first && last && *last > *first) {
-            plan.a = vc3d::line_annotation::PiecePlanEnd{};
-            plan.b = vc3d::line_annotation::PiecePlanEnd{};
-            plan.a.lineIndex = *first;
-            plan.b.lineIndex = *last;
-        }
+        if (*last > *first) { lineFrom = *first; lineTo = *last; }
     }
     // A stretch a solve accuses is reviewed against that solve: the annotation
     // shows the normals the run used, and interpolates on top of those.
@@ -4592,13 +4575,15 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
             // A stretch is reviewed against the normals of its solve. Without
             // them it is not opened: no other normals stand in.
             _controller->setSolverLineNormals(fiberId, nullptr);
-            const auto message = tr("ERROR: stretch not opened - the solve's normals for this fiber cannot be read: %1").arg(why);
+            const auto message = tr("ERROR: fiber not opened for approval - the solve's normals for this fiber cannot be read: %1").arg(why);
             Logger()->error("fiber map: {}", message.toStdString());
             setOperationStatus(message);
             return;
         }
     }
-    emit openFiberPieceRequested(fiberId, plan);
+    const QString run = _solveController && _solveController->selected()
+        ? QString::fromStdString(_solveController->selected()->run.runUuid) : QString();
+    emit openFiberApprovalRequested(fiberId, run, lineFrom, lineTo, int(controlFrom), int(controlTo));
 }
 
 void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
@@ -5217,32 +5202,19 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                 }
                 emit openFiberAtControlPointRequested(fiberId, bestIndex);
             });
-        // Piece approval: open the fiber as a piece from this control point
-        // to another lock control point or a fiber end.
-        if (const auto controls = _controller ? _controller->storedControlSummaries(fiberId)
-                                              : std::vector<LineAnnotationController::StoredControlSummary>{};
-            size_t(bestIndex) < controls.size() && controls[size_t(bestIndex)].storeId >= 0) {
-            QMenu* pieceMenu = menu.addMenu(tr("Open piece from control point %1 to").arg(bestIndex));
-            const auto addPiece = [&](const QString& label, vc3d::line_annotation::PiecePlanEnd other, bool otherFirst) {
-                QAction* pieceAction = pieceMenu->addAction(label);
-                vc3d::line_annotation::PiecePlan plan;
-                vc3d::line_annotation::PiecePlanEnd here;
-                here.storeId = controls[size_t(bestIndex)].storeId;
-                // Ends in line order: a fiber start comes first, a fiber end last.
-                plan.a = otherFirst ? other : here;
-                plan.b = otherFirst ? here : other;
-                connect(pieceAction, &QAction::triggered, this, [this, fiberId, plan]() {
-                    emit openFiberPieceRequested(fiberId, plan);
-                });
-            };
-            for (const auto& control : controls) {
-                if (int(control.index) == bestIndex || control.storeId < 0 || !control.lock) continue;
-                vc3d::line_annotation::PiecePlanEnd end; end.storeId = control.storeId;
-                addPiece(tr("lock control point %1").arg(control.index), end, int(control.index) < bestIndex);
-            }
-            vc3d::line_annotation::PiecePlanEnd fiberEnd; fiberEnd.fiberEnd = true;
-            addPiece(tr("the fiber start"), fiberEnd, true);
-            addPiece(tr("the fiber end"), fiberEnd, false);
+        // Approval: the whole fiber in the approval window, on the selected solve.
+        {
+            QAction* approvalAction = menu.addAction(tr("Open in fiber approval"));
+            std::string uuid;
+            for (const auto& [known, id] : _fiberIdByUuid)
+                if (id == fiberId) { uuid = known; break; }
+            approvalAction->setEnabled(!uuid.empty() && _solveController && _solveController->selected());
+            if (!approvalAction->isEnabled())
+                approvalAction->setToolTip(tr("Select a scaffold solve first: a fiber is approved on a solve's normals."));
+            connect(approvalAction, &QAction::triggered, this, [this, uuid]() {
+                openScaffoldPiece(uuid, -1, -1, std::numeric_limits<double>::quiet_NaN(),
+                                  std::numeric_limits<double>::quiet_NaN());
+            });
         }
         menu.addSeparator();
     }

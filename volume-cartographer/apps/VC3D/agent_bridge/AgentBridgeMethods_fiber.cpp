@@ -81,57 +81,47 @@ void AgentBridgeServer::registerFiberHandlers()
         },
         [this](const QJsonValue& p) { return handleFiberOpen(p); });
 
-    const auto pieceEnd = [](const QString& name) {
-        return Params::requiredObject(
-            name,
-            {
-                Params::optionalNumber(QStringLiteral("controlPointId")),
-                nonNegativeIndex(QStringLiteral("lineIndex")),
-                Params::optionalBoolean(QStringLiteral("fiberEnd"), false),
-            });
-    };
+    // The approval window (docs/fiber_approval_workflow.md): opened on
+    // the solve whose normals the fiber map handed over for the fiber.
     registerMethod(
         {
-            .name = QStringLiteral("fiber.open_piece"),
+            .name = QStringLiteral("fiber.open_approval"),
             .params = {
                 fiberId(QStringLiteral("fiberId")),
-                pieceEnd(QStringLiteral("a")),
-                pieceEnd(QStringLiteral("b")),
-                Params::optionalBoolean(QStringLiteral("editable"), false),
+                Params::optionalString(QStringLiteral("run")),
+                nonNegativeIndex(QStringLiteral("lineFrom")),
+                nonNegativeIndex(QStringLiteral("lineTo")),
             },
             .errors = {-32602, -32000, -32010, -32007, -32005},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_open_piece")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_open_approval")),
         },
-        [this](const QJsonValue& p) { return handleFiberOpenPiece(p); });
+        [this](const QJsonValue& p) { return handleFiberOpenApproval(p); });
 
+    // One edit in the fiber's approval window: a stretch state (from, to,
+    // aspect, state) or a normal point (normalPoint, optional normal, remove).
     registerMethod(
         {
-            .name = QStringLiteral("fiber.approve_piece"),
+            .name = QStringLiteral("fiber.approval_edit"),
             .params = {
                 fiberId(QStringLiteral("fiberId")),
+                Params::optionalNumber(QStringLiteral("from")),
+                Params::optionalNumber(QStringLiteral("to")),
                 Params::optionalStringEnum(
                     QStringLiteral("aspect"),
                     {QStringLiteral("geometry"), QStringLiteral("normals")},
                     QStringLiteral("geometry")),
-                Params::optionalBoolean(QStringLiteral("approved"), true),
+                Params::optionalStringEnum(
+                    QStringLiteral("state"),
+                    {QStringLiteral("undefined"), QStringLiteral("approved"), QStringLiteral("broken")},
+                    QStringLiteral("approved")),
+                Params::optionalNumber(QStringLiteral("normalPoint")),
+                Params::optionalArray(QStringLiteral("normal"), Params::optionalNumber(QString())),
+                Params::optionalBoolean(QStringLiteral("remove"), false),
             },
             .errors = {-32602, -32000, -32010, -32007, -32005},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_approve_piece")),
+            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_approval_edit")),
         },
-        [this](const QJsonValue& p) { return handleFiberApprovePiece(p); });
-
-    registerMethod(
-        {
-            .name = QStringLiteral("fiber.lock_cp"),
-            .params = {
-                fiberId(QStringLiteral("fiberId")),
-                nonNegativeIndex(QStringLiteral("controlPointIndex")),
-                Params::optionalBoolean(QStringLiteral("enabled"), true),
-            },
-            .errors = {-32602, -32000, -32010, -32007, -32005},
-            .mcp = Mcp::snakeCase(QStringLiteral("vc3d_fiber_lock_cp")),
-        },
-        [this](const QJsonValue& p) { return handleFiberLockControlPoint(p); });
+        [this](const QJsonValue& p) { return handleFiberApprovalEdit(p); });
 
     registerMethod(
         {

@@ -85,7 +85,7 @@ store.scanExtensionRows(read, table.name, [&](const ExtensionRow& row) {
 
 `extensionTables(transaction)` returns registered descriptors. `scanExtensionRows` streams in primary-key order within a physical table; an optional equality prefix uses that key's index. `ExtensionValue` is a variant of null, signed 64-bit integer, double, string and byte vector. `extensionUuid()` converts between UUID text and the common binary representation. The shared `extensionSourcesJson()`/`extensionSourcesFromJson()` codec can also be used by extension-owned run metadata.
 
-Immutable rows can be neither updated nor deleted; an extension that needs to retract or narrow a row appends a *superseding* row that names the replaced one (see [fiber-piece-approval.md](fiber-piece-approval.md) for the pattern). Inside a transaction request, `CreateExtensionTableOp` and `AppendExtensionRowsOp` (`objects/Transactions.hpp`) register a table and append immutable rows under the request's version expectations, so a row can be committed together with the object edit it describes; `StoreReader::scanExtensionRows` reads immutable rows through any local attachment (a hosted reader throws).
+Immutable rows can be neither updated nor deleted; an extension that needs to retract or narrow a row appends a *superseding* row that names the replaced one (see [Measured constraint approval](#measured-constraint-approval) for the pattern); an extension whose state is replaced as a whole appends a new *generation* (see [fiber-approval.md](fiber-approval.md)). Inside a transaction request, `CreateExtensionTableOp` and `AppendExtensionRowsOp` (`objects/Transactions.hpp`) register a table and append immutable rows under the request's version expectations, so a row can be committed together with the object edit it describes; `StoreReader::scanExtensionRows` reads immutable rows through any local attachment (a hosted reader throws).
 
 Registration does not replace an existing table definition or its input provenance. Repeating the same definition is a no-op; incompatible definitions fail. A table containing immutable results uses `versioned=false` and accepts appended rows with distinct keys. Manual data uses the versioned operations described below, not an append that bypasses owner versioning.
 
@@ -161,6 +161,22 @@ Operations that preserve complete databases retain optional tables. `exportJson`
 
 Generic extension read/write methods are currently local C++/Python APIs. `HostedStore`, server transaction operations and hosted extension-row queries have not been added. Hosting a store does not make its optional rows remotely queryable through core object listings. Existing core reads remain usable, but remote consumers must not treat those listings or object-copy operations as a complete extension export.
 
+## Listing and dropping tables
+
+`vc_object_extensions` lists a store's extension tables and removes tables of extensions that no longer exist:
+
+```
+vc_object_extensions --db objects.vcobj --list
+vc_object_extensions --db objects.vcobj --author NAME --drop TABLE [--drop TABLE ...] [--yes]
+```
+
+- `--list` prints name, extension, format version and row count of every table.
+- `--drop` without `--yes` only prints what would be dropped.
+- A drop removes the table, all its rows and its registration in one commit. It cannot be undone and the store
+  records nothing about the table's contents; copy the store first if they may still be needed.
+- A name the store does not register fails the whole call. Close every program that has the store open first.
+- Native: `ObjectStore::dropExtensionTable(WriteTxn&, name)`. There is no transaction-request operation for it.
+
 ## Fiber graph solve extension
 
 The shared extension family is `ext_fiber_graph_solve`. Import definitions and row builders are in [`objects/FiberImportExtension.hpp`](../include/vc_object_store/objects/FiberImportExtension.hpp); workflow-result definitions are in [`objects/FiberGraphSolveExtension.hpp`](../include/vc_object_store/objects/FiberGraphSolveExtension.hpp). These are optional typed tables, not additional core-schema columns. Importers create only the applicable source/constraint tables; merely requesting a solver-table definition creates nothing. This supplies storage for workflows without changing or rerunning any solver algorithm.
@@ -233,7 +249,7 @@ For numerical stage setup, `CollectionReader.fiber_result_columns(run_uuid)` ret
 
 `p_h`, `p_v` and `p_broken` are joint classification probabilities (not H/V probabilities conditional on being enabled). `selected_probability` and `_hypotheses.probability` are winding probabilities conditional on being enabled; `joint_probability` includes disablement. An explicit `enabled` flag records the output selection rather than imposing a probability threshold in storage. Sample directions and normal axes are in the fiber's core XYZ coordinate frame. `normal_sign` is the whole-fiber multiplier applied to the locally aligned sample axes; `sign_probability` is the probability of multiplier +1, not an inward/outward label. A downstream stage can reference the sampling/classification run through `_inputs` instead of repeating its rows.
 
-`_residuals` rows are ranked within their run: `residual_index` 0 is the most expensive violation. A violated constraint whose two fibers are not otherwise connected lies on no cycle and leaves `cycle_hops`, `cycle_piece_length` and `redundancy` NULL together; a row with one of them must have all three. `redundancy` counts the edge-disjoint alternative paths a run looked for, so it is at least 1 whenever a cycle was found and is capped by the solve's own setting. `_residual_pieces` names the stretches between the constraints that enter and leave each fiber of that cycle; `control_from`/`control_to` bracket the stretch outward, so it covers the spans `control_from` to `control_to - 1` and a piece opened between those two controls contains it (NULL only for a fiber without control points). These rows are a solver's ranking of its own violations, not a verdict about the annotation.
+`_residuals` rows are ranked within their run: `residual_index` 0 is the most expensive violation. A violated constraint whose two fibers are not otherwise connected lies on no cycle and leaves `cycle_hops`, `cycle_piece_length` and `redundancy` NULL together; a row with one of them must have all three. `redundancy` counts the edge-disjoint alternative paths a run looked for, so it is at least 1 whenever a cycle was found and is capped by the solve's own setting. `_residual_pieces` names the stretches between the constraints that enter and leave each fiber of that cycle; `control_from`/`control_to` bracket the stretch outward, so it covers the spans `control_from` to `control_to - 1` (NULL only for a fiber without control points). These rows are a solver's ranking of its own violations, not a verdict about the annotation.
 
 Metrics use exactly one of `value` or `count`. For example, a mean residual and its sample count are two separately named metrics, not a floating value with an overloaded count field. Missing metrics stay absent/NULL rather than pretending to be zero.
 
@@ -329,8 +345,7 @@ A link between two fibers carries its approval state on its edge record. A
 *measured* constraint - a crossing an extraction found rather than an
 annotation - has no record to carry one, so its approval is a row of
 `ext_fiber_constraint_approval` (extension `fiber-constraint-approval`, format
-1, `keySpace="objects"`, immutable). Revoking appends a superseding row, as in
-[piece approval](fiber-piece-approval.md); live rows of one constraint never
+1, `keySpace="objects"`, immutable). Revoking appends a superseding row; live rows of one constraint never
 overlap.
 
 | Column | Type | Value |
@@ -354,9 +369,9 @@ every time, while a re-extraction places the same crossing within one quantum
 of where it was, so the approval survives it. A different crossing of the same
 pair falls in another quantum and keeps its own identity.
 
-The two span fingerprints are the piece-approval ones (FNV-1a 64 over the
-span's line points): editing either covering span invalidates the approval the
-same way it invalidates a piece approval, and
+The two span fingerprints are `fiberSpanHash` of `objects/FiberContent.hpp`
+(FNV-1a 64 over the line points between two neighbouring control points):
+editing either covering span invalidates the approval, and
 `fiberConstraintApprovalCurrent` is what states that. An approval row carries
 both fingerprints; a revocation carries neither.
 

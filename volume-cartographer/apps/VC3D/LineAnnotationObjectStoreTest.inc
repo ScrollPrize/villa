@@ -117,7 +117,7 @@ int runObjectStoreControllerTests()
 #include "LineAnnotationHostedReadTest.inc"
 #include "LineAnnotationCompoundTest.inc"
 #include "LineAnnotationFiberCacheTest.inc"
-#include "LineAnnotationPieceLockTest.inc"
+#include "LineAnnotationApprovalTest.inc"
 #include "FiberMapScaffoldApprovalTest.inc"
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;

@@ -216,6 +216,18 @@ struct ScaffoldSolveResult {
     std::vector<WindingArc> arcs; // aggregated, as solved
     std::vector<std::int64_t> winding, component; // per fiber; unconstrained fibers get their own component
     std::int64_t components = 0, isolatedFibers = 0;
+    // A fiber with broken geometry is solved as its parts (the stretches of
+    // arc between the broken ones), each with a winding of its own. `winding`
+    // and `component` hold the longest part; all parts are listed here.
+    // Components and isolated fibers count parts.
+    struct Part {
+        std::int64_t fiber = 0;
+        double arcFrom = 0, arcTo = 0;
+        std::int64_t winding = 0, component = 0;
+        bool main = false;
+    };
+    std::vector<Part> parts;
+    std::int64_t splitFibers = 0;
     std::vector<ScaffoldResidual> residuals; // violated constraints, worst cost first
     std::vector<ScaffoldPieceScore> pieces;  // highest score first
     double objective = 0, maxResidual = 0;

@@ -249,6 +249,17 @@ void detail::createExtensionTable(sqlite3* db,const ExtensionTable& spec) {
         spec.extension,spec.formatVersion,sources,provisioning.dump(),spec.keySpace,int64_t(spec.versioned),writeCommitSequence(db),spec.name);
     changed(db,spec.name);save.release();
 }
+void detail::dropExtensionTable(sqlite3* db,const std::string& name) {
+    if(!extensionTable(db,name,false))throw std::invalid_argument("extension: unregistered table "+name);
+    Savepoint save(db);
+    // Stamped while the registration still exists: the store is dirty and
+    // older feed cursors end here, as for any other extension change.
+    changed(db,name);
+    execute(db,"DELETE FROM extension_tables WHERE table_uuid=(SELECT uuid FROM table_directory WHERE name=?)",name);
+    exec(db,("DROP TABLE "+identifier(name)).c_str());
+    registerStorageTables(db);
+    save.release();
+}
 void detail::appendExtensionRows(sqlite3* db,const std::string& name,std::span<const ExtensionRow> rows) {
     const auto info=extensionTable(db,name,false);if(!info)throw std::invalid_argument("extension: unregistered table "+name);
     if(info->versioned)throw std::invalid_argument("extension: versioned fields require replaceExtensionRows");
@@ -369,6 +380,7 @@ std::optional<ExtensionTableInfo> detail::resolvedExtensionTable(sqlite3* db,con
     }
     return result;
 }
+void ObjectStore::dropExtensionTable(WriteTxn& t,const std::string& name){detail::dropExtensionTable(static_cast<sqlite3*>(connection(t)),name);}
 void ObjectStore::createExtensionTable(WriteTxn& t,const ExtensionTable& spec){detail::createExtensionTable(static_cast<sqlite3*>(connection(t)),spec);}
 std::vector<ExtensionTableInfo> ObjectStore::extensionTables(const Txn& t) const{
     std::vector<ExtensionTableInfo> result;

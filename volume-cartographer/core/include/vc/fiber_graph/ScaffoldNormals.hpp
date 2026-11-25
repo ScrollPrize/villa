@@ -20,7 +20,7 @@
 //
 //   1. a stretch approved for the normals aspect: the normals shown at its
 //      line points when it was approved are stored with the approval
-//      (FiberPieceApproval::spanNormals). Every chain node on the stretch is
+//      (FiberApprovalLayer::lineNormals). Every chain node on the stretch is
 //      held on that axis, and the stretch's line points come out with the
 //      stored normals themselves;
 //   2. a control point's `display_normal` with source `manual` outside an

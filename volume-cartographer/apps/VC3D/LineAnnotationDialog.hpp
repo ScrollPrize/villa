@@ -1,6 +1,7 @@
 #pragma once
 
-#include "LineAnnotationPieceLock.hpp"
+#include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationStoredFiber.hpp"
 #include <QMainWindow>
 #include <QElapsedTimer>
 #include <QList>
@@ -224,17 +225,28 @@ public:
     void setFiberTags(const std::vector<std::string>& knownTags,
                       const std::vector<std::string>& activeTags,
                       bool enabled);
-    // Piece approval display (LineAnnotationPieceLock.hpp): the dimmed and
-    // approved/stale line ranges, the lock control points, and the two
-    // approval checkboxes' state (shown only while a piece is open).
-    void setPieceLockDisplay(const vc3d::line_annotation::PieceDisplayRanges& ranges,
-                             const std::vector<size_t>& lockControls,
-                             const vc3d::line_annotation::PieceApprovalBoxState& boxes,
-                             bool editable);
+    // Line ranges (line positions) marked on the overview bar: drawn dimmed
+    // (also in the strips and cuts), and underlined as approved or stale.
+    struct LineRangeDisplay {
+        std::vector<std::pair<double, double>> dimmed, approved, stale;
+    };
+    void setLineRangeDisplay(const LineRangeDisplay& ranges);
     void setCloseAfterFinalizationAllowed(bool allowed);
     // A stored fiber opens read-only with an Enable editing button (disabled
     // when canEdit is false); the fiber settings are locked meanwhile.
     void setReadOnly(bool readOnly, bool canEdit = true);
+    // The approval window: the fiber stays read only, but normal points can
+    // be set (the cross view's Shift-drag, a control point placement) and
+    // stretches given a state. Call after setReadOnly(true).
+    void setApprovalMode(bool approval);
+    struct ApprovalDisplay {
+        std::optional<std::pair<double, double>> selection;  // line positions
+        std::vector<std::pair<double, double>> approvedGeometry, approvedNormals, broken, stale;
+        // State of the selection per aspect: 0 undefined, 1 approved, 2 broken, -1 mixed.
+        int geometryState = 0, normalsState = 0;
+        int normalPoints = 0;
+    };
+    void setApprovalDisplay(const ApprovalDisplay& display);
     // Called by the receiver of an edit commit (crossSectionDragFinished,
     // controlDirectionCreated, controlDirectionChanged) as it takes it over.
     void acknowledgeEditCommit() { _editCommitReceived = true; }
@@ -299,12 +311,6 @@ signals:
                                      size_t firstControlPointIndex,
                                      size_t secondControlPointIndex,
                                      bool linkHalves);
-    void generatedControlPointLockChangeRequested(const std::string& surfaceName,
-                                                  size_t controlPointIndex,
-                                                  bool enabled);
-    void generatedPieceOpenRequested(const std::string& surfaceName,
-                                     vc3d::line_annotation::GeneratedPieceEnd a,
-                                     vc3d::line_annotation::GeneratedPieceEnd b);
     void generatedSpanGapChangeRequested(const std::string& surfaceName,
                                          size_t firstControlPointIndex,
                                          size_t secondControlPointIndex,
@@ -348,8 +354,11 @@ signals:
     void fiberFollowSettingsChanged();
     void fiberFollowConfidenceChanged();
     void fiberTagChangeRequested(const QString& tag, bool enabled);
-    // aspect: 0 geometry ("Approved"), 1 normals ("Normal approved").
-    void pieceApprovalChangeRequested(int aspect, bool approved);
+    // Approval window. bound: 0 the stretch starts, 1 ends at the line
+    // position; 2 selects the whole annotated line.
+    void approvalSelectionBoundRequested(int bound, double linePosition);
+    // aspect: 0 geometry, 1 normals; state: 0 undefined, 1 approved, 2 broken.
+    void approvalStateRequested(int aspect, int state);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
     void fiberOptimizationModeChanged(
@@ -689,11 +698,14 @@ private:
     QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPushButton* _enableEditingButton = nullptr;
-    QCheckBox* _pieceApprovedBox = nullptr;
-    QCheckBox* _pieceNormalApprovedBox = nullptr;
-    vc3d::line_annotation::PieceDisplayRanges _pieceRanges;
-    std::vector<size_t> _pieceLockControls;
+    LineRangeDisplay _lineRanges;
     bool _readOnly = false;
+    bool _approvalMode = false;
+    QWidget* _approvalPanel = nullptr;
+    QLabel* _approvalLabel = nullptr;
+    QComboBox* _approvalGeometryCombo = nullptr;
+    QComboBox* _approvalNormalsCombo = nullptr;
+    ApprovalDisplay _approvalDisplay;
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
     QWidget* _fiberTraceStatus = nullptr;

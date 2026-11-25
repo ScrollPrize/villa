@@ -1,11 +1,10 @@
 // The scaffold approval dock's rules against a real store: a measured
 // crossing may only be approved while both pieces it lies on are approved
-// geometry, the approval drops out again when a piece approval is revoked,
+// geometry, the approval drops out again when that geometry approval is cleared,
 // and an anchor's covering span is resolved from the fiber's own controls.
 // Included in runObjectStoreControllerTests (VC_TESTING only).
 {
     namespace la = vc3d::line_annotation;
-    using Aspect = vc::objects::FiberPieceAspect;
     using vc::fiber_graph::ScaffoldConstraintKind;
     using vc::fiber_graph::ScaffoldStoredResidual;
     QTemporaryDir directory;
@@ -111,7 +110,7 @@
         require(onControl && *onControl == std::int64_t(std::llround(found->arcFrom)),
                 "a stretch's end is an existing control's line point");
         const auto controls = controller.storedControlSummaries(horizontal.id);
-        require(controls.size() == 8, "the fiber's controls are untouched until the piece is edited");
+        require(controls.size() == 8, "the fiber's controls are untouched");
     }
 
     // Approval is refused while the pieces are not approved, and nothing is
@@ -120,24 +119,36 @@
     require(!refusal.isEmpty(), "a crossing over unapproved geometry is refused");
     require(!solves.constraintApproved(residual), "the refusal stored no approval");
 
-    // Approve the covering piece of both fibers, as the piece view does.
-    const auto approvePiece = [&](const Controller::StoredFiber& fiber) {
+    // The geometry between controls 3 and 4 of both fibers gets a state in
+    // their approval layer, as the approval window writes it.
+    const auto writeLayer = [&](const Controller::StoredFiber& fiber, vc::objects::FiberStretchState stretchState) {
         auto request = state.objectStoreSession()->newRequest(fiber.storePin->attachment);
-        std::vector<vc::objects::ExtensionRow> values;
+        vc::objects::FiberApprovalLayer layer;
         state.objectStoreSession()->readStore(fiber.storePin->attachment, [&](const StoreReader& reader, const auto&) {
             const auto revisions = reader.objectsAtVersions({fiber.storePin->reference()});
             const auto content = vc::objects::fiberPieceContent(reader, *revisions.front());
-            vc::objects::FiberPieceRange range; range.first = 3; range.last = 4;
-            values.push_back(vc::objects::fiberPieceApprovalRow(
-                vc::objects::approveFiberPiece(content, fiber.uuid, range, Aspect::Geometry,
-                                               revisions.front()->version, request.author,
-                                               "2026-11-18T12:00:00Z", "test-host")));
+            const auto stored = vc::objects::readFiberApproval(reader, fiber.uuid);
+            layer.fiberUuid = fiber.uuid;
+            layer.generation = (stored ? stored->generation : 0) + 1;
+            layer.fiberVersion = revisions.front()->version;
+            layer.author = request.author;
+            layer.savedAt = "2026-11-18T12:00:00Z";
+            layer.host = "test-host";
+            vc::objects::setFiberStretchState(layer.stretches, vc::objects::FiberApprovalAspect::Geometry,
+                                              double(content.controlLineIndex[3]), double(content.controlLineIndex[4]),
+                                              stretchState, content.linePoints);
         });
-        request.operations.push_back(
-            vc::objects::CreateExtensionTableOp{vc::objects::fiberPieceApprovalTable()});
-        request.operations.push_back(
-            vc::objects::AppendExtensionRowsOp{vc::objects::kFiberPieceApprovalTable, std::move(values)});
+        for (const auto& table : vc::objects::fiberApprovalTables())
+            request.operations.push_back(vc::objects::CreateExtensionTableOp{table});
+        auto rows = vc::objects::fiberApprovalRows(layer);
+        request.operations.push_back(vc::objects::AppendExtensionRowsOp{vc::objects::kFiberApprovalTable, {rows.header}});
+        if (!rows.stretches.empty())
+            request.operations.push_back(
+                vc::objects::AppendExtensionRowsOp{vc::objects::kFiberApprovalStretchTable, rows.stretches});
         state.objectStoreSession()->submitDurably(fiber.storePin->attachment, request);
+    };
+    const auto approvePiece = [&](const Controller::StoredFiber& fiber) {
+        writeLayer(fiber, vc::objects::FiberStretchState::Approved);
     };
     approvePiece(horizontal);
     approvePiece(vertical);
@@ -150,23 +161,8 @@
     require(approved.isEmpty(), "the crossing is approved once its pieces are");
     require(solves.constraintApproved(residual), "the approval is read back");
 
-    // Revoking a piece approval leaves the row but takes the constraint's
-    // approval out of the next solve: the live piece state decides.
-    {
-        auto request = state.objectStoreSession()->newRequest(horizontal.storePin->attachment);
-        std::vector<vc::objects::ExtensionRow> values;
-        state.objectStoreSession()->readStore(horizontal.storePin->attachment,
-                                              [&](const StoreReader& reader, const auto&) {
-            for (const auto& row : vc::objects::liveFiberPieceApprovals(
-                     vc::objects::readFiberPieceApprovals(reader, horizontal.uuid)))
-                values.push_back(vc::objects::fiberPieceApprovalRow(
-                    vc::objects::revokeFiberPieceApproval(row, request.author, "2026-11-18T12:30:00Z")));
-        });
-        require(!values.empty(), "the piece approval is live before it is revoked");
-        request.operations.push_back(
-            vc::objects::AppendExtensionRowsOp{vc::objects::kFiberPieceApprovalTable, std::move(values)});
-        state.objectStoreSession()->submitDurably(horizontal.storePin->attachment, request);
-    }
+    // Back to undefined: the next generation of the layer decides.
+    writeLayer(horizontal, vc::objects::FiberStretchState::Undefined);
     solves.loadApprovals();
     require(!solves.anchorSpan(residual.fiberA, residual.arcA).geometryApproved,
             "the revoked piece is unapproved again");

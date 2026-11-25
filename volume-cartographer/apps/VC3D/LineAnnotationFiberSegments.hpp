@@ -168,6 +168,13 @@ struct LineControlPoint : vc::lasagna::LineControlPoint {
     explicit LineControlPoint(const vc::lasagna::LineControlPoint& value) : vc::lasagna::LineControlPoint(value) {}
 };
 
+inline bool isNormalPoint(const LineControlPoint& control)
+{
+    for (const auto& tag : control.tags)
+        if (tag == "normal_point") return true;
+    return false;
+}
+
 inline void clearControlPointCorrections(LineControlPoint& control)
 {
     control.direction.reset();
@@ -265,6 +272,10 @@ inline constexpr const char* kReviewedTag = "reviewed";
 // kollesis (sheet join). Set from the control point context menu; rendered
 // pale yellow in the line annotation views and the Fiber Map.
 inline constexpr const char* kKollesisTerminationTag = "kollesis_termination";
+// A normal point of the approval window: a control point of the session only,
+// never of the fiber. It carries a normal and changes no geometry
+// (docs/fiber_approval_workflow.md).
+inline constexpr const char* kNormalPointTag = "normal_point";
 
 // Per-control-point tag: the point sits at the edge of a break in the papyrus.
 // Any control point may carry it. A span whose two endpoints (neighbours in
@@ -514,14 +525,6 @@ struct FiberModeOptimizationRequest {
     std::optional<std::vector<size_t>> dirtySegments;
     bool globalGoalsOnly = false;
     bool retraceAll = false;
-    // Spans fixed by piece approvals (LineAnnotationPieceLock.hpp): never
-    // attempted, their base geometry kept whatever the dirty set or a
-    // whole-line pass asks for.
-    std::vector<size_t> lockedSpans;
-    // Keep the base line's open tail on this side (the side is locked)
-    // instead of re-tracing or regrowing it.
-    bool retainLeftTail = false;
-    bool retainRightTail = false;
     // Ordinary line annotation retains open geometry outside the controls.
     // Spiral 2D annotation uses the controls as inclusive bounds.
     bool retainOpenTails = true;

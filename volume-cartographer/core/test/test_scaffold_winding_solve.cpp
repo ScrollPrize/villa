@@ -67,15 +67,12 @@ struct Builder {
         return graph.fibers.size() - 1;
     }
 
-    // Every span of a fiber approved for geometry: the condition a link or a
+    // The whole fiber approved for geometry: the condition a link or a
     // measured constraint has to meet to be held rigid.
     void approveGeometry(std::size_t fiber)
     {
         auto& entry = graph.fibers[fiber];
-        const auto spans = entry.content.controlIds.size() - 1;
-        auto& approved = entry.approvals.approvedSpans[std::size_t(vc::objects::FiberPieceAspect::Geometry)];
-        approved.clear();
-        for (std::size_t span = 0; span < spans; ++span) approved.push_back(span);
+        entry.approval.approvedGeometry = {{0., double(entry.pointCount - 1)}};
     }
 
     // Anchors on the polylines at height `height`, so their projection
@@ -526,6 +523,50 @@ TEST_CASE("a sign constraint bounds the step from one side and costs only when b
         approved.front().approved = true;
         CHECK_THROWS(solveScaffoldWinding(builder.graph, geometry, options, approved));
     }
+}
+
+TEST_CASE("broken geometry splits a fiber: its parts take their own winding")
+{
+    Builder builder;
+    const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+    const auto b = builder.fiber(ScaffoldFamily::Vertical, 110.);
+    // Two crossings of the same pair that disagree by one winding: `a` left
+    // its sheet somewhere between them.
+    std::vector<ScaffoldConstraint> measured(2);
+    for (std::size_t i = 0; i < 2; ++i) {
+        measured[i].kind = ScaffoldConstraintKind::Perpendicular;
+        measured[i].a = std::int64_t(a);
+        measured[i].b = std::int64_t(b);
+        measured[i].arcA = i == 0 ? 50. : 350.;
+        measured[i].arcB = 200.;
+        measured[i].target = std::int64_t(i);
+        measured[i].weight = 1.;
+    }
+    ScaffoldSolveOptions options;
+    options.links.useLinks = false;
+    {
+        const ScaffoldGeometry geometry(builder.graph);
+        const auto whole = solveScaffoldWinding(builder.graph, geometry, options, measured);
+        CHECK(whole.objective == doctest::Approx(1.));
+        CHECK(whole.parts.empty());
+    }
+    // Line points 30 to 50 (arc 150 to 250) are marked broken.
+    builder.graph.fibers[a].approval.brokenGeometry = {{30., 50.}};
+    const ScaffoldGeometry geometry(builder.graph);
+    CHECK(geometry.nearGap(a, 200., 0.));
+    CHECK_FALSE(geometry.nearGap(a, 100., 0.));
+    const auto result = solveScaffoldWinding(builder.graph, geometry, options, measured);
+    CHECK(result.objective == doctest::Approx(0.));
+    CHECK(result.splitFibers == 1);
+    REQUIRE(result.parts.size() == 2);
+    REQUIRE(result.winding.size() == 2);
+    CHECK(result.parts[0].arcTo == doctest::Approx(200.));
+    // The part at the second crossing lies one winding from the first.
+    CHECK(std::abs(result.parts[1].winding - result.parts[0].winding) == 1);
+    CHECK(result.parts[0].main != result.parts[1].main);
+    const auto& main = result.parts[0].main ? result.parts[0] : result.parts[1];
+    CHECK(result.winding[a] == main.winding);
+    CHECK(result.violatedConstraints == 0);
 }
 
 TEST_CASE("links switched off solve on the measured constraints alone")

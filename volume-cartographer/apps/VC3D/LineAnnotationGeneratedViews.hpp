@@ -98,9 +98,6 @@ struct GeneratedOverlay {
         bool isKollesisTermination = false;
         // Tagged break: dotted amber ring.
         bool isBreak = false;
-        // Tagged lock: a lock control point of an approval piece, fixed in
-        // position and direction; drawn with a light grey ring.
-        bool isLock = false;
         // The span this point owns (to the next control in line order)
         // carries the gap span tag: drawn as the dotted amber line, closed
         // to placement. Read from the span descriptor, never inferred from
@@ -213,8 +210,9 @@ struct GeneratedOverlay {
     // Same, for spans carrying the damaged span tag: drawn as alternating
     // amber and red dashes in place of the fiber's own line.
     std::vector<std::pair<double, double>> damagedLineRanges;
-    // Line-position ranges outside the open approval piece: drawn at half
-    // intensity in place of the fiber's own line (outranks gap and damaged).
+    // Dimmed line-position ranges (outside the approval window's selected
+    // stretch): drawn at half intensity in place of the fiber's own line
+    // (outranks gap and damaged).
     std::vector<std::pair<double, double>> dimmedLineRanges;
     cv::Vec3f seedPoint{std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
@@ -318,8 +316,8 @@ struct GeneratedViews {
     int seedLineIndex = -1;
     int initialCenterIndex = 0;
     std::optional<std::pair<double, double>> initialStripLinePositionRange;
-    // Line-position ranges outside the open approval piece (tails included):
-    // drawn dimmed in the strips and cuts (LineAnnotationPieceLock.hpp).
+    // Line-position ranges drawn dimmed in the strips and cuts
+    // (LineAnnotationDialog::setLineRangeDisplay).
     std::vector<std::pair<double, double>> dimmedLineRanges;
     // Fit the complete line in both strips once instead of restoring saved zooms.
     bool initialFitWholeLine = false;
@@ -3236,15 +3234,6 @@ inline std::vector<GeneratedOverlay::ControlPointMarker> generatedDisplaySpaceCo
     return controls;
 }
 
-// One end of a piece chosen from a context menu: a control, a line position
-// (a lock control is inserted there) or the fiber start / end.
-struct GeneratedPieceEnd {
-    std::optional<size_t> controlIndex;
-    std::optional<double> linePosition;
-    bool fiberStart = false;
-    bool fiberEnd = false;
-};
-
 struct GeneratedControlPointContextMenuOptions {
     QWidget* parent = nullptr;
     std::string surfaceName;
@@ -3317,13 +3306,6 @@ struct GeneratedControlPointContextMenuOptions {
     // (controlIndex, enabled): toggle the break tag on the point. Checkable;
     // adding it is disabled while the point is a kollesis termination.
     std::function<void(size_t, bool)> setBreak;
-    // (controlIndex, enabled): toggle the lock tag of an approval piece on the
-    // point (LineAnnotationPieceLock.hpp); the controller refuses removing a
-    // lock an approval still references.
-    std::function<void(size_t, bool)> setLock;
-    // Open the fiber as an approval piece between the two ends (the lower
-    // line position first).
-    std::function<void(GeneratedPieceEnd, GeneratedPieceEnd)> openPiece;
 };
 
 // The marker of an adjacent-winding link: an upright triangle whose

@@ -436,40 +436,25 @@ QJsonObject AgentBridgeServer::handleFiberDelete(const QJsonValue& params)
 }
 
 
-// fiber.open_piece: the fiber as an approval piece between two ends, each a
-// stored control point id, a line index (a lock control is inserted there)
-// or the fiber end on that side (LineAnnotationPieceLock.hpp).
-QJsonObject AgentBridgeServer::handleFiberOpenPiece(const QJsonValue& params)
+// fiber.open_approval: the fiber in the approval window
+// (docs/fiber_approval_workflow.md).
+QJsonObject AgentBridgeServer::handleFiberOpenApproval(const QJsonValue& params)
 {
     namespace la = vc3d::line_annotation;
     LineAnnotationController* ctrl = fiberController();
     const QJsonObject p = params.toObject();
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
     requireKnownFiber(ctrl, fiberId);
-    const auto endFrom = [](const QJsonObject& o, const char* name) {
-        la::PiecePlanEnd end;
-        int given = 0;
-        if (o.contains("controlPointId")) { end.storeId = int64_t(o.value("controlPointId").toDouble()); ++given; }
-        if (o.contains("lineIndex")) { end.lineIndex = o.value("lineIndex").toInt(); ++given; }
-        if (o.value("fiberEnd").toBool(false)) { end.fiberEnd = true; ++given; }
-        if (given != 1) {
-            QJsonObject data;
-            data["param"] = name;
-            throw AgentBridgeError{-32602, "a piece end is exactly one of controlPointId, lineIndex, fiberEnd", data};
-        }
-        return end;
-    };
-    la::PiecePlan plan;
-    plan.a = endFrom(p.value("a").toObject(), "a");
-    plan.b = endFrom(p.value("b").toObject(), "b");
+    // Opens the fiber in the approval window on the solve whose normals the
+    // fiber map handed over; a stretch is given as stored line indices.
     const QString err = captureFiberError(ctrl, [&] {
-        ctrl->openFiberPiece(fiberId, plan);
-        if (p.value("editable").toBool(false)) ctrl->enableFiberEditing(fiberId);
+        ctrl->openFiberApproval(fiberId, p.value("run").toString().toStdString(), p.value("lineFrom").toInt(-1),
+                                p.value("lineTo").toInt(-1), -1, -1);
     });
     if (!err.isEmpty()) {
         QJsonObject data;
         data["detail"] = err;
-        throw AgentBridgeError{-32005, "fiber.open_piece failed", data};
+        throw AgentBridgeError{-32005, "fiber.open_approval failed", data};
     }
     QJsonObject result;
     result["opened"] = true;
@@ -478,51 +463,44 @@ QJsonObject AgentBridgeServer::handleFiberOpenPiece(const QJsonValue& params)
     return result;
 }
 
-// fiber.approve_piece: approve or revoke the open piece of the fiber for one aspect.
-QJsonObject AgentBridgeServer::handleFiberApprovePiece(const QJsonValue& params)
+// fiber.approval_edit: an edit in the fiber's approval window.
+QJsonObject AgentBridgeServer::handleFiberApprovalEdit(const QJsonValue& params)
 {
     namespace la = vc3d::line_annotation;
     LineAnnotationController* ctrl = fiberController();
     const QJsonObject p = params.toObject();
     const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
     requireKnownFiber(ctrl, fiberId);
-    const auto aspect = p.value("aspect").toString("geometry") == QStringLiteral("normals")
-        ? la::FiberPieceAspect::Normals : la::FiberPieceAspect::Geometry;
-    const bool approved = p.value("approved").toBool(true);
+    // Approval window edits: a stretch state ("from"/"to" stored line
+    // positions, "aspect" geometry|normals, "state" undefined|approved|broken)
+    // or a normal point ("normalPoint": line position, optional "normal"
+    // [x,y,z], "remove": true).
     std::optional<QString> failure;
-    const QString err = captureFiberError(ctrl, [&] { failure = ctrl->setFiberPieceApproval(fiberId, aspect, approved); });
+    bool stored = false;
+    const QString err = captureFiberError(ctrl, [&] {
+        if (p.contains("normalPoint")) {
+            std::optional<cv::Vec3d> normal;
+            const auto values = p.value("normal").toArray();
+            if (values.size() == 3) normal = cv::Vec3d(values[0].toDouble(), values[1].toDouble(), values[2].toDouble());
+            stored = ctrl->setFiberApprovalNormalPoint(fiberId, p.value("normalPoint").toDouble(), normal,
+                                                       p.value("remove").toBool(false));
+        } else {
+            const QString state = p.value("state").toString("approved");
+            stored = ctrl->setFiberApprovalState(
+                fiberId, p.value("from").toDouble(), p.value("to").toDouble(),
+                p.value("aspect").toString("geometry") == QStringLiteral("normals") ? 1 : 0,
+                state == QStringLiteral("broken") ? 2 : state == QStringLiteral("undefined") ? 0 : 1);
+        }
+    });
+    if (err.isEmpty() && !stored) failure = QStringLiteral("the approval layer was not stored");
     if (!err.isEmpty() || failure) {
         QJsonObject data;
         data["detail"] = failure ? *failure : err;
-        throw AgentBridgeError{-32005, "fiber.approve_piece failed", data};
+        throw AgentBridgeError{-32005, "fiber.approval_edit failed", data};
     }
     QJsonObject result;
     result["fiberId"] = QString::number(fiberId);
-    result["aspect"] = aspect == la::FiberPieceAspect::Normals ? "normals" : "geometry";
-    result["approved"] = approved;
-    return result;
-}
-
-// fiber.lock_cp: toggle the lock tag on a control point of the fiber's open pane.
-QJsonObject AgentBridgeServer::handleFiberLockControlPoint(const QJsonValue& params)
-{
-    LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = params.toObject();
-    const uint64_t fiberId = jsonToFiberId(p.value("fiberId"), "fiberId");
-    requireKnownFiber(ctrl, fiberId);
-    const size_t index = size_t(p.value("controlPointIndex").toInt());
-    const bool enabled = p.value("enabled").toBool(true);
-    std::optional<QString> failure;
-    const QString err = captureFiberError(ctrl, [&] { failure = ctrl->setFiberControlLock(fiberId, index, enabled); });
-    if (!err.isEmpty() || failure) {
-        QJsonObject data;
-        data["detail"] = failure ? *failure : err;
-        throw AgentBridgeError{-32005, "fiber.lock_cp failed", data};
-    }
-    QJsonObject result;
-    result["fiberId"] = QString::number(fiberId);
-    result["controlPointIndex"] = int(index);
-    result["locked"] = enabled;
+    result["stored"] = true;
     return result;
 }
 

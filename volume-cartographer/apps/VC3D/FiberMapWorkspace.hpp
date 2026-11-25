@@ -1,6 +1,7 @@
 #pragma once
 
-#include "LineAnnotationPieceLock.hpp"
+#include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationStoredFiber.hpp"
 #include <QFutureWatcher>
 #include <QGraphicsView>
 #include <QHash>
@@ -141,9 +142,11 @@ public:
 
 signals:
     void openFiberAtControlPointRequested(uint64_t fiberId, int controlPointIndex);
-    // "Open piece from control point ... to ...": the fiber as an approval
-    // piece (LineAnnotationPieceLock.hpp).
-    void openFiberPieceRequested(uint64_t fiberId, vc3d::line_annotation::PiecePlan plan);
+    // Open a fiber in the approval window on the selected solve `runUuid`.
+    // The stretch to start on is a range of stored line points, or of
+    // control points when the line range is -1; all -1 is the whole fiber.
+    void openFiberApprovalRequested(uint64_t fiberId, QString runUuid, int lineFrom, int lineTo, int controlFrom,
+                                    int controlTo);
     // A dock of this workspace was moved, floated or closed, so the window
     // state is worth saving again (CWindow owns the settings).
     void dockLayoutChanged();
@@ -196,10 +199,9 @@ private:
     // The approval row under the mouse: drawn in a style of its own, without
     // selecting anything or moving the view.
     void showScaffoldHover(const vc3d::fiber_map::ScaffoldHighlight& highlight);
-    // Opens a ranked stretch as an approval piece between its bracketing
-    // control points.
-    // `arcFrom`/`arcTo`: the stretch's own ends, used for the lock controls
-    // when the fiber states them; NaN falls back to the bracketing controls.
+    // Opens a fiber in the approval window on the selected solve's normals,
+    // starting on a ranked stretch. `arcFrom`/`arcTo`: the stretch's own ends
+    // (in the solve's frame); NaN falls back to the bracketing control points.
     void openScaffoldPiece(const std::string& fiberUuid, std::int64_t controlFrom, std::int64_t controlTo,
                            double arcFrom = std::numeric_limits<double>::quiet_NaN(),
                            double arcTo = std::numeric_limits<double>::quiet_NaN());
@@ -542,6 +544,7 @@ private:
     std::vector<QGraphicsItem*> _highlightSpanItems;
     std::vector<QGraphicsItem*> _hoverItems;
     // The solve the map currently follows (empty: the map's own evidence).
+    bool _solveAgainWhenIdle = false;
     vc3d::fiber_map::FollowedSolve _followedSolve;
     // The datasets one Solve click captured, shared by its two openers for
     // one turn of the event loop.

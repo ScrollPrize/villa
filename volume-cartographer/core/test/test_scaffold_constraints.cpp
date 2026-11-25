@@ -136,9 +136,8 @@ struct Scaffold {
                                                 {"display_normal_source", "manual"}};
     }
 
-    // A normals approval of the whole fiber as the loader hands it over: the
-    // approved normal at the given line points (zero elsewhere), every span
-    // approved by one live row.
+    // A normals approval as the loader hands it over: the approved normal at
+    // the given line points (zero elsewhere), one approved stretch.
     void approveNormals(std::size_t fiber, std::size_t firstPoint, std::size_t lastPoint,
                         const std::function<Point(std::size_t point, const Point& at)>& normal)
     {
@@ -148,20 +147,8 @@ struct Scaffold {
             const auto at = std::size_t(3 * (entry.pointFirst + std::int64_t(j)));
             entry.approvedLineNormals[j] = normal(j, Point{graph.linePoints[at], graph.linePoints[at + 1], graph.linePoints[at + 2]});
         }
-        vc::objects::FiberPieceApproval row;
-        row.rowUuid = vc::objects::util::newUuid();
-        row.aspect = vc::objects::FiberPieceAspect::Normals;
-        entry.approvals.live = {row};
-        entry.approvals.rowCurrent = {true};
-        const auto aspect = std::size_t(vc::objects::FiberPieceAspect::Normals);
-        entry.approvals.spans[aspect].assign(entry.content.controlIds.size() - 1, {});
-        entry.approvals.approvedSpans[aspect].clear();
-        for (std::size_t span = 0; span + 1 < entry.content.controlIds.size(); ++span) {
-            const auto from = std::size_t(entry.content.controlLineIndex[span]), to = std::size_t(entry.content.controlLineIndex[span + 1]);
-            if (from < firstPoint || to > lastPoint) continue;
-            entry.approvals.spans[aspect][span] = {std::size_t(0), true};
-            entry.approvals.approvedSpans[aspect].push_back(span);
-        }
+        entry.approval.generation = 1;
+        entry.approval.approvedNormals = {{double(firstPoint), double(lastPoint)}};
     }
 
     // The test's way to give fibers their outward facing, as a run gets it
@@ -1034,16 +1021,13 @@ TEST_CASE("an approval row marks the measured constraint it names")
     CHECK(approvals.withoutPieces >= 1);
     CHECK_FALSE(measured.front().approved);
 
-    // With both covering pieces approved it applies.
-    const auto covering = scaffoldConstraintSpans(scaffold.graph, geometry, measured.front());
-    REQUIRE(covering.has_value());
-    const auto approveSpan = [&](std::int64_t fiber, std::size_t span) {
-        scaffold.graph.fibers[std::size_t(fiber)]
-            .approvals.approvedSpans[std::size_t(vc::objects::FiberPieceAspect::Geometry)]
-            .push_back(span);
+    // With the geometry approved at both anchors it applies.
+    const auto approveAll = [&](std::int64_t fiber) {
+        auto& entry = scaffold.graph.fibers[std::size_t(fiber)];
+        entry.approval.approvedGeometry = {{0., double(entry.pointCount - 1)}};
     };
-    approveSpan(measured.front().a, covering->spanA);
-    approveSpan(measured.front().b, covering->spanB);
+    approveAll(measured.front().a);
+    approveAll(measured.front().b);
     applyScaffoldConstraintApprovals(scaffold.graph, geometry, measured, {&row, 1}, approvals);
     CHECK(approvals.live == 1);
     CHECK(approvals.approved >= 1);

@@ -37,7 +37,6 @@
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationStoredFiber.hpp"
-#include "LineAnnotationPieceLock.hpp"
 #include "FiberMapAutoLink.hpp"
 #include "FiberMapStaleness.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
@@ -372,11 +371,26 @@ public:
     // points against.
     [[nodiscard]] std::optional<std::vector<cv::Vec3d>> fiberMapLinePoints(uint64_t fiberId) const;
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
-    // Opens the fiber as an approval piece: the whole fiber, focused on the
-    // piece's lower end, everything outside it dimmed and locked, the plan's
-    // lock controls inserted or tagged in the session only until the first
-    // edit (docs/line_annotation_fibers.md, "Piece approval and lock control points").
-    void openFiberPiece(uint64_t fiberId, const vc3d::line_annotation::PiecePlan& plan);
+    // Opens the fiber in the approval window (docs/fiber_approval_workflow.md)
+    // on the scaffold solve `runUuid`, whose normals must have been handed
+    // over with setSolverLineNormals. The fiber is never changed there: only
+    // normal points and the states of stretches are, stored in the fiber's
+    // approval layer. The stretch to start on is a range of stored line
+    // points, or of control points when that is -1; all -1 selects the
+    // annotated line.
+    void openFiberApproval(uint64_t fiberId, const std::string& runUuid, int lineFrom, int lineTo, int controlFrom,
+                           int controlTo);
+    // Whether the fiber has a current approval layer (stretch states or
+    // normal points) that editing it would invalidate.
+    bool fiberHasApproval(const std::string& fiberUuid) const;
+    // The approval window's edits by fiber (its most recent approval window),
+    // as the window's own gestures make them; true when the layer was stored.
+    // A normal point without a normal holds what is shown there; `remove`
+    // deletes the normal point nearest the position.
+    bool setFiberApprovalNormalPoint(uint64_t fiberId, double linePosition, std::optional<cv::Vec3d> normal,
+                                     bool remove = false);
+    // aspect: 0 geometry, 1 normals; state: 0 undefined, 1 approved, 2 broken.
+    bool setFiberApprovalState(uint64_t fiberId, double from, double to, int aspect, int state);
     // The normals a scaffold solve used along a fiber, in the active volume:
     // one per point of the line the solve read, pointing away from the scroll
     // centre. While set, every session of that fiber takes them as its
@@ -387,18 +401,9 @@ public:
         std::vector<cv::Vec3f> points, normals;
     };
     void setSolverLineNormals(uint64_t fiberId, std::shared_ptr<const SolverLineNormals> normals);
-    // Approves (or revokes the approval of) the open piece in the most recent
-    // pane of the fiber for one aspect: saves the session first (which crops
-    // neighbouring approvals), then appends the row expecting the saved
-    // version. The error text when it could not.
-    std::optional<QString> setFiberPieceApproval(uint64_t fiberId, vc3d::line_annotation::FiberPieceAspect aspect,
-                                                 bool approved);
-    // Toggles the lock tag on a control point of the fiber's most recent
-    // pane (the agent bridge's fiber.lock_cp); the error text on failure.
-    std::optional<QString> setFiberControlLock(uint64_t fiberId, size_t controlPointIndex, bool enabled);
-    // The stored fiber's control points as (index, stable id, lock-tagged),
-    // for menus that offer pieces; empty when the fiber is not stored.
-    struct StoredControlSummary { size_t index = 0; int64_t storeId = -1; bool lock = false; };
+    // The stored fiber's control points as (index, stable id); empty when
+    // the fiber is not stored.
+    struct StoredControlSummary { size_t index = 0; int64_t storeId = -1; };
     [[nodiscard]] std::vector<StoredControlSummary> storedControlSummaries(uint64_t fiberId) const;
     // The stored fiber's line index nearest an arc position on its annotated
     // line (first to last control point; a tail is never named), the measure
@@ -577,6 +582,9 @@ public:
     [[nodiscard]] bool prepareForPackageSwitch();
 
 signals:
+    // The approval layer of a fiber changed while its approval window was
+    // open; emitted once, when that window closes.
+    void fiberApprovalChanged(QString fiberUuid);
     void volumeOverlayToggleRequested();
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
     // Store fibers changed: a commit, an external change or a new attachment.
@@ -612,6 +620,10 @@ private:
     // state private prevents external code from mutating controlPoints/branches
     // without the branch metadata synchronization hook.
     struct LineAnnotationSession;
+    struct ApprovalOpen {
+        std::string runUuid;
+        int lineFrom = -1, lineTo = -1, controlFrom = -1, controlTo = -1;
+    };
     struct FiberMetricsTaskResult;
     struct ControlSpanRecord {
         int spanIndex = 0;
@@ -645,8 +657,6 @@ private:
 
     struct FiberSaveSnapshot {
         StoredFiber fiber;
-        // What the commit verifies and crops for the session's piece locks.
-        std::optional<vc3d::line_annotation::PieceSaveCheck> pieceCheck;
     };
 
     using BranchLinkValidationIssue = vc3d::line_annotation::BranchLinkValidationIssue;
@@ -763,18 +773,6 @@ private:
     // panes get them when editing is enabled.
     void connectSessionEditing(LineAnnotationDialog* dialog, const std::string& surfaceName);
     bool enableSessionEditing(const std::string& surfaceName);
-    // Piece approval (LineAnnotationPieceLock.hpp). The lock state is read
-    // from the store on open and after every commit, and recomputed over the
-    // session's controls after every edit that renumbers them.
-    void refreshPieceLockState(LineAnnotationSession& session, bool rereadStore);
-    bool applyPiecePlan(LineAnnotationSession& session, const vc3d::line_annotation::PiecePlan& plan, QString* error);
-    void applyLockControlInsertion(LineAnnotationSession& session, const vc3d::line_annotation::LockControlInsertion& insertion);
-    // Shows the refusal and returns true when the edit touches the session's
-    // lock set; otherwise records the piece's first edit and returns false.
-    bool refuseLockedEdit(LineAnnotationSession& session, std::span<const size_t> dirtySpans,
-                          std::span<const size_t> touchedControls,
-                          vc3d::line_annotation::FiberPieceAspect aspect = vc3d::line_annotation::FiberPieceAspect::Geometry);
-    void pushPieceDisplayToDialog(LineAnnotationSession& session);
     bool launchSession(SourceKind sourceKind,
                        const std::string& surfaceName,
                        std::shared_ptr<Surface> sourceSurface,
@@ -787,7 +785,18 @@ private:
                                    std::optional<int> linePointIndex = std::nullopt,
                                    std::optional<std::pair<int, int>> spanControlIndices = std::nullopt,
                                    bool collectionInspection = false,
-                                   const vc3d::line_annotation::PiecePlan* piecePlan = nullptr);
+                                   const ApprovalOpen* approval = nullptr);
+    // Approval window internals (LineAnnotationController.cpp, "Approval window").
+    bool loadApprovalLayer(LineAnnotationSession& session, const ApprovalOpen& open, QString* error);
+    void connectApprovalEditing(LineAnnotationDialog* dialog, const std::string& surfaceName);
+    void approvalPlaceNormalPoint(const std::string& surfaceName, double linePosition,
+                                  std::optional<cv::Vec3d> normal);
+    void approvalDeleteNormalPoint(const std::string& surfaceName, double linePosition);
+    void approvalSetSelectionBound(const std::string& surfaceName, int bound, double linePosition);
+    void approvalSetState(const std::string& surfaceName, int aspect, int state);
+    bool saveApprovalLayer(LineAnnotationSession& session);
+    bool refreshApprovalViews(LineAnnotationSession& session);
+    void pushApprovalDisplay(LineAnnotationSession& session);
     // seedTags: per-control-point tags the seed keeps (a reopened
     // single-point fiber's stored tags); empty for a new placement.
     void handleLineSeed(const std::string& surfaceName,
@@ -869,12 +878,6 @@ private:
     void handleGeneratedControlPointSetKollesisTermination(const std::string& surfaceName,
                                                            size_t controlPointIndex,
                                                            bool enabled);
-    void handleGeneratedControlPointSetLock(const std::string& surfaceName,
-                                            size_t controlPointIndex,
-                                            bool enabled);
-    void handleGeneratedPieceOpen(const std::string& surfaceName,
-                                  vc3d::line_annotation::GeneratedPieceEnd a,
-                                  vc3d::line_annotation::GeneratedPieceEnd b);
     void handleGeneratedControlPointSetBreak(const std::string& surfaceName,
                                              size_t controlPointIndex,
                                              bool enabled);

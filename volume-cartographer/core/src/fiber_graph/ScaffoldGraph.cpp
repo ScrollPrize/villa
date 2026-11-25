@@ -217,11 +217,48 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
         }
         fiber.content.resolveLineIndices();
         mappingOf.insert_or_assign(fiber.uuid, view.mapping());
-        if (options.readPieceApprovals) {
-            const auto rows = objects::readFiberPieceApprovals(reader, fiber.uuid);
-            graph.report.pieceApprovalRows += std::int64_t(rows.size());
-            fiber.approvals = objects::fiberPieceApprovalStates(fiber.content, rows);
-            fiber.approvedLineNormals = objects::approvedFiberLineNormals(fiber.content, fiber.approvals);
+        if (options.readApprovals) {
+            if (const auto layer = objects::readFiberApproval(reader, fiber.uuid); layer && !layer->empty()) {
+                // The layer is over the stored line points, tails included and
+                // as stored; the run reads the annotated part, mapped.
+                const auto stored = snapshot.fiber(revision).load().linePoints;
+                if (stored.size() != raw.size())
+                    throw std::runtime_error("scaffold graph: fiber " + fiber.uuid + " reads " +
+                                             std::to_string(raw.size()) + " line points mapped and " +
+                                             std::to_string(stored.size()) + " stored");
+                const auto status = objects::fiberApprovalStatus(*layer, stored);
+                const double shift = double(annotated.data() - raw.data()), last = double(lines.size() - 1);
+                const auto ranges = [&](objects::FiberApprovalAspect aspect, objects::FiberStretchState state) {
+                    ScaffoldApproval::Ranges out;
+                    for (auto [from, to] : objects::fiberStretchRanges(*layer, status, aspect, state)) {
+                        from = std::clamp(from - shift, 0.0, last);
+                        to = std::clamp(to - shift, 0.0, last);
+                        if (to > from) out.emplace_back(from, to);
+                    }
+                    return out;
+                };
+                using Aspect = objects::FiberApprovalAspect;
+                using State = objects::FiberStretchState;
+                auto& approval = fiber.approval;
+                approval.generation = layer->generation;
+                approval.approvedGeometry = ranges(Aspect::Geometry, State::Approved);
+                approval.approvedNormals = ranges(Aspect::Normals, State::Approved);
+                approval.brokenGeometry = ranges(Aspect::Geometry, State::Broken);
+                approval.brokenNormals = ranges(Aspect::Normals, State::Broken);
+                approval.staleStretches = status.staleStretches;
+                approval.staleNormalPoints = status.staleNormalPoints;
+                approval.normalPoints = std::int64_t(layer->normalPoints.size()) - status.staleNormalPoints;
+                const auto normals = objects::approvedFiberLineNormals(*layer, status, stored.size());
+                if (!normals.empty())
+                    fiber.approvedLineNormals.assign(normals.begin() + std::ptrdiff_t(shift),
+                                                     normals.begin() + std::ptrdiff_t(shift) + std::ptrdiff_t(lines.size()));
+                ++graph.report.approvalLayers;
+                graph.report.approvedStretches +=
+                    std::int64_t(approval.approvedGeometry.size() + approval.approvedNormals.size());
+                graph.report.brokenStretches +=
+                    std::int64_t(approval.brokenGeometry.size() + approval.brokenNormals.size());
+                graph.report.staleApprovalItems += status.staleStretches + status.staleNormalPoints;
+            }
         }
         // The polylines live once, packed for seam transport; the per-fiber
         // copy would double a scaffold's largest allocation.
@@ -318,6 +355,11 @@ ScaffoldGeometry::ScaffoldGeometry(const ScaffoldGraph& graph, std::size_t worke
             const double from = controlArc(fiber, control), to = controlArc(fiber, control + 1);
             gaps_[fiber].emplace_back(std::min(from, to), std::max(from, to));
         }
+        // A broken stretch is removed like a gap: nothing is measured on it.
+        const auto& entry = graph.fibers[fiber];
+        for (const auto* ranges : {&entry.approval.brokenGeometry, &entry.approval.brokenNormals})
+            for (const auto& [from, to] : *ranges)
+                gaps_[fiber].emplace_back(arcAtLineIndex(fiber, from), arcAtLineIndex(fiber, to));
     }
 }
 
@@ -348,6 +390,25 @@ ScaffoldGeometry::Projection ScaffoldGeometry::project(std::size_t fiber, const 
         }
     }
     return best;
+}
+
+double ScaffoldGeometry::arcAtLineIndex(std::size_t fiber, double index) const
+{
+    const auto& entry = graph_->fibers.at(fiber);
+    if (entry.pointCount <= 0) return 0;
+    index = std::clamp(index, 0.0, double(entry.pointCount - 1));
+    const auto lower = std::size_t(index), upper = std::min(lower + 1, std::size_t(entry.pointCount - 1));
+    const auto first = std::size_t(entry.pointFirst);
+    return columns_.arc[first + lower] + (index - double(lower)) * (columns_.arc[first + upper] - columns_.arc[first + lower]);
+}
+
+std::vector<double> ScaffoldGeometry::splitArcs(std::size_t fiber) const
+{
+    std::vector<double> cuts;
+    for (const auto& [from, to] : graph_->fibers.at(fiber).approval.brokenGeometry)
+        cuts.push_back(arcAtLineIndex(fiber, 0.5 * (from + to)));
+    std::sort(cuts.begin(), cuts.end());
+    return cuts;
 }
 
 std::int64_t ScaffoldGeometry::lineIndexAt(std::size_t fiber, double arc) const

@@ -1,6 +1,6 @@
 // Scaffold winding solve from the command line.
 //
-// Reads a store's annotated fibers, their links, piece approvals and
+// Reads a store's annotated fibers, their links, approval layers and
 // umbilicus, assembles the integer winding arcs, solves them exactly with
 // LEMON and writes the residual ranking the approval workflow orders by. The
 // same library backs the fiber map's solver dock, so a run here and a run in
@@ -581,7 +581,10 @@ int run(const std::string& configPath)
                        {"filtered_subset", graph.report.filteredSubset},
                        {"short_fibers", graph.report.shortFibers},
                        {"links", graph.report.links},
-                       {"piece_approval_rows", graph.report.pieceApprovalRows},
+                       {"approval_layers", graph.report.approvalLayers},
+                       {"approved_stretches", graph.report.approvedStretches},
+                       {"broken_stretches", graph.report.brokenStretches},
+                       {"stale_approval_items", graph.report.staleApprovalItems},
                        {"line_points", std::int64_t(graph.linePoints.size() / 3)},
                        {"umbilicus_points", std::int64_t(graph.umbilicus.size())},
                        {"commit_sequence", graph.source.commitSequence},
@@ -595,6 +598,8 @@ int run(const std::string& configPath)
                        {"contracted_fibers", result.contractedFibers},
                        {"weighted_l1_turns", result.objective},
                        {"max_residual_turns", result.maxResidual},
+                       {"split_fibers", result.splitFibers},
+                       {"split_parts", std::int64_t(result.parts.size())},
                        {"violated_constraints", result.violatedConstraints},
                        {"violated_arcs", result.violatedArcs},
                        {"solve_seconds", result.seconds}}},

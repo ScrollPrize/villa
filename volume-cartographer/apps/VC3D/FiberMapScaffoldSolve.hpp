@@ -3,8 +3,8 @@
 // and the approval ranking they feed.
 //
 // The solve itself is the native library (vc/fiber_graph), which reads the
-// store directly: the fibers, their links with anchor positions, their piece
-// approvals and the umbilicus. Nothing here does arithmetic on windings; this
+// store directly: the fibers, their links with anchor positions, their
+// approval layers and the umbilicus. Nothing here does arithmetic on windings; this
 // file is the Qt skin and the store-write path.
 //
 // A run is saved in the store it solved (ext_fiber_graph_solve rows), so the
@@ -123,7 +123,7 @@ public:
     [[nodiscard]] const std::vector<vc::fiber_graph::ScaffoldStoredRun>& runs() const { return _runs; }
     [[nodiscard]] const ScaffoldRunView* selected() const { return _selected ? &*_selected : nullptr; }
     [[nodiscard]] const QString& lastError() const { return _lastError; }
-    // Piece approvals of every fiber of the store, loaded on demand (the
+    // Approved spans of every fiber of the store, loaded on demand (the
     // highlight checkboxes ask for them) and dropped when the store changes.
     [[nodiscard]] const std::map<std::string, ScaffoldApprovalSpans>& approvals() const { return _approvals; }
     [[nodiscard]] bool approvalsLoaded() const { return _approvalsLoaded; }
@@ -145,7 +145,7 @@ public:
     };
     [[nodiscard]] std::optional<RunFiberNormals> runFiberNormals(const std::string& fiberUuid, QString* why = nullptr) const;
     // The span of a fiber covering an anchor arc, and whether it is approved.
-    // Answers from the loaded piece approvals, so it needs loadApprovals().
+    // Answers from the loaded approvals, so it needs loadApprovals().
     [[nodiscard]] ScaffoldAnchorSpan anchorSpan(const std::string& fiberUuid, double arc) const;
     // Why anchorSpan() knows no span there; empty when it does.
     [[nodiscard]] QString anchorSpanProblem(const std::string& fiberUuid, double arc) const;
@@ -263,15 +263,6 @@ public:
     // The map supplies the frame it drew in and the sense the catalog states;
     // the panel does not go looking for either.
     void setFrame(const std::string& volume, std::optional<int> fallbackHandedness);
-    // The fibers of the map's currently selected network, for the restricted
-    // scope. Asked on the GUI thread when a run starts; an empty answer makes
-    // the controller refuse the run.
-    using ScopeResolver = std::function<std::vector<std::string>()>;
-    void setScopeResolver(ScopeResolver);
-    // Whether the map can restrict a run to a selected network. Without a
-    // layout there is no selection, so the scope is the whole scaffold and
-    // the chooser says why.
-    void setScopeAvailable(bool available);
     [[nodiscard]] ScaffoldSolveRequest request() const;
     [[nodiscard]] bool fixApprovedSubgraphs() const;
 
@@ -284,21 +275,7 @@ private:
     void showProgress();
 
     ScaffoldSolveController* _controller = nullptr;
-    QCheckBox* _approvedCheck = nullptr;
-    QCheckBox* _pendingCheck = nullptr;
-    QCheckBox* _autoCheck = nullptr;
-    QCheckBox* _fixApprovedCheck = nullptr;
-    QCheckBox* _crossingsCheck = nullptr;
-    QCheckBox* _windingDistanceCheck = nullptr;
-    QDoubleSpinBox* _manualWeightSpin = nullptr;
-    QDoubleSpinBox* _perpendicularWeightSpin = nullptr;
-    QDoubleSpinBox* _parallelWeightSpin = nullptr;
-    QDoubleSpinBox* _enclosureWeightSpin = nullptr;
-    QDoubleSpinBox* _signWeightSpin = nullptr;
-    QComboBox* _normalSourceCombo = nullptr;
-    QComboBox* _signBackendCombo = nullptr;
-    QComboBox* _backendCombo = nullptr;
-    QComboBox* _scopeCombo = nullptr;
+    QComboBox* _profileCombo = nullptr;
     QPushButton* _runButton = nullptr;
     QPushButton* _cancelButton = nullptr;
     QLabel* _statusLabel = nullptr;
@@ -310,13 +287,12 @@ private:
     std::string _progressStage;
     std::chrono::steady_clock::time_point _progressStarted;
     std::int64_t _progressStageFirstDone = 0;
-    ScopeResolver _scope;
     std::string _volume;
     std::optional<int> _fallbackHandedness;
 };
 
-// The list of saved solves. Selecting one, with the switch on, lays the map
-// out from it.
+// The list of saved solves, newest on top. Selecting one lays the map out
+// from it.
 class ScaffoldRunsPanel : public QWidget
 {
     Q_OBJECT
@@ -324,11 +300,6 @@ class ScaffoldRunsPanel : public QWidget
 public:
     ScaffoldRunsPanel(ScaffoldSolveController* controller, QWidget* parent = nullptr);
 
-    // Whether the map should follow the selected solve's links.
-    [[nodiscard]] bool follow() const;
-
-signals:
-    void followChanged();
 
 private:
     enum Column {
@@ -361,7 +332,6 @@ private:
 
     ScaffoldSolveController* _controller = nullptr;
     QTreeWidget* _tree = nullptr;
-    QCheckBox* _followCheck = nullptr;
     QLabel* _diffLabel = nullptr;
     bool _rebuilding = false;
 };
