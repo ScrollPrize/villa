@@ -7,8 +7,11 @@ import torch.nn.functional as F
 
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import SheetStripConfig, SheetStripFollower
 from vesuvius.neural_tracing.tracers.fibers.tests.test_sheet_strip import SMALL, STRIP
+from vesuvius.neural_tracing.tracers.models.mps_cnn import metal_tensor_ops
 
 pytestmark = pytest.mark.skipif(not torch.backends.mps.is_available(), reason='needs PyTorch with MPS')
+# optimize_for_mps picks MetalCropCNN only where Metal has tensor ops (macOS 26 and later)
+needs_metal4 = pytest.mark.skipif(not metal_tensor_ops(), reason='MetalCropCNN needs Metal 4 (macOS 26)')
 
 
 def relative(got, want):
@@ -16,12 +19,10 @@ def relative(got, want):
     return ((got.cpu().double()-want).abs().max()/want.pow(2).mean().sqrt()).item()  # MPS has no float64
 
 
-def test_metal_crop_cnn_matches_float64():
+def random_crop_cnn(seed):
     from vesuvius.neural_tracing.tracers.models.blocks import CropCNN
-    from vesuvius.neural_tracing.tracers.models.mps import optimize_for_mps
-    from vesuvius.neural_tracing.tracers.models.mps_cnn import MetalCropCNN
 
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     model = torch.nn.Module()
     model.cnn = CropCNN((12, 24, 64), (2, 2, 1), (1, 2, 2), activation='leaky_relu', in_channels=2, context=64)
     with torch.no_grad():
@@ -34,6 +35,15 @@ def test_metal_crop_cnn_matches_float64():
             elif isinstance(module, torch.nn.InstanceNorm3d):
                 module.weight.normal_(1., .2)
                 module.bias.normal_(0., .2)
+    return model
+
+
+@needs_metal4
+def test_metal_crop_cnn_matches_float64():
+    from vesuvius.neural_tracing.tracers.models.mps import optimize_for_mps
+    from vesuvius.neural_tracing.tracers.models.mps_cnn import MetalCropCNN
+
+    model = random_crop_cnn(0)
     ref = copy.deepcopy(model.cnn).double()
     image = torch.randn(2, 2, 32, 32, 32)
     model.to('mps')
@@ -44,6 +54,23 @@ def test_metal_crop_cnn_matches_float64():
         want = ref.features(image.double())
     assert got.shape == want.shape
     assert torch.isfinite(got).all()
+    assert relative(got, want) < 1e-4
+
+
+@needs_metal4
+def test_metal_crop_cnn_follows_loaded_weights():
+    from vesuvius.neural_tracing.tracers.models.mps import optimize_for_mps
+
+    model, other = random_crop_cnn(0), random_crop_cnn(1)
+    ref = copy.deepcopy(other.cnn).double()
+    image = torch.randn(2, 2, 32, 32, 32)
+    model.to('mps')
+    optimize_for_mps(model)
+    with torch.no_grad():
+        model.cnn.features(image.to('mps'))  # caches the first weights' kernel layouts
+        model.load_state_dict(other.state_dict())
+        got = model.cnn.features(image.to('mps'))
+        want = ref.features(image.double())
     assert relative(got, want) < 1e-4
 
 

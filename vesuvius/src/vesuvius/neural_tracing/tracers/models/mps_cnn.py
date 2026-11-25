@@ -160,6 +160,12 @@ def _even(sizes, halvings):
     return all(int(s) % (1 << halvings) == 0 for s in sizes)
 
 
+def _stamp(tensor):
+    """What identifies ``tensor``'s current values: its storage and in-place version (inference tensors keep no
+    version counter, and nothing outside inference mode can write them in place)"""
+    return tensor.data_ptr(), None if tensor.is_inference() else tensor._version
+
+
 def _padded_rows(b, d, h, w):
     """Rows (of C values) of a padded [B, D + 2, H + 2, W + 2, C] buffer plus the tail every tap view may read"""
     return b*(d+2)*(h+2)*(w+2)+2*(h+2)*(w+2)+2*(w+2)+2
@@ -181,14 +187,18 @@ class _Runner:
     def weight(self, conv, kind='taps'):
         """``conv``'s weight in the layout of its kernel: taps [O, k, k, k, C], 'pool' [O, 2, 2, 2, C] (w / 8), 'raw'"""
         key = (id(conv), kind)
-        if key not in self.weights:
+        # load_state_dict and optimizer steps write the weight in place (a new version), and assigning a new
+        # Parameter changes its storage, so either one rebuilds the layout
+        stamp = _stamp(conv.weight)
+        cached = self.weights.get(key)
+        if cached is None or cached[0] != stamp:
             w = conv.weight.detach().float()
             if kind == 'pool':
                 w = (w[:, :, 0, 0, 0]/8.)[:, None, None, None, :].expand(-1, 2, 2, 2, -1)
             elif kind == 'taps':
                 w = w.permute(0, 2, 3, 4, 1)
-            self.weights[key] = w.contiguous()
-        return self.weights[key]
+            cached = self.weights[key] = stamp, w.contiguous()
+        return cached[1]
 
     def int_table(self, *values):
         if values not in self.ints:
