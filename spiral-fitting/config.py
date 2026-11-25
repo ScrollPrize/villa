@@ -364,6 +364,7 @@ def _field_spec(key, default):
                 } else 0),
             maximum=(1_000_000 if key == "output_num_slices_for_visualization"
                      else 16 if key == "fit_volume_level"
+                     else 1 if key == "fiber_sampling_length_exponent"
                      else 1_000_000_000),
             step=1 if kind == "integer" else .01,
         )
@@ -453,10 +454,13 @@ class Config:
         self.sample_count_points_per_patch = 800
         self.sample_count_tracks_per_step = 48000
         self.sample_count_track_points_per_step = 96
-        # Fiber CC loss draws: this many components (by fiber count), then
-        # this many (fiber, point) picks in each.
+        # Fiber CC loss draws: this many components (by their fibers' total
+        # weight), then this many (fiber, point) picks in each.
         self.sample_count_fiber_ccs = 1024
         self.sample_count_points_per_fiber_cc = 16
+        # A fiber's weight in those draws is its point count raised to this
+        # power (0 = every fiber alike, 1 = every point alike), in [0, 1].
+        self.fiber_sampling_length_exponent = 1.0
         self.sample_count_dense_normal_points = 60000
         self.sample_count_fiber_direction_points = 60000
         self.sample_count_regularisation_points = 4500

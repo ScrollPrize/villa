@@ -505,10 +505,14 @@ correctly placed CC. Per sampled point, Huber on the error (quadratic below
   `fiber_dt_target_update_interval` steps and at start or resume (nothing is
   checkpointed); the log counts the targets that change.
 
-Sampling: `sample_count_fiber_ccs` draws per step pick a CC by its number of
-fibers in the z window (so the largest CC gets nearly all of them), then
-`sample_count_points_per_fiber_cc` points in it, each a fiber uniformly and a
-point uniformly along it.
+Sampling: a fiber weighs `k ** fiber_sampling_length_exponent`, `k` its
+points in the z window (0 weighs every fiber alike, 1 every point alike, the
+default; at most 1). `sample_count_fiber_ccs` draws per step pick a CC by its
+fibers' total weight (so the largest CC gets nearly all of them), then
+`sample_count_points_per_fiber_cc` points in it, each a fiber by its weight
+and a point uniformly along it. The health metrics below weigh fibers alike
+whatever the setting. A checkpoint written before the setting existed
+resumes with the default 1; set 0 to keep its equal weight per fiber.
 
 Gauge and outlier backstop, at build, from each fiber's whole-fiber label
 range `[floor(w_min − c), floor(w_max − c)]` (the z window plays no part),

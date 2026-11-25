@@ -146,8 +146,10 @@ def whole_winding_targets(group, s, ok, num_groups):
 
 class _Table:
     """Sampling tables over items (points or consecutive-point pairs) grouped
-    by fiber: CC by its fiber count, a fiber uniformly within it, then an
-    item uniformly within the fiber's range."""
+    by fiber. A fiber with k items weighs k ** exponent (fibers without items
+    never draw): a CC by its fibers' total weight, a fiber within it by its
+    weight, then an item uniformly within the fiber's range. Exponent 0
+    weighs every fiber alike, 1 every item alike."""
 
     def __init__(self, item_start, item_count, fiber_cc, num_cc, device):
         fibers = np.flatnonzero(item_count > 0)
@@ -161,16 +163,73 @@ class _Table:
         self.cc_weight = torch.as_tensor(cc_count, dtype=torch.float32, device=device)
         self.item_start = as_tensor(item_start)
         self.item_count = as_tensor(item_count)
+        # Per fiber in CC order, for the weighted tables (_weighted).
+        self._order_counts = item_count[order].astype(np.float64)
+        self._cc_end = np.cumsum(cc_count)
+        self._cc_begin = self._cc_end - cc_count
+        self._weighted_exponent = None
 
-    def sample(self, draws, per_draw, generator=None):
+    def _weighted(self, exponent):
+        """(cumulative weight at each CC's end, cumulative fiber weight, cc
+        base, cc total) for ``exponent``, built on first use and kept until
+        it changes. The tables are float64 (CPU on MPS, which has none): one
+        point among millions weighs less than a float32 can resolve."""
+        if self._weighted_exponent != exponent:
+            weight = self._order_counts ** exponent
+            cumulative = np.cumsum(weight)
+            edges = np.concatenate([[0.0], cumulative])
+            end, base = edges[self._cc_end], edges[self._cc_begin]
+            device = self.cc_count.device
+            table = torch.device('cpu') if device.type == 'mps' else device
+            as_double = lambda values: torch.as_tensor(values, dtype=torch.float64, device=table)  # noqa: E731
+            self._weighted_tables = (
+                as_double(end), as_double(cumulative), as_double(base), as_double(end - base))
+            # The last CC with weight: where rounding up to the total lands.
+            self._last_cc = int(np.searchsorted(end, end[-1])) if len(end) else 0
+            self._weighted_exponent = exponent
+        return self._weighted_tables
+
+    def _fraction(self, count, like, generator):
+        """``count`` uniforms in [0, 1) as ``like``'s dtype and device, drawn
+        on the sampler's device. A float32 uniform has 24 bits, too coarse
+        for one point among millions: a second draw refines it below
+        2 ** -24."""
+        u = torch.rand((2, count), device=self.cc_count.device, generator=generator).to(like)
+        return u[0] + u[1] * 2.0 ** -24
+
+    def sample(self, draws, per_draw, generator=None, exponent=0.0):
         """``(cc, item)`` int64 [draws * per_draw]: ``draws`` CCs, then
-        ``per_draw`` (fiber, item) picks in each."""
-        cc = torch.multinomial(self.cc_weight, draws, replacement=True, generator=generator)
+        ``per_draw`` (fiber, item) picks in each, fibers weighted by their
+        item count ** ``exponent``. Exponent 0 is the uniform-fiber draw."""
+        exponent = float(exponent)
+        weighted = self._weighted(exponent) if exponent != 0.0 else None
+        if weighted is None:
+            cc = torch.multinomial(self.cc_weight, draws, replacement=True, generator=generator)
+        else:
+            # Inverse CDF over the CCs (a multinomial on float32 weights
+            # cannot resolve a few-point CC beside one of millions); a CC
+            # without weight has an empty interval and is never drawn.
+            cc_end = weighted[0]
+            target = self._fraction(draws, cc_end, generator) * cc_end[-1]
+            cc = torch.searchsorted(cc_end, target, right=True)
+            cc = cc.clamp(max=self._last_cc).to(self.cc_count.device)
         cc = cc[:, None].expand(draws, per_draw).reshape(-1)
         u = torch.rand((2, cc.numel()), device=cc.device, generator=generator)
         count = self.cc_count[cc]
-        rank = torch.minimum((u[0] * count).long(), count - 1)
-        fiber = self.fiber_order[self.cc_start[cc] + rank]
+        if weighted is None:
+            rank = torch.minimum((u[0] * count).long(), count - 1)
+            fiber = self.fiber_order[self.cc_start[cc] + rank]
+        else:
+            # Inverse CDF within the CC, clamped into its range against
+            # rounding at either end.
+            _, cumulative, base, total = weighted
+            cc_table = cc.to(cumulative.device)
+            fraction = self._fraction(cc.numel(), cumulative, generator)
+            target = base[cc_table] + fraction * total[cc_table]
+            position = torch.searchsorted(cumulative, target, right=True).to(cc.device)
+            start = self.cc_start[cc]
+            position = torch.minimum(torch.maximum(position, start), start + count - 1)
+            fiber = self.fiber_order[position]
         count = self.item_count[fiber]
         item = self.item_start[fiber] + torch.minimum((u[1] * count).long(), count - 1)
         return cc, item
@@ -346,7 +405,8 @@ class FiberCCLoss:
             self.refresh_targets(transform, dr, iteration)
         cc, index = self.points.sample(
             int(config['sample_count_fiber_ccs']),
-            int(config['sample_count_points_per_fiber_cc']), generator)
+            int(config['sample_count_points_per_fiber_cc']), generator,
+            exponent=config['fiber_sampling_length_exponent'])
         spiral, theta, n, rho, s_vox = self._evaluate(transform, dr, index)
         valid = accepted(rho)
         largest = self.cc_is_largest[cc]
@@ -383,7 +443,9 @@ class FiberCCLoss:
         metrics' own generator: the rejected fraction (|rho| > RHO_MAX), the
         largest CC's mean |s - c0| (turns), its signed median and the share of
         it off by more than half a turn, and the label-step mismatch fraction of consecutive
-        accepted pairs (n must step exactly where q does, at theta = 0)."""
+        accepted pairs (n must step exactly where q does, at theta = 0). Fibers
+        weigh alike here whatever fiber_sampling_length_exponent says, so the
+        checks compare across settings."""
         generator = torch.Generator(device=self.device)
         generator.manual_seed(METRIC_SEED + int(iteration))
         cc, index = self.points.sample(METRIC_SAMPLES, 1, generator)
