@@ -6,13 +6,14 @@ import json
 import math
 import shutil
 import sys
+import tempfile
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 from dtypes import numpy_float_hi
-import tifffile
+from vc_reader import images
 import torch
 
 import cli_json
@@ -55,10 +56,24 @@ class _StoreTarget:
 
 @dataclass(frozen=True)
 class _Written:
-	"""An exported surface: the directory its side files go in (the tifxyz directory, or the stored surface's
-	artifact directory) and its UUID when stored."""
+	"""An exported surface: the directory its side files go in (the tifxyz directory, or, for a stored surface,
+	a temporary directory published as its artifacts by _publish_side_files) and its UUID when stored."""
 	files_dir: Path
 	surface_uuid: str | None = None
+
+
+def _publish_side_files(written: _Written, store: _StoreTarget | None) -> None:
+	"""A stored surface's side files (model checkpoint, model parameters, mask debug output) become its
+	artifacts (relative paths as names); the temporary directory is then removed."""
+	if store is None or written.surface_uuid is None:
+		return
+	try:
+		files = {path.relative_to(written.files_dir).as_posix(): path
+				 for path in sorted(written.files_dir.rglob("*")) if path.is_file()}
+		if files:
+			store.session.publish_artifacts(written.surface_uuid, files)
+	finally:
+		shutil.rmtree(written.files_dir, ignore_errors=True)
 
 
 def _valid_xyz_mask(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
@@ -76,7 +91,8 @@ def _build_parser() -> argparse.ArgumentParser:
 	g = p.add_argument_group("io")
 	g.add_argument("--input", required=True, help="Model checkpoint (.pt)")
 	g.add_argument("--output", default=None, help="Output directory (or --store)")
-	g.add_argument("--store", default=None, help="Create the surfaces in this VC object store instead")
+	g.add_argument("--store", default=None,
+		help="Create the surfaces in this VC object store instead: a store file or a vc_object_server endpoint")
 	g.add_argument("--volume-uuid", default=None, help="With --store: the volume the surfaces' coordinates are in")
 	g.add_argument("--voxel-scale", type=float, default=1.0,
 				   help="With --store: those coordinates are at this scale of the volume's voxels (2^-N at level N)")
@@ -326,7 +342,7 @@ def _write_atlas_control_results(written: _Written, results: dict | None, store:
 	document = {key: value for key, value in results.items() if key != "fibers"}
 	from vc_object_store.documents import attach_document
 	attach_document(
-		store.session.path, written.surface_uuid, document, role=ATLAS_RESULTS_ROLE, list_key="records",
+		store.session.location, written.surface_uuid, document, role=ATLAS_RESULTS_ROLE, list_key="records",
 		position_key="target_xyz", name="atlas control points results", volume=store.volume,
 		voxel_scale=store.voxel_scale, author=store.session.author)
 
@@ -342,7 +358,7 @@ def _write_corr_points_results(written: _Written, results: dict | None, store: _
 	document["points_list"] = _corr_points_result_list(results)
 	from vc_object_store.documents import attach_document
 	attach_document(
-		store.session.path, written.surface_uuid, document, role=CORR_RESULTS_ROLE, list_key="points_list",
+		store.session.location, written.surface_uuid, document, role=CORR_RESULTS_ROLE, list_key="points_list",
 		position_key="p", name="correction points results", volume=store.volume,
 		voxel_scale=store.voxel_scale, author=store.session.author)
 
@@ -368,21 +384,14 @@ def _layer_output_name(cfg: ExportConfig, store: _StoreTarget | None, layer: int
 
 
 def _stored_sources(job_spec: dict | None) -> tuple[str, ...]:
-	"""UUIDs of the stored surfaces a job read (its ``{"type": "surface", "uuid": ...}`` references)."""
-	found: list[str] = []
-
-	def visit(item: object) -> None:
-		if isinstance(item, dict):
-			if item.get("type") == "surface" and isinstance(item.get("uuid"), str) and item["uuid"] not in found:
-				found.append(item["uuid"])
-			for child in item.values():
-				visit(child)
-		elif isinstance(item, list):
-			for child in item:
-				visit(child)
-
-	visit(job_spec)
-	return tuple(found)
+	"""Source UUID projection of the exact inputs captured when the job ran."""
+	if job_spec is None:
+		return ()
+	if "input_references" not in job_spec:
+		raise ValueError("checkpoint has no selected input references; regenerate its input provenance")
+	from vc_object_store import object_versions_from_json
+	return tuple(dict.fromkeys(ref["object"] for ref in
+		object_versions_from_json(json.dumps(job_spec["input_references"]))))
 
 
 def _mark_segment_vertices(
@@ -953,17 +962,9 @@ def _write_mask_debug_artifacts(
 		encoding="utf-8",
 	)
 	if raw_mask is not None:
-		tifffile.imwrite(
-			str(out_dir / "approval_inpaint_output_mask_raw.tif"),
-			raw_mask.astype(np.uint8) * 255,
-			compression="lzw",
-		)
+		images.write_tiff(str(out_dir / "approval_inpaint_output_mask_raw.tif"), raw_mask.astype(np.uint8) * 255, compression="lzw")
 	if mask is not None:
-		tifffile.imwrite(
-			str(out_dir / "approval_inpaint_output_mask_dilated.tif"),
-			mask.astype(np.uint8) * 255,
-			compression="lzw",
-		)
+		images.write_tiff(str(out_dir / "approval_inpaint_output_mask_dilated.tif"), mask.astype(np.uint8) * 255, compression="lzw")
 
 
 def _print_mask_debug(debug: dict) -> None:
@@ -992,6 +993,7 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 				  components: list[list[int]] | None = None,
 				  base_shape_zyx: tuple[int, int, int] | None = None,
 				  lasagna_base_shape_zyx: tuple[int, int, int] | None = None,
+				  export_coordinate_scale: float = 1.0,
 				  extra_channels: dict[str, np.ndarray] | None = None,
 				  extra_channel_specs: list[dict] | None = None,
 				  atlas_control_points_summary: dict | None = None,
@@ -1029,6 +1031,9 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		meta["base_shape_zyx"] = [int(v) for v in base_shape_zyx]
 	if lasagna_base_shape_zyx is not None:
 		meta["lasagna_base_shape_zyx"] = [int(v) for v in lasagna_base_shape_zyx]
+	# The factor taking Lasagna base coordinates to the exported ones, so a reader can check the frame
+	# instead of inferring it from which shape keys are present.
+	meta["export_coordinate_scale"] = float(export_coordinate_scale)
 	if components is not None:
 		meta["components"] = components
 	if area is not None:
@@ -1074,11 +1079,11 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		return _store_surface(store, out_dir.name, np.stack([xf, yf, zf], axis=-1), meta, channels, model_source)
 
 	(out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-	tifffile.imwrite(str(out_dir / "x.tif"), xf, compression=None)
-	tifffile.imwrite(str(out_dir / "y.tif"), yf, compression=None)
-	tifffile.imwrite(str(out_dir / "z.tif"), zf, compression=None)
+	images.write_tiff(str(out_dir / "x.tif"), xf, compression=None)
+	images.write_tiff(str(out_dir / "y.tif"), yf, compression=None)
+	images.write_tiff(str(out_dir / "z.tif"), zf, compression=None)
 	for file_name, arr in channels.items():
-		tifffile.imwrite(str(out_dir / file_name), arr, compression=None)
+		images.write_tiff(str(out_dir / file_name), arr, compression=None)
 	if model_source is not None:
 		_copy_model(model_source, out_dir)
 	return _Written(out_dir)
@@ -1095,7 +1100,8 @@ def _copy_model(model_source: Path, directory: Path) -> None:
 
 def _store_surface(store: _StoreTarget, name: str, xyz: np.ndarray, meta: dict, channels: dict[str, np.ndarray],
 				   model_source: Path | None) -> _Written:
-	"""Create the exported surface in the store; the model checkpoint goes to its artifact directory."""
+	"""Create the exported surface in the store; the model checkpoint and other side files are written to a
+	temporary directory and published as its artifacts (_publish_side_files)."""
 	meta = copy.deepcopy(meta)
 	scale = float(meta["scale"][0])
 	meta.pop("model_source", None)
@@ -1107,14 +1113,14 @@ def _store_surface(store: _StoreTarget, name: str, xyz: np.ndarray, meta: dict, 
 	name = name[:-len(".tifxyz")] if name.endswith(".tifxyz") else name
 	from vc_object_store.surfaces import create_surface
 	surface_uuid = create_surface(
-		store.session.path, xyz, name=name, scale=scale, volume=store.volume, tool="lasagna", sources=store.sources,
+		store.session.location, xyz, name=name, scale=scale, volume=store.volume, tool="lasagna", sources=store.sources,
 		meta=meta, channels=channels, tags=store.tags, author=store.session.author, voxel_scale=store.voxel_scale)
 	store.created.append(surface_uuid)
 	print(f"surface_uuid: {surface_uuid}", flush=True)
-	artifacts = store.session.artifact_directory(surface_uuid)
+	side_files = Path(tempfile.mkdtemp(prefix=f"lasagna-{surface_uuid}-"))
 	if model_source is not None:
-		_copy_model(model_source, artifacts)
-	return _Written(artifacts, surface_uuid)
+		_copy_model(model_source, side_files)
+	return _Written(side_files, surface_uuid)
 
 
 def _as_numpy_float32(value: object, *, name: str) -> np.ndarray:
@@ -1220,12 +1226,14 @@ def _export_flatten_checkpoint(
 		area=area,
 		base_shape_zyx=output_base_shape_zyx,
 		lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+		export_coordinate_scale=export_factor,
 		atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export),
 		store=store,
 	)
 	if model_params is not None:
 		(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 	_write_atlas_control_results(written, atlas_control_export, store)
+	_publish_side_files(written, store)
 	_print_area(area)
 	print(f"[fit2tifxyz] exported {out_dir.name}", flush=True)
 	return 0
@@ -1276,13 +1284,10 @@ def main(argv: list[str] | None = None, *, cancel_fn=None, state: dict | None = 
 	session = stored_surfaces.StoreSession(cfg.store) if own_session else store_session
 	if cfg.output_name and args.output_name_mode != "exact":
 		cfg = replace(cfg, output_name=stored_surfaces.next_free_name(
-			session.path, cfg.output_name.removesuffix(".tifxyz"), args.output_name_mode))
+			session.location, cfg.output_name.removesuffix(".tifxyz"), args.output_name_mode))
 	created = created_surfaces if created_surfaces is not None else []
 	try:
-		result = _export(cfg, cancel_fn=_check_cancel, state=state, store_session=session, created=created)
-		if own_session:
-			session.sync()
-		return result
+		return _export(cfg, cancel_fn=_check_cancel, state=state, store_session=session, created=created)
 	finally:
 		if own_session:
 			session.close()
@@ -1467,6 +1472,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 					  area=area, components=components if D > 1 else None,
 					  base_shape_zyx=output_base_shape_zyx,
 					  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+					  export_coordinate_scale=export_factor,
 					  extra_channels=extra_all,
 					  extra_channel_specs=flow_gate_channel_specs,
 					  atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export),
@@ -1488,6 +1494,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 			(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 		_write_corr_points_results(written, corr_points_results, store)
 		_write_atlas_control_results(written, atlas_control_export, store)
+		_publish_side_files(written, store)
 	else:
 		# One tifxyz per depth layer (winding)
 		total_area = {"area_vx2": 0.0}
@@ -1540,6 +1547,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 						  area=area,
 						  base_shape_zyx=output_base_shape_zyx,
 						  lasagna_base_shape_zyx=lasagna_base_shape_zyx,
+						  export_coordinate_scale=export_factor,
 						  extra_channels=extra_layer,
 						  extra_channel_specs=flow_gate_channel_specs,
 						  atlas_control_points_summary=_atlas_summary_for_meta(atlas_control_export),
@@ -1560,6 +1568,7 @@ def _export(cfg: ExportConfig, *, cancel_fn, state: dict | None,
 				(written.files_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
 			_write_corr_points_results(written, corr_points_results, store)
 			_write_atlas_control_results(written, atlas_control_export, store)
+			_publish_side_files(written, store)
 		_print_area(total_area)
 
 	return 0

@@ -44,12 +44,12 @@ TEST_CASE("new surface UUID survives metadata and geometry saves")
     QuadSurface created(grid(), cv::Vec2f(1.f, 1.f));
     created.save(segDir);
     QuadSurface loaded(segDir);
-    const std::string uuid = loaded.meta["uuid"].get_string();
+    const std::string uuid = loaded.meta["uuid"].get<std::string>();
     CHECK(vc::objects::util::isUuid(uuid));
     CHECK(loaded.id == "named_surface");
     loaded.ensureLoaded();
     loaded.saveOverwrite();
-    CHECK(QuadSurface(segDir).meta["uuid"].get_string() == uuid);
+    CHECK(QuadSurface(segDir).meta["uuid"].get<std::string>() == uuid);
     fs::remove_all(root);
 }
 
@@ -131,7 +131,7 @@ TEST_CASE("save(path, force_overwrite=true): atomic-exchange replaces existing")
     }
     REQUIRE(fs::exists(segDir / "x.tif"));
     QuadSurface reloaded(segDir);
-    CHECK(reloaded.meta["uuid"].get_string() == "uuid-b");
+    CHECK(reloaded.meta["uuid"].get<std::string>() == "uuid-b");
     fs::remove_all(root);
 }
 
@@ -168,7 +168,7 @@ TEST_CASE("load rolls back an interrupted multi-file save generation")
                   fs::copy_options::overwrite_existing);
 
     QuadSurface recovered(segDir);
-    CHECK(recovered.meta["uuid"].get_string() == "uuid-old");
+    CHECK(recovered.meta["uuid"].get<std::string>() == "uuid-old");
     recovered.ensureLoaded();
     CHECK(recovered.rawPointsPtr()->at<cv::Vec3f>(0, 0)[2] == doctest::Approx(1.f));
     CHECK_FALSE(fs::exists(rollbackDir));

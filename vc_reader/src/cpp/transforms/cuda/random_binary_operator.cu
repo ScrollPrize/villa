@@ -24,7 +24,7 @@ void apply_cuda(const RandomBinaryOperator& t, Sample& s, const Parameters& p, S
             launch(blocks(g.size),256,0,vcr::device::stream(), morphology_kernel_launch{}, all.ptr+c.channel*g.size,first.ptr,g,f.ptr,count,op == Morph::Dilate || op == Morph::Close);
             if (op == Morph::Close || op == Morph::Open) {
                 launch(blocks(g.size),256,0,vcr::device::stream(), morphology_kernel_launch{}, first.ptr,second.ptr,g,f.ptr,count,op == Morph::Open);
-                std::swap(first.ptr,second.ptr);
+                first.swap_storage(second);
             }
             launch(blocks(g.size),256,0,vcr::device::stream(), assign_mask_launch{}, all.ptr,first.ptr,g.size,c.channel,selected.ptr,channels.size());
             check(cudaGetLastError());

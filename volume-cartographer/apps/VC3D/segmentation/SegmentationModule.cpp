@@ -1,11 +1,12 @@
 #include "SegmentationModule.hpp"
 #include "SurfaceStoreEdit.hpp"
 
-#include "../OpenDataManifest.hpp"
+#include "../OpenDataResourceSelection.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CState.hpp"
+#include "OpenedVolumes.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
 #include "SurfaceGridEdit.hpp"
@@ -44,7 +45,7 @@
 #include <utility>
 #include <vector>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -192,11 +193,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     }
 
     if (_overlay) {
-        _overlay->setEditManager(_editManager);
         _overlay->setEditingEnabled(_editingEnabled);
     }
 
-    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _widget, _state);
+    _pushPullTool = std::make_unique<SegmentationPushPullTool>(*this, _editManager, _state);
     _pushPullTool->setStepMultiplier(initialPushPullStep);
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
@@ -229,7 +229,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_state) {
         connect(_state, &CState::surfaceChanged,
                 this, &SegmentationModule::onSurfaceCollectionChanged);
-        connect(_state, &CState::pointCollectionsSaveRequested, this, &SegmentationModule::saveCorrections);
+        _state->saveSurfaceCorrections = [editor = QPointer<SegmentationModule>(this)] {
+            return !editor || editor->saveCorrections();
+        };
+        connect(_state, &CState::recoveredDraftFound, this, &SegmentationModule::offerRecoveredDraft);
     }
 
     if (_pointCollection) {
@@ -591,6 +594,10 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
 {
     qCInfo(lcSegModule) << "Active segment changed";
 
+    // Do not discard the loaded correction state if it cannot be committed.
+    if (_pointCollection && !saveCorrections())
+        throw std::runtime_error("Correction points were not saved; keep the current editor open");
+
     resetManualAddState(true);
 
     if (_surfaceMaskTool) {
@@ -598,15 +605,8 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
         _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
     }
 
-    // Save corrections for old segment and load for new segment
-    if (_pointCollection) {
-        saveCorrections();
-    }
     // The previous surface's pending saves are done: its store edit ends here.
-    if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
-        _storeEdit.reset();
-        _editLease = {};
-    }
+    _storeEdit.reset(); // A new selection may be another version of the same UUID.
     if (_pointCollection) {
         loadCorrections(newSurface);
     }
@@ -1315,8 +1315,8 @@ bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
     if (!surface->meta.is_null() && surface->meta.is_object() && surface->meta.contains("grid_offset")) {
         const auto& offset = surface->meta["grid_offset"];
         if (offset.is_array() && offset.size() >= 2 && offset[0].is_number() && offset[1].is_number()) {
-            offsetCol = offset[0].get_int();
-            offsetRow = offset[1].get_int();
+            offsetCol = offset[0].get<int>();
+            offsetRow = offset[1].get<int>();
         }
     }
 
@@ -1786,7 +1786,10 @@ bool SegmentationModule::followSheetForManualAdd()
         return false;
     }
     if (!_sheetNormals || _sheetNormalsVolume != volume) {
-        _sheetNormals = std::make_shared<SheetNormalField>(volume);
+        // Working level 0, whose indices are the surface's world coordinates; the
+        // array stays open while the field holds it.
+        auto opened = _state->openedVolumes()->level(*volume, 0).array;
+        _sheetNormals = std::make_shared<SheetNormalField>(std::shared_ptr<vcr::Array>(opened, opened->array.get()));
         _sheetNormalsVolume = volume;
     }
     setSheetWalkRunning(true);
@@ -2326,16 +2329,8 @@ void SegmentationModule::refreshEditedRegion(VolumeViewerBase* editViewer)
 {
     if (!_editManager)
         return;
-    std::optional<cv::Rect> changedCells;
-    if (const auto touched = _editManager->recentTouchedBounds()) {
-        changedCells = cv::Rect(touched->x - 1, touched->y - 1,
-                                touched->width + 2, touched->height + 2);
-    }
     const auto refresh = [&](VolumeViewerBase* viewer) {
-        if (changedCells)
-            viewer->invalidateVisRegion("segmentation", *changedCells);
-        else
-            viewer->invalidateVis();
+        viewer->invalidateVis();
         viewer->requestRender("segmentation edit refresh");
     };
     if (editViewer)
@@ -2535,7 +2530,6 @@ void SegmentationModule::updateHover(VolumeViewerBase* viewer,
             float surfaceDistance = 0.0f;
             if (auto gridIndex = _editManager->worldToGridIndex(targetWorld,
                                                                 &surfaceDistance,
-                                                                SegmentationEditManager::GridSearchResolution::High,
                                                                 false)) {
                 const float maxHoverDistance = std::max(gridStepWorld(), 1.0f) * 100.0f;
                 if (surfaceDistance <= maxHoverDistance) {
@@ -2722,10 +2716,12 @@ void SegmentationModule::performAutosave()
     }
 
     const auto autosaveTicket = _autosaveState.startSave();
+    // The draft revision this save holds (edits reach the draft as they are made).
+    const auto draftRevision = _state ? _state->objectStoreSession()->draftRevision(surfacePtr->id) : 0;
 
     emit statusMessageRequested(tr("Saving..."), kStatusShort);
 
-    _saveFuture = QtConcurrent::run([snapshot, storeEdit, rect, channels,
+    _saveFuture = QtConcurrent::run([snapshot, storeEdit, rect, channels, draftRevision,
                                       vertexUpdates = std::move(vertexUpdates)]() mutable -> std::shared_ptr<QuadSurface> {
         auto* points = snapshot->rawPointsPtr();
         if (!points || points->empty()) {
@@ -2741,7 +2737,7 @@ void SegmentationModule::performAutosave()
         if (!vertexUpdates.empty()) {
             snapshot->invalidateCache();
         }
-        storeEdit->save(*snapshot, rect, channels);
+        storeEdit->save(*snapshot, rect, channels, draftRevision);
         return snapshot;
     });
     auto saveFuture = _saveFuture;
@@ -2863,7 +2859,13 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
     }
     const auto origin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
     // Saves continue from the edit's own revisions until the surface is reopened.
-    if (_storeEdit && _storeEdit->uuid() == surface->id && (!origin || origin->pin == _storeEdit->origin())) {
+    const auto sameView = [&] {
+        const auto& view = _storeEdit->view();
+        return view && view->volume == origin->view.volume && view->scale == origin->view.scale &&
+               view->mapping == origin->view.mapping;
+    };
+    if (_storeEdit && _storeEdit->uuid() == surface->id &&
+        (!origin || (origin->pin == _storeEdit->origin() && sameView()))) {
         return _storeEdit;
     }
     if (!origin || !_state) {
@@ -2878,7 +2880,8 @@ std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* 
     return _storeEdit;
 }
 
-bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels)
+bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels,
+                                     const std::optional<std::string>& geometryRevision)
 {
     const auto storeEdit = surface ? storeEditFor(surface) : nullptr;
     if (!storeEdit) {
@@ -2895,7 +2898,8 @@ bool SegmentationModule::saveSurface(QuadSurface* surface, bool vertices, const 
             _saveFuture.waitForFinished();
         }
         const auto* points = surface->rawPointsPtr();
-        storeEdit->save(*surface, vertices && points ? cv::Rect(0, 0, points->cols, points->rows) : cv::Rect(), loaded);
+        storeEdit->save(*surface, vertices && points ? cv::Rect(0, 0, points->cols, points->rows) : cv::Rect(), loaded,
+                        _state->objectStoreSession()->draftRevision(surface->id), geometryRevision);
         return true;
     } catch (const std::exception& error) {
         qCWarning(lcSegModule) << "Saving surface channels failed:" << error.what();

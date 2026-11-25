@@ -9,7 +9,7 @@ from typing import Tuple
 
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.data import affine
 from vesuvius.models.datasets.cross_frame_dataset import CrossFrameZarrDataset
@@ -38,16 +38,12 @@ def _write_transform(path: Path, matrix_xyz: np.ndarray) -> None:
 
 
 def _write_zarr_array(path: Path, arr: np.ndarray, chunks: Tuple[int, int, int]) -> None:
-    z = zarr.open(str(path), mode="w", shape=arr.shape, dtype=arr.dtype, chunks=chunks)
+    z = ZarrWriter.create(path, shape=arr.shape, dtype=arr.dtype, chunks=chunks)
     z[...] = arr
 
 
 def _create_group_array(group, name: str, data: np.ndarray, chunks: Tuple[int, int, int]) -> None:
-    create_array = getattr(group, "create_array", None)
-    if create_array is not None:
-        create_array(name, data=data, chunks=chunks)
-    else:
-        group.create_dataset(name, shape=data.shape, data=data, chunks=chunks)
+    group.create_array(name, shape=data.shape, chunks=chunks, dtype=data.dtype)[...] = data
 
 
 def _make_mgr(
@@ -274,7 +270,7 @@ def test_coarse_scan_level(tmp_path: Path):
 
     base = tmp_path / "labels.ome.zarr"
     base.mkdir(parents=True)
-    group = zarr.open_group(str(base), mode="w")
+    group = create_group(base)
     _create_group_array(group, "0", labels, chunks=(16, 16, 16))
     coarse = (labels[::4, ::4, ::4] > 0).astype(np.uint8)  # 16^3
     _create_group_array(group, "1", coarse, chunks=(8, 8, 8))
@@ -476,3 +472,43 @@ def test_binarize_labels_explicit_overrides_default(tmp_path: Path):
     sample = ds[0]
     label = sample["fibers"].numpy().squeeze(0)
     assert set(np.unique(label).tolist()).issubset({0.0, 1.0})
+
+
+@pytest.mark.parametrize("scheme", ["none", "zscore", "minmax", "rescale_to_01", "robust", "ct"])
+def test_native_normalization_preserves_crop_statistics(identity_pair, scheme):
+    mgr = _make_mgr(image_url=identity_pair.image_url, labels_url=identity_pair.labels_url,
+                    transform_url=identity_pair.tform_url, cache_dir=identity_pair.root)
+    mgr.normalization_scheme = scheme
+    mgr.intensity_properties = dict(mean=100., std=40., percentile_00_5=20., percentile_99_5=230.)
+    ds = CrossFrameZarrDataset(mgr, is_training=False)
+    sample = ds[0]
+    pos = sample["patch_info"]["position"]
+    crop = identity_pair.image[tuple(slice(p, p+16) for p in pos)].astype(np.float64)
+    if scheme == "zscore":
+        expected = (crop-crop.mean()) / crop.std()
+    elif scheme in ("minmax", "rescale_to_01"):
+        expected = (crop-crop.min()) / (crop.max()-crop.min())
+    elif scheme == "robust":
+        clipped = np.clip(crop, *np.percentile(crop, [1, 99]))
+        median = np.median(clipped)
+        expected = (clipped-median) / (1.4826*np.median(np.abs(clipped-median)))
+    elif scheme == "ct":
+        expected = (np.clip(crop, 20, 230)-100) / 40
+    else:
+        expected = crop
+    np.testing.assert_allclose(sample["image"].numpy()[0], expected, atol=1e-6, rtol=1e-6)
+
+    # The other training datasets select the same native operation from their configuration.
+    from vesuvius.models.datasets.zarr_dataset import ZarrDataset
+    from vesuvius.models.datasets.mutex_affinity_dataset import MutexAffinityDataset
+    for cls in (ZarrDataset, MutexAffinityDataset):
+        other = cls.__new__(cls)
+        other.mgr = mgr
+        other.normalization_scheme = scheme
+        other.intensity_properties = mgr.intensity_properties
+        other._initialize_normalization()
+        if scheme == "none":
+            assert other.normalizer is None
+        else:
+            got = other.normalizer({"image": crop.astype(np.float32)[None]}, seed=0)["image"][0]
+            np.testing.assert_allclose(got, expected, atol=1e-6, rtol=1e-6)

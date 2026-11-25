@@ -74,7 +74,6 @@ public:
                          const QPointF& scenePos,
                          bool appendToPreview,
                          float viewScale,
-                         const VCCollection* pointCollection,
                          const SceneToVolumeFn& sceneToVolume,
                          const VolumeToSceneFn& volumeToScene,
                          const SetOverlayGroupFn& setOverlayGroup,
@@ -88,7 +87,6 @@ public:
                             const ClearOverlayGroupFn& clearOverlayGroup);
     bool appendManualPreview(const QPointF& scenePos,
                              float viewScale,
-                             const VCCollection* pointCollection,
                              const SceneToVolumeFn& sceneToVolume,
                              const VolumeToSceneFn& volumeToScene,
                              const SetOverlayGroupFn& setOverlayGroup,

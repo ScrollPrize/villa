@@ -1,9 +1,10 @@
 """Public entry point for the Vesuvius package."""
 
-from . import data, install
+from . import data
+from .data import Cube
+from .utils import list_cubes
 
-# Always expose Volume; protect VCDataset because it depends on PyTorch.
-from .data import Volume
+# Protect VCDataset because it depends on PyTorch.
 try:
     from .data import VCDataset  # requires the 'models' extra (torch)
 except Exception:
@@ -18,36 +19,18 @@ try:
     from . import structure_tensor  # heavy segmentation extras
 except Exception:
     structure_tensor = None  # type: ignore
-try:
-    from . import tifxyz  # tifxyz format I/O (requires tifffile, scipy)
-except Exception:
-    tifxyz = None  # type: ignore
-
-# Attempt to import utils.  utils requires aiohttp and nest_asyncio; if they aren't
-# installed (e.g. when you install with [volume-only] or without extras), we silently
-# fall back to None.  Users who need catalog utilities should install the appropriate
-# optional extra.
+# Keep the utilities namespace available alongside its public cube listing.
 try:
     from . import utils  # type: ignore
-    from .utils import is_aws_ec2_instance, list_cubes, list_files, update_list  # type: ignore
 except Exception:
     utils = None  # type: ignore
-    is_aws_ec2_instance = None  # type: ignore
-    list_cubes = None  # type: ignore
-    list_files = None  # type: ignore
-    update_list = None  # type: ignore
 
 __all__ = [
-    "Volume",
+    "Cube",
+    "list_cubes",
     "VCDataset",
     "data",
-    "install",
     "utils",
     "models",
     "structure_tensor",
-    "tifxyz",
-    "is_aws_ec2_instance",
-    "list_cubes",
-    "list_files",
-    "update_list",
 ]

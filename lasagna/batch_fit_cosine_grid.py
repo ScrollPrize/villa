@@ -2,7 +2,7 @@ from pathlib import Path
 import argparse
 from typing import Optional, List
 
-import tifffile
+from vc_reader import images
 
 from fit_cosine_grid import fit_cosine_grid
 
@@ -19,14 +19,13 @@ def _ensure_out_dir(out_dir: Path) -> None:
 
 
 def _num_layers(path: Path) -> int:
-	with tifffile.TiffFile(str(path)) as tif:
-		series = tif.series[0]
-		shape = series.shape
-		if len(shape) == 2:
-			return 1
-		if len(shape) == 3:
-			return int(shape[0])
-		raise ValueError(f"Unsupported TIFF shape {shape} for {path}")
+	with images.open(path) as reader:
+		shape = reader.shape
+	if len(shape) == 2:
+		return 1
+	if len(shape) == 3:
+		return int(shape[0])
+	raise ValueError(f"Unsupported TIFF shape {shape} for {path}")
 
 
 def batch_fit_cosine(

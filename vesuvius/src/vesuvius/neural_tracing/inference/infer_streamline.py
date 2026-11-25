@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import zarr
+from vc_reader.reader import ZarrGroup, create_group
 from tqdm import tqdm
 
 from vesuvius.neural_tracing.datasets.common import (
@@ -29,14 +29,13 @@ from vesuvius.neural_tracing.datasets.growth_direction import make_growth_direct
 from vesuvius.neural_tracing.heatmap_single_point.tifxyz import save_tifxyz
 from vesuvius.neural_tracing.inference.napari_helpers import show_streamline_geometry_napari
 from vesuvius.neural_tracing.nets.models import load_checkpoint
-from vesuvius.tifxyz import read_tifxyz
+from vc_reader import tifxyz
 
 
 TIFXYZ_PATH = None
 VOLUME_PATH = "auto"
 VOLUME_SCALE = 0
 VOLUME_CACHE_DIR = "/home/sean/Documents/tmp_infer/vesuvius-volume-cache"
-VOLUME_CACHE_RETRY_SECONDS = 0.0
 CHECKPOINT_PATH = None
 
 # Keep None unless intentionally debugging shape mismatches. The default reads
@@ -552,13 +551,11 @@ def upsample_voxelize_tifxyz_surface_in_bboxes(
     x_min, x_max)` tuple produced by `get_cond_edge_bboxes`. The returned
     `voxels` are crop-local `(D, H, W)` uint8 masks.
     """
-    surface.use_stored_resolution()
-    scale_y, scale_x = surface._scale
+    scale_y, scale_x = surface.scale
     crop_shape = tuple(int(v) for v in crop_size)
 
     if stored_zyxs is None or valid is None:
-        x_s, y_s, z_s, valid_s = surface[:]
-        stored_zyxs = np.stack([z_s, y_s, x_s], axis=-1)
+        stored_zyxs, valid_s = surface.xyz[..., ::-1], surface.valid
         valid = np.asarray(valid_s, dtype=bool)
     else:
         stored_zyxs = np.asarray(stored_zyxs)
@@ -579,10 +576,9 @@ def upsample_voxelize_tifxyz_surface_in_bboxes(
             continue
 
         r_min, r_max, c_min, c_max = grid_bbox
-        x_s, y_s, z_s, valid_s = surface[r_min:r_max + 1, c_min:c_max + 1]
-        if x_s.size == 0:
-            trimmed = None
-        elif strict_valid and valid_s is not None and not np.asarray(valid_s, dtype=bool).all():
+        xyz_s = surface.xyz[r_min:r_max + 1, c_min:c_max + 1]
+        x_s, y_s, z_s = xyz_s[..., 0], xyz_s[..., 1], xyz_s[..., 2]
+        if strict_valid and not surface.valid[r_min:r_max + 1, c_min:c_max + 1].all():
             trimmed = None
         else:
             x_full, y_full, z_full = _upsample_world_surface(x_s, y_s, z_s, scale_y, scale_x)
@@ -616,12 +612,9 @@ def _load_surface_zyx(tifxyz_path):
     if not tifxyz_path.is_dir():
         raise NotADirectoryError(f"tifxyz path must be a directory: {tifxyz_path}")
 
-    surface = read_tifxyz(tifxyz_path)
-    surface.use_stored_resolution()
-    x, y, z, valid = surface[:]
-    stored_zyxs = np.stack([z, y, x], axis=-1)
-    valid = _sanitize_surface_validity(stored_zyxs, valid)
-    return stored_zyxs, valid
+    surface = tifxyz.read(tifxyz_path)
+    stored_zyxs = surface.xyz[..., ::-1].copy()
+    return stored_zyxs, surface.valid.copy()
 
 
 def _read_tifxyz_meta(tifxyz_path):
@@ -740,12 +733,9 @@ def _crop_size_from_config(config):
 def _open_volume_array(volume_path, volume_scale):
     root = open_zarr_group(
         volume_path,
-        config={
-            "volume_cache_dir": VOLUME_CACHE_DIR,
-            "volume_cache_retry_seconds": VOLUME_CACHE_RETRY_SECONDS,
-        },
+        config={"volume_cache_dir": VOLUME_CACHE_DIR},
     )
-    if isinstance(root, zarr.Group):
+    if isinstance(root, ZarrGroup):
         scale_key = str(int(volume_scale))
         if scale_key not in root:
             raise KeyError(f"volume scale {scale_key!r} not found in {volume_path}")
@@ -1259,8 +1249,8 @@ class _SparseChunkOutputMerger:
 
     def finalize(self):
         try:
-            outputs = self.root.require_group("outputs")
-            avg_group = outputs.require_group("avg")
+            outputs = self.root.create_group("outputs")
+            avg_group = outputs.create_group("avg")
             avg_group.attrs["window_min_zyx"] = self.root.attrs.get("window_min_zyx", [0, 0, 0])
             avg_group.attrs["window_shape_zyx"] = self.root.attrs.get("window_shape_zyx", None)
             avg_group.attrs["merge_backing"] = "mmap"
@@ -1271,7 +1261,7 @@ class _SparseChunkOutputMerger:
                 if output_name in avg_group:
                     del avg_group[output_name]
 
-                avg = avg_group.create_dataset(
+                avg = avg_group.create_array(
                     output_name,
                     shape=(int(channels), *self.window_shape),
                     chunks=(int(channels), *self.chunks_3d),
@@ -1850,6 +1840,10 @@ def _apply_surface_attract_correction(sampler, candidate):
     return corrected, usable
 
 
+def _store_array(group, name, *, data, chunks):
+    group.create_array(name, shape=data.shape, chunks=chunks, dtype=data.dtype)[...] = data
+
+
 def integrate_streamlines_from_edge(avg_group, edge_zyx, edge_axis_scale, window_min, zarr_root):
     velocity = _require_avg_field(avg_group, "velocity_dir", 3)
     attract = _require_avg_field(avg_group, "surface_attract", 3)
@@ -1966,7 +1960,7 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, edge_axis_scale, window
     diag_validity_oob = diag_validity_oob_t.detach().cpu().numpy()
     diag_validity_nonfinite = diag_validity_nonfinite_t.detach().cpu().numpy()
     diag_low_validity = diag_low_validity_t.detach().cpu().numpy()
-    integration = zarr_root.require_group("streamline_integration")
+    integration = zarr_root.create_group("streamline_integration")
     for name in (
         "seed_zyx",
         "points_zyx",
@@ -1993,48 +1987,48 @@ def integrate_streamlines_from_edge(avg_group, edge_zyx, edge_axis_scale, window
     ):
         if name in integration:
             del integration[name]
-    integration.create_dataset("seed_zyx", data=seeds_world.astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
-    integration.create_dataset("points_zyx", data=traces_world.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096), 3))
-    integration.create_dataset("active_mask", data=active_mask.astype(np.uint8), chunks=(1, min(seeds_world.shape[0], 4096)))
-    integration.create_dataset("cumulative_distance", data=cumulative_distance.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096)))
-    integration.create_dataset("endpoint_zyx", data=traces_world[-1].astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
-    integration.create_dataset("endpoint_active", data=endpoint_active.astype(np.uint8), chunks=(min(seeds_world.shape[0], 4096),))
-    integration.create_dataset(
+    _store_array(integration, "seed_zyx", data=seeds_world.astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
+    _store_array(integration, "points_zyx", data=traces_world.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096), 3))
+    _store_array(integration, "active_mask", data=active_mask.astype(np.uint8), chunks=(1, min(seeds_world.shape[0], 4096)))
+    _store_array(integration, "cumulative_distance", data=cumulative_distance.astype(np.float32), chunks=(1, min(seeds_world.shape[0], 4096)))
+    _store_array(integration, "endpoint_zyx", data=traces_world[-1].astype(np.float32), chunks=(min(seeds_world.shape[0], 4096), 3))
+    _store_array(integration, "endpoint_active", data=endpoint_active.astype(np.uint8), chunks=(min(seeds_world.shape[0], 4096),))
+    _store_array(integration,
         "support_source_sparse_index",
         data=seed_bundle["source_sparse_index"].astype(np.int64),
         chunks=(min(seeds_world.shape[0], 4096),),
     )
-    integration.create_dataset(
+    _store_array(integration,
         "support_offset_full_res",
         data=seed_bundle["support_offset_full_res"].astype(np.float32),
         chunks=(min(seeds_world.shape[0], 4096),),
     )
-    integration.create_dataset(
+    _store_array(integration,
         "support_weight",
         data=seed_bundle["support_weight"].astype(np.float32),
         chunks=(min(seeds_world.shape[0], 4096),),
     )
-    integration.create_dataset(
+    _store_array(integration,
         "support_is_center",
         data=seed_bundle["support_is_center"].astype(np.uint8),
         chunks=(min(seeds_world.shape[0], 4096),),
     )
-    integration.create_dataset(
+    _store_array(integration,
         "sparse_edge_index",
         data=seed_bundle["sparse_edge_indices"].astype(np.int64),
         chunks=(min(seed_bundle["sparse_seed_count"], 4096),),
     )
-    integration.create_dataset("diagnostic_step_index", data=np.arange(1, n_steps + 1, dtype=np.int32), chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_active_before", data=diag_active_before, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_accepted", data=diag_accepted, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_velocity_oob", data=diag_velocity_oob, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_velocity_nonfinite", data=diag_velocity_nonfinite, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_velocity_zero", data=diag_velocity_zero, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_attract_oob", data=diag_attract_oob, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_candidate_nonfinite", data=diag_candidate_nonfinite, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_validity_oob", data=diag_validity_oob, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_validity_nonfinite", data=diag_validity_nonfinite, chunks=(min(n_steps, 4096),))
-    integration.create_dataset("diagnostic_low_validity", data=diag_low_validity, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_step_index", data=np.arange(1, n_steps + 1, dtype=np.int32), chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_active_before", data=diag_active_before, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_accepted", data=diag_accepted, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_velocity_oob", data=diag_velocity_oob, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_velocity_nonfinite", data=diag_velocity_nonfinite, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_velocity_zero", data=diag_velocity_zero, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_attract_oob", data=diag_attract_oob, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_candidate_nonfinite", data=diag_candidate_nonfinite, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_validity_oob", data=diag_validity_oob, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_validity_nonfinite", data=diag_validity_nonfinite, chunks=(min(n_steps, 4096),))
+    _store_array(integration, "diagnostic_low_validity", data=diag_low_validity, chunks=(min(n_steps, 4096),))
     integration.attrs["tifxyz_voxel_step"] = float(TIFXYZ_VOXEL_STEP)
     integration.attrs["tifxyz_steps"] = int(TIFXYZ_STEPS)
     integration.attrs["integration_steps"] = int(len(step_sizes))
@@ -2409,17 +2403,17 @@ def _cleanup_temp_output_zarr(output_path):
 
 
 def _store_iteration_geometry(output_root, bboxes, edge):
-    geometry = output_root.require_group("geometry")
+    geometry = output_root.create_group("geometry")
     bboxes = np.asarray(bboxes, dtype=np.int64).reshape(-1, 6)
     edge = np.asarray(edge, dtype=np.float32).reshape(-1, 3)
     if bboxes.shape[0] > 0:
-        geometry.create_dataset(
+        _store_array(geometry,
             "bboxes",
             data=bboxes,
             chunks=(min(int(bboxes.shape[0]), 4096), 6),
         )
     if edge.shape[0] > 0:
-        geometry.create_dataset(
+        _store_array(geometry,
             "edge_zyx",
             data=edge,
             chunks=(min(int(edge.shape[0]), 4096), 3),
@@ -2581,8 +2575,8 @@ def _run_streamline_iteration(
         cond_valid=valid,
         integration_margin=bbox_integration_margin,
     )
-    surface = read_tifxyz(input_tifxyz_path)
-    edge_axis_scale = surface._scale[0] if _get_direction_spec(cond_direction)["axis"] == "col" else surface._scale[1]
+    surface = tifxyz.read(input_tifxyz_path)
+    edge_axis_scale = surface.scale[0] if _get_direction_spec(cond_direction)["axis"] == "col" else surface._scale[1]
     output_path = _output_zarr_path(iteration_idx)
     expected_output_tifxyz_path = None
     if context.is_rank0:
@@ -2601,7 +2595,7 @@ def _run_streamline_iteration(
         output_root = None
         if context.is_rank0:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_root = zarr.open_group(str(output_path), mode="w")
+            output_root = create_group(output_path, overwrite=True, auth=None)
             output_root.attrs["input_tifxyz_path"] = str(input_tifxyz_path)
             output_root.attrs["iteration"] = int(iteration_idx)
             output_root.attrs["total_iterations"] = int(total_iterations)
@@ -2775,7 +2769,6 @@ def _parse_args(argv=None):
         help="Volume pyramid scale. Defaults to the matched checkpoint dataset scale when --volume-path=auto.",
     )
     parser.add_argument("--volume-cache-dir", default="/tmp/vesuvius-volume-cache")
-    parser.add_argument("--volume-cache-retry-seconds", type=float, default=60.0)
     parser.add_argument("--output-dir", required=True, help="Run output directory.")
     parser.add_argument("--grow-direction", default="left", choices=sorted(_DIRECTION_SPECS))
     parser.add_argument("--num-iterations", type=int, default=10)
@@ -2811,7 +2804,7 @@ def _parse_args(argv=None):
 
 
 def _apply_runtime_config(args, resolved_volume_path, resolved_volume_scale, tifxyz_voxel_step, runtime_device=None):
-    global TIFXYZ_PATH, VOLUME_PATH, VOLUME_SCALE, VOLUME_CACHE_DIR, VOLUME_CACHE_RETRY_SECONDS
+    global TIFXYZ_PATH, VOLUME_PATH, VOLUME_SCALE, VOLUME_CACHE_DIR
     global CHECKPOINT_PATH, BATCH_SIZE, DEVICE, COMPILE_MODEL, OUTPUT_TIFXYZ_DIR
     global OUTPUT_TIFXYZ_VOXEL_SIZE_UM, RUN_OUTPUT_DIR, RUN_TIMESTAMP, USE_TTA
     global GROW_DIRECTION, TIFXYZ_VOXEL_STEP, TIFXYZ_STEPS, NUM_ITERATIONS
@@ -2822,7 +2815,6 @@ def _apply_runtime_config(args, resolved_volume_path, resolved_volume_scale, tif
     VOLUME_PATH = str(resolved_volume_path)
     VOLUME_SCALE = int(resolved_volume_scale)
     VOLUME_CACHE_DIR = str(args.volume_cache_dir)
-    VOLUME_CACHE_RETRY_SECONDS = float(args.volume_cache_retry_seconds)
     BATCH_SIZE = int(args.batch_size)
     DEVICE = str(args.device if runtime_device is None else runtime_device)
     COMPILE_MODEL = bool(args.compile_model)

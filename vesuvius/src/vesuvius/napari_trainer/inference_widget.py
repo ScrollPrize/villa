@@ -21,18 +21,6 @@ class ActivationType(Enum):
     SIGMOID = "sigmoid" 
     ARGMAX = "argmax"
 
-# Define mode options
-class BlendMode(Enum):
-    CONSTANT = "constant"
-    GAUSSIAN = "gaussian"
-
-# Define padding mode options
-class PaddingMode(Enum):
-    CONSTANT = "constant"
-    REFLECT = "reflect"
-    REPLICATE = "replicate"
-    CIRCULAR = "circular"
-
 @magicgui(
     call_button="Run Inference",
     layout="vertical",
@@ -41,9 +29,7 @@ class PaddingMode(Enum):
     activation_type={"label": "Activation Type", "choices": [ActivationType.NONE, ActivationType.SOFTMAX, ActivationType.SIGMOID, ActivationType.ARGMAX]},
     batch_size={"label": "Batch Size", "widget_type": "SpinBox", "min": 1, "max": 256, "step": 1, "value": 2},
     overlap={"label": "Overlap", "widget_type": "FloatSpinBox", "min": 0.0, "max": 0.75, "step": 0.05, "value": 0.25},
-    mode={"label": "Blend Mode", "choices": [BlendMode.CONSTANT, BlendMode.GAUSSIAN]},
-    sigma_scale={"label": "Sigma Scale (gaussian)", "widget_type": "FloatSpinBox", "min": 0.01, "max": 1.0, "step": 0.025, "value": 0.125},
-    padding_mode={"label": "Padding Mode", "choices": [PaddingMode.CONSTANT, PaddingMode.REFLECT, PaddingMode.REPLICATE, PaddingMode.CIRCULAR]},
+    sigma_scale={"label": "Gaussian sigma = patch / ", "widget_type": "FloatSpinBox", "min": 1.0, "max": 64.0, "step": 0.5, "value": 8.0},
 )
 def inference_widget(
     viewer: napari.Viewer,
@@ -52,9 +38,7 @@ def inference_widget(
     activation_type: ActivationType = ActivationType.NONE,
     batch_size: int = 2,
     overlap: float = 0.25,
-    mode: BlendMode = BlendMode.CONSTANT,
-    sigma_scale: float = 0.125,
-    padding_mode: PaddingMode = PaddingMode.CONSTANT,
+    sigma_scale: float = 8.0,
 ) -> Optional[napari.layers.Image]:
     if not model_path or not os.path.exists(model_path):
         print("Please select a valid model checkpoint file")
@@ -70,10 +54,8 @@ def inference_widget(
             layer=layer,
             checkpoint_path=model_path,
             overlap=overlap,
-            sw_batch_size=batch_size,
-            mode=mode.value,
+            batch_size=batch_size,
             sigma_scale=sigma_scale,
-            padding_mode=padding_mode.value,
             activation_type=activation_type.value
         )
         

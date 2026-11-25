@@ -106,10 +106,15 @@ required_formulae=(
   ceres-solver
   eigen
   opencv
-  cgal
   c-blosc
+  c-blosc2
+  concurrentqueue
+  zstd
+  lz4
   boost
   libtiff
+  libpng
+  jpeg-turbo
   curl
   nlohmann-json
   sqlite

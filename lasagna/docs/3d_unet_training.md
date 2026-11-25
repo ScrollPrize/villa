@@ -695,7 +695,10 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--devices` | Multi-GPU selection: `all` visible GPUs or a comma-separated subset such as `cuda:0,cuda:2`. Cannot be combined with `--device`. |
 | `--prefetch-workers` | CPU/Zarr tile readers. `0` selects a bounded automatic count. |
 | `--slots-per-gpu` | Fixed shared-memory input/result pipeline slots per GPU (default 2). |
-| `--download-workers` | Parallel automatic S3 chunk transfers (default 64); independent of inference and pyramid workers. |
+| `--input-disk-cache-dir` | vc_reader disk cache for a remote `--input`; chunks are kept decoded there across runs. |
+| `--input-disk-cache-gib` | Bound on that cache in GiB; least recently used chunks are removed past it. |
+| `--input-connections` | Parallel remote input reads (default 64); independent of inference and pyramid workers. |
+| `--read-ahead-tiles` | Tiles of a remote input read ahead into the caches (default 10000). |
 | `--chunk-z` | Zarr chunk size along Z in the output (default 32). |
 | `--chunk-yx` | Zarr chunk size along Y and X in the output (default 32). |
 
@@ -720,7 +723,7 @@ full OME-Zarr chunks, and discarded before the next bands are processed. Input
 tiles are read lazily from the zarr — the full crop is never loaded into RAM.
 
 Multi-GPU inference keeps only the independent axis lattices and generates
-their Cartesian tile stream on demand. Asynchronous TensorStore bounding-box
+their Cartesian tile stream on demand. Background bounding-box
 reads use a separate bounded read-ahead window while persistent per-GPU model
 workers use fixed shared-memory input/result slots. Completed input arrays are
 copied into shared memory only when a GPU queue and both slot types are
@@ -728,9 +731,8 @@ available, then released. Worker results can finish out of order, but they are
 accumulated in the same canonical order as serial inference; only the
 coordinator advances the rolling Z ring after publication workers acknowledge
 their writes. The conservative input
-memory bound is the read-ahead window times one padded tile, plus TensorStore's
-cache and the shared-memory slots. `--input-reader python-zarr` retains the old
-threaded reader for comparison.
+memory bound is the read-ahead window times one padded tile, plus the reader's
+memory cache and the shared-memory slots.
 
 `--profile-pipeline` enables fixed-memory multi-device diagnostics. Historical
 `gpuN_sum` spans CPU dtype conversion through output D2H; the detailed report

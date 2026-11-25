@@ -1,4 +1,6 @@
+#include "vc/core/util/CudaSampling.hpp"
 #include "SeedingWidget.hpp"
+#include "OpenedVolumes.hpp"
 #include "ToolExecutable.hpp"
 #include "VolumeCommandPath.hpp"
 #include "ObjectStoreRegions.hpp"
@@ -25,7 +27,6 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 
@@ -38,6 +39,7 @@
 #include <functional>
 #include <limits>
 #include <unordered_set>
+#include "vc_reader/array.hpp"
 
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
@@ -111,7 +113,6 @@ SegmentTriangleHit segmentSegmentClosestOnFirst(const cv::Vec3f& p1,
 
 SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWidget* parent)
     : QWidget(parent)
-    , currentZSlice(0)
     , isDrawing(false)
     , colorIndex(0)
     , jobsRunning(false)
@@ -311,11 +312,6 @@ void SeedingWidget::onVolumeChanged(std::shared_ptr<Volume> vol, const std::stri
     updateButtonStates();
 }
 
-void SeedingWidget::updateCurrentZSlice(int z)
-{
-    currentZSlice = z;
-}
-
 void SeedingWidget::onClearPeaksClicked()
 {
     if (const auto id = _point_collection->getCollectionId("seeding_peaks"))
@@ -346,6 +342,22 @@ void SeedingWidget::setDrawEnabled(bool enabled)
     displayPaths();
 }
 
+// Trilinear values of the current volume's working level at XYZ points (vc_reader's
+// interpolated floats, clamped to the 8-bit range).
+std::vector<float> SeedingWidget::sampleIntensities(const Volume& volume, const std::vector<cv::Vec3f>& points) const
+{
+    const auto level = _state->openedVolumes()->level(volume, 0);
+    std::vector<double> zyx;
+    zyx.reserve(3 * points.size());
+    for (const auto& p : points)
+        zyx.insert(zyx.end(), {double(p[2]), double(p[1]), double(p[0])});
+    std::vector<float> values(points.size());
+    vc::cuda::sampleLinear(*level.array->array, level.array->meta.type, level.cuda.get(), zyx.data(), points.size(), values.data());
+    for (auto& v : values)
+        v = std::clamp(v, 0.0f, 255.0f);
+    return values;
+}
+
 void SeedingWidget::computeDistanceTransform()
 {
     auto currentVolume = _state ? _state->currentVolume() : nullptr;
@@ -353,22 +365,22 @@ void SeedingWidget::computeDistanceTransform()
         return;
     }
 
-    // Get the current slice data
-    const int width = currentVolume->sliceWidth();
-    const int height = currentVolume->sliceHeight();
-    
-    cv::Mat_<uint8_t> sliceData(height, width);
-    
-    // Extract the slice data from the volume
-    cv::Mat_<cv::Vec3f> coords(height, width);
-    for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-            coords(y, x) = cv::Vec3f(x, y, currentZSlice);
-        }
-    }
-    
-    // Read the slice data using the volume's dataset
-    currentVolume->sample(sliceData, coords, vc::SampleParams{});
+    // Read the current slice of the volume's working level
+    const auto level = _state->openedVolumes()->level(*currentVolume, 0);
+    const auto& meta = level.array->meta;
+    const int width = int(meta.shape[2]);
+    const int height = int(meta.shape[1]);
+    cv::Mat_<float> values(height, width);
+    // The slice the xy plane view shows, in the level's indices.
+    double planeZ = 0.0;
+    if (auto* plane = dynamic_cast<PlaneSurface*>(_state->surfaceRaw("xy plane")))
+        planeZ = plane->origin()[2];
+    const auto zIndex = std::clamp<std::int64_t>(
+        std::llround(level.array->placement.fromLevel0(0, level.working.toLevel0(0, planeZ))), 0, meta.shape[0] - 1);
+    level.array->array->read_many_float({{zIndex, 0, 0}}, {{1, height, width}},
+                                        {reinterpret_cast<std::uint8_t*>(values.ptr<float>())}, meta.type, false);
+    cv::Mat_<uint8_t> sliceData;
+    values.convertTo(sliceData, CV_8U);
     
     // Threshold the slice to create a binary image for distance transform
     cv::Mat binaryImage;
@@ -448,7 +460,7 @@ bool SeedingWidget::runSegmentationHeadless(QString* errorMessage)
     _batchVolumePath = vc3d::commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for segmentation "
-                    "(no local mirror and no remote locator)."));
+                    "(no local path and no remote locator)."));
         return false;
     }
 
@@ -751,18 +763,10 @@ void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
             pt[1] >= by0 && pt[1] < by1 &&
             pt[2] >= bz0 && pt[2] < bz1) {
             
-            // Create a single-point coordinate matrix for reading
-            cv::Mat_<cv::Vec3f> coord(1, 1);
-            coord(0, 0) = pt;
-            
-            // Read the intensity value at this 3D point
-            cv::Mat_<uint8_t> intensity(1, 1);
-            currentVolume->sample(intensity, coord, vc::SampleParams{});
-
-            intensities.push_back(intensity(0, 0));
             positions.push_back(pt);
         }
     }
+    intensities = sampleIntensities(*currentVolume, positions);
     
     if (intensities.empty()) {
         return;
@@ -921,26 +925,22 @@ void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
         computeDistanceTransform();
     }
 
-    // Create a new target collection.
+    // addPoint creates the target only once a complete query produces hits.
     std::string newColName = _point_collection->generateNewCollectionName("wraps");
-    uint64_t newColId = _point_collection->addCollection(newColName);
 
     int addedPoints = 0;
     if (usePatchIntersections) {
         addedPoints = findPatchIntersectionsAlongPathToCollection(currentPath, newColName);
     } else {
         findPeaksAlongPathToCollection(currentPath, newColName);
-        const auto& collections = _point_collection->getAllCollections();
-        const auto it = collections.find(newColId);
-        if (it != collections.end()) {
-            addedPoints = static_cast<int>(it->second.points.size());
-        }
+        if (const auto id = _point_collection->getCollectionId(newColName))
+            addedPoints = static_cast<int>(_point_collection->getAllCollections().at(*id).points.size());
     }
 
     if (addedPoints > 0) {
         // Auto fill winding annotations in chosen direction.
         _point_collection->autoFillWindingNumbers(
-            newColId,
+            _point_collection->getCollectionId(newColName).value(),
             shiftHeld ? VCCollection::WindingFillMode::Decremental : VCCollection::WindingFillMode::Incremental
         );
     }
@@ -977,14 +977,10 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
         if (pt[0] >= bx0 && pt[0] < bx1 &&
             pt[1] >= by0 && pt[1] < by1 &&
             pt[2] >= bz0 && pt[2] < bz1) {
-            cv::Mat_<cv::Vec3f> coord(1, 1);
-            coord(0, 0) = pt;
-            cv::Mat_<uint8_t> intensity(1, 1);
-            currentVolume->sample(intensity, coord, vc::SampleParams{});
-            intensities.push_back(intensity(0, 0));
             positions.push_back(pt);
         }
     }
+    intensities = sampleIntensities(*currentVolume, positions);
 
     if (intensities.empty()) return;
 
@@ -1094,6 +1090,7 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                 const auto crossings = SurfaceCatalog::region(*_surfaceCatalog->session(), _surfaceCatalog->sources(),
                                                               _surfaceCatalog->voxels(),
                                                               vc3d::store::regionSlice(*region), {});
+                crossings.requireComplete();
                 for (const auto& run : crossings.runs) {
                     auto& out = intersections[run.objectUuid];
                     for (size_t i = 1; i < run.points.size(); ++i)
@@ -1102,6 +1099,8 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                 }
             } catch (const std::exception& error) {
                 Logger()->warn("Relative winding surface query failed: {}", error.what());
+                QMessageBox::warning(this, tr("Winding annotations not created"), QString::fromUtf8(error.what()));
+                return 0;
             }
         }
     }
@@ -1343,7 +1342,7 @@ bool SeedingWidget::runExpandSeedsHeadless(QString* errorMessage)
     _batchVolumePath = vc3d::commandPathForVolume(currentVolume);
     if (_batchVolumePath.isEmpty()) {
         setError(tr("Could not resolve a volume path for expansion "
-                    "(no local mirror and no remote locator)."));
+                    "(no local path and no remote locator)."));
         return false;
     }
 

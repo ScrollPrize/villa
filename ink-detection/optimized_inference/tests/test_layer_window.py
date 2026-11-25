@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import tifffile
-import zarr
+from vc_reader import images
+from vc_reader.reader import open_zarr
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -20,7 +20,7 @@ def _layer_stack(tmp_path, n=8):
     paths = []
     for i in range(n):
         p = tmp_path / f"{i:02d}.tif"
-        tifffile.imwrite(p, np.full((16, 16), i, dtype=np.uint8))
+        images.write_tiff(p, np.full((16, 16), i, dtype=np.uint8))
         paths.append(str(p))
     return paths
 
@@ -33,7 +33,7 @@ def test_prepared_zarr_window_is_rebased(tmp_path):
     processing.record_layer_window(out, start, end)
 
     assert processing.resolve_zarr_layer_window(out, start, end) == (0, end - start)
-    z = zarr.open(out, mode="r")
+    z = open_zarr(out)
     assert z.shape[2] == end - start
     assert int(z[0, 0, 0]) == start  # channel 0 is source layer START_LAYER
 

@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from vc_object_store import ObjectStore
 from vc_object_store.documents import attach_document, attached_document
@@ -18,6 +19,10 @@ def test_results_document_round_trips_as_attached_data():
         document = {"collection_avgs": {"7": 0.25},
                     "points_list": [{"point_id": 1, "p": [1, 2, 3], "winding_err": 0.25},
                                     {"point_id": 2, "p": None}, "not a record"]}
+        for bad in ({}, None, "", 1, True):
+            with pytest.raises(ValueError, match="array"):
+                attach_document(store, surface, dict(document, points_list=bad), role="results",
+                                list_key="points_list", position_key="p", name="bad", volume="vol", author="test")
         collection = attach_document(store, surface, document, role="results", list_key="points_list",
                                      position_key="p", name="results", volume="vol", author="test")
         read = attached_document(store, surface, "results")

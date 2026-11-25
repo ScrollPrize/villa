@@ -1,5 +1,4 @@
 import argparse
-import multiprocessing
 import os
 import socket
 import subprocess
@@ -11,17 +10,6 @@ import torch
 from vesuvius.models.configuration.config_manager import ConfigManager
 from vesuvius.models.datasets.intensity_properties import load_intensity_props_formatted
 from vesuvius.models.utilities.cli_utils import update_config_from_args
-
-
-def _maybe_set_spawn_start_method(argv):
-    # s3fs/fsspec can misbehave with fork; force spawn if s3/config is present.
-    if not argv:
-        return
-    if any('s3://' in str(arg) for arg in argv) or '--config-path' in argv or '--config' in argv:
-        try:
-            multiprocessing.set_start_method('spawn', force=True)
-        except RuntimeError:
-            pass
 
 
 def _configured_auxiliary_target_names(mgr) -> list[str]:
@@ -202,8 +190,6 @@ def build_parser() -> argparse.ArgumentParser:
                              help="Optional custom name for the Weights & Biases run")
     grp_logging.add_argument("--wandb-resume", nargs='?', const='allow', default=None,
                              help="Weights & Biases resume mode or run id. Provide a resume policy ('allow', 'auto', 'must', 'never') or a run id (defaults to 'allow' if flag used without value).")
-    grp_logging.add_argument("--profile-augmentations", action="store_true",
-                             help="Collect per-augmentation timing and report per-epoch totals")
     grp_logging.add_argument("--verbose", action="store_true",
                              help="Enable verbose debug output")
 
@@ -214,8 +200,6 @@ def main(argv=None):
     """Main entry point for the training script."""
     if argv is None:
         argv = sys.argv[1:]
-
-    _maybe_set_spawn_start_method(argv)
 
     parser = build_parser()
     args = parser.parse_args(argv)

@@ -5,6 +5,9 @@
 
 #include <cstddef>
 #include <cstdlib>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include <mutex>
 #include <new>
 #include <unordered_map>
@@ -13,6 +16,24 @@
 namespace vcr {
 
 class OutputPool {
+    // The Windows CRT has no aligned_alloc; its aligned blocks need _aligned_free.
+    static void* allocate(std::size_t nbytes)
+    {
+#ifdef _WIN32
+        return ::_aligned_malloc(nbytes, kAlign);
+#else
+        return std::aligned_alloc(kAlign, nbytes);
+#endif
+    }
+    static void deallocate(void* p)
+    {
+#ifdef _WIN32
+        ::_aligned_free(p);
+#else
+        std::free(p);
+#endif
+    }
+
 public:
     static OutputPool& instance()
     {
@@ -31,7 +52,7 @@ public:
             retained_ -= nbytes;
             ++hits_;
         } else {
-            p = std::aligned_alloc(kAlign, round_up(nbytes));
+            p = allocate(round_up(nbytes));
             if (!p)
                 throw std::bad_alloc();
             ++misses_;
@@ -57,7 +78,7 @@ public:
                 return;
             }
         }
-        std::free(p);
+        deallocate(p);
     }
 
     void set_max_bytes(std::size_t n)
@@ -75,7 +96,7 @@ public:
             }
         }
         for (void* p : drop)
-            std::free(p);
+            deallocate(p);
     }
 
     std::size_t max_bytes() { std::lock_guard lock(mutex_); return max_bytes_; }

@@ -9,11 +9,13 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
-#include "support/TestProject.hpp"
-
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
 #include <filesystem>
 #include <fstream>
+#include "support/TestProject.hpp"
+
 #include <random>
 
 namespace fs = std::filesystem;
@@ -66,13 +68,11 @@ TEST_CASE("The volume an author last viewed is kept with the project")
 fs::path makeLocalVolume(const fs::path& root, const std::string& id = "vol1")
 {
     auto volDir = root / "volumes" / id;
-    vc::test::ZarrVolumeSpec o;
-    o.shapeZYX = {16, 16, 16};
-    o.chunkShapeZYX = {16, 16, 16};
-    o.numLevels = 1;
-    o.uuid = id;
-    o.name = id;
-    auto v = vc::test::createZarrVolume(volDir, o);
+    const std::filesystem::path volumeRoot = volDir;
+    const vcr::zarr::CreateOptions levelZero{.shape = {16, 16, 16}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", id}, {"name", id}, {"format", "zarr"}, {"width", 16}, {"height", 16}, {"slices", 16}, {"voxelsize", 1.0}}.dump();
+    auto v = Volume::New(volumeRoot);
     REQUIRE(v);
     return volDir;
 }

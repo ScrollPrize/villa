@@ -5,11 +5,13 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QScopeGuard>
+#include <QTemporaryDir>
 #include <QTemporaryFile>
 #include <QThread>
 #include <QtTest/QtTest>
 
 #include "CommandLineToolRunner.hpp"
+#include "ToolProcess.hpp"
 
 Q_DECLARE_METATYPE(CommandLineToolRunner::Tool)
 
@@ -101,6 +103,17 @@ int runChild(const QStringList& arguments)
         return 0;
     }
     return 3;
+}
+
+bool writeScript(const QString& path, const QByteArray& body)
+{
+    QFile script(path);
+    if (!script.open(QIODevice::WriteOnly)) {
+        return false;
+    }
+    script.write("#!/bin/sh\n" + body);
+    script.close();
+    return script.setPermissions(script.permissions() | QFileDevice::ExeOwner);
 }
 
 } // namespace
@@ -257,6 +270,76 @@ private slots:
         QCOMPARE(second.readAll(), QByteArray("17"));
     }
 
+    // In the Linux AppImage (APPDIR set, glibc bundled) a bundled tool starts
+    // through usr/lib/ld-linux-x86-64.so.2, as AppRun starts it; any other
+    // executable starts directly. Shell stand-ins record how they were started.
+    void appImageToolsStartThroughTheBundledLoader()
+    {
+#if defined(Q_OS_UNIX)
+        QTemporaryDir appDir;
+        QVERIFY(appDir.isValid());
+        const QString lib = appDir.filePath("usr/lib");
+        const QString tool = appDir.filePath("usr/bin/vc_tool");
+        const QString other = appDir.filePath("vc_tool");
+        const QByteArray record = QFile::encodeName(appDir.filePath("record.txt"));
+        QVERIFY(QDir().mkpath(lib) && QDir().mkpath(appDir.filePath("usr/bin")));
+        QVERIFY(writeScript(lib + "/ld-linux-x86-64.so.2",
+                            "printf '%s\\n' loader \"$@\" > '" + record + "'\n"));
+        for (const QString& path : {tool, other}) {
+            QVERIFY(writeScript(path, "printf '%s\\n' direct \"$@\" > '" + record + "'\n"));
+        }
+
+        const bool hadAppDir = qEnvironmentVariableIsSet("APPDIR");
+        const QByteArray previousAppDir = qgetenv("APPDIR");
+        const auto restoreAppDir = qScopeGuard([&] {
+            if (hadAppDir) {
+                qputenv("APPDIR", previousAppDir);
+            } else {
+                qunsetenv("APPDIR");
+            }
+        });
+
+        // The arguments the stand-in that ran was started with.
+        const auto run = [&](const QString& executable, bool lowPriority) {
+            QFile::remove(QFile::decodeName(record));
+            vc3d::ToolProcess process;
+            bool done = false;
+            bool ok = false;
+            connect(&process, &vc3d::ToolProcess::finished, this,
+                    [&](const vc3d::ToolProcess::Result& result) {
+                        done = true;
+                        ok = result.ok;
+                    });
+            vc3d::ToolProcess::Launch launch;
+            launch.tool = executable;
+            launch.args = {"--flag", "a b"};
+            launch.lowPriority = lowPriority;
+            if (!process.start(launch) || !QTest::qWaitFor([&] { return done; }, 5000) || !ok) {
+                return QStringList{"failed"};
+            }
+            QFile output(QFile::decodeName(record));
+            if (!output.open(QIODevice::ReadOnly)) {
+                return QStringList{"no record"};
+            }
+            return QString::fromUtf8(output.readAll()).split('\n', Qt::SkipEmptyParts);
+        };
+
+        const QStringList direct{"direct", "--flag", "a b"};
+        const QStringList viaLoader{"loader", "--library-path", lib, tool, "--flag", "a b"};
+
+        qunsetenv("APPDIR");
+        QCOMPARE(run(tool, false), direct);
+
+        qputenv("APPDIR", QFile::encodeName(appDir.path()));
+        QCOMPARE(run(tool, false), viaLoader);
+        // nice/ionice wrap the loader, not the bare tool.
+        QCOMPARE(run(tool, true), viaLoader);
+        QCOMPARE(run(other, false), direct);
+#else
+        QSKIP("The AppImage is Linux-only");
+#endif
+    }
+
     void zarrRenderCanRequestSiblingTiffSlices()
     {
         CommandLineToolRunner runner(nullptr, {});
@@ -347,14 +430,6 @@ private slots:
         runner.setObjRefineParams("volume.zarr", "src-uuid", "", "params.json", "vol");
         args = runner.argumentsForTesting(CommandLineToolRunner::Tool::AlphaCompRefine);
         QVERIFY2(!args.contains("--name"), "no name refines in place");
-
-        runner.setMergePatchParams("parent-uuid", "child-uuid", true, 16, 6, 4, 3000, 5, 10, 3, 0, 0);
-        args = runner.argumentsForTesting(CommandLineToolRunner::Tool::MergePatch);
-        QCOMPARE(args.count("--surface"), 2);
-        QCOMPARE(args.at(args.indexOf("--surface") + 1), QString("parent-uuid"));
-        QCOMPARE(args.at(args.lastIndexOf("--surface") + 1), QString("child-uuid"));
-        QVERIFY(args.contains("--explicit-roles"));
-        QVERIFY(!args.contains("--parent") && !args.contains("--child"));
 
         // At a working level the tools work in that level's voxels of the volume.
         runner.setStore("objects.vcobj", 0.25);

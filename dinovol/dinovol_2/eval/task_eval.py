@@ -12,7 +12,7 @@ from PIL import Image
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from tifffile import imread
+from vc_reader import images
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
@@ -86,7 +86,7 @@ def resolve_eval_decoder_type(value: Any) -> str:
 
 
 def _read_volume(path: Path) -> np.ndarray:
-    return np.asarray(imread(path))
+    return np.asarray(images.read(path))
 
 
 def _scaled_shape(shape: tuple[int, int, int], factor: float) -> tuple[int, int, int]:

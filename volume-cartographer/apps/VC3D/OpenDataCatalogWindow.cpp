@@ -1,3 +1,4 @@
+#include "vc/lasagna/Catalog.hpp"
 #include "OpenDataCatalogWindow.hpp"
 
 #include "OpenDataLasagna.hpp"
@@ -5,16 +6,13 @@
 #include "ProjectCreationDefaults.hpp"
 #include "VCSettings.hpp"
 
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/HttpFetch.hpp"
+#include "vc_reader/native/http.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <QCheckBox>
 #include <QClipboard>
 #include <QColor>
-#include <QCoreApplication>
-#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QDialogButtonBox>
@@ -27,7 +25,6 @@
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QImage>
-#include <QIODevice>
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
@@ -37,13 +34,11 @@
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QResizeEvent>
-#include <QSaveFile>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QSplitter>
 #include <QStringList>
-#include <QStandardPaths>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTabWidget>
@@ -250,7 +245,7 @@ bool canAttachRepresentation(const vcr::catalog::OpenDataSample& sample,
                            [&](const auto& info) { return info.artifactIndex == ref.artifactIndex; });
     }
     case vcr::catalog::OpenDataRepresentationKind::Lasagna: {
-        const auto lasagna = lasagnaArtifacts(volume);
+        const auto lasagna = vc::lasagna::catalogArtifacts(volume);
         return std::find(lasagna.begin(), lasagna.end(), ref.artifactIndex) != lasagna.end();
     }
     case vcr::catalog::OpenDataRepresentationKind::Prediction:
@@ -883,7 +878,7 @@ void OpenDataCatalogWindow::reloadManifest()
         result.sourceLabel = QString::fromStdString(manifestUrl);
         try {
             auto loaded = vcr::catalog::loadCatalog(manifestUrl,
-                {cachedOpenDataManifestPath(), true});
+                {vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)), true});
             result.manifest = std::move(loaded.manifest);
             if (loaded.fromCache) result.sourceLabel += QStringLiteral(" (cached)");
             if (!loaded.warning.empty()) result.sourceLabel += QStringLiteral(": ") + QString::fromStdString(loaded.warning);
@@ -918,11 +913,11 @@ void OpenDataCatalogWindow::onFetchFinished()
 
 void OpenDataCatalogWindow::loadCachedManifestIfAvailable()
 {
-    const auto path = cachedOpenDataManifestPath();
+    const auto path = vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl));
     if (!std::filesystem::is_regular_file(path)) {
         return;
     }
-    if (const auto manifest = cachedCatalog())
+    if (const auto manifest = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl))))
         applyManifest(*manifest, qstr(path.string()), true);
     else
         setStatus(tr("Could not parse cached open-data manifest %1").arg(qstr(path.string())));
@@ -1164,7 +1159,11 @@ void OpenDataCatalogWindow::loadOverviewPhoto(const vcr::catalog::OpenDataSample
         result.sampleId = sampleId;
         result.url = url;
         try {
-            result.image = imageFromBytes(vc::httpGetBytes(url.toStdString()));
+            vcr::HttpClient http{vcr::HttpOptions{}};
+            std::vector<std::uint8_t> received;
+            http.get(url.toStdString(), received);
+            const auto* bytes = reinterpret_cast<const std::byte*>(received.data());
+            result.image = imageFromBytes(std::vector<std::byte>(bytes, bytes + received.size()));
             if (result.image.isNull()) {
                 result.error = QStringLiteral("Could not decode photo.");
             }

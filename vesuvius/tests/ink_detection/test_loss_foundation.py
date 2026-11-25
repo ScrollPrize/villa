@@ -16,7 +16,7 @@ from vesuvius.ink_detection.training.losses import (
     create_loss,
 )
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 def _smoothed_bce_loss(*, weight_dice: float = 0.0):
@@ -165,7 +165,7 @@ def test_composite_applies_ordered_weights_and_records_literal_metrics():
 
 
 def test_configured_composite_retains_term_weights_and_smoothing():
-    authored = _config_mapping()
+    authored = config_mapping()
     authored["loss"] = {
         "terms": [
             {

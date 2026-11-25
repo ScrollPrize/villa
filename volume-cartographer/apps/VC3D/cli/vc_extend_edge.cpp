@@ -7,7 +7,8 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
 
 #include <boost/program_options.hpp>
 
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -25,12 +27,16 @@ namespace po = boost::program_options;
 namespace
 {
 
-std::shared_ptr<Volume> openVolume(const std::string& where)
+// Level 0 of the volume at `where`, opened as VC3D opens it (its cache directory
+// for remote chunks), with a memory cache for the cubes the walk reads repeatedly.
+std::shared_ptr<vcr::Array> openLevel0(const std::string& where)
 {
-    if (where.rfind("http://", 0) == 0 || where.rfind("https://", 0) == 0 || where.rfind("s3://", 0) == 0) {
-        return Volume::NewFromUrl(where);
-    }
-    return Volume::New(fs::path(where));
+    auto volume = vcr::zarr::isRemote(where) ? Volume::NewFromUrl(where) : Volume::New(fs::path(where));
+    auto options = volume->sourceOpenOptions();
+    options.memoryCache = std::make_shared<vcr::MemoryCache>(std::size_t(1) << 30);
+    auto opened = std::make_shared<vcr::zarr::OpenedArray>(
+        vcr::zarr::openPyramidLevel(volume->sourceLocation(), volume->baseScaleLevel(), options));
+    return std::shared_ptr<vcr::Array>(opened, opened->array.get());
 }
 
 } // namespace
@@ -119,20 +125,26 @@ int main(int argc, char** argv)
 
     const auto started = std::chrono::steady_clock::now();
     std::unique_ptr<QuadSurface> surface;
-    std::shared_ptr<Volume> volume;
+    std::shared_ptr<vcr::Array> volume;
     try {
         surface = load_quad_from_tifxyz(input.string());
-        volume = openVolume(vm["normals-volume"].as<std::string>());
+        volume = openLevel0(vm["normals-volume"].as<std::string>());
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';
         return 1;
     }
     const cv::Size before = surface->rawPointsPtr()->size();
 
-    SheetNormalField normals(volume);
+    std::optional<SheetNormalField> normals;
+    try {
+        normals.emplace(volume);
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << '\n';
+        return 1;
+    }
     std::string status;
     const auto result = segmentation::autoExtendSurface(
-        *surface, [&](const cv::Vec3f& world) { return normals.normalAt(world, options.sheetWalk.continuousNormals()); }, options, &status);
+        *surface, [&](const cv::Vec3f& world) { return normals->normalAt(world, options.sheetWalk.continuousNormals()); }, options, &status);
     if (!result) {
         std::cerr << "error: " << status << '\n';
         return 1;
@@ -148,7 +160,7 @@ int main(int argc, char** argv)
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     const cv::Size after = surface->rawPointsPtr()->size();
 
-    auto report = utils::Json::object();
+    auto report = nlohmann::json::object();
     {
         report["input"] = input.string();
         report["output"] = output.string();
@@ -158,17 +170,17 @@ int main(int argc, char** argv)
         report["integrator"] = integrator;
         report["cells"] = options.cells;
         report["rounds"] = options.rounds;
-        report["grid_before"] = utils::Json::array();
+        report["grid_before"] = nlohmann::json::array();
         report["grid_before"].push_back(before.height);
         report["grid_before"].push_back(before.width);
-        report["grid_after"] = utils::Json::array();
+        report["grid_after"] = nlohmann::json::array();
         report["grid_after"].push_back(after.height);
         report["grid_after"].push_back(after.width);
         report["added"] = result->added;
         report["seconds"] = seconds;
-        auto steps = utils::Json::array();
+        auto steps = nlohmann::json::array();
         for (const auto& step : result->steps) {
-            auto s = utils::Json::object();
+            auto s = nlohmann::json::object();
             s["round"] = step.round;
             s["side"] = segmentation::extendSideName(step.side);
             s["lines"] = step.lines;

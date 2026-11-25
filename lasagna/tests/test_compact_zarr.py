@@ -4,9 +4,9 @@ import json
 
 import numpy as np
 import pytest
-import zarr
+from vc_reader.reader import ZarrWriter, open_group, open_zarr
 
-from lasagna.compact_zarr import CompactOutputAdapter, resolve_output, chunk_file
+from lasagna.compact_zarr import CompactOutputAdapter, resolve_output
 from lasagna.lasagna_volume import LasagnaVolume
 from lasagna.tiled_predict3d import OutputProductSpec
 
@@ -25,10 +25,10 @@ def test_native_only_policy_and_mixed_policy_rejection(tmp_path):
     output.prepare(base_shape_zyx=(8,8,8), ome_chunk=4)
     output.write_products_chunk([(p, {"presence": np.ones((4,4,4), np.uint8)})], chunk_origin_zyx=(0,0,0))
     output.build_pyramids(workers=1)
-    group = zarr.open_group(str(tmp_path / "native.zarr/sd0"), mode="r")
-    assert list(group.array_keys()) == ["0"]
-    assert [d["path"] for d in group.attrs["multiscales"][0]["datasets"]] == ["0"]
-    assert group.attrs["lasagna_pyramid_downsample"] == {"presence": "none"}
+    assert list(open_group(tmp_path / "native.zarr/sd0").array_keys()) == ["0"]
+    attrs = json.loads((tmp_path / "native.zarr/sd0/.zattrs").read_text())
+    assert [d["path"] for d in attrs["multiscales"][0]["datasets"]] == ["0"]
+    assert attrs["lasagna_pyramid_downsample"] == {"presence": "none"}
     with pytest.raises(ValueError, match="cannot mix"):
         CompactOutputAdapter(root=tmp_path / "mixed.zarr", products=(p, product("width", ["width"])),
                              n_levels=3, validity_channel="presence")
@@ -37,7 +37,7 @@ def test_native_only_policy_and_mixed_policy_rejection(tmp_path):
 def test_special_reducers_do_not_compute_discarded_scalar_means(tmp_path, monkeypatch):
     from lasagna.compact_zarr import _build_compact_pyramid_chunk
     import lasagna.omezarr_pyramid as pyramid
-    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_grad_mag"])
+    p = product("fiber", ["presence", "nx", "ny", "width", "grad_mag"])
     output = CompactOutputAdapter(root=tmp_path / "p.zarr", products=(p,), n_levels=2,
                                   validity_channel="presence", blank_invalid=True)
     output.prepare(base_shape_zyx=(4,4,4), ome_chunk=4)
@@ -54,10 +54,10 @@ def test_special_reducers_do_not_compute_discarded_scalar_means(tmp_path, monkey
         channel_dtypes={n: np.dtype("uint8") for n in p.channel_names}, blank_invalid=True)
     assert calls == [False, True]  # presence and magnitude only
     output.build_pyramids(workers=1)
-    methods = zarr.open_group(str(tmp_path / "p.zarr/sd0"), mode="r").attrs["lasagna_pyramid_downsample"]
+    methods = json.loads((tmp_path / "p.zarr/sd0/.zattrs").read_text())["lasagna_pyramid_downsample"]
     assert methods == dict(presence="mean_pool2x", nx="normal_second_moment_mean_pool2x",
                           ny="normal_second_moment_mean_pool2x", width="mean_pool2x_valid_presence",
-                          sheet_grad_mag="mean_pool2x_zero_overrides")
+                          grad_mag="mean_pool2x_zero_overrides")
 
 
 def test_touched_python_parses():
@@ -80,7 +80,7 @@ def test_packed_atomic_blank_resume_pyramid(tmp_path):
     presence[0, 0, 0] = 0
     data = [(p, dict(presence=presence, nx=values, ny=values)), (width, dict(width=values))]
     output.write_products_chunk(data, chunk_origin_zyx=(0, 0, 0))
-    array = zarr.open_array(str(tmp_path / "prediction.zarr/sd0/0"), mode="r")
+    array = open_zarr(tmp_path / "prediction.zarr/sd0/0")
     assert array.chunks == (4, 4, 4, 4)
     assert np.array_equal(array[:, 0, 0, 0], [0, 0, 0, 0])
     assert np.array_equal(array[:, 1, 1, 1], [255]*4)
@@ -92,15 +92,15 @@ def test_packed_atomic_blank_resume_pyramid(tmp_path):
     with pytest.raises(ValueError, match="partial"):
         output.write_products_chunk(data[:1], chunk_origin_zyx=(0, 0, 0))
     output.build_pyramids(workers=2)
-    assert chunk_file(tmp_path / "prediction.zarr/sd0/1", (0, 0, 0)).exists()
+    assert ZarrWriter.open(tmp_path / "prediction.zarr/sd0/1").chunk_exists((0, 0, 0, 0))
     output.write_products_chunk(data, chunk_origin_zyx=(0, 0, 0))
-    assert not chunk_file(tmp_path / "prediction.zarr/sd0/1", (0, 0, 0)).exists()
+    assert not ZarrWriter.open(tmp_path / "prediction.zarr/sd0/1").chunk_exists((0, 0, 0, 0))
 
 
 def test_pyramid_auto_workers_progress_resume_and_exact_output(tmp_path, monkeypatch, capsys):
     import lasagna.compact_zarr as compact
     monkeypatch.setattr(compact.multiprocessing, "cpu_count", lambda: 2)
-    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny", "sheet_grad_mag"])
+    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny"])
     rng = np.random.default_rng(19)
     data = {name: rng.integers(0, 256, (16, 16, 16), dtype=np.uint8) for name in p.channel_names}
     data['presence'][::2] = 0
@@ -116,15 +116,15 @@ def test_pyramid_auto_workers_progress_resume_and_exact_output(tmp_path, monkeyp
                     output.write_products_chunk([(p, {name: a[z:z+4,y:y+4,x:x+4] for name,a in data.items()})],
                                                 chunk_origin_zyx=(z,y,x))
         output.build_pyramids(workers=workers)
-        results.append([zarr.open_array(str(root / 'sd0' / str(level)), mode='r')[:] for level in (1,2)])
-        published = chunk_file(root / 'sd0/1', (0,0,0))
+        results.append([open_zarr(root / 'sd0' / str(level))[:] for level in (1,2)])
+        published = root / 'sd0/1/0/0/0/0'
         modified = published.stat().st_mtime_ns
         output.build_pyramids(workers=workers)
         assert published.stat().st_mtime_ns == modified
     for serial, parallel in zip(*results):
         np.testing.assert_array_equal(serial, parallel)
     log = capsys.readouterr().out
-    assert '[pyramid sd0 L1] workers=2 native_threads_per_worker=1' in log
+    assert '[pyramid sd0 L1] workers=2' in log
     assert '8/8 (100.0%)' in log
     assert 'skip_existing=8' in log
     assert 'eta ' in log
@@ -147,6 +147,26 @@ def test_scales_validity_and_zero_chunks(tmp_path):
         LasagnaVolume.validate_compact(attrs["lasagna"])
 
 
+def test_chunk_validity_stores_all_zero_chunks(tmp_path):
+    """With validity by chunk existence, a computed chunk that is entirely zero is
+    still published: its existence is what marks the voxels as predicted."""
+    p = product("fiber", ["presence", "nx", "ny"])
+    output = CompactOutputAdapter(root=tmp_path / "chunks.zarr", products=(p,), n_levels=1, validity_channel="chunks")
+    output.prepare(base_shape_zyx=(4, 8, 4), ome_chunk=4)
+    output.write_products_chunk([(p, {c: np.zeros((4, 4, 4), np.uint8) for c in p.channel_names})],
+                                chunk_origin_zyx=(0, 0, 0))
+    writer = ZarrWriter.open(tmp_path / "chunks.zarr/sd0/0")
+    assert writer.chunk_exists((0, 0, 0, 0))
+    assert not writer.chunk_exists((0, 0, 1, 0))
+    manifest = LasagnaVolume.load(tmp_path / "chunks.zarr")
+    assert manifest.validity_by_chunks and manifest.validity_channel == "chunks"
+    with pytest.raises(ValueError, match="chunks"):
+        CompactOutputAdapter(root=tmp_path / "bad.zarr", products=(product("x", ["chunks", "nx"]),),
+                             n_levels=1, validity_channel="chunks").prepare(base_shape_zyx=(4, 4, 4), ome_chunk=4)
+    with pytest.raises(ValueError, match="validity_channel"):
+        CompactOutputAdapter(root=tmp_path / "bad2.zarr", products=(p,), n_levels=1, validity_channel="missing")
+
+
 def test_output_resolution(tmp_path):
     assert resolve_output(tmp_path / "new.lasagna.json")[0].name == "new.zarr"
     old = tmp_path / "old.lasagna.json"
@@ -165,12 +185,12 @@ def test_coordinate_scale_preserves_output_grid_and_boundary_chunks(tmp_path, fa
     values = np.full((4, 4, 4), 128, np.uint8)
     output.write_products_chunk([(p, {c: values for c in p.channel_names})],
                                 chunk_origin_zyx=(4, 4, 4))
-    array = zarr.open_array(str(root / "sd1/1"), mode="r")
+    array = open_zarr(root / "sd1/1")
     assert array.shape == (3, 8, 8, 8)
     assert np.all(array[:, 4:, 4:, 4:] == 128)
     output.prepare(**kwargs)  # Resume uses the same dimensions.
     output.build_pyramids(workers=1)
-    assert zarr.open_array(str(root / "sd1/2"), mode="r").shape == (3, 4, 4, 4)
+    assert open_zarr(root / "sd1/2").shape == (3, 4, 4, 4)
     attrs = json.loads((root / "sd1/.zattrs").read_text())
     assert attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"][0]["scale"] == [1, factor*2, factor*2, factor*2]
     assert LasagnaVolume.load(root).source_to_base == factor
@@ -188,7 +208,7 @@ def test_compact_options_and_resume_encoding(tmp_path):
     output.write_products_chunk([(p, dict(presence=np.zeros_like(data), nx=data, ny=data)),
                                  (width, dict(width=np.full(data.shape, 12.5, np.float32)))],
                                 chunk_origin_zyx=(0,0,0))
-    packed = zarr.open_array(str(tmp_path / "p.zarr/sd0/0"), mode="r")
+    packed = open_zarr(tmp_path / "p.zarr/sd0/0")
     assert packed.dtype == np.float32
     assert np.array_equal(packed[:,0,0,0], [0,128,128,12.5])
     output.prepare(**kwargs)
@@ -275,11 +295,7 @@ def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_
         kwargs["output_level_arr"][:] = 91
     monkeypatch.setattr(module, "_compute_pred_dt_slab", distance)
     source = tmp_path / "input.zarr"
-    try:
-        array = zarr.open_array(str(source), mode="w", shape=(8,8,8), chunks=(4,4,4), dtype="uint8", zarr_format=2)
-    except TypeError:
-        array = zarr.open_array(str(source), mode="w", shape=(8,8,8), chunks=(4,4,4), dtype="uint8")
-    array[:] = 50
+    ZarrWriter.create(source, shape=(8,8,8), chunks=(4,4,4), dtype="uint8")[:] = 50
     for fmt in ("legacy", "compact"):
         events.clear()
         dest = tmp_path / fmt / "output.lasagna.json"
@@ -298,9 +314,9 @@ def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_
     assert not (tmp_path / "compact/output_pred_dt.ome.zarr").exists()
     for group in manifest.groups.values():
         for level in range(group.scaledown, 3):
-            packed = zarr.open_array(str(packed_root / f"sd{group.scaledown}/{level}"), mode="r")
+            packed = open_zarr(packed_root / f"sd{group.scaledown}/{level}")
             for i, channel in enumerate(group.channels):
-                legacy = zarr.open_array(str(tmp_path / f"legacy/output_{channel}.ome.zarr/{level}"), mode="r")
+                legacy = open_zarr(tmp_path / f"legacy/output_{channel}.ome.zarr/{level}")
                 assert np.array_equal(packed[i], legacy[:])
 
 
@@ -325,7 +341,7 @@ def test_compact_publication_benchmark(tmp_path):
     print("publication benchmark: one CPU caller, 64^3, three random uint8 channels, blosc-zstd, 3 warmups + 20 measured writes")
     for name, times in measured.items():
         print(name, "mean/p50/p95 ms", np.mean(times), *np.percentile(times,[50,95]))
-    assert np.array_equal(zarr.open_array(str(tmp_path / "compound.zarr/sd0/0"),mode="r")[:],np.stack(list(data.values())))
+    assert np.array_equal(open_zarr(tmp_path / "compound.zarr/sd0/0")[:],np.stack(list(data.values())))
 
 
 def test_compact_live_store_native_trace(tmp_path):

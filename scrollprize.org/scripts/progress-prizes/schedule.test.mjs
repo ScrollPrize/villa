@@ -95,14 +95,14 @@ test('preparation boundaries follow Pacific calendar days in PST and leap Februa
 
 test('the final-day 23:40 slot dispatches before both PDT and PST cutoffs', () => {
   const pdt = plan('2026-08-01T06:40:00Z', SCHEDULE_CRONS.PRE_CUTOFF);
-  assert.equal(pdt.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(pdt.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(pdt.reason, SCHEDULE_REASONS.PRE_CUTOFF);
   assert.equal(pdt.sourceCycle, '2026-07');
   assert.equal(pdt.targetCycle, '2026-08');
   assert.equal(pdt.activationAt.toISOString(), '2026-08-01T07:00:00.000Z');
 
   const pst = plan('2027-01-01T07:40:00Z', SCHEDULE_CRONS.PRE_CUTOFF);
-  assert.equal(pst.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(pst.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(pst.reason, SCHEDULE_REASONS.PRE_CUTOFF);
   assert.equal(pst.sourceCycle, '2026-12');
   assert.equal(pst.targetCycle, '2027-01');
@@ -137,13 +137,13 @@ test('leap February uses February 29 while non-leap February uses February 28', 
 
 test('first-day recovery slots dispatch at 00:17 and 06:47 Pacific', () => {
   const early = plan('2026-08-01T07:17:00Z', SCHEDULE_CRONS.EARLY_RECOVERY);
-  assert.equal(early.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(early.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(early.reason, SCHEDULE_REASONS.EARLY_RECOVERY);
   assert.equal(early.sourceCycle, '2026-07');
   assert.equal(early.targetCycle, '2026-08');
 
   const late = plan('2026-08-01T13:47:00Z', SCHEDULE_CRONS.LATE_RECOVERY);
-  assert.equal(late.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(late.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(late.reason, SCHEDULE_REASONS.LATE_RECOVERY);
   assert.equal(late.sourceCycle, '2026-07');
   assert.equal(late.targetCycle, '2026-08');
@@ -157,7 +157,7 @@ test('late recovery targets the previous rollover on days 1, 2, and 7', () => {
   ]) {
     const recovery = plan(now, SCHEDULE_CRONS.LATE_RECOVERY);
     assert.equal(recovery.dispatch, true, now);
-    assert.equal(recovery.operation, SCHEDULE_OPERATIONS.ACTIVATE, now);
+    assert.equal(recovery.operation, SCHEDULE_OPERATIONS.READY, now);
     assert.equal(recovery.reason, SCHEDULE_REASONS.LATE_RECOVERY, now);
     assert.equal(recovery.sourceCycle, sourceCycle, now);
     assert.equal(recovery.targetCycle, targetCycle, now);
@@ -172,37 +172,37 @@ test('late recovery handles PDT, PST, leap February, and December rollover', () 
     ['2027-01-07T14:47:00Z', '2026-12', '2027-01', '2027-01-01T08:00:00.000Z'],
   ]) {
     const recovery = plan(now, SCHEDULE_CRONS.LATE_RECOVERY);
-    assert.equal(recovery.operation, SCHEDULE_OPERATIONS.ACTIVATE, now);
+    assert.equal(recovery.operation, SCHEDULE_OPERATIONS.READY, now);
     assert.equal(recovery.sourceCycle, sourceCycle, now);
     assert.equal(recovery.targetCycle, targetCycle, now);
     assert.equal(recovery.activationAt.toISOString(), activationAt, now);
   }
 });
 
-test('delayed activation events recover by their actual first-day Pacific window', () => {
+test('delayed ready events recover by their actual first-day Pacific window', () => {
   const delayedPreCutoff = plan('2026-08-01T07:43:00Z', SCHEDULE_CRONS.PRE_CUTOFF);
-  assert.equal(delayedPreCutoff.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(delayedPreCutoff.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(delayedPreCutoff.reason, SCHEDULE_REASONS.EARLY_RECOVERY);
 
   const earlyDelayedPastLateSlot = plan(
     '2026-08-01T16:05:00Z',
     SCHEDULE_CRONS.EARLY_RECOVERY,
   );
-  assert.equal(earlyDelayedPastLateSlot.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(earlyDelayedPastLateSlot.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(earlyDelayedPastLateSlot.reason, SCHEDULE_REASONS.LATE_RECOVERY);
 
   const lateDelayedToEvening = plan(
     '2026-08-02T05:59:59Z',
     SCHEDULE_CRONS.LATE_RECOVERY,
   );
-  assert.equal(lateDelayedToEvening.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(lateDelayedToEvening.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(lateDelayedToEvening.reason, SCHEDULE_REASONS.LATE_RECOVERY);
 
   const preCutoffDelayedToEndOfFirstDay = plan(
     '2026-08-02T06:59:59Z',
     SCHEDULE_CRONS.PRE_CUTOFF,
   );
-  assert.equal(preCutoffDelayedToEndOfFirstDay.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(preCutoffDelayedToEndOfFirstDay.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(preCutoffDelayedToEndOfFirstDay.sourceCycle, '2026-07');
 });
 
@@ -220,7 +220,7 @@ test('cutoff and 00:17 recovery slots remain bounded to the first day', () => {
 test('a delayed day-seven recovery may cross midnight but day eight no-ops', () => {
   const delayed = plan('2026-08-08T10:00:00Z', SCHEDULE_CRONS.LATE_RECOVERY);
   assert.equal(delayed.dispatch, true);
-  assert.equal(delayed.operation, SCHEDULE_OPERATIONS.ACTIVATE);
+  assert.equal(delayed.operation, SCHEDULE_OPERATIONS.READY);
   assert.equal(delayed.sourceCycle, '2026-07');
   assert.equal(delayed.targetCycle, '2026-08');
 
@@ -291,7 +291,7 @@ test('serialized plans expose only stable public control fields', () => {
   ));
   assert.deepEqual(serialized, {
     dispatch: true,
-    operation: 'activate',
+    operation: 'ready',
     reason: 'pre-cutoff',
     eventName: 'schedule',
     scheduledCron: '40 23 28-31 * *',

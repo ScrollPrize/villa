@@ -419,16 +419,13 @@ class PrimusL(PrimusX):
 
 
 if __name__ == "__main__":
-    from fvcore.nn import parameter_count, FlopCountAnalysis, parameter_count_table
     import time
 
     print("Primus S")
     x = torch.rand([1, 1, 96, 96, 96], device="cuda", dtype=torch.float32)
     model = PrimusS(1, 2, (8, 8, 8), (96, 96, 96)).cuda()
     _ = model(x)
-    print(f"Parameter count: {parameter_count(model)[''] / 1e6:.2f}M")
-    print(FlopCountAnalysis(model, x))
-    print(parameter_count_table(model, max_depth=2))
+    print(f"Parameter count: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     test_submodules_loadable(model)
 
@@ -436,9 +433,7 @@ if __name__ == "__main__":
     print("Primus B")
     model = PrimusB(1, 2, (8, 8, 8), (96, 96, 96)).cuda()
     _ = model(x)
-    print(f"Parameter count: {parameter_count(model)[''] / 1e6:.2f}M")
-    print(FlopCountAnalysis(model, x))
-    print(parameter_count_table(model, max_depth=2))
+    print(f"Parameter count: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     test_submodules_loadable(model)
     time.sleep(5)
@@ -446,9 +441,7 @@ if __name__ == "__main__":
     print("Primus M")
     model = PrimusM(1, 2, (8, 8, 8), (96, 96, 96)).cuda()
     _ = model(x)
-    print(f"Parameter count: {parameter_count(model)[''] / 1e6:.2f}M")
-    print(FlopCountAnalysis(model, x))
-    print(parameter_count_table(model, max_depth=2))
+    print(f"Parameter count: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     test_submodules_loadable(model)
     time.sleep(5)
@@ -456,9 +449,7 @@ if __name__ == "__main__":
     print("Primus L")
     model = PrimusL(1, 2, (8, 8, 8), (96, 96, 96)).cuda()
     _ = model(x)
-    print(f"Parameter count: {parameter_count(model)[''] / 1e6:.2f}M")
-    print(FlopCountAnalysis(model, x))
-    print(parameter_count_table(model, max_depth=2))
+    print(f"Parameter count: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     test_submodules_loadable(model)
     time.sleep(5)

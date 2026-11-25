@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stream an Automated Fiber Volume v1 into a NEW object store.
 
-All AFV handling lives here; writes use the public vc_object_store Python API.
-Requires the existing Python extension and NumPy (no setup is performed):
+AFV decoding uses the shared native reader; writes use the public Python API.
+Requires the existing Python extension (no setup is performed):
 
   PYTHONPATH=build/python python3 scripts/import_afv.py INPUT.afv OUTPUT.vcobj \
       --volume-id CATALOG_VOLUME_ID --volume /path/to/volume.zarr
@@ -15,7 +15,7 @@ set its root meta.json "uuid" to that ID; this script does not modify CT metadat
 --scale-factor is stored units per active volume voxel (1 for native L0, 4 for
 an explicitly rebased level-2 volume). Coordinates are NEVER rescaled.
 Use --unbound explicitly when the authoritative volume identity is unknown.
-The --volume path is provenance only; it is not used to guess identity.
+The --volume path only checks local input availability; it is not used to guess identity.
 
 Paris 4:
   PYTHONPATH=build/python python3 scripts/import_afv.py \
@@ -26,10 +26,12 @@ Paris 4:
 vc_reader identifies this as PHercParis4/20260411134726. Its catalog volume ID
 20260411134726 is stored unchanged as coordinates.volume_uuid.
 
-Every original float64 XYZ sample becomes line_points. Two endpoint controls
-with stable IDs 0,1 make the polyline editable without duplicating all samples.
+Every original float64 XYZ sample becomes line_points. Control arrays stay empty:
+AFV traces do not contain control points, and none are invented during import.
 Names, families, catalog summaries and per-fiber annotations are retained;
-collection metadata/provenance is stored once in a generic collection object.
+the source UUID and declared counts are stored in compact extension provisioning.
+Full source metadata, paths, reports and ID lists are not copied into provisioning.
+Numeric source IDs and annotations use typed extension rows, not object metadata.
 Trace annotations such as fiber_follow.links remain provenance: they describe
 proximity, not validated branch anchors, and are not invented into branch edges.
 
@@ -43,102 +45,46 @@ from __future__ import annotations
 import argparse
 import contextlib
 import getpass
-import itertools
 import json
 import math
 import os
 from pathlib import Path
 import sqlite3
-import struct
 import tempfile
 import time
 import uuid
 
-import numpy as np
-from vc_object_store import ObjectStore
+from vc_object_store import ObjectStore, AfvSource, fiber_source_extension, fiber_source_row
 
 
 @contextlib.contextmanager
 def open_afv(path):
     # Hold one read snapshot: metadata and blocks must describe the same source.
-    with contextlib.closing(sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True)) as db:
-        db.execute('PRAGMA query_only=ON')
-        db.execute('PRAGMA cache_size=-32768')
-        db.execute('BEGIN')
-        if (db.execute('PRAGMA application_id').fetchone()[0],
-                db.execute('PRAGMA user_version').fetchone()[0]) != (0x56434643, 1):
-            raise ValueError('Expected AFV application ID and format version 1')
-        metadata = {k: json.loads(v) for k, v in db.execute('SELECT key,value FROM metadata')}
-        if metadata.get('complete') is not True:
-            raise ValueError('AFV is incomplete')
-        uuid.UUID(metadata['uuid'])
-        for key in ('fiber_count', 'point_count'):
-            if type(metadata[key]) is not int or metadata[key] < 0:
-                raise ValueError(f'Invalid AFV {key}')
-        frame, root = metadata['frame'], metadata['root']
-        for declaration in (frame, root):
-            if (declaration.get('vc_open_data_source_coordinate_level', 0) != 0 or
-                    declaration.get('vc_open_data_source_coordinate_scale_factor', 1) != 1):
-                raise ValueError('Only native L0 AFV coordinates are supported')
-        if root.get('scale', 1) != 1:
-            raise ValueError('Only native L0 AFV coordinates are supported')
-        if root.get('coordinate_order') != 'XYZ' or root.get('coordinate_units') != 'voxel':
-            raise ValueError('AFV must declare XYZ voxel coordinates')
-        yield db, metadata
+    source = AfvSource(Path(path).resolve())
+    yield source
 
 
 def fibers(db):
-    """One fiber in memory, no per-fiber SQL and no Python coordinate lists."""
-    # The UNIQUE(fiber_id,first_segment) index supplies order, without a blob sort.
-    query = '''SELECT f.id,f.name,f.family,f.point_count,f.length,
-        f.min_x,f.min_y,f.min_z,f.max_x,f.max_y,f.max_z,f.annotation,
-        b.first_segment,b.points FROM fibers f
-        LEFT JOIN blocks b ON b.fiber_id=f.id ORDER BY f.id,b.first_segment'''
-    for _, group in itertools.groupby(db.execute(query), key=lambda row: row[0]):
-        first = next(group)
-        fid, name, family, count, length, *rest = first[:12]
-        bounds, annotation = rest[:6], rest[6]
-        if count < 2 or not math.isfinite(length) or length < 0:
-            raise ValueError(f'Invalid catalog entry for fiber {fid}')
-        pieces, next_segment, previous = [], 0, None
-        for row in itertools.chain((first,), group):
-            start, blob = row[-2:]
-            if not isinstance(blob, bytes) or len(blob) % 24 or not 2 <= len(blob) // 24 <= 257:
-                raise ValueError(f'Invalid block size for fiber {fid}')
-            if start != next_segment or (previous is not None and blob[:24] != previous):
-                raise ValueError(f'Discontinuous blocks for fiber {fid}')
-            pieces.append(blob if previous is None else blob[24:])
-            previous = blob[-24:]
-            next_segment += len(blob) // 24 - 1
-        if next_segment + 1 != count:
-            raise ValueError(f'Point count mismatch for fiber {fid}')
-        raw = b''.join(pieces)
-        points = np.frombuffer(raw, dtype='<f8').reshape(-1, 3)
-        if not np.isfinite(points).all():
-            raise ValueError(f'Non-finite coordinates in fiber {fid}')
-        actual = np.concatenate((points.min(axis=0), points.max(axis=0)))
-        if not np.array_equal(actual, bounds):
-            raise ValueError(f'Bounds mismatch for fiber {fid}')
-        yield fid, name, family, count, length, bounds, json.loads(annotation), raw
+    """Native streaming cursor shared with the C++ bulk import workflow."""
+    yield from db
 
 
 def prepared(row, collection_uuid, coordinates):
     fid, name, family, count, length, bounds, annotation, raw = row
     object_uuid = str(uuid.uuid5(uuid.UUID(collection_uuid), f'fiber:{fid}'))
     record = dict(uuid=object_uuid, kind='fiber', name=name, format_version=4,
-        fiber=dict(family=family, control_point_count=2, line_point_count=count,
+        fiber=dict(family=family, control_point_count=0, line_point_count=count,
                    length=length, bbox=bounds),
-        meta=dict(coordinates=coordinates, source=dict(afv=dict(
-            collection_uuid=collection_uuid, fiber_id=fid, annotation=annotation))))
+        meta=dict(coordinates=coordinates))
     geometry = dict(kind='fiber', arrays=[
-        dict(name='control_points', dtype='<f8', shape=[2, 3], data=raw[:24] + raw[-24:]),
-        dict(name='control_point_ids', dtype='<i8', shape=[2], data=struct.pack('<2q', 0, 1)),
+        dict(name='control_points', dtype='<f8', shape=[0, 3], data=b''),
+        dict(name='control_point_ids', dtype='<i8', shape=[0], data=b''),
         dict(name='line_points', dtype='<f8', shape=[count, 3], data=raw)])
-    return record, geometry
+    return record, geometry, fiber_source_row(object_uuid, fid, annotation)
 
 
 def import_afv(source, destination, *, volume_id=None, volume=None, scale_factor=1,
-               unbound=False, author=None, batch_size=256, batch_mib=64, progress=True):
+               unbound=False, author=None, batch_size=256, batch_mib=64, progress=True, source_sha256=None):
     source, destination = Path(source).absolute(), Path(destination).absolute()
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(destination)
@@ -157,17 +103,16 @@ def import_afv(source, destination, *, volume_id=None, volume=None, scale_factor
     coordinates = dict(volume_uuid=volume_id if volume_id else None, scale_factor=scale_factor)
     started = time.perf_counter()
     count = points = payload = 0
-    with open_afv(source) as (input_db, metadata), tempfile.TemporaryDirectory(
+    with open_afv(source) as input_db, tempfile.TemporaryDirectory(
             prefix='.' + destination.name + '-', dir=destination.parent) as staging:
-        collection_uuid = str(uuid.UUID(metadata['uuid']))
+        collection_uuid = input_db.uuid
+        source_fibers, source_points = input_db.fiber_count, input_db.point_count
         staged = Path(staging) / 'objects.vcobj'
         with ObjectStore.create(str(staged), author=author or getpass.getuser(),
                                 reader_pool_size=1, geometry_cache_bytes=0, spatial_cache_bytes=0) as store:
-            collection = dict(uuid=collection_uuid, kind='collection', name=source.stem,
-                meta=dict(coordinates=coordinates, afv=dict(metadata=metadata, source=str(source),
-                    volume=str(Path(volume).absolute()) if volume else None)))
-            with store.write(expected_revisions={collection_uuid: None}) as tx:
-                tx.upsert_object(collection)
+            source_table = fiber_source_extension(collection_uuid, sha256=source_sha256,
+                                                   fiber_count=source_fibers, point_count=source_points)
+            store.create_extension_table(source_table)
             pending, pending_bytes = [], 0
             last_report = started
 
@@ -175,16 +120,17 @@ def import_afv(source, destination, *, volume_id=None, volume=None, scale_factor
                 nonlocal pending_bytes, last_report
                 if not pending:
                     return
-                with store.write(expected_revisions={r['uuid']: None for r, _ in pending}) as tx:
-                    for record, geometry in pending:
+                with store.write(expected_versions={r['uuid']: None for r, _, _ in pending}) as tx:
+                    for record, geometry, _ in pending:
                         tx.upsert_object(record)
                         tx.put_geometry(record['uuid'], geometry)
+                    tx.append_extension_rows(source_table['name'], [extension['values'] for _, _, extension in pending])
                 pending.clear()
                 pending_bytes = 0
                 now = time.perf_counter()
                 if progress and now - last_report >= 5:
                     elapsed = now - started
-                    print(f'{count:,}/{metadata["fiber_count"]:,} fibers; '
+                    print(f'{count:,}/{source_fibers:,} fibers; '
                           f'{points:,} points; {count/elapsed:,.0f} fibers/s; {elapsed:.1f}s', flush=True)
                     last_report = now
 
@@ -198,10 +144,8 @@ def import_afv(source, destination, *, volume_id=None, volume=None, scale_factor
                 points += row[3]
                 payload += len(row[-1])
             flush()
-            if count != metadata['fiber_count'] or points != metadata['point_count']:
+            if count != source_fibers or points != source_points:
                 raise ValueError('AFV catalog totals do not match collection metadata')
-            with store.write(expected_revisions={collection_uuid: store.current_object_revision(collection_uuid)['uuid']}) as tx:
-                tx.set_meta(collection_uuid, 'import', dict(fibers=count, points=points))
         # A closed store has checkpointed its WAL. Link publishes atomically
         # without a check/replace race; staging is on the destination filesystem.
         os.link(staged, destination)
@@ -221,7 +165,8 @@ def main():
     binding = parser.add_mutually_exclusive_group()
     binding.add_argument('--volume-id', help='Volume id from metadata.json, stored verbatim')
     binding.add_argument('--unbound', action='store_true', help='Explicitly leave authoritative volume identity unknown')
-    parser.add_argument('--volume', type=Path, help='CT directory, retained as provenance')
+    parser.add_argument('--volume', type=Path, help='Optional CT directory availability check; never stored in provisioning')
+    parser.add_argument('--source-sha256', help='Known source-file SHA-256, if available (not computed during import)')
     parser.add_argument('--scale-factor', type=float, default=1)
     parser.add_argument('--author', default=getpass.getuser())
     parser.add_argument('--batch-size', type=int, default=256)

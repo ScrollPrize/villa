@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from scipy.ndimage import distance_transform_edt
+import vc_reader.transforms as A
 
 from .base_aux_trainer import BaseAuxTrainer
 
@@ -25,16 +25,8 @@ class DistanceTransformTrainer(BaseAuxTrainer):
 
         binary_mask = (source_np[0] > 0).astype(np.uint8)
 
-        inside = distance_transform_edt(binary_mask)
-        outside = distance_transform_edt(1 - binary_mask)
         mode = str(target_cfg.get("distance_type", "signed")).lower()
-
-        if mode == "inside":
-            distance = inside.astype(np.float32)
-        elif mode == "outside":
-            distance = outside.astype(np.float32)
-        else:
-            distance = (outside - inside).astype(np.float32)
-
-        aux_np = distance[np.newaxis, ...]
+        if mode not in ("inside", "outside"):
+            mode = "signed"
+        aux_np = A.DistanceTransform(mode=mode, implicit_background=True)(binary_mask[np.newaxis])
         return torch.from_numpy(np.ascontiguousarray(aux_np, dtype=np.float32))

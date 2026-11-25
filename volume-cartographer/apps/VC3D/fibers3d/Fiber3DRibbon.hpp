@@ -8,6 +8,7 @@
 #include <opencv2/core.hpp>
 #include "vc/lasagna/LineViewBuilder.hpp"
 
+class OpenedVolumes;
 class Volume;
 
 namespace vc3d::fibers3d::ribbon
@@ -51,10 +52,10 @@ struct Image {
     bool complete = true;
 };
 
-// One trilinear sample per texel, with nonblocking viewer-cache sampling at
-// the zoom's level and coarse fallback. No depth slab or MIP. Bounded tiles
-// share a border row; their mesh and sampling coordinates agree.
+// One trilinear sample per texel at the zoom's level, read blocking: call off the GUI
+// thread. No depth slab or MIP. Bounded tiles share a border row; their mesh and
+// sampling coordinates agree.
 // Throws on unsupported CT type, missing level, cancellation or the 8M-texel cap.
-std::shared_ptr<Image> sampleProgressive(const Frames&, Volume&, int widthVoxels, int rotationDegrees, int level, const std::atomic_bool* cancelled = nullptr);
+std::shared_ptr<Image> sampleRibbon(const Frames&, OpenedVolumes&, const Volume&, int widthVoxels, int rotationDegrees, int level, const std::atomic_bool* cancelled = nullptr);
 
 }  // namespace vc3d::fibers3d::ribbon

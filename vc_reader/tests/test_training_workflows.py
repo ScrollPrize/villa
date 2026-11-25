@@ -67,7 +67,7 @@ class TrainingTests(unittest.TestCase):
         label = dataset.specs[0].reference
         view = ScrollSource.from_dict(json.loads(json.dumps(label.scroll.to_dict())))
         label = view.labels[label.id]
-        other = replace(label.source, id='user:shifted-label')
+        other = label.source.replace(id='user:shifted-label')
         view = view.with_source(other, kind='label', volume='a', image=label.images.zarr().id,
                                 pixel_affine=((1, 0, 2), (0, 1, 0)))
         shifted = view.labels[other.id]
@@ -77,7 +77,7 @@ class TrainingTests(unittest.TestCase):
         result = dataset[0]
         np.testing.assert_array_equal(result['label_valid'][..., :2], False)
         np.testing.assert_array_equal(result['label'][0, :, 2:], np.tile([0, 1, 2], (4, 1)))
-        self.assertIs(dataset.reader(0)._options['memory_cache'], dataset.reader(1)._options['memory_cache'])
+        self.assertIs(dataset.reader(0)._memory, dataset.reader(1)._memory)
         self.assertLessEqual(dataset._runtime[2].nbytes, dataset.memory_cache_bytes)
         with data_loader(dataset, workers=1, batch_size=1) as loader:
             actual = next(iter(loader))
@@ -183,7 +183,7 @@ class TrainingTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             TrainingDataset(dataset.specs, dataset.requests, dataset.arrays, seeds=[1.5] * len(dataset))
         spec = dataset.specs[0]
-        bad = replace(spec.targets['label'].source, registration=None)
+        bad = spec.targets['label'].source.replace(registration=None)
         dataset.specs = (replace(spec, targets={'label': bad}),)
         with self.assertRaises(ValueError):
             dataset[0]

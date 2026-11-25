@@ -11,7 +11,7 @@ struct Normalize {
     Normalization mode = Normalization::ZScore;
     bool nonzero = true;           // zscore: statistics exclude zeros, which stay zero
     bool masked = false;
-    double eps = 0;                // zscore: lower bound of the standard deviation
+    double eps = 0;                // zscore: lower bound of the standard deviation; minmax: of max-min
     double lower = 1, upper = 99;  // robust/percentile: NumPy linear percentiles
     bool clip = true;              // robust: clip to the percentiles before median/MAD
     bool median = false;           // percentile: (x-median)/(span/2), else (x-lower)/span

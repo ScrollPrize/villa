@@ -124,7 +124,6 @@ int main(int argc, char** argv)
     require(pressSpy.count() == 3 && releaseSpy.count() == 3 && panSpy.count() == 3,
             "Disabled middle-button pan should forward middle mouse events");
 
-    view.setScrollPanDisabled(true);
     QKeyEvent keyPress(QEvent::KeyPress, Qt::Key_Left, Qt::ShiftModifier);
     QApplication::sendEvent(&view, &keyPress);
     QKeyEvent keyRelease(QEvent::KeyRelease, Qt::Key_Left, Qt::ShiftModifier);

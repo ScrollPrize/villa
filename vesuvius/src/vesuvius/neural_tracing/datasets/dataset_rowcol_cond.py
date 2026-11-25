@@ -1,4 +1,4 @@
-import vesuvius.tifxyz as tifxyz
+from vc_reader import tifxyz
 import hashlib
 import os
 import numpy as np
@@ -44,6 +44,7 @@ from vesuvius.neural_tracing.datasets.conditioning import (
 )
 from vesuvius.neural_tracing.datasets.perturbation import maybe_perturb_conditioning_surface
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
+from vc_reader import transforms as A
 import warnings
 
 
@@ -78,6 +79,8 @@ class EdtSegDataset(Dataset):
         if apply_augmentation and aug_config.get('enabled', True):
             self._augmentations = create_training_transforms(
                 patch_size=self.crop_size,
+                label_names=["segmentation"],
+                extra_targets={"keypoints": A.Points(order="zyx", outside="keep")},
                 no_spatial=False,
                 no_scaling=False,
                 only_spatial_and_intensity=aug_config.get('only_spatial_and_intensity', False),
@@ -105,11 +108,12 @@ class EdtSegDataset(Dataset):
                     volume_path,
                     auth_json_path=dataset.get('volume_auth_json'),
                     config=config,
+                    threads=1,  # read in DataLoader workers
                 )
                 segments_path = dataset['segments_path']
                 z_range = _parse_z_range(dataset.get('z_range', None))
                 dataset_segments = list(tqdm(
-                    tifxyz.load_folder(segments_path),
+                    (tifxyz.read(entry.location) for entry in tifxyz.list_surfaces(segments_path)),
                     desc=f"Loading segments dataset {dataset_idx}",
                     unit="segment",
                 ))
@@ -126,7 +130,6 @@ class EdtSegDataset(Dataset):
                     seg_scaled = seg if retarget_factor == 1 else seg.retarget(retarget_factor)
                     if not _segment_overlaps_z_range(seg_scaled, z_range):
                         continue
-                    seg_scaled.volume = volume
                     scaled_segments.append(seg_scaled)
 
                 if not scaled_segments:
@@ -371,7 +374,7 @@ class EdtSegDataset(Dataset):
         seg = wrap["segment"]
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
-        seg_h, seg_w = seg._valid_mask.shape
+        seg_h, seg_w = seg.shape
         r_min = max(0, r_min)
         r_max = min(seg_h - 1, r_max)
         c_min = max(0, c_min)
@@ -379,14 +382,11 @@ class EdtSegDataset(Dataset):
         if r_max < r_min or c_max < c_min:
             return None
 
-        seg.use_stored_resolution()
-        scale_y, scale_x = seg._scale
-        x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
-        if x_s.size == 0:
+        scale_y, scale_x = seg.scale
+        if not seg.valid[r_min:r_max + 1, c_min:c_max + 1].all():
             return None
-        if valid_s is not None:
-            if not valid_s.all():
-                return None
+        xyz_s = seg.xyz[r_min:r_max + 1, c_min:c_max + 1]
+        x_s, y_s, z_s = xyz_s[..., 0], xyz_s[..., 1], xyz_s[..., 2]
 
         x_full, y_full, z_full = _upsample_world_surface(x_s, y_s, z_s, scale_y, scale_x)
         trimmed = _trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)

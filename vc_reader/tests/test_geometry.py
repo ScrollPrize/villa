@@ -8,7 +8,7 @@ from build_support import load_build
 load_build()
 
 from vc_reader import cuda, _reader
-from vc_reader.geometry import PolylineSet, VoxelSet, transform_points
+from vc_reader.geometry import PolylineSet, VoxelSet, fill_holes, label_components, transform_points
 
 
 def host(x):
@@ -165,13 +165,25 @@ def test_transforms(backend):
     np.testing.assert_array_equal(actual,np.stack([p[0]@mat[:,:3].T,p[1]@mat[:,:3].T*2]))
 
 
+def test_singular_transform_json_applies_when_allowed(tmp_path):
+    from vc_reader import Affine
+    path = tmp_path / "transform.json"
+    path.write_text('{"transformation_matrix": [[2, 0, 0, 1], [0, 3, 0, 2], [0, 0, 0, 3]]}')
+    with pytest.raises(ValueError):
+        Affine.load_transform_json(str(path))
+    transform = Affine.load_transform_json(str(path), allow_singular=True)
+    assert transform.determinant == 0
+    actual = transform_points(np.array([[3, 2, 1]], np.float32), np.asarray(transform.matrix, np.float32))
+    np.testing.assert_array_equal(actual, [[7, 8, 3]])
+
+
 def test_sparse_voxels_rounding_batches_and_dense(backend):
     p = np.array([[0,0,0],[0,0,0],[1.5,2.5,3.5],[-.5,0,0],[-.51,0,0],[3.5,0,0],[np.nan,0,0],[2,2,2]],np.float32)
     ids = np.array([0,1,1,0,0,0,0,2],np.int64)
     v = VoxelSet(upload(p,backend),(4,4,5),batch_ids=upload(ids,backend),batches=2)
     dense = host(v.to_dense())
     expected = np.zeros((2,4,4,5),np.uint8)
-    expected[0,0,0,0]=expected[1,0,0,0]=expected[1,2,2,4]=1
+    expected[0,0,0,0]=expected[1,0,0,0]=expected[1,2,3,4]=1  # spatial half ties round up: 1.5,2.5,3.5 -> 2,3,4
     np.testing.assert_array_equal(dense,expected)
     r = host(v.contains(upload(p,backend),batch_ids=upload(ids,backend)))
     np.testing.assert_array_equal(r,[True,True,True,True,False,False,False,False])
@@ -339,3 +351,57 @@ def test_gather_candidates_without_host_roundtrip(backend):
     gathered=host(c.gather(candidates['indices'].reshape(-1),segments=True))
     assert gathered['valid'].sum()==2
     np.testing.assert_array_equal(gathered['curve_ids'][:2],[0,0])
+
+
+@pytest.mark.parametrize('connectivity,dims,structure', [(4,2,1),(8,2,2),(6,3,1),(18,3,2),(26,3,3)])
+def test_label_components_match_scipy(backend, connectivity, dims, structure):
+    ndi = pytest.importorskip('scipy.ndimage')
+    rng = np.random.default_rng(connectivity)
+    for trial in range(6):
+        shape = tuple(int(n) for n in rng.integers(1, 70 if dims == 3 else 400, dims))
+        mask = rng.random(shape) < (.05, .3, .5, .7)[trial % 4]
+        if trial == 5:
+            mask = ndi.binary_dilation(rng.random(shape) < .02, iterations=2)
+        expected, count = ndi.label(mask, structure=ndi.generate_binary_structure(dims, structure))
+        for threads in ((1, 5, 0) if backend == 'cpu' else (0,)):
+            labels, n = label_components(cuda.asarray(mask) if backend == 'cuda' else mask, connectivity=connectivity, threads=threads)
+            assert n == count and host(labels).dtype == np.int32
+            np.testing.assert_array_equal(host(labels), expected)
+    with pytest.raises(ValueError, match='connectivity'):
+        label_components(np.zeros((3,) * dims, bool), connectivity=5 if dims == 2 else 8)
+
+
+@pytest.mark.parametrize('connectivity,planar', [(6, 4), (18, 8), (26, 8)])
+def test_label_components_reads_3d_connectivity_in_plane_for_2d(backend, connectivity, planar):
+    # cc3d's reading: a 2D mask is one plane, so 6 labels it as 4 and 18 or 26 as 8.
+    mask = np.random.default_rng(connectivity).random((120, 90)) < .45
+    expected, count = label_components(mask, connectivity=planar)
+    labels, n = label_components(upload(mask, backend), connectivity=connectivity)
+    assert n == count
+    np.testing.assert_array_equal(host(labels), expected)
+    filled = fill_holes(upload(mask, backend), connectivity=connectivity)
+    np.testing.assert_array_equal(host(filled), fill_holes(mask, connectivity=planar))
+
+
+@pytest.mark.parametrize('connectivity,dims,structure', [(0,2,1),(8,2,2),(0,3,1),(18,3,2),(26,3,3)])
+def test_fill_holes_matches_scipy(backend, connectivity, dims, structure):
+    ndi = pytest.importorskip('scipy.ndimage')
+    rng = np.random.default_rng(connectivity + dims)
+    for trial in range(5):
+        shape = tuple(int(n) for n in rng.integers(1, 50 if dims == 3 else 300, dims))
+        mask = rng.random(shape) < (.4, .6, .75, .9, .5)[trial]
+        expected = ndi.binary_fill_holes(mask, structure=ndi.generate_binary_structure(dims, structure))
+        for threads in ((1, 0) if backend == 'cpu' else (0,)):
+            filled = fill_holes(upload(mask, backend), connectivity=connectivity, threads=threads)
+            np.testing.assert_array_equal(host(filled), expected)
+
+
+def test_pool_release_threshold():
+    if not cuda.is_available():
+        pytest.skip('CUDA build/device required')
+    previous = cuda.pool_release_threshold()
+    try:
+        cuda.set_pool_release_threshold(0); assert cuda.pool_release_threshold() == 0
+        cuda.set_pool_release_threshold(1 << 30); assert cuda.pool_release_threshold() == 1 << 30
+    finally:
+        cuda.set_pool_release_threshold(previous)

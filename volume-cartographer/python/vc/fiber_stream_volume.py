@@ -21,29 +21,29 @@ import time
 
 import msgpack
 import numpy as np
-from numcodecs import Zstd
+from vc_reader.reader import atomic_write, compress_bytes, decompress_zstd_frame
 
 from vc import fiber_trace as ft
-from vc.fiber_chunk_volume import configure_loader, open_inputs, job_keys, output_lock
+from vc.fiber_chunk_volume import open_inputs, job_keys, output_lock
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume_policy import (
     Owned, LivePaths, deferred_owner, novel_parts, tangents, runs, outside_ct_cut)
 
 
+# Refuses a damaged frame that claims an absurd size; far above any real tile.
+MAX_PAGE_BYTES=1<<36
+
+
 def atomic_json(path, value):
-    tmp=path.with_suffix('.partial.json')
-    tmp.write_text(json.dumps(value,indent=2)+'\n')
-    tmp.replace(path)
+    atomic_write(path,(json.dumps(value,indent=2)+'\n').encode())
 
 
 def save_page(path, pieces):
     data=msgpack.packb(dict(version=1,coordinate_units='base_voxels',pieces=pieces),use_bin_type=True)
-    tmp=path.with_suffix('.partial')
-    tmp.write_bytes(Zstd(level=1).encode(data))
-    tmp.replace(path)
+    atomic_write(path,compress_bytes(data,dict(id='zstd',level=1)))
 
 
 def read_page(path):
-    return msgpack.unpackb(Zstd().decode(path.read_bytes()),raw=False)
+    return msgpack.unpackb(decompress_zstd_frame(path.read_bytes(),MAX_PAGE_BYTES),raw=False)
 
 
 def uniform_path(points, widths, losses, spacing=8.):
@@ -58,24 +58,17 @@ def uniform_path(points, widths, losses, spacing=8.):
 
 
 class NativeCT:
-    """Use the regular native cache for the neural policy's CT-zero checks."""
+    """Nearest-voxel CT-zero checks on one opened level of the volume, read blocking."""
     def __init__(self, locator, level=2):
-        from vc.volume import Volume
-        self.volume=Volume.open_url(locator)
-        self.level=level-self.volume.base_scale_level
-        if self.level<0 or not self.volume.has_scale_level(self.level):
-            raise ValueError('CT requested level is unavailable')
-        # Native coordinates are relative to the opened base, NOT selected level.
-        self.scale=2.**self.volume.base_scale_level
+        from vc_reader import open_zarr
+        self.reader=open_zarr(locator,level=level)
+        self.scale=2.**level
 
     def outside(self, base_xyz):
-        p=np.ascontiguousarray(np.asarray(base_xyz,dtype=np.float32).reshape(1,-1,3)/self.scale)
-        if not p.shape[1]:
+        p=np.asarray(base_xyz,dtype=np.float64).reshape(-1,3)[:,::-1]/self.scale
+        if not len(p):
             return np.empty(0,bool)
-        # Native nearest sampling applies the requested level itself.
-        image, *_=self.volume.sample_coords(p,np.ones(p.shape[:2],bool),level=self.level,
-            sampling='nearest',blocking=True,sampler_threads=1)
-        return np.asarray(image).ravel()==0
+        return np.asarray(self.reader.sample(p,order=0)).ravel()==0
 
 
 class Stream:
@@ -95,7 +88,6 @@ class Stream:
         self.begin=time.monotonic();self.start_cpu=time.process_time()
         self.last_progress=self.begin;self.peak_active=0
         base={k:v for k,v in cfg.items() if k!='stream'}
-        configure_loader(base,self.rows_limit)
         self.field,self.normals,self.trace,self.chunk=open_inputs(base)
         if self.chunk.gpu_library or self.trace.parallel_threads!=1:
             raise ValueError('stream requires CPU seed construction and one native thread per trace')
@@ -370,14 +362,15 @@ def run_native(cfg,out):
     options.setdefault('workers',options.get('rows',128))
     options.setdefault('active_fibers',10*options['workers'])
     base={k:v for k,v in cfg.items() if k!='stream'}
-    configure_loader(base,options['workers'])
     field,normals,trace,chunks=open_inputs(base)
     if chunks.gpu_library or trace.parallel_threads!=1:
         raise ValueError('native streaming uses one shared CPU pool')
+    trace=ft.stream_trace_config(trace,options.setdefault('reverse_consistency',True))
     _,_,_,shape=ft.prediction_presence_storage(field)
     options.setdefault('box_base_xyz',[[0,0,0],list(shape[::-1])])
     keys=job_keys(base,field,chunks)
-    identity=hashlib.sha256(json.dumps(cfg,sort_keys=True).encode()).hexdigest()
+    effective=dict(cfg,trace=trace.to_dict(),stream=options,reverse_policy_version=1)
+    identity=hashlib.sha256(json.dumps(effective,sort_keys=True).encode()).hexdigest()
     record=out/'run.json'
     if record.exists():
         saved=json.loads(record.read_text())
@@ -386,7 +379,7 @@ def run_native(cfg,out):
         if saved['identity']!=identity:
             raise ValueError('resume settings/source differ')
     else:
-        atomic_json(record,dict(identity=identity,config=cfg,policy='neural-volume+width-v1',
+        atomic_json(record,dict(identity=identity,config=effective,policy='neural-volume+width+reverse-v1',
             output_schema='fiber-stream-attributes-v2',
             coordinates='base voxels',decision_base=options.get('decision_base',64)))
     atomic_json(out/'scheduler.json',dict(backend='native-cooperative-v1',options=options))
@@ -402,6 +395,8 @@ def main(argv=None):
         if not args.python_reference:
             run_native(cfg,args.output)
             return 0
+        if cfg['stream'].get('reverse_consistency',True):
+            raise ValueError('FW/BW verification requires the native runner; Python reference is off-only')
         stream=Stream(cfg,args.output)
         if os.environ.get('VC_STREAM_PROFILE'):
             import cProfile

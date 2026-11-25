@@ -447,10 +447,9 @@ class _VolumePatchFactory:
     origin_zyx: tuple[int, int, int]
 
     def __call__(self):
-        from vc.volume import Volume, initialize_chunk_cache
+        from vc_reader.reader import ZarrReader
 
-        initialize_chunk_cache(64 * 1024**2, 1, 1, 1)
-        return _VolumePatch(Volume.open(self.path), self.origin_zyx)
+        return _VolumePatch(ZarrReader.open(self.path, memory_cache=64 * 1024**2, threads=1), self.origin_zyx)
 
 
 @dataclass(frozen=True)
@@ -460,9 +459,9 @@ class _VolumePatch:
 
     def __call__(self, index):
         z, y, x = self.origin_zyx
-        # Overlapping patches exercise actual native cached CT reads; no
-        # source writes, normal data, model or GPU are needed by the queue.
-        return self.volume.read_zyx((z, y, x + index * 2), (32, 32, 32))
+        # Overlapping patches exercise actual cached CT reads; no source
+        # writes, normal data, model or GPU are needed by the queue.
+        return self.volume.read_region((z, y, x + index * 2), (32, 32, 32))
 
 
 @dataclass(frozen=True)
@@ -479,14 +478,12 @@ class _FlipPatchFactory:
 
 @pytest.mark.parametrize("shared", [False, True], ids=["fixed", "shared"])
 @pytest.mark.parametrize("context", ["spawn", "forkserver"])
-def test_real_volume_patches_match_serial_reads(shared, context):
-    path = os.environ.get("VC_QUEUE_TEST_VOLUME")
-    if not path:
-        pytest.skip("set VC_QUEUE_TEST_VOLUME to a local native-readable CT array")
+def test_volume_patches_match_serial_reads(shared, context, tmp_path):
     if context not in mp.get_all_start_methods():
         pytest.skip(f"{context} unavailable on this platform")
     import numpy as np
     from pathlib import Path
+    from tests.zarr_utils import create_v2_array
     import vesuvius.neural_tracing.ordered_sample_pipeline as queue_module
 
     # An editable install of another checkout must not silently validate that
@@ -494,12 +491,15 @@ def test_real_volume_patches_match_serial_reads(shared, context):
     assert Path(queue_module.__file__).resolve() == (
         Path(__file__).resolve().parents[2] / "src/vesuvius/neural_tracing/ordered_sample_pipeline.py"
     )
-    origin = tuple(int(v) for v in os.environ.get(
-        "VC_QUEUE_TEST_ORIGIN_ZYX", "0,0,0").split(","))
-    factory = _VolumePatchFactory(path, origin)
+    path = tmp_path / "ct.zarr"
+    volume = np.random.default_rng(3).integers(1, 256, size=(40, 40, 48), dtype=np.uint8)
+    create_v2_array(path, shape=volume.shape, chunks=(16, 16, 16), dtype=np.uint8)[:] = volume
+    origin = (4, 6, 0)
+    factory = _VolumePatchFactory(str(path), origin)
     serial = factory()
     expected = [serial(i)[::-1].copy() for i in range(4)]
-    assert all(np.count_nonzero(patch) for patch in expected), "empty CT fixture"
+    for index, patch in enumerate(expected):
+        np.testing.assert_array_equal(patch, volume[4:36, 6:38, 2 * index:2 * index + 32][::-1])
     args = dict(stage1_factory=factory, stage2_factory=_FlipPatchFactory(),
                 multiprocessing_context=context, item_count=4, max_in_flight=2,
                 raw_queue_capacity=1, result_queue_capacity=1)

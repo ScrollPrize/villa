@@ -197,8 +197,7 @@ deserializeFiberletTraces(std::span<const std::byte> bytes);
     std::span<const std::byte> bytes);
 
 // Decode field compression while retaining the same strict payload envelope.
-// Generated ChunkCache instances keep this byte form in their decoded LRU and
-// keep the compressed form only in the authoritative sparse dataset.
+// The compressed form stays only in the authoritative sparse dataset.
 [[nodiscard]] std::vector<std::byte> materializeFiberletPayload(std::span<const std::byte> bytes);
 
 }  // namespace vc::fiber_tracer

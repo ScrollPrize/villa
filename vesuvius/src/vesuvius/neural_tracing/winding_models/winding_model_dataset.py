@@ -13,12 +13,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
-import scipy.ndimage
 import torch
 from skimage.restoration import unwrap_phase
 from vc.grid_raycast import GridRaycaster
 
-import vesuvius.tifxyz as tifxyz
+from vc_reader import tifxyz
+import vc_reader.transforms as A
 from vesuvius.neural_tracing.winding_models.volume_slab_extractor import (
     SlabFrame,
     VolumeSlabExtractor,
@@ -30,8 +30,6 @@ from vesuvius.neural_tracing.winding_models.winding_targets import (
 _WINDING_NAME = re.compile(r"(?:^|-)w(?P<index>\d+)(?:_|$)")
 
 _SEGMENT_CACHE_VERSION = 2
-
-_MALFORMED_CHUNK_ERROR = "decoded chunk byte size does not match full chunk shape"
 
 # Surface rasterization constants, all in slab sample units. Quads are
 # subdivided to at most _RASTER_STEP between samples, each sample is assigned
@@ -171,17 +169,14 @@ def _segment_block_bounds(
     )
 
 
-def _bilinear(
-    v00: np.ndarray, v10: np.ndarray, v01: np.ndarray, v11: np.ndarray,
-    u: np.ndarray, v: np.ndarray,
-) -> np.ndarray:
-    """Bilinear patch samples; u follows the row axis, v the column axis."""
-    return (
-        v00[:, None] * ((1.0 - u) * (1.0 - v))[None, :, None]
-        + v10[:, None] * (u * (1.0 - v))[None, :, None]
-        + v01[:, None] * ((1.0 - u) * v)[None, :, None]
-        + v11[:, None] * (u * v)[None, :, None]
-    )
+def _sample_quad_fields(v00, v10, v01, v11, u, v):
+    # These conservative raster cells use corner bounds for culling and carry
+    # winding phase values. Linear interpolation must stay inside those bounds.
+    from vc_reader.torch import sample_array
+    values = np.stack((v00, v01, v10, v11), axis=-1).reshape(len(v00), -1, 2, 2)
+    points = np.broadcast_to(np.stack((u, v), -1), (len(v00), len(u), 2)).copy()
+    result = sample_array(torch.from_numpy(values), torch.from_numpy(points), boundary="border")
+    return result.transpose(1, 2).numpy()
 
 
 class WindingModelDataset(torch.utils.data.Dataset):
@@ -256,16 +251,16 @@ class WindingModelDataset(torch.utils.data.Dataset):
                 patch_bbox_min = pack.bbox_min
                 patch_bbox_max = pack.bbox_max
             else:
-                for info in tifxyz.list_tifxyz(volume_cfg["segments_path"]):
+                for info in tifxyz.list_surfaces(volume_cfg["segments_path"]):
                     segment = self._load_segment(
-                        info.path,
+                        Path(info.location),
                         erode_cells=erode_cells,
                         inner_fraction=inner_fraction,
                     )
                     if not len(segment.sample_cells):
                         print(
                             "winding dataset: skipping segment with no valid "
-                            f"inner quads: {info.path}"
+                            f"inner quads: {info.location}"
                         )
                         continue
                     segments.append(segment)
@@ -379,7 +374,6 @@ class WindingModelDataset(torch.utils.data.Dataset):
             ray_length=self.ray_length,
             spacing=self.spacing,
             sampling=str(cfg.get("sampling", "trilinear")),
-            tile_size=int(cfg.get("tile_size", 32)),
             cache_bytes=int(cfg.get("volume_cache_bytes", 0)),
             io_threads=int(cfg.get("volume_io_threads", 0)),
             segment_to_volume_xyz=[
@@ -450,30 +444,23 @@ class WindingModelDataset(torch.utils.data.Dataset):
         build_raycaster: bool = True,
         need_turns: bool = True,
     ) -> Segment:
-        surface = tifxyz.read_tifxyz(path)
-        xyz = np.ascontiguousarray(
-            np.stack([surface._x, surface._y, surface._z], axis=-1),
-            dtype=np.float32,
-        )
+        surface = tifxyz.read(path)
+        xyz = np.array(surface.xyz, dtype=np.float32)
         winding_idx = self._winding_index(path)
 
         # Trim vertices near the border of the valid region, where annotation
         # errors concentrate — the same erosion fit_spiral applies to patches
         # before consuming them.
-        valid_vertex = surface.valid_vertex_mask
+        valid_vertex = surface.valid
         if erode_cells > 0:
-            valid_vertex = scipy.ndimage.binary_erosion(
-                valid_vertex, iterations=erode_cells, border_value=0
-            )
+            valid_vertex = A.Morphology("erode", radius=erode_cells, footprint="cross")(valid_vertex[None])[0]
             xyz[~valid_vertex] = -1.0
-            quad_mask = (
-                valid_vertex[:-1, :-1]
-                & valid_vertex[1:, :-1]
-                & valid_vertex[:-1, 1:]
-                & valid_vertex[1:, 1:]
-            )
-        else:
-            quad_mask = surface.valid_quad_mask
+        quad_mask = (
+            valid_vertex[:-1, :-1]
+            & valid_vertex[1:, :-1]
+            & valid_vertex[:-1, 1:]
+            & valid_vertex[1:, 1:]
+        )
 
         # Winding turns are only needed for segments without an explicit
         # winding index; unwrapping the phase of a large grid is the one
@@ -828,9 +815,8 @@ class WindingModelDataset(torch.utils.data.Dataset):
 
         Anchored at the primary ray's midpoint, cast within the multiview
         cone with a randomized position along the new ray. Needs no
-        targets: the loss is label-free. Samples that draw no pair (or
-        whose extraction hits a truncated chunk) return zero-filled fields
-        with ``has_pair`` False so batch keys stay collate-uniform.
+        targets: the loss is label-free. Samples that draw no pair return
+        zero-filled fields with ``has_pair`` False so batch keys stay collate-uniform.
         """
         size = self.transverse_size
         empty = {
@@ -851,14 +837,9 @@ class WindingModelDataset(torch.utils.data.Dataset):
         anchor = origin + 0.5 * self.ray_extent * frame.direction
         direction = self._pair_direction(frame.direction)
         offset = self.ray_extent * (0.35 + 0.3 * float(torch.rand(())))
-        try:
-            image, valid, pair_frame = self.slab_extractor.extract(
-                volume_idx, direction, anchor - offset * direction
-            )
-        except RuntimeError as exc:
-            if _MALFORMED_CHUNK_ERROR not in str(exc):
-                raise
-            return empty
+        image, valid, pair_frame = self.slab_extractor.extract(
+            volume_idx, direction, anchor - offset * direction
+        )
         return {
             "pair_image": torch.from_numpy(np.ascontiguousarray(image)),
             "pair_valid": torch.from_numpy(np.ascontiguousarray(valid)).bool(),
@@ -1154,7 +1135,7 @@ class WindingModelDataset(torch.utils.data.Dataset):
             u_grid, v_grid = (
                 grid.reshape(-1) for grid in np.meshgrid(steps, steps, indexing="ij")
             )
-            samples = _bilinear(
+            samples = _sample_quad_fields(
                 corners[0][select],
                 corners[1][select],
                 corners[2][select],
@@ -1162,7 +1143,7 @@ class WindingModelDataset(torch.utils.data.Dataset):
                 u_grid,
                 v_grid,
             )
-            sample_winds = _bilinear(
+            sample_winds = _sample_quad_fields(
                 winds[0][select, None],
                 winds[1][select, None],
                 winds[2][select, None],
@@ -1537,44 +1518,36 @@ class WindingModelDataset(torch.utils.data.Dataset):
                     for bracket_segment in bracket
                 ]
 
-            try:
-                hits = self._filter_crossings(
-                    volume_idx, hits, require_anchored=not crossings_only
-                )
-                if len(hits) < (1 if crossings_only else 2):
-                    continue
-                origin, hits = self._randomly_position_crossings(
-                    origin, direction, hits
-                )
-                slab_image, slab_valid, frame = self.slab_extractor.extract(
-                    volume_idx, direction, origin
-                )
-                if crossings_only:
-                    slab_min, slab_max = self._slab_bounds(frame)
-                    raster_specs = [
-                        (neighbor, None, 0.0)
-                        for ref in self._patches_in_bounds(
-                            volume, slab_min, slab_max
-                        )
-                        for neighbor in (self._load_patch(volume, ref),)
-                        if neighbor is not None
-                    ]
-                    if not raster_specs:
-                        continue
-                targets = self._slab_targets(
-                    frame,
-                    raster_specs,
-                    slab_image,
-                    slab_valid,
-                    crossings_only=crossings_only,
-                )
-            except RuntimeError as exc:
-                # A few locally stored Zarr chunks may be truncated. Discard
-                # only samples that touch those chunks; unrelated runtime
-                # failures must still terminate training.
-                if _MALFORMED_CHUNK_ERROR not in str(exc):
-                    raise
+            hits = self._filter_crossings(
+                volume_idx, hits, require_anchored=not crossings_only
+            )
+            if len(hits) < (1 if crossings_only else 2):
                 continue
+            origin, hits = self._randomly_position_crossings(
+                origin, direction, hits
+            )
+            slab_image, slab_valid, frame = self.slab_extractor.extract(
+                volume_idx, direction, origin
+            )
+            if crossings_only:
+                slab_min, slab_max = self._slab_bounds(frame)
+                raster_specs = [
+                    (neighbor, None, 0.0)
+                    for ref in self._patches_in_bounds(
+                        volume, slab_min, slab_max
+                    )
+                    for neighbor in (self._load_patch(volume, ref),)
+                    if neighbor is not None
+                ]
+                if not raster_specs:
+                    continue
+            targets = self._slab_targets(
+                frame,
+                raster_specs,
+                slab_image,
+                slab_valid,
+                crossings_only=crossings_only,
+            )
             if targets is None:
                 continue
             sample = {

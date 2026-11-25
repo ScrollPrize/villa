@@ -138,7 +138,7 @@ QString vesuviusSourceDirectory(const QString& applicationDirectory)
     const QDir app(applicationDirectory);
     for (const auto* relative : {"../../vesuvius/src", "../../../vesuvius/src"}) {
         const QDir source(app.filePath(relative));
-        if (QFileInfo::exists(source.filePath("vesuvius/afv_spline_generator/__main__.py")))
+        if (QFileInfo::exists(source.filePath("vesuvius/fiber_spline_generator/__main__.py")))
             return QDir::cleanPath(source.absolutePath());
     }
     return {};

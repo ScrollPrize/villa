@@ -1,2 +1,1 @@
-include setup/configs/*.yaml
-include vesuvius/setup/configs/*.yaml
+include src/vesuvius/install/configs/cubes.yaml

@@ -20,14 +20,19 @@ def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_w
     # ...so should have (K + 0.5) * dr_per_winding * 2 * pi / inter_point_spacing steps
     # can construct these thetas directly, then r's via formula
 
-    # The angles are built in float_hi (float64 except on MPS or under FIT_SPIRAL_MAX_PRECISION_FLOAT=32):
-    # in float32 the winding offset k * 2 * pi takes the mantissa, and at winding 250 sin and cos times a
-    # radius of 4000 voxels move a node by up to half a voxel. Only the positions are cast back to the default dtype.
+    # The angles are built in float64: in float32 the winding offset k * 2 * pi takes the mantissa, and at
+    # winding 250 sin and cos times a radius of 4000 voxels move a node by up to half a voxel. Where float_hi
+    # is float32 (MPS has no float64; FIT_SPIRAL_MAX_PRECISION_FLOAT=32 does the same on any device) they are
+    # built on the CPU, and the positions are copied to the device after the cast back to the default dtype.
+    # The copies keep the graph to a tensor dr_per_winding; the spiral is built once per export, not per step.
+    on_host = float_hi(device) != torch.float64
+    if on_host and torch.is_tensor(dr_per_winding):
+        dr_per_winding = dr_per_winding.cpu()
     thetas = [
         winding_idx * 2 * torch.pi + torch.arange(
             0, 2 * np.pi,
             step=inter_point_spacing / (winding_idx + 0.5) / float(dr_per_winding),
-            device=device, dtype=float_hi(device),
+            device='cpu' if on_host else device, dtype=torch.float64,
         )
         for winding_idx in range(num_windings)
     ]
@@ -38,6 +43,8 @@ def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_w
          * radii_for_winding[:, None]).to(torch.get_default_dtype())
         for thetas_for_winding, radii_for_winding in zip(thetas, radii)
     ]
+    if on_host:
+        yxs = [yxs_for_winding.to(device) for yxs_for_winding in yxs]
 
     if group_by_winding:
         return yxs

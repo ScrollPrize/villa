@@ -40,16 +40,14 @@ with the source implementation's existing rounding bounds; same-backend serial
 and queued results are exact. This does not import the later randomized-sigma
 GPU augmentation recipe or remove validity masks.
 
-`volume_io_threads`, `volume_decode_threads` and `volume_sample_threads` expose
-the shared sampler's native thread controls. Queue load workers initialize the
-native cache before opening volumes and force one I/O, decode and sampling
-worker. Native CPU compute and Torch workers are single-threaded. Separate
-loader processes retain their own caches; this API does not imply a cross-process
-decoded cache.
+Each loader record opens its CT level with vc_reader (`ZarrReader.open`), with
+a memory cache of `volume_cache_memory_mib` and `volume_io_threads` read
+threads. Queue load workers force one read thread. Native CPU compute and Torch
+workers are single-threaded. Separate loader processes retain their own memory
+caches; there is no cross-process decoded cache.
 
-Remote VC3D volumes use the process-wide cache root configured by VC3D, just
-as before this extraction. The sampler's legacy `cache_root` argument is not a
-per-volume override for this backend; `Volume.open_url` accepts only the URL.
+Remote volumes are disk-cached under VC3D's configured cache root (`"vc3d"`),
+then searched in `volume_cache_dir` if set.
 
 The shared tensor bank keeps large volumes **and validity masks** out of queue
 payloads; only metadata and generation-checked descriptors cross the queues.
@@ -208,12 +206,10 @@ exceptions and hard/clean worker exits, saturated shutdown, retained storage
 leases, one-worker operation, zero-worker parking/resume, explicit admission,
 and train/test/train phase transitions.
 
-To include real CT transport, set `VC_QUEUE_TEST_VOLUME` to a local array
-readable by `vc.volume.Volume.open` and `VC_QUEUE_TEST_ORIGIN_ZYX` to an occupied
-crop origin in that array's coordinates. Four overlapping 32³ patches and a
-deterministic axis flip must match direct serial reads byte-for-byte in fixed
-and shared modes, using both `spawn` and `forkserver` where supported. These
-tests skip without an explicit fixture; no downloads or source writes occur.
+CT transport is covered with a small random local Zarr written by the test and
+read through vc_reader in the worker processes: four overlapping 32³ patches and
+a deterministic axis flip must match the array byte-for-byte in fixed and shared
+modes, using both `spawn` and `forkserver` where supported. No downloads occur.
 They validate transport and scheduling, not a throughput or model-quality gain.
 
 `tests/neural_tracing/test_sample_pipeline.py` carries the original CPU-stage

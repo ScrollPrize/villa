@@ -1,3 +1,4 @@
+#include <vc_reader/slab.hpp>
 #pragma once
 
 // True-orthographic volumetric compositing for the flattened-segment view.
@@ -132,18 +133,6 @@ SlabMargins computeSlabMargins(const CameraParams& cam,
                                float outputScale,
                                int outW,
                                int outH);
-
-// Opacity transfer function: 256-entry LUT from raw value.
-// alphaMin/alphaMax window the raw value to rho in [0,1], then
-// alpha = opacity * rho^gamma, scaled by segmentLength (the per-frame
-// ray-segment length correction 1/|d_w|) and clamped to 1. Values below
-// isoCutoff get alpha 0 (hard highpass).
-std::array<float, 256> buildOpacityLut(float alphaMin,
-                                       float alphaMax,
-                                       float opacity,
-                                       float gamma,
-                                       uint8_t isoCutoff,
-                                       float segmentLength);
 
 // Front-to-back emission/absorption compositing through the layer stack.
 //  layerValues/layerCoverage  one buffer per layer, sized to the output

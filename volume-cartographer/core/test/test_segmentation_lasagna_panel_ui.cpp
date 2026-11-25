@@ -1,3 +1,4 @@
+#include <nlohmann/json.hpp>
 #include <QApplication>
 #include <QComboBox>
 #include <QJsonArray>
@@ -23,18 +24,22 @@
 
 #include "CState.hpp"
 #include "LasagnaServiceManager.hpp"
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "SurfaceCatalog.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "support/TestZarrVolume.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
 
 #include <memory>
-#include <filesystem>
 #include <cstdlib>
 #include <iostream>
 
@@ -90,12 +95,6 @@ QuadSurface wrappedSurface()
     return QuadSurface(points, cv::Vec2f{1.0f, 1.0f});
 }
 
-nlohmann::json pinJson(const vc::objects::PinnedObject& pin)
-{
-    return {{"store_uuid", pin.object.storeUuid}, {"object_uuid", pin.object.objectUuid},
-            {"object_revision", pin.objectRevision}, {"geometry_revision", pin.geometryRevision.value_or("")}};
-}
-
 } // namespace
 
 int main(int argc, char** argv)
@@ -109,6 +108,8 @@ int main(int argc, char** argv)
 
     QTemporaryDir tempDir;
     require(tempDir.isValid(), "Failed to create temporary settings dir");
+    // The panel's setters persist through writeSetting into VC3D's own INI.
+    qputenv("VC3D_CONFIG_DIR", tempDir.path().toUtf8());
     const QString configPath = tempDir.filePath(QStringLiteral("config.json"));
     QFile configFile(configPath);
     require(configFile.open(QIODevice::WriteOnly | QIODevice::Text),
@@ -188,12 +189,11 @@ int main(int argc, char** argv)
     // The store jobs read: a volume's surfaces, one of them a Lasagna fit
     // (its model in the store, the reference surface it read in its meta).
     namespace vo = vc::objects;
-    vc::test::ZarrVolumeSpec volumeOptions;
-    volumeOptions.shapeZYX = {4, 4, 4};
-    volumeOptions.chunkShapeZYX = {4, 4, 4};
-    volumeOptions.uuid = "lasagna-test-volume";
-    const auto volume = vc::test::createZarrVolume(std::filesystem::path(tempDir.filePath(QStringLiteral("ct.zarr")).toStdString()),
-                                    volumeOptions);
+    const std::filesystem::path volumeRoot = std::filesystem::path(tempDir.filePath(QStringLiteral("ct.zarr")).toStdString());
+    const vcr::zarr::CreateOptions levelZero{.shape = {4, 4, 4}, .chunks = {4, 4, 4}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "lasagna-test-volume"}, {"name", "lasagna-test-volume"}, {"format", "zarr"}, {"width", 4}, {"height", 4}, {"slices", 4}, {"voxelsize", 1.0}}.dump();
+    const auto volume = Volume::New(volumeRoot);
     const auto storePath = std::filesystem::path(tempDir.filePath(QStringLiteral("objects.vcobj")).toStdString());
     vo::OpenOptions storeOptions;
     storeOptions.author = "lasagna-panel-test";
@@ -207,15 +207,16 @@ int main(int argc, char** argv)
     auto addSurface = [&](const std::string& name, nlohmann::json meta) {
         const auto uuid = vo::util::newUuid();
         meta.update(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(volume->id(), 1)}});
-        session->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-            vo::ObjectRecord record;
-            record.uuid = uuid;
-            record.kind = "surface";
-            record.name = name;
-            record.meta = meta.dump();
-            db.upsertObject(txn, record);
-            db.putGeometry(txn, uuid, quad_surface_geometry(grid));
-        });
+        vo::ObjectRecord record;
+        record.uuid = uuid;
+        record.kind = "surface";
+        record.name = name;
+        record.meta = meta.dump();
+        auto request = session->newRequest(attachment);
+        request.expectedObjects = {{uuid, std::nullopt}};
+        request.operations.push_back(vo::CreateObjectOp{vo::objectRecordJson(record)});
+        request.operations.push_back(vo::PutGeometryOp{uuid, quad_surface_geometry(grid), {}});
+        session->submit(attachment, request);
         return uuid;
     };
     const auto referenceUuid = addSurface("reference_surface", nlohmann::json::object());
@@ -223,8 +224,10 @@ int main(int argc, char** argv)
         {"sources", nlohmann::json::array({referenceUuid})}}}});
     addSurface("sheet_off1", nlohmann::json::object());
     const auto noModelUuid = addSurface("sheet_no_model", nlohmann::json::object());
-    writeFile(QString::fromStdString((session->artifactDirectory(attachment, fittedUuid) / "model.pt").string()),
-              QByteArrayLiteral("model"));
+    const auto modelFile = std::filesystem::path(storePath).parent_path() / "model.pt";
+    writeFile(QString::fromStdString(modelFile.string()), QByteArrayLiteral("model"));
+    session->publishArtifacts(attachment, session->currentObject(attachment, fittedUuid)->reference(),
+                              {{"model.pt", modelFile}});
     LasagnaServiceManager::instance().setObjectStore(session, attachment);
     SurfaceCatalog catalog(session);
     catalog.setSource(attachment, volume, {volume->id()});
@@ -416,6 +419,42 @@ int main(int argc, char** argv)
         return opened;
     };
     auto surface = openSurface(fittedUuid);
+
+    // An imported surface links to itself. The service accepts only numbered
+    // versions, including heads published before the active history generation.
+    state.setSurface("segmentation", openSurface(referenceUuid), true);
+    std::optional<vc::objects::ObjectRevision> reference;
+    session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        reference = reader.currentObject(referenceUuid);
+    });
+    {
+        vc::objects::OpenOptions options;
+        options.author = "lasagna-test";
+        auto store = vc::objects::ObjectStore::open(storePath, options);
+        store.startHistoryGeneration("test historical head in Lasagna request");
+    }
+    require(reference && reference->generation != session->status(attachment).generation,
+            "The selected head should belong to an earlier history generation");
+    for (const auto mode : {SegmentationLasagnaPanel::LasagnaMode::NewModel,
+                            SegmentationLasagnaPanel::LasagnaMode::Offset}) {
+        QString error;
+        require(panel.startOptimizationHeadless(&state, mode, configPath, cv::Vec3i{4, 5, 6}, &error),
+                "An imported surface should launch a Lasagna job");
+        const auto spec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+        const auto links = spec[QStringLiteral("linked_surfaces")].toArray();
+        const auto external = spec[QStringLiteral("config")].toObject()[QStringLiteral("external_surfaces")].toArray();
+        require(links.size() == 1 && external.size() == 1, "The imported surface should link to itself");
+        for (const auto& value : {links[0], external[0]}) {
+            const auto ref = value.toObject();
+            const auto selected = vc::objects::objectVersionFromJson(
+                QJsonDocument(ref[QStringLiteral("reference")].toObject()).toJson().toStdString());
+            require(selected == reference->reference() &&
+                        !ref.contains(QStringLiteral("generation")) &&
+                        !ref.contains(QStringLiteral("version")) &&
+                        !ref.contains(QStringLiteral("revision")),
+                    "Lasagna references must pin the selected object's numbered version and its own generation");
+        }
+    }
 
     state.setSurface("segmentation", surface, true);
     panel._lastLasagnaMode = SegmentationLasagnaPanel::LasagnaMode::NewModel;

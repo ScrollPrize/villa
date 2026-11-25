@@ -10,13 +10,15 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import numpy as np
-import tifffile
+from vc_reader import images
 
-from vesuvius.label_zarr import (
+from vc_reader.reader import create_group, ome_multiscales, write_pyramid_level
+from vesuvius.ink_detection.label_zarr import (
+    ARRAY_DIMENSIONS,
+    CHUNK_SHAPE,
     DEFAULT_LEVELS,
+    LABEL_CODEC,
     LABEL_SLICE,
-    create_label_array,
-    create_label_group,
     pyramid_shapes,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -25,7 +27,7 @@ BLOCK_SIZE = 1024
 
 
 def _load_label_2d(path: Path) -> np.ndarray:
-    image = np.squeeze(np.asarray(tifffile.imread(path)))
+    image = np.squeeze(np.asarray(images.read(path)))
     if image.ndim == 3:
         image = image[..., 0]
     if image.ndim != 2:
@@ -44,8 +46,7 @@ def write_label_zarr(
     """Write ``image_2d`` as a koine-convention OME-Zarr label pyramid.
 
     Every level holds a 65-deep volume whose only non-zero slice is
-    ``LABEL_SLICE``; nearest downsampling of that volume equals nearest
-    downsampling of the 2D image, so levels are derived purely in 2D.
+    ``LABEL_SLICE``.
     """
 
     if output_path.exists():
@@ -54,29 +55,41 @@ def write_label_zarr(
         shutil.rmtree(output_path)
 
     shapes = pyramid_shapes(image_2d.shape, levels)
-    group = create_label_group(output_path, levels=levels)
+    multiscales = ome_multiscales(
+        name=output_path.stem, levels=levels - 1, factors=(1, 2, 2), reduction="nearest"
+    )
+    group = create_group(
+        output_path, attrs={"multiscales": [multiscales]}, overwrite=True, auth=None
+    )
     if extra_attributes:
         group.attrs.update(extra_attributes)
 
-    level_image = image_2d
+    datasets = []
+    # Keep fixed chunks even for levels smaller than CHUNK_SHAPE.
     for level, shape in enumerate(shapes):
-        dataset = create_label_array(
-            group,
+        array = group.create_array(
             str(level),
             shape=shape,
+            chunks=CHUNK_SHAPE,
             dtype=image_2d.dtype,
+            fill_value=0,
+            separator="/",
+            overwrite=True,
+            skip_empty=True,
+            **LABEL_CODEC,
         )
-        height, width = level_image.shape
-        for y0 in range(0, height, BLOCK_SIZE):
-            y1 = min(height, y0 + BLOCK_SIZE)
-            for x0 in range(0, width, BLOCK_SIZE):
-                x1 = min(width, x0 + BLOCK_SIZE)
-                block = level_image[y0:y1, x0:x1]
-                if not block.any():
-                    continue
-                dataset[LABEL_SLICE, y0:y1, x0:x1] = block
-
-        level_image = np.ascontiguousarray(level_image[::2, ::2])
+        array.attrs["_ARRAY_DIMENSIONS"] = ARRAY_DIMENSIONS
+        datasets.append(array)
+    height, width = image_2d.shape
+    for y0 in range(0, height, BLOCK_SIZE):
+        y1 = min(height, y0 + BLOCK_SIZE)
+        for x0 in range(0, width, BLOCK_SIZE):
+            x1 = min(width, x0 + BLOCK_SIZE)
+            block = image_2d[y0:y1, x0:x1]
+            if block.any():
+                datasets[0][LABEL_SLICE, y0:y1, x0:x1] = block
+    for level in range(1, levels):
+        write_pyramid_level(output_path, level, factors=(1, 2, 2), reduction="nearest")
 
 
 def _provenance_attributes(input_path: Path) -> Dict[str, object]:

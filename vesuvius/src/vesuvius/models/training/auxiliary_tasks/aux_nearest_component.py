@@ -11,7 +11,8 @@ Outputs shape: (C_dir + 1, H, W) or (C_dir + 1, D, H, W), where C_dir is 2 (2D) 
 
 from typing import Dict, Any, Tuple
 import numpy as np
-from scipy.ndimage import distance_transform_edt, gaussian_filter
+
+import vc_reader.transforms as A
 
 
 def create_nearest_component_config(name: str, cfg: Dict[str, Any], source_target_name: str, is_2d: bool) -> Dict[str, Any]:
@@ -45,12 +46,11 @@ def compute_nearest_component(binary_mask: np.ndarray, is_2d: bool, *, sdf_sigma
     Returns array with shape (C_dir+1, H, W) for 2D or (C_dir+1, D, H, W) for 3D.
     """
     # Signed distance: positive outside, negative inside
-    inside = distance_transform_edt(binary_mask)
-    outside = distance_transform_edt(1 - binary_mask)
-    sdf = (outside - inside).astype(np.float32)
+    sdf = A.DistanceTransform(implicit_background=True)(np.asarray(binary_mask)[None])
 
     if sdf_sigma and sdf_sigma > 0:
-        sdf = gaussian_filter(sdf, sigma=sdf_sigma)
+        sdf = A.GaussianBlur(sigma=sdf_sigma, boundary="reflect", truncate=4, full_width=False)(sdf)
+    sdf = sdf[0]
 
     # Gradients
     if is_2d:

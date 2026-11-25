@@ -40,16 +40,11 @@ extras. The label-transfer extra does not install torch or napari:
 uv sync --extra label-transfer --extra tests
 ```
 
-Optionally build the dependency-free C++17 rasterizer once per machine; it
-accelerates the per-pixel stage roughly 8× and is verified against the
-NumPy reference by differential tests:
-
-```bash
-uv run --no-sync python -m vesuvius.tifxyz_label_transfer.build_native
-```
-
-NumPy remains the default when this library is absent. Nothing compiles during
-package installation or import. For the optional interactive viewer, install
+Surface sampling and the per-pixel rasterizer are provided by `vc_reader`.
+`--rasterizer auto` and `native` select its prepared kernel.
+Raw CT rendering uses the native grid renderer with volume fill outside bounds.
+Target geometry and rendering use bicubic positions and tangent normals.
+For the optional interactive viewer, install
 napari separately (and the Qt backend appropriate for your platform):
 
 ```bash
@@ -58,18 +53,13 @@ python -m pip install napari
 
 ### Remote data
 
-The QA tools read scan data exclusively through the external `rclone` binary
-(never HTTP). Install and configure `rclone` yourself; this package neither
-wraps nor auto-configures it.
+The QA tools read scan data through vc_reader, from an `s3://` URL, an HTTP(S) URL or a local path.
 
-- The public `vesuvius-challenge-open-data` bucket is read anonymously by
-  default through an inline rclone remote; no local rclone configuration is
-  needed.
-- The ink annotation dataset and the raw scan volumes are private. Point
-  `--ink-rclone-root` and `--source-raw-rclone-root` at your own rclone
-  remotes for them (for example `myremote:bucket/datasets/ink/ink_YYYYMM`).
-- Credentials come from your environment or rclone config; nothing is read
-  implicitly from local files.
+- The public open-data bucket is the default for `--open-data-root` and reads anonymously.
+- The ink dataset and raw scan volumes are private: point
+  `--ink-root` and `--source-raw-root` at your own copy.
+- Credentials come from your environment or `~/.aws`; nothing is read
+  implicitly from elsewhere.
 
 ## Quick start
 
@@ -116,7 +106,7 @@ independent CT comparisons and only approves when they agree:
 uv run --no-sync python -m \
   vesuvius.tifxyz_label_transfer.prepare_canvas_offset_evidence \
   --case-dir /data/cases/pherc0139-w039 \
-  --ink-rclone-root myremote:bucket/datasets/ink/ink_YYYYMM
+  --ink-root s3://bucket/datasets/ink/ink_YYYYMM
 
 uv run --no-sync python -m \
   vesuvius.tifxyz_label_transfer.estimate_canvas_offset_evidence \
@@ -143,10 +133,10 @@ All are documented in [docs/reference.md](docs/reference.md).
 | `core.py` | production geometry: surfaces, nearest-triangle mapping, per-pixel 3D verification |
 | `io.py` | TIFXYZ, TIFF/PNG, and label-Zarr reading/writing |
 | `planar.py` | optional global planar approximation (weaker guarantees, kept separate) |
-| `native.py`, `native_rasterizer.cpp`, `build_native.py` | optional compiled rasterizer, differentially tested against NumPy |
+| `native.py` | application reporting over the vc_reader surface-transfer kernel |
 | `transfer.py` | `single` / `pipeline` CLI |
 | `make_label_zarrs.py` | convert transferred TIFFs to koine-style OME-Zarr labels |
-| `prepare_canvas_offset_evidence.py` | fetch offset evidence (rclone only) |
+| `prepare_canvas_offset_evidence.py` | fetch offset evidence |
 | `estimate_canvas_offset_evidence.py` | blessed offset estimation + approval from that evidence |
 | `estimate_canvas_offset.py` | single-pair offset estimator (library + diagnostic CLI) |
 | `self_render_tifxyz.py` | raw-CT self-render validation |

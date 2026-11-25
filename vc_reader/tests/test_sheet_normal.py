@@ -1,4 +1,5 @@
 """Independent reference for the graph-linking anisotropic normal recipe."""
+import json
 import numpy as np
 import pytest
 from scipy.ndimage import correlate1d
@@ -7,7 +8,8 @@ from build_support import load_build
 load_build()
 
 from vc_reader import _reader
-from vc_reader.sheet_normal import sheet_normals, sheet_normal_regions
+from vc_reader.reader import ZarrReader
+from vc_reader.sheet_normal import sample_sheet_normals, sheet_normals, sheet_normal_regions
 
 
 def reference(image, offset):
@@ -99,6 +101,40 @@ def test_invalid_and_float_input():
     with pytest.raises(ValueError):
         sheet_normals(image, [[3,0,0]])
     assert sheet_normals(np.empty((0,109,109,109),np.uint8)).shape == (0,4)
+
+
+def _normal_volume(root):
+    values = np.ascontiguousarray(examples()[0])
+    (root/'.zarray').write_text(json.dumps(dict(zarr_format=2, shape=values.shape, chunks=values.shape, dtype='|u1',
+                                                compressor=None, filters=None, fill_value=0, order='C')))
+    (root/'0.0.0').write_bytes(values.tobytes())
+    return values
+
+
+POINTS = [[54., 54., 54.], [55.25, 56.5, 54.125], [53.99, 54., 54.]]
+
+
+def test_regions_and_sampling_match_explicit_patches(tmp_path):
+    values = _normal_volume(tmp_path)
+    starts, offsets, valid = sheet_normal_regions(POINTS, values.shape)
+    np.testing.assert_array_equal(starts, [[0, 0, 0], [0, 0, 0], [0, 0, -3]])
+    np.testing.assert_array_equal(valid, [True, True, False])
+    np.testing.assert_array_equal(offsets[1], np.float32([1.25, 2.5, .125]))
+    with ZarrReader.open(tmp_path) as reader:
+        result = sample_sheet_normals(reader, POINTS)
+    expected = sheet_normals(np.stack([values]*3), offsets, valid=valid)
+    np.testing.assert_array_equal(result, expected)
+    np.testing.assert_array_equal(result[2], 0)
+    with pytest.raises(ValueError):
+        sheet_normal_regions([[np.nan, 0, 0]], values.shape)
+
+
+def test_sampling_on_the_device_matches_the_cpu(tmp_path, torch_cuda):
+    _normal_volume(tmp_path)
+    with ZarrReader.open(tmp_path) as reader, reader.cuda(cache_bytes=64 << 20) as device:
+        expected = sample_sheet_normals(reader, POINTS)
+        result = sample_sheet_normals(device, POINTS)
+        np.testing.assert_allclose(result.numpy(), expected, atol=2e-5)
 
 
 def test_cpu_normal_output():

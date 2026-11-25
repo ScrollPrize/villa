@@ -7,10 +7,8 @@ masking over the foreground label region.
 """
 
 from typing import Dict, Any
-import torch
 import numpy as np
-from scipy.ndimage import distance_transform_edt
-from vesuvius.image_proc.geometry.structure_tensor import StructureTensorComputer
+import vc_reader.transforms as A
 
 
 def create_structure_tensor_config(aux_task_name: str, aux_config: Dict[str, Any],
@@ -95,30 +93,10 @@ def compute_structure_tensor(
         base = binary_mask.astype(np.float32)
     else:
         # Signed distance: positive outside, negative inside
-        inside = distance_transform_edt(binary_mask)
-        outside = distance_transform_edt(1 - binary_mask)
-        base = (outside - inside).astype(np.float32)
+        base = A.DistanceTransform(implicit_background=True)(binary_mask[None])[0]
 
-    component_sigma = tensor_sigma if tensor_sigma and tensor_sigma > 0 else None
-    smooth_components = component_sigma is not None
-    computer = StructureTensorComputer(
-        sigma=float(grad_sigma),
-        component_sigma=component_sigma,
-        smooth_components=smooth_components,
-        device="cpu",
-        dtype=torch.float32,
-    )
-    spatial_dims = 2 if is_2d else 3
-    st = computer.compute(
-        base,
-        sigma=float(grad_sigma),
-        component_sigma=component_sigma,
-        smooth_components=smooth_components,
-        device="cpu",
-        as_numpy=True,
-        spatial_dims=spatial_dims,
-    ).astype(np.float32)
-
+    st = A.StructureTensor(sigma=float(grad_sigma), rho=max(float(tensor_sigma or 0), 0.0),
+                           scale=3.0 / 8.0 if is_2d else 1.0)(base[None])
     # Mask background for masked regression
     if ignore_index is not None:
         bg = (binary_mask == 0)

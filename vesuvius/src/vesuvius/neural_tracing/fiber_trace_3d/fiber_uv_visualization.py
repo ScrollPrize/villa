@@ -83,7 +83,7 @@ class TiledRaster:
 
     def save(self,path):
         from PIL import Image,ImageDraw
-        import tifffile
+        from vc_reader import images
         t=self.tile
         def tiles():
             for y in range(0,self.height,t):
@@ -93,9 +93,8 @@ class TiledRaster:
                         shifted=tuple(v-(x if i%2==0 else y) for i,v in enumerate(coords))
                         getattr(draw,kind)(shifted,**kwargs)
                     yield np.asarray(image)
-        tifffile.imwrite(path,tiles(),shape=(self.height,self.width,3),dtype=np.uint8,
-                         photometric='rgb',tile=(t,t),compression='lzw',bigtiff=True,
-                         maxworkers=8,metadata=None)
+        with images.TiffWriter(path,(self.height,self.width,3),np.uint8,tile=(t,t),compression='lzw') as writer:
+            writer.write_tiles(tiles())
 
 
 class VectorPDF:

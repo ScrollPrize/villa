@@ -25,12 +25,12 @@ import time
 from pathlib import Path
 
 import numpy as np
+from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength
 from vc3d_fiber_format import parse_vc3d_fiber_format
 
 from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import fiber_tag
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import ChunkedArray
 from vesuvius.neural_tracing.tracers.shared.ct_structure import CT_CONTEXT_RADIUS, MIN_EIGENGAP, SeedHeadingError, ct_sheet_normal
 from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
@@ -70,7 +70,7 @@ def sheet_normal(volume, point: np.ndarray) -> np.ndarray | None:
     if np.any(start < 0) or np.any(start+size > np.asarray(volume.shape)):
         return None
     try:
-        return ct_sheet_normal(volume.read(start, size), point[::-1]-start, min_gap=MIN_EIGENGAP)
+        return ct_sheet_normal(volume.read_region(start, size), point[::-1]-start, min_gap=MIN_EIGENGAP)
     except SeedHeadingError:
         return None
 
@@ -180,8 +180,8 @@ def main(argv=None):
     source = checkpoint_source(args.checkpoint, path)
     cfg.trace.confidence_threshold = args.threshold
     d = cfg.data
-    volume = ChunkedArray(f'{d.volume}/{d.volume_level}', 1 << 28)
-    level0 = ChunkedArray(f'{d.volume}/0', 1 << 28)  # sheet normals are estimated on level-0 CT
+    volume = open_zarr(d.volume, level=d.volume_level, memory_cache=1 << 28)
+    level0 = open_zarr(d.volume, level=0, memory_cache=1 << 28)  # sheet normals are estimated on level-0 CT
     shape = np.asarray(volume.shape)[::-1]*(1 << d.volume_level)  # xyz, level 0
     length = (args.points-1)*d.point_spacing
     rng = np.random.default_rng(args.seed)
@@ -217,7 +217,7 @@ def main(argv=None):
                 if seed is None or np.any(seed < 0) or np.any(seed >= shape):
                     continue
                 idx = np.floor((seed[:, ::-1]+.5)/(1 << d.volume_level)-.5).astype(int)
-                if np.mean([volume.read(i, (1, 1, 1))[0, 0, 0] > 0 for i in idx]) < .9:
+                if np.mean(volume.read_points(idx) > 0) < .9:
                     continue
                 rows, confs = trace(model, cfg, seed, direction, args.steps, args.device, follow=True,
                                     fibers=around(path, seed))
@@ -249,7 +249,7 @@ def main(argv=None):
         if np.any(points < 0) or np.any(points >= shape):
             continue
         idx = np.floor((points[:, ::-1]+.5)/(1 << d.volume_level)-.5).astype(int)
-        if np.mean([volume.read(i, (1, 1, 1))[0, 0, 0] > 0 for i in idx]) < .9:  # off the scan or on masked CT
+        if np.mean(volume.read_points(idx) > 0) < .9:  # off the scan or on masked CT
             continue
         traced = {}
         for sign in signs:

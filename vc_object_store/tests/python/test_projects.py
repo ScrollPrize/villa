@@ -1,5 +1,7 @@
 """A store as a project: its record and the resources it references."""
 import pytest
+import os
+import subprocess
 import vc_object_store as vos
 from vc_object_store import ObjectStore
 
@@ -29,3 +31,39 @@ def test_project_record_and_resources(tmp_path):
 def test_plain_store_has_no_project_record(db):
     assert db.project_record() is None
     assert db.project_resources("volume") == []
+
+
+def test_resource_identity_distinguishes_location_and_owner(db):
+    shared = db.add_project_resource("volume", "/datasets/owner/alice")
+    private = db.add_project_resource("volume", "/datasets", owner="alice")
+    assert shared != private
+    assert {v["uuid"] for v in db.project_resources("volume", viewer="alice")} == {shared, private}
+    assert [v["uuid"] for v in db.project_resources("volume", viewer="bob")] == [shared]
+
+
+def test_readding_retired_resource_restores_visibility(db):
+    uuid = db.add_project_resource("volume", "/scan", owner="alice")
+    with db.write(expected_versions=db.select_expected_versions({uuid: db.current_version(uuid)})) as writer:
+        writer.retire_object(uuid)
+    assert db.project_resources("volume") == []
+    assert db.add_project_resource("volume", "/scan", owner="alice", meta={"checked": True}) == uuid
+    assert db.project_resources("volume", viewer="alice")[0]["meta"] == {"checked": True}
+    assert db.project_resources("volume", viewer="bob") == []
+
+
+def test_project_resource_cannot_reuse_unrelated_uuid(db):
+    uuid = vos.project_resource_uuid("volume", "/scan")
+    db.upsert_object(dict(uuid=uuid, kind="note"))
+    with pytest.raises(ValueError, match="different object"):
+        db.add_project_resource("volume", "/scan")
+    assert db.object(uuid)["kind"] == "note"
+
+
+@pytest.mark.parametrize("port", ["65536", "123junk", "-1"])
+def test_server_rejects_invalid_port_before_opening_store(tmp_path, port):
+    server = os.environ.get("VC_OBJECT_SERVER")
+    if not server:
+        pytest.skip("needs the built vc_object_server")
+    result = subprocess.run([server, str(tmp_path / "absent.vcobj"), "--port", port],
+                            capture_output=True, text=True, timeout=5)
+    assert result.returncode == 1 and "--port must be an integer" in result.stderr

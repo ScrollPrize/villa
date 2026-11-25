@@ -496,10 +496,7 @@ struct PrefetchedNormalSamples {
 
 struct PrefetchTiming {
     int calls = 0;
-    double chunkPrefetchMs = 0.0;
     double materializeMs = 0.0;
-    uint64_t requestedChunks = 0;
-    uint64_t chunksRead = 0;
 };
 
 struct PrefetchedSurfaceStraightnessResidual final : public ceres::SizedCostFunction<4, 3, 3, 3> {
@@ -1459,35 +1456,6 @@ using Clock = std::chrono::steady_clock;
     return transported;
 }
 
-using NormalPrefetchFuture = std::future<NormalPrefetchReport>;
-
-void enqueueNormalPrefetch(
-    const NormalSampler& sampler,
-    std::vector<cv::Vec3d> predictedPoints,
-    bool withDerivative,
-    std::vector<NormalPrefetchFuture>& pendingPrefetches)
-{
-    constexpr size_t kMaxPendingPrefetches = 2;
-    if (pendingPrefetches.size() >= kMaxPendingPrefetches) {
-        (void)pendingPrefetches.front().get();
-        pendingPrefetches.erase(pendingPrefetches.begin());
-    }
-    pendingPrefetches.push_back(std::async(
-        std::launch::async,
-        [&sampler,
-         predictedPoints = std::move(predictedPoints),
-         withDerivative]() {
-            return sampler.prefetchNormalSamples(predictedPoints, withDerivative);
-        }));
-}
-
-void waitForNormalPrefetches(std::vector<NormalPrefetchFuture>& pendingPrefetches)
-{
-    for (auto& prefetch : pendingPrefetches) {
-        (void)prefetch.get();
-    }
-}
-
 [[nodiscard]] std::vector<std::array<double, 3>> directNormalConstructedPoints(
     const cv::Vec3d& seedPoint,
     const cv::Vec3d& seedTangent,
@@ -1500,9 +1468,6 @@ void waitForNormalPrefetches(std::vector<NormalPrefetchFuture>& pendingPrefetche
     forward.reserve(static_cast<size_t>(config.segmentsPerSide));
 
     auto grow = [&](int sign, std::vector<std::array<double, 3>>& out) {
-        constexpr int kPrefetchLookaheadSteps = 12;
-        constexpr int kPrefetchRefreshSteps = 8;
-        std::vector<NormalPrefetchFuture> pendingPrefetches;
         cv::Vec3d point = seedPoint;
         cv::Vec3d direction = normalizedOrZero(seedTangent) * static_cast<double>(sign);
         NormalSample previousSample = sampler.sampleNormal(point);
@@ -1511,26 +1476,6 @@ void waitForNormalPrefetches(std::vector<NormalPrefetchFuture>& pendingPrefetche
             previousNormal = {0.0, 0.0, 0.0};
         }
         for (int i = 0; i < config.segmentsPerSide; ++i) {
-            if (i % kPrefetchRefreshSteps == 0) {
-                const int lookahead = std::min(
-                    kPrefetchLookaheadSteps, config.segmentsPerSide - i);
-                std::vector<cv::Vec3d> predictedPoints;
-                predictedPoints.reserve(static_cast<size_t>(lookahead));
-                for (int step = 1; step <= lookahead; ++step) {
-                    predictedPoints.push_back(
-                        point + direction * (config.segmentLength * static_cast<double>(step)));
-                }
-                if (sampler.supportsConcurrentSampling()) {
-                    enqueueNormalPrefetch(
-                        sampler,
-                        std::move(predictedPoints),
-                        config.differentiableNormalSampling,
-                        pendingPrefetches);
-                } else {
-                    (void)sampler.prefetchNormalSamples(
-                        predictedPoints, config.differentiableNormalSampling);
-                }
-            }
             const cv::Vec3d predicted = point + direction * config.segmentLength;
             const NormalSample sample = sampler.sampleNormal(predicted);
             cv::Vec3d normal = normalizedOrZero(sample.normal);
@@ -1544,7 +1489,6 @@ void waitForNormalPrefetches(std::vector<NormalPrefetchFuture>& pendingPrefetche
             point += direction * config.segmentLength;
             out.push_back(toArray(point));
         }
-        waitForNormalPrefetches(pendingPrefetches);
     };
 
     // Both halves depend on the seed but not on each other. Concurrent-capable
@@ -1910,9 +1854,6 @@ void growNormalConstructedExtension(
     const LineOptimizationConfig& config,
     std::vector<std::array<double, 3>>& out)
 {
-    constexpr int kPrefetchLookaheadSteps = 12;
-    constexpr int kPrefetchRefreshSteps = 8;
-    std::vector<NormalPrefetchFuture> pendingPrefetches;
     cv::Vec3d point = startPoint;
     direction = normalizedOrZero(direction);
     if (length(direction) <= kEpsilon) {
@@ -1925,26 +1866,6 @@ void growNormalConstructedExtension(
     }
     out.reserve(static_cast<size_t>(config.segmentsPerSide));
     for (int i = 0; i < config.segmentsPerSide; ++i) {
-        if (i % kPrefetchRefreshSteps == 0) {
-            const int lookahead = std::min(
-                kPrefetchLookaheadSteps, config.segmentsPerSide - i);
-            std::vector<cv::Vec3d> predictedPoints;
-            predictedPoints.reserve(static_cast<size_t>(lookahead));
-            for (int step = 1; step <= lookahead; ++step) {
-                predictedPoints.push_back(
-                    point + direction * (config.segmentLength * static_cast<double>(step)));
-            }
-            if (sampler.supportsConcurrentSampling()) {
-                enqueueNormalPrefetch(
-                    sampler,
-                    std::move(predictedPoints),
-                    config.differentiableNormalSampling,
-                    pendingPrefetches);
-            } else {
-                (void)sampler.prefetchNormalSamples(
-                    predictedPoints, config.differentiableNormalSampling);
-            }
-        }
         const cv::Vec3d predicted = point + direction * config.segmentLength;
         const NormalSample sample = sampler.sampleNormal(predicted);
         cv::Vec3d normal = normalizedOrZero(sample.normal);
@@ -1958,7 +1879,6 @@ void growNormalConstructedExtension(
         point += direction * config.segmentLength;
         out.push_back(toArray(point));
     }
-    waitForNormalPrefetches(pendingPrefetches);
 }
 
 void growHardDirectionConstructedExtension(
@@ -2466,10 +2386,7 @@ void fillPrefetchedNormalSamples(
     }
     if (timing) {
         ++timing->calls;
-        timing->chunkPrefetchMs += batchReport.prefetchMs;
         timing->materializeMs += batchReport.materializeMs;
-        timing->requestedChunks += batchReport.prefetch.requestedChunks;
-        timing->chunksRead += batchReport.prefetch.chunksRead;
     }
 }
 
@@ -2590,7 +2507,7 @@ private:
     ceres::Solver::Options options = solverOptions(config, config.printSolverProgress);
     options.update_state_every_iteration = true;
     options.callbacks.push_back(&prefetchCallback);
-    const double normalMsBeforeSolve = prefetchTiming.chunkPrefetchMs + prefetchTiming.materializeMs;
+    const double normalMsBeforeSolve = prefetchTiming.materializeMs;
     const auto solveStart = Clock::now();
     ceres::Solve(options, &problem, &summary);
     // The iteration callback's SOLVER_ABORT only stops Ceres; without this
@@ -2599,7 +2516,7 @@ private:
     // caller could mistake the aborted partial state for a real solution.
     throwIfCancelled(config);
     const auto solveEnd = Clock::now();
-    const double normalMsAfterSolve = prefetchTiming.chunkPrefetchMs + prefetchTiming.materializeMs;
+    const double normalMsAfterSolve = prefetchTiming.materializeMs;
     const double normalCallbackMs = std::max(0.0, normalMsAfterSolve - normalMsBeforeSolve);
     const double ceresWallMs = elapsedMs(solveStart, solveEnd);
 
@@ -3642,7 +3559,6 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
 {
     const LineOptimizationConfig config = sanitizedConfig(rawConfig);
     throwIfCancelled(config);
-    (void)normalSampler_.prefetchNormalSamples({seedPoint}, false);
     const NormalSample seedNormal = normalSampler_.sampleNormal(seedPoint);
     const cv::Vec3d tangent = initialTangentFromConfig(seedNormal, config);
 
@@ -3688,11 +3604,8 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
         result.report.converged = true;
         result.report.normalPrefetchCalls = 0;
         result.report.ceresSolveMs = 0.0;
-        result.report.normalChunkPrefetchMs = 0.0;
         result.report.normalMaterializeMs = 0.0;
         result.report.totalMs = elapsedMs(directNormalStart, Clock::now());
-        result.report.normalPrefetchRequestedChunks = 0;
-        result.report.normalPrefetchChunksRead = 0;
         std::ostringstream message;
         message.imbue(std::locale::classic());
         message << std::scientific << std::setprecision(3)
@@ -3743,11 +3656,8 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
     result.report.converged = selected.usable;
     result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
     result.report.ceresSolveMs = selected.ceresSolveMs;
-    result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
     result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
     result.report.totalMs = selected.milliseconds;
-    result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
-    result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
     std::ostringstream message;
     message.imbue(std::locale::classic());
     message << std::scientific << std::setprecision(3)
@@ -3758,15 +3668,11 @@ LineOptimizationResult LineOptimizer::optimizeFromSeed(
             << std::setw(7) << selected.iterations
             << std::setw(13) << selected.initialRms
             << std::setw(13) << selected.finalRms
-            << "\n\nNormal prefetch/materialization:\n"
+            << "\n\nNormal materialization:\n"
             << "calls=" << selected.prefetchTiming.calls
             << " ceres_solve_ms=" << selected.ceresSolveMs
-            << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
             << " materialize_ms=" << selected.prefetchTiming.materializeMs
-            << " requested_chunks=" << selected.prefetchTiming.requestedChunks
-            << " chunks_read=" << selected.prefetchTiming.chunksRead
-            << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
-                                selected.prefetchTiming.materializeMs)
+            << " total_ms=" << selected.prefetchTiming.materializeMs
             << "\n\nSelected candidate report:\n"
             << selected.report;
     result.report.message = message.str();
@@ -3937,11 +3843,8 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     result.report.converged = selected.usable;
     result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
     result.report.ceresSolveMs = selected.ceresSolveMs;
-    result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
     result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
     result.report.totalMs = selected.milliseconds;
-    result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
-    result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
     result.report.finalLosses = evaluateLosses(selected.points,
                                                spacing,
                                                normalSampler_,
@@ -3967,15 +3870,11 @@ LineOptimizationResult LineOptimizer::optimizeExistingLine(
     for (const int index : fixedPointIndices) {
         message << ' ' << index;
     }
-    message << "\n\nNormal prefetch/materialization:\n"
+    message << "\n\nNormal materialization:\n"
             << "calls=" << selected.prefetchTiming.calls
             << " ceres_solve_ms=" << selected.ceresSolveMs
-            << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
             << " materialize_ms=" << selected.prefetchTiming.materializeMs
-            << " requested_chunks=" << selected.prefetchTiming.requestedChunks
-            << " chunks_read=" << selected.prefetchTiming.chunksRead
-            << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
-                                selected.prefetchTiming.materializeMs)
+            << " total_ms=" << selected.prefetchTiming.materializeMs
             << "\n\nSelected candidate report:\n"
             << selected.report;
     result.report.message = message.str();
@@ -4789,11 +4688,8 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
     result.report.converged = selected.usable;
     result.report.normalPrefetchCalls = selected.prefetchTiming.calls;
     result.report.ceresSolveMs = selected.ceresSolveMs;
-    result.report.normalChunkPrefetchMs = selected.prefetchTiming.chunkPrefetchMs;
     result.report.normalMaterializeMs = selected.prefetchTiming.materializeMs;
     result.report.totalMs = selected.milliseconds;
-    result.report.normalPrefetchRequestedChunks = selected.prefetchTiming.requestedChunks;
-    result.report.normalPrefetchChunksRead = selected.prefetchTiming.chunksRead;
 
     std::ostringstream message;
     message.imbue(std::locale::classic());
@@ -4818,15 +4714,11 @@ LineOptimizationResult LineOptimizer::optimizeFromControlPoints(
                 << " active_points=" << (localProblemEnd - localProblemStart + 1)
                 << " total_points=" << selected.points.size();
     }
-    message << "\n\nNormal prefetch/materialization:\n"
+    message << "\n\nNormal materialization:\n"
             << "calls=" << selected.prefetchTiming.calls
             << " ceres_solve_ms=" << selected.ceresSolveMs
-            << " chunk_prefetch_ms=" << selected.prefetchTiming.chunkPrefetchMs
             << " materialize_ms=" << selected.prefetchTiming.materializeMs
-            << " requested_chunks=" << selected.prefetchTiming.requestedChunks
-            << " chunks_read=" << selected.prefetchTiming.chunksRead
-            << " total_ms=" << (selected.prefetchTiming.chunkPrefetchMs +
-                                selected.prefetchTiming.materializeMs)
+            << " total_ms=" << selected.prefetchTiming.materializeMs
             << "\n\nSelected candidate report:\n"
             << selected.report;
     result.report.message = message.str();

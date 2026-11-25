@@ -37,7 +37,7 @@ DeviceArray resolution_channel(View<T> data, const Grid& grid, const Shape& redu
 void apply_cuda(const LowResolution&, Sample& s, const Parameters& p, Session& session) {
     for (const auto& c : p.channels) {
         auto& a = session.arrays.at(c.key); Shape shape = a.spatial(); Grid grid(shape);
-        for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1,std::size_t(round_even(shape[j]*c.values[j])));
+        for (std::size_t j = 0; j < shape.size(); ++j) shape[j] = std::max<std::size_t>(1,std::size_t(round_half_even(shape[j]*c.values[j])));
         if (shape==grid.shape) continue;
         const auto run = [&]<class T>() {
             // The table offset is a sum of extents, distinct from voxel count.

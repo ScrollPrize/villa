@@ -27,9 +27,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import fsspec
 import numpy as np
 from tqdm.auto import tqdm
+from vc_reader.reader import ObjectStore
 
 from vesuvius.utils.k8s import get_tqdm_kwargs
 
@@ -45,10 +45,14 @@ def _override_cache_url() -> Optional[str]:
     return url or None
 
 
-def _url_to_fs(url: str, *, anon: bool = False):
-    """Resolve (fs, fs_path) for ``url``. Apply ``anon`` only to S3 URLs."""
-    storage_options = {"anon": True} if anon and url.startswith("s3://") else {}
-    return fsspec.core.url_to_fs(url, **storage_options)
+def _input_auth(anon: bool):
+    return None if anon else "aws"
+
+
+def _read_url(url: str, *, anon: bool = False) -> Optional[bytes]:
+    """The object at a local path or URL; None when it does not exist."""
+    parent, name = url.rstrip("/").rsplit("/", 1)
+    return ObjectStore(parent, auth=_input_auth(anon)).read(name)
 
 
 def _local_cache_dir() -> Path:
@@ -67,28 +71,12 @@ def _sidecar_url(array_url: str) -> str:
 
 
 def _zarray_signature(array_url: str, *, anon: bool = False) -> Optional[str]:
-    """Return a short stable signature for the array's .zarray (ETag on S3, mtime+size locally)."""
-    zarray_url = array_url.rstrip("/") + "/.zarray"
+    """A short stable signature of the array's .zarray: the MD5 S3 lists as its ETag."""
     try:
-        fs, fs_path = _url_to_fs(zarray_url, anon=anon)
-        info = fs.info(fs_path)
-        etag = info.get("ETag") or info.get("etag")
-        if etag:
-            return str(etag).strip('"')
-        mtime = info.get("mtime")
-        size = info.get("size")
-        if mtime is not None and size is not None:
-            # Local-style signature when ETag is unavailable.
-            try:
-                mtime_ns = int(mtime.timestamp() * 1_000_000_000) if hasattr(mtime, "timestamp") else int(mtime)
-            except Exception:
-                mtime_ns = 0
-            return f"{mtime_ns}-{size}"
-        if size is not None:
-            return f"size={size}"
-        return None
+        data = _read_url(array_url.rstrip("/") + "/.zarray", anon=anon)
     except Exception:
         return None
+    return None if data is None else hashlib.md5(data).hexdigest()
 
 
 def serialize_bitmap(bitmap: np.ndarray, sig: str) -> bytes:
@@ -117,19 +105,10 @@ def deserialize_bitmap(blob: bytes, expected_sig: str, expected_grid: Tuple[int,
     return bitmap.astype(bool, copy=False)
 
 
-# Backwards-compatible aliases for internal callers.
-_serialize_bitmap = serialize_bitmap
-_deserialize_bitmap = deserialize_bitmap
-
-
 def _read_cache_blob(url: str) -> Optional[bytes]:
     """Read raw bytes from a cache URL, or None on miss. Never uses anon."""
     try:
-        fs, fs_path = _url_to_fs(url)
-        if not fs.exists(fs_path):
-            return None
-        with fs.open(fs_path, "rb") as f:
-            return f.read()
+        return _read_url(url)
     except Exception as e:
         warnings.warn(f"Failed to read chunk occupancy cache at {url}: {e}")
         return None
@@ -138,18 +117,8 @@ def _read_cache_blob(url: str) -> Optional[bytes]:
 def _write_cache_blob(url: str, blob: bytes) -> bool:
     """Write bytes to a cache URL. Returns True on success."""
     try:
-        fs, fs_path = _url_to_fs(url)
-        parent = os.path.dirname(fs_path.rstrip("/"))
-        if parent:
-            try:
-                fs.makedirs(parent, exist_ok=True)
-            except TypeError:
-                try:
-                    fs.makedirs(parent)
-                except FileExistsError:
-                    pass
-        with fs.open(fs_path, "wb") as f:
-            f.write(blob)
+        parent, name = url.rstrip("/").rsplit("/", 1)
+        ObjectStore(parent).write(name, blob)
         return True
     except Exception as e:
         warnings.warn(f"Failed to write chunk occupancy cache at {url}: {e}")
@@ -171,14 +140,14 @@ def _load_cached(
     if override:
         blob = _read_cache_blob(override)
         if blob is not None:
-            bitmap = _deserialize_bitmap(blob, sig, expected_grid)
+            bitmap = deserialize_bitmap(blob, sig, expected_grid)
             if bitmap is not None:
                 return bitmap, f"override:{override}"
 
     sidecar = _sidecar_url(array_url)
     blob = _read_cache_blob(sidecar)
     if blob is not None:
-        bitmap = _deserialize_bitmap(blob, sig, expected_grid)
+        bitmap = deserialize_bitmap(blob, sig, expected_grid)
         if bitmap is not None:
             return bitmap, f"sidecar:{sidecar}"
 
@@ -187,7 +156,7 @@ def _load_cached(
         try:
             with open(local, "rb") as f:
                 blob = f.read()
-            bitmap = _deserialize_bitmap(blob, sig, expected_grid)
+            bitmap = deserialize_bitmap(blob, sig, expected_grid)
             if bitmap is not None:
                 return bitmap, f"local:{local}"
         except Exception as e:
@@ -197,7 +166,7 @@ def _load_cached(
 
 def _save_cached(array_url: str, sig: str, bitmap: np.ndarray) -> None:
     """Write override URL first, then sidecar, then per-host local fallback."""
-    blob = _serialize_bitmap(bitmap, sig)
+    blob = serialize_bitmap(bitmap, sig)
 
     override = _override_cache_url()
     if override:
@@ -206,23 +175,13 @@ def _save_cached(array_url: str, sig: str, bitmap: np.ndarray) -> None:
             return
 
     sidecar = _sidecar_url(array_url)
-    try:
-        fs, fs_path = _url_to_fs(sidecar)
-        if array_url.startswith("s3://"):
-            with fs.open(fs_path, "wb") as f:
-                f.write(blob)
-        else:
-            tmp = fs_path + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(blob)
-            os.replace(tmp, fs_path)
+    if _write_cache_blob(sidecar, blob):
         print(f"  Chunk occupancy cache SAVED to sidecar: {sidecar}")
         return
-    except Exception as e:
-        warnings.warn(
-            f"Could not write chunk occupancy sidecar to {sidecar}: {e}. "
-            f"Falling back to local per-host cache (partitions will rebuild independently)."
-        )
+    warnings.warn(
+        f"Could not write chunk occupancy sidecar to {sidecar}. "
+        f"Falling back to local per-host cache (partitions will rebuild independently)."
+    )
 
     local = _local_cache_path(array_url)
     try:
@@ -243,87 +202,10 @@ def _read_zarray(array_url: str, *, anon: bool = False) -> Optional[dict]:
     """
     zarray_url = array_url.rstrip("/") + "/.zarray"
     try:
-        fs, fs_path = _url_to_fs(zarray_url, anon=anon)
-        with fs.open(fs_path, "rb") as f:
-            return json.loads(f.read())
+        return json.loads(_read_url(zarray_url, anon=anon))
     except Exception as e:
         warnings.warn(f"Failed to read {zarray_url}: {e}")
         return None
-
-
-def _list_chunks_s3(array_url: str, sub_prefix: str, *, anon: bool = False) -> List[str]:
-    """List chunk keys under an S3 zarr v2 array at `sub_prefix`.
-
-    Returns keys relative to the array prefix (e.g. `"0/12/3/7"` for a
-    `/`-separated 4D array, or `"0.12.3.7"` for a `.`-separated one).
-    """
-    fs = fsspec.filesystem("s3", anon=anon)
-    bucket_and_prefix = array_url.replace("s3://", "").rstrip("/")
-    bucket, _, prefix = bucket_and_prefix.partition("/")
-    if prefix and not prefix.endswith("/"):
-        prefix = prefix + "/"
-    full_prefix = prefix + sub_prefix
-
-    results: List[str] = []
-    continuation = None
-    while True:
-        kwargs = {"Bucket": bucket, "Prefix": full_prefix, "MaxKeys": 1000}
-        if continuation is not None:
-            kwargs["ContinuationToken"] = continuation
-        resp = fs.call_s3("list_objects_v2", **kwargs)
-        for obj in resp.get("Contents", []) or []:
-            key = obj["Key"]
-            rest = key[len(prefix):] if prefix else key
-            results.append(rest)
-        if not resp.get("IsTruncated"):
-            break
-        continuation = resp.get("NextContinuationToken")
-        if continuation is None:
-            break
-    return results
-
-
-def _list_chunks_local(array_url: str, sub_prefix: str, sep: str) -> List[str]:
-    """List chunk keys under a local zarr v2 array at `sub_prefix`.
-
-    For `sep == "."` the chunks are flat files directly under `array_url`,
-    so `sub_prefix` is a filename-prefix filter. For `sep == "/"` the
-    chunks are nested in directories — walk the deepest level and
-    reassemble paths relative to `array_url`.
-    """
-    base = array_url.rstrip("/")
-    results: List[str] = []
-
-    if sep == ".":
-        try:
-            with os.scandir(base) as it:
-                for entry in it:
-                    if entry.is_file() and entry.name.startswith(sub_prefix):
-                        results.append(entry.name)
-        except FileNotFoundError:
-            pass
-        return results
-
-    # Nested-directory layout: sub_prefix is e.g. "0/12/" — recurse under it.
-    start = os.path.join(base, sub_prefix.rstrip("/")) if sub_prefix else base
-    if not os.path.isdir(start):
-        return results
-
-    prefix_depth = len(base.rstrip("/")) + 1  # strip "base/" from absolute paths
-    stack = [start]
-    while stack:
-        d = stack.pop()
-        try:
-            with os.scandir(d) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append(entry.path)
-                    elif entry.is_file():
-                        rel = entry.path[prefix_depth:]
-                        results.append(rel)
-        except FileNotFoundError:
-            continue
-    return results
 
 
 def build_chunk_occupancy(
@@ -410,8 +292,8 @@ def build_chunk_occupancy(
         return None
 
     # Partition the chunk keyspace along the leading axis (z, or c×z for 4D).
-    # Each sub-prefix corresponds to one "row" of chunks and is listed
-    # independently — in parallel on S3, sequentially on local FS.
+    # Each sub-prefix corresponds to one "row" of chunks, listed in parallel on
+    # S3; a local array is listed once.
     z_grid = grid_dims[0]
     if rank == 4:
         c_grid = int(np.ceil(shape[0] / chunks[0])) if chunks[0] > 0 else 0
@@ -458,18 +340,17 @@ def build_chunk_occupancy(
     }
     pbar = tqdm(**pbar_kwargs)
     try:
+        store = ObjectStore(array_url, auth=_input_auth(anon))
         if array_url.startswith("s3://"):
             with ThreadPoolExecutor(max_workers=min(_LIST_MAX_WORKERS, max(1, len(sub_prefixes)))) as ex:
-                futures = [ex.submit(_list_chunks_s3, array_url, sp, anon=anon) for sp in sub_prefixes]
+                futures = [ex.submit(store.keys, sp) for sp in sub_prefixes]
                 for fut in as_completed(futures):
                     _consume(fut.result())
                     pbar.update(1)
                     pbar.set_postfix_str(f"found={parsed}")
         else:
-            for sp in sub_prefixes:
-                _consume(_list_chunks_local(array_url, sp, sep))
-                pbar.update(1)
-                pbar.set_postfix_str(f"found={parsed}")
+            _consume(store.keys())
+            pbar.update(len(sub_prefixes))
     finally:
         pbar.close()
 

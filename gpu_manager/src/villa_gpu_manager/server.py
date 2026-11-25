@@ -10,9 +10,11 @@ import stat
 import tempfile
 import time
 
+import psutil
+
 from .engine import Engine
-from .processes import peer_uid, process_identity, descendants
-from .protocol import MAX_FRAME, VERSION, ProtocolError, decode, encode, require
+from .processes import peer_uid, process_identity, descendants, host_boot_id
+from .protocol import MAX_FRAME, VERSION, ProtocolError, decode, encode, require, identity as validate_identity
 
 
 def save_journal(path, state):
@@ -89,18 +91,59 @@ class Server:
                 state = json.load(f)
         elif self.path.exists() or os.fstat(self.lock).st_size:
             raise RuntimeError("missing recovery journal; refusing empty-ledger takeover")
-        # A fully retired CPU ledger can adopt a corrected CPU inventory. Never
-        # reinterpret live reservations or change the managed GPU pool here.
-        if (state is not None and state["inventory"]["gpus"] == self.inventory["gpus"]
-                and state.get("override") is None
-                and all(t["terminal"] and not t["held"]["gpus"] and not t["held"]["cpu_cores"]
-                        and not t["granted"]["gpus"] and not t["granted"]["cpu_cores"]
-                        for t in state["tasks"].values())):
-            state["inventory"] = self.inventory
         service_identity = process_identity()
         options = {"protected_processes": lambda: [service_identity] + descendants(service_identity, os.getuid())}
         options.update(self.engine_options)
-        self.engine = Engine(self.inventory, controller_uids=self.controllers, state=state, **options)
+        boot = host_boot_id()
+        if boot is not None:
+            validate_identity(boot)
+        if state is not None:
+            old_boot = state.get("host_boot_id")
+            if old_boot is not None:
+                validate_identity(old_boot)
+            rebooted = (old_boot != boot if old_boot is not None and boot is not None
+                        else self.journal.stat().st_mtime < psutil.boot_time())
+            # Use the ordinary process-tree retirement path, on a private copy.
+            # Never overwrite recovery evidence if inspection or migration fails.
+            recovered = Engine(state["inventory"], controller_uids=self.controllers,
+                               state=state, **options)
+            if self.monitor is not None:
+                # scan_processes also reconciles waiting jobs. No new grant may
+                # escape recovery before the driver's first valid observation.
+                recovered.blocked_gpus = set(state["inventory"]["gpus"])
+            inspect, discover = recovered.inspect, recovered.discover
+
+            def checked(identity, uid):
+                result = "dead" if rebooted else inspect(identity, uid)
+                require(result != "unknown",
+                        f"cannot verify journal ownership: pid={identity['pid']} "
+                        f"start_us={identity['start_us']} uid={uid}; "
+                        f"inspect permissions/process state before restarting; journal={self.journal}")
+                return result
+
+            recovered.inspect = checked
+            if rebooted:
+                recovered.discover = lambda identity, uid: []
+            recovered.scan_processes()
+            recovered.inspect, recovered.discover = inspect, discover
+            state = recovered.state
+            self.engine = recovered
+            if state["inventory"] != self.inventory:
+                live = [t for t in state["tasks"].values() if not t["terminal"]]
+                require(not live,
+                        f"journal inventory differs and {len(live)} task(s) still have live processes; "
+                        f"stop those jobs before changing hardware inventory; journal={self.journal}")
+                state["inventory"] = self.inventory
+                state["override"] = None
+                state["allowed_gpu_uuids"] = sorted(
+                    set(state.get("allowed_gpu_uuids", self.inventory["gpus"])) & self.inventory["gpus"].keys())
+                state["policy_revision"] += 1
+                print(f"gpu manager: retired obsolete journal inventory; "
+                      f"current hardware adopted, ownership history retained: {self.journal}", flush=True)
+                self.engine = Engine(self.inventory, controller_uids=self.controllers, state=state, **options)
+        else:
+            self.engine = Engine(self.inventory, controller_uids=self.controllers, **options)
+        self.engine.state["host_boot_id"] = boot
         if self.monitor is not None:
             self.engine.update_blocked_gpus(self.inventory["gpus"])
         save_journal(self.journal, self.engine.state)

@@ -2,28 +2,45 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
+
+#include <vc_reader/zarr.hpp>
 
 namespace vc::settings {
 
 inline constexpr auto kRemoteCacheDirectory = "viewer/remote_cache_dir";
 inline constexpr auto kRemoteCacheDelta3d = "perf/remote_cache_delta3d";
 inline constexpr bool kRemoteCacheDelta3dDefault = false;
-// Disk budget for every managed remote Zarr chunk beneath remoteCachePath().
-// Zero maximum means unlimited.
-inline constexpr auto kRemoteCacheMaxGiB = "perf/remote_cache_max_gib";
-inline constexpr std::uint64_t kRemoteCacheMaxGiBDefault = 0;
-inline constexpr auto kRemoteCacheMinFreeGiB = "perf/remote_cache_min_free_gib";
-inline constexpr std::uint64_t kRemoteCacheMinFreeGiBDefault = 20;
+inline constexpr auto kRemoteCacheMaxGib = "perf/remote_cache_max_gib";
+inline constexpr unsigned long long kRemoteCacheMaxGibDefault = 0;  // unlimited
+inline constexpr auto kRemoteCacheMinFreeGib = "perf/remote_cache_min_free_gib";
+inline constexpr unsigned long long kRemoteCacheMinFreeGibDefault = 20;
+inline constexpr auto kRemoteDownloadAutomatic = "perf/remote_download_automatic";
+inline constexpr bool kRemoteDownloadAutomaticDefault = true;
+inline constexpr auto kRemoteDownloadParallelism = "perf/remote_download_parallelism";
+inline constexpr int kRemoteDownloadParallelismDefault = 16;
+// Remote volumes read only from the cache root, never the network: "off" (default),
+// "on" (a chunk not in the cache is an error), "fill" (it reads as fill and is
+// recorded, vcr::Array::offline_misses). Metadata must be cached in both offline modes.
+inline constexpr auto kRemoteOffline = "perf/remote_offline";
+enum class RemoteOffline { Off, On, Fill };
 
 [[nodiscard]] std::filesystem::path settingsFilePath();
 // Resolved once on first use. Changes written to VC3D.ini take effect after
 // the process restarts.
 [[nodiscard]] std::filesystem::path remoteCachePath();
 [[nodiscard]] bool remoteCacheDelta3dEnabled();
-// Applies the VC3D.ini disk budget above to remoteCachePath(), as the VC3D app
-// does at startup. Command-line tools call it before opening a remote volume;
-// without a configured budget the persistent cache grows until the disk fills.
-// Reuses a budget that is already configured for that root.
-void configureRemoteCacheBudget();
+// The byte limit of the remote cache root; nullopt means unlimited.
+[[nodiscard]] std::optional<std::int64_t> remoteCacheMaxBytes();
+[[nodiscard]] std::int64_t remoteCacheMinFreeBytes();
+// Simultaneous downloads; nullopt leaves the choice to vc_reader.
+[[nodiscard]] std::optional<int> remoteDownloadParallelism();
+// kRemoteOffline; an unknown value is "off".
+[[nodiscard]] RemoteOffline remoteOffline();
+// These settings as vc_reader options for the cache root `root`: the root as the cache
+// directory with its byte limit (unlimited lifts a limit stored there) and free-space
+// floor, the download parallelism, and remoteOffline(). An empty root sets the
+// parallelism and offline mode only. Access is the caller's.
+[[nodiscard]] vcr::zarr::OpenOptions remoteOpenOptions(const std::filesystem::path& root);
 
 } // namespace vc::settings

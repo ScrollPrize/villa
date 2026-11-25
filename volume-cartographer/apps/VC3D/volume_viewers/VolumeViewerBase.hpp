@@ -19,7 +19,6 @@
 #include <opencv2/core/mat.hpp>
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "volume_viewers/SurfaceProjection.hpp"
-#include "vc/core/types/Sampling.hpp"
 #include "vc/core/PointCollections.hpp"
 #include "vc/core/util/Compositing.hpp"
 
@@ -27,6 +26,7 @@ class CVolumeViewerView;
 class QGraphicsItem;
 class Surface;
 class QuadSurface;
+namespace vcr::grid { class Surface; }
 class Volume;
 class VCCollection;
 
@@ -70,30 +70,21 @@ public:
     virtual void setSurface(const std::string& name) = 0;
     virtual void setIntersects(const std::set<std::string>& names) = 0;
     virtual void renderVisible(
-        bool force = false,
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
     virtual void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
-    // Called by ViewerManager's global maintenance clock. Render requests submit
-    // immediately; this hook is for non-render maintenance such as deferred
-    // intersections and status refreshes.
-    virtual void serviceRenderTick() {}
+    // Called by ViewerManager's status clock every few seconds.
+    virtual void refreshStatus() {}
     virtual void invalidateVis() = 0;
-    virtual void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
-    {
-        (void)name;
-        (void)changedCells;
-        invalidateVis();
-    }
-    virtual void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) = 0;
-    virtual void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) = 0;
+    virtual void centerOnVolumePoint(const cv::Vec3f& point) = 0;
+    virtual void centerOnSurfacePoint(const cv::Vec2f& point) = 0;
     virtual void adjustZoomByFactor(float factor) = 0;
     virtual void adjustSurfaceOffset(float delta) = 0;
     virtual void resetSurfaceOffsets() = 0;
     virtual void fitSurfaceInView() = 0;
-    virtual void resetViewForCurrentContent(bool forceRender = false) { (void)forceRender; }
+    virtual void resetViewForCurrentContent() {}
 
     // --- Data access ---
     virtual Surface* currentSurface() const = 0;
@@ -103,9 +94,7 @@ public:
 
     // --- Display settings ---
     virtual float getCurrentScale() const = 0;
-    virtual float dsScale() const = 0;
     virtual float normalOffset() const = 0;
-    virtual int datasetScaleIndex() const = 0;
 
     // --- Surface normal hints ---
     virtual bool isShowSurfaceNormals() const = 0;
@@ -131,24 +120,15 @@ public:
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
-    virtual void setOverlaySamplingMethod(vc::Sampling method) = 0;
+    // Position and normal at a grid position (column, row) of `quad`, as frames place them,
+    // so overlays measure depth the same way; false when this viewer draws no such frames.
+    virtual bool framePointAt(const QuadSurface&, float /*column*/, float /*row*/, float* /*xyz*/, float* /*normal*/) const { return false; }
+    virtual void setOverlaySamplingMethod(int method) = 0;
     virtual void setOverlayIntensityAsAlpha(bool enabled) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
     virtual void setOverlayMaxDisplayedResolution(int level) = 0;
     virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
     virtual void reloadPerfSettings() = 0;
-
-    // SurfaceCache budgets for the flattened segmentation view (base, overlay).
-    // Zero disables that channel; viewers that are not a flattened
-    // QuadSurface view ignore both.
-    virtual void setSurfaceCacheBudgets(std::size_t, std::size_t) {}
-
-    // When the SurfaceCache band covers a frame, stop publishing that frame's
-    // raw-path viewport chunk demand so the (background-priority) tile fills
-    // are not starved by interactive fetches for a sampling path the frame
-    // never executes. Off by default; enabled by the main and Spiral
-    // workspaces.
-    virtual void setPreferSurfaceTileFills(bool) {}
 
     // --- Interaction state ---
     virtual std::optional<vc::PointRef> highlightedPoint() const = 0;

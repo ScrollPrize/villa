@@ -1,6 +1,6 @@
 # Native CPU training preparation kernels
 
-`vc.volume` exposes three single-threaded CPU operations used by the Fiber3D
+`vc.volume` exposes two single-threaded CPU operations used by the Fiber3D
 preparation work. This is an extraction of the existing implementations, not a
 change to their arithmetic, sampling convention or augmentation distribution.
 The trainer and loader do not switch paths in this change. No CUDA, Torch,
@@ -65,33 +65,6 @@ that array contiguous before passing it to the native sampler. Convert the
 validity image to boolean. This layout conversion does not change the coordinate
 values or the sampler's interpolation policy.
 
-## Oriented CPU blur
-
-```python
-filtered = vc.volume.anisotropic_blur_3d(
-    volume_zyx, axis_zyx, sigma_along, sigma_across,
-)
-```
-
-`volume_zyx` has shape `(Z, Y, X)`, and `axis_zyx` is a finite, nonzero vector.
-The function normalizes that vector and constructs two perpendicular axes.
-It performs one Gaussian pass along the supplied axis, then one along each
-perpendicular axis, using the same across sigma for both. Sigmas are finite,
-nonnegative and measured in input-array voxels; zero skips that pass. If all
-passes are skipped, an independent copy is still returned.
-
-Each 1D kernel has radius `max(1, ceil(3 * sigma))` and is normalized to unit
-sum. Axis-aligned passes use a direct line convolution. Other passes precompute
-the existing trilinear oriented-tap stencil and merge coincident offsets.
-Sampling beyond the input replicates its edge values. Interior application
-reuses linear offsets without repeating boundary checks per tap.
-
-This is the existing **three-pass CPU filter**. It is not a replacement for the
-later GPU direct-formula rectangular convolution and should not be described as
-bit-identical to that different filter. No GPU convolution grouping or sampling
-recipe is transferred here. Use finite image values and practical augmentation
-sigmas; this API is not intended for unbounded kernel radii.
-
 ## Fused value transform
 
 ```python
@@ -142,7 +115,7 @@ differences; the extracted C++ operations themselves are unchanged.
 
 Supply a local CT array via `--vc-real-volume`, an occupied base XYZ crop via
 `--vc-origin-xyz` and the selected `--vc-level` to run a real-data chain:
-inverse warp, native sampling, oriented blur and value transform. Tests never
+inverse warp, native sampling and value transform. Tests never
 download data, change the volume, acquire a GPU or start training. The companion
 `test_native_sampling.py` suite checks exact sampler fast-path equality and
 offers a real-volume timing check. Extraction alone makes no new throughput or
@@ -150,7 +123,7 @@ model-quality claim.
 
 Extraction validation on Ubuntu/Python 3.14 passed 86 native binding/sampling
 tests and the companion 27 ordered-queue tests. On a 128³ Paris4 CT patch,
-coordinates, validity, oblique blur and transformed values also matched an
+coordinates, validity and transformed values also matched an
 existing source binary byte-for-byte (GCC 11 Release reference versus GCC 13
 Release extraction). A Clang 14 syntax check passed; macOS/arm64 runtime
 validation remains pending.

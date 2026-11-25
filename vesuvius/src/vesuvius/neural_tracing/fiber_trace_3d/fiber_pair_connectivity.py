@@ -10,7 +10,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
-from numcodecs.registry import get_codec
+from vc_reader.reader import open_zarr
+from vc_reader.resident import sample_array
+import vc_reader.transforms as A
+from vc_reader.geometry import label_components
 from scipy import ndimage
 from skimage.morphology import skeletonize
 
@@ -18,53 +21,11 @@ from lasagna.inference_provenance import atomic_write
 from .embedding import nearest_polyline_points
 
 
-_CONN6 = ndimage.generate_binary_structure(3, 1)
-_CONN26 = ndimage.generate_binary_structure(3, 3)
+_OUTSIDE_DISTANCE = A.DistanceTransform(mode="outside", implicit_background=True)
 
 
-class LocalZarrV2:
-    """Small, bounded reader for the immutable local V2 arrays used here.
-
-    Reading chunks directly avoids making this diagnostic depend on Zarr's
-    asynchronous store machinery.  The accepted metadata is deliberately
-    narrow and validated rather than silently supporting a second data path.
-    """
-
-    def __init__(self, path):
-        self.path = Path(path)
-        meta = json.loads((self.path / ".zarray").read_text())
-        if (meta.get("zarr_format") != 2 or meta.get("dimension_separator") != "/"
-                or meta.get("order") != "C" or meta.get("filters") not in (None, [])):
-            raise ValueError("pair connectivity requires a C-order, slash-separated local Zarr V2 array")
-        self.shape = np.asarray(meta["shape"], dtype=np.int64)
-        self.chunks = np.asarray(meta["chunks"], dtype=np.int64)
-        self.dtype = np.dtype(meta["dtype"])
-        self.fill = np.asarray(meta.get("fill_value", 0), dtype=self.dtype).item()
-        self.codec = get_codec(meta["compressor"]) if meta.get("compressor") else None
-
-    def read(self, begin_zyx, end_zyx):
-        begin = np.asarray(begin_zyx, dtype=np.int64)
-        end = np.asarray(end_zyx, dtype=np.int64)
-        if begin.shape != (3,) or end.shape != (3,) or np.any(begin < 0) or np.any(end > self.shape) or np.any(end <= begin):
-            raise ValueError("invalid local Zarr crop")
-        result = np.full(tuple(end - begin), self.fill, dtype=self.dtype)
-        first, last = begin // self.chunks, (end - 1) // self.chunks
-        for key in itertools.product(*(range(int(a), int(b) + 1) for a, b in zip(first, last))):
-            chunk_begin = np.asarray(key) * self.chunks
-            chunk_end = np.minimum(chunk_begin + self.chunks, self.shape)
-            path = self.path.joinpath(*(str(v) for v in key))
-            if not path.is_file():
-                continue
-            payload = path.read_bytes()
-            if self.codec is not None:
-                payload = self.codec.decode(payload)
-            chunk = np.frombuffer(payload, dtype=self.dtype).reshape(tuple(chunk_end - chunk_begin))
-            source_begin = np.maximum(begin, chunk_begin)
-            source_end = np.minimum(end, chunk_end)
-            src = tuple(slice(int(a - c), int(b - c)) for a, b, c in zip(source_begin, source_end, chunk_begin))
-            dst = tuple(slice(int(a - c), int(b - c)) for a, b, c in zip(source_begin, source_end, begin))
-            result[dst] = chunk[src]
-        return result
+def _read_box(array, begin_zyx, end_zyx):
+    return array[tuple(slice(int(begin), int(end)) for begin, end in zip(begin_zyx, end_zyx))]
 
 
 def _manifest_group(manifest_path, name):
@@ -102,8 +63,7 @@ def _compact_normal(nx, ny):
 def _sample_scalar(volume, points_base_xyz, origin_zyx, scale, order):
     xyz = np.asarray(points_base_xyz, dtype=np.float64) / scale
     coordinates = np.vstack([xyz[:, 2] - origin_zyx[0], xyz[:, 1] - origin_zyx[1], xyz[:, 0] - origin_zyx[2]])
-    return ndimage.map_coordinates(volume, coordinates, order=order, mode="constant", cval=0.0,
-                                    prefilter=order > 1)
+    return sample_array(volume, coordinates.T, order=order, boundary="constant")
 
 
 def _sample_normals(nx, ny, points, origin_zyx, scale):
@@ -135,15 +95,8 @@ def endpoint_ellipsoids(shape, origin_zyx, scale, endpoints_xyz, normals_xyz,
     return masks
 
 
-def _ball(radius):
-    if radius == 0:
-        return np.ones((1, 1, 1), dtype=bool)
-    grid = np.indices((2*radius+1,)*3) - radius
-    return np.sum(grid*grid, axis=0) <= radius*radius
-
-
-def connecting_component(mask, endpoint_masks, connectivity=_CONN26):
-    labels, count = ndimage.label(mask, structure=connectivity)
+def connecting_component(mask, endpoint_masks, connectivity=26):
+    labels, count = label_components(mask, connectivity=connectivity)
     common = None
     hits = []
     for endpoint in endpoint_masks:
@@ -165,16 +118,16 @@ def _closed_mask(mask, settings):
         return mask
     # One iteration uses the full 3x3x3 neighborhood. Repeating it grows and
     # shrinks by one Chebyshev voxel per iteration.
-    return ndimage.binary_closing(mask, structure=_CONN26, iterations=iterations)
+    return A.Morphology("close", radius=iterations, footprint="cube")(mask[None])[0]
 
 
 def _transforms(presence, settings):
     yield {"kind": "raw", "sigma": 0.0, "amount": 0.0}, presence
     for sigma in settings["gaussian_sigmas_prediction"]:
-        blurred = ndimage.gaussian_filter(presence, float(sigma), mode="nearest")
+        blurred = A.GaussianBlur(sigma=float(sigma), boundary="nearest", truncate=4, full_width=False)(presence[None])[0]
         yield {"kind": "gaussian", "sigma": float(sigma), "amount": 0.0}, blurred
     for sigma in settings["unsharp_sigmas_prediction"]:
-        blurred = ndimage.gaussian_filter(presence, float(sigma), mode="nearest")
+        blurred = A.GaussianBlur(sigma=float(sigma), boundary="nearest", truncate=4, full_width=False)(presence[None])[0]
         for amount in settings["unsharp_amounts"]:
             sharpened = np.clip(presence + float(amount)*(presence-blurred), 0.0, 1.0)
             yield {"kind": "unsharp", "sigma": float(sigma), "amount": float(amount)}, sharpened
@@ -201,7 +154,7 @@ def search_connectivity(presence, endpoint_masks, settings, domain=None):
             raw = values >= float(threshold_u8)/255.0
             if domain is not None:
                 raw &= domain
-            distances = ndimage.distance_transform_edt(~raw) if radius else None
+            distances = _OUTSIDE_DISTANCE(raw[None])[0] if radius else None
             dilated = raw if radius == 0 else distances <= radius
             if domain is not None:
                 dilated &= domain
@@ -281,13 +234,13 @@ def _materialize_choice(presence, endpoint_masks, choice, domain=None):
     if kind == "raw":
         values = presence
     else:
-        blurred = ndimage.gaussian_filter(presence, sigma, mode="nearest")
+        blurred = A.GaussianBlur(sigma=float(sigma), boundary="nearest", truncate=4, full_width=False)(presence[None])[0]
         values = blurred if kind == "gaussian" else np.clip(presence + amount*(presence-blurred), 0, 1)
     raw = values >= choice["threshold_u8"]/255.0
     if domain is not None:
         raw &= domain
     radius = choice["dilation_radius_prediction"]
-    dilated = ndimage.binary_dilation(raw, structure=_ball(radius)) if radius else raw
+    dilated = A.Morphology("dilate", radius=radius)(raw[None])[0] if radius else raw
     if domain is not None:
         dilated &= domain
     base_component, _ = connecting_component(dilated, endpoint_masks)
@@ -317,7 +270,7 @@ def skeleton_topology(component, origin_zyx, scale, required_masks, long_arm_min
     kernel[1, 1, 1] = 0
     degree = ndimage.convolve(skeleton.astype(np.uint8), kernel, mode="constant", cval=0)
     critical = skeleton & (degree != 2)
-    node_labels, node_count = ndimage.label(critical, structure=_CONN26)
+    node_labels, node_count = label_components(critical, connectivity=26)
     shape = np.asarray(skeleton.shape, dtype=np.int64)
     offsets = [np.asarray(v, dtype=np.int64) for v in itertools.product((-1, 0, 1), repeat=3)
                if v != (0, 0, 0)]
@@ -391,7 +344,7 @@ def skeleton_topology(component, origin_zyx, scale, required_masks, long_arm_min
         else:
             edge["kind"] = "other"
 
-    component_labels, component_count = ndimage.label(skeleton, structure=_CONN26)
+    component_labels, component_count = label_components(skeleton, connectivity=26)
     node_free_cycles = 0
     for label in range(1, component_count + 1):
         if not np.any(critical & (component_labels == label)):
@@ -692,7 +645,7 @@ def fiber_corridor(shape, origin_zyx, scale, fibers, radius_base):
         valid = np.all((index_xyz >= 0) & (index_xyz < np.asarray(shape)[::-1]), axis=1)
         index_zyx = index_xyz[valid, ::-1]
         seeds[index_zyx[:, 0], index_zyx[:, 1], index_zyx[:, 2]] = True
-    return ndimage.distance_transform_edt(~seeds) <= radius_base/scale
+    return _OUTSIDE_DISTANCE(seeds[None])[0] <= radius_base/scale
 
 
 def _frames(points, tangents, normals):
@@ -847,28 +800,28 @@ def run_pair_connectivity(workload):
         raise ValueError("connectivity diagnostic requires exactly two single-span fibers")
     source = evaluation["sources"][0]
     presence_path, presence_scale = _manifest_group(source["fiber_manifest"], "presence")
-    presence_array = LocalZarrV2(presence_path)
+    presence_array = open_zarr(presence_path)
     all_points = np.concatenate(points)
     halo = float(settings["roi_halo_base"])
     lo_xyz = np.maximum(0, np.floor((all_points.min(axis=0)-halo)/presence_scale).astype(int))
     hi_xyz = np.minimum(presence_array.shape[::-1],
                         np.ceil((all_points.max(axis=0)+halo)/presence_scale).astype(int)+1)
     origin_zyx = lo_xyz[::-1]
-    presence_u8 = presence_array.read(origin_zyx, hi_xyz[::-1])
+    presence_u8 = _read_box(presence_array, origin_zyx, hi_xyz[::-1])
     presence = presence_u8.astype(np.float32)/255.0
 
     nx_path, normal_scale = _manifest_group(source["normal_manifest"], "nx")
     ny_path, ny_scale = _manifest_group(source["normal_manifest"], "ny")
     if ny_scale != normal_scale:
         raise ValueError("normal channels have inconsistent scales")
-    nx_array, ny_array = LocalZarrV2(nx_path), LocalZarrV2(ny_path)
+    nx_array, ny_array = open_zarr(nx_path), open_zarr(ny_path)
     normal_halo = float(settings["render_half_width_base"])+2*normal_scale
     normal_lo_xyz = np.maximum(0, np.floor((all_points.min(axis=0)-normal_halo)/normal_scale).astype(int))
     normal_hi_xyz = np.minimum(nx_array.shape[::-1],
         np.ceil((all_points.max(axis=0)+normal_halo)/normal_scale).astype(int)+1)
     normal_origin = normal_lo_xyz[::-1]
-    normal_x = nx_array.read(normal_origin, normal_hi_xyz[::-1])
-    normal_y = ny_array.read(normal_origin, normal_hi_xyz[::-1])
+    normal_x = _read_box(nx_array, normal_origin, normal_hi_xyz[::-1])
+    normal_y = _read_box(ny_array, normal_origin, normal_hi_xyz[::-1])
 
     endpoints = np.asarray([points[0][0], points[0][-1], points[1][0], points[1][-1]])
     nearest, squared = nearest_polyline_points(points[0], points[1])
@@ -887,7 +840,7 @@ def run_pair_connectivity(workload):
     selected = feasible[0]
     raw, dilation_added, closing_added, component = _materialize_choice(
         presence, required_masks, selected, domain)
-    six_component, _ = connecting_component(component, required_masks, _CONN6)
+    six_component, _ = connecting_component(component, required_masks, 6)
     selected["connected_with_6_neighbors"] = six_component is not None
     overlap = np.zeros(presence.shape, dtype=np.uint8)
     for mask in endpoint_masks:

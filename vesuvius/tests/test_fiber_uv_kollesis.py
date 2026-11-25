@@ -1,11 +1,42 @@
 import numpy as np
+import json
+import pytest
 
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_kollesis import (
     Maps, conditional_abs, conditional_discrepancy, length_maps, ratio, edge_maps, write_plots)
+from .fiber_graph_fixture import measured_store
 
 
 def fid(k):
     return f'00000000-0000-4000-8000-{k:012d}'
+
+
+def test_event_geometry_rejects_unavailable_compact_endpoint_coordinates(tmp_path):
+    from lasagna.inference_provenance import sha256_file
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_graph_store import store_digest
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_kollesis import event_geometry
+    # Event IDs must not travel through float64, which loses this low bit.
+    eid=2**53+7
+    database=measured_store(tmp_path,[(eid,1,2,False,.5),(eid+1,1,3,False,.5)],
+                            field_overrides={eid+1:dict(normal_b_valid=0)})
+    stage=tmp_path/'normal.npz';np.savez(stage,normal_sign=[1,1,1])
+    tensor=tmp_path/'tensors.npz'
+    signature=dict(database=store_digest(database),stage1=sha256_file(stage))
+    tensor.with_suffix('.json').write_text(json.dumps(dict(signature=signature)))
+    config=dict(database=str(database),stage1=str(stage),tensor_cache=str(tensor))
+    # Compact v22 measurements deliberately omit XYZ and distance magnitude;
+    # diagnostics requiring them must fail loudly, never invent coordinates.
+    d=dict(event_ids=np.array([0,1],dtype=np.int64))
+    with pytest.raises(ValueError,match='do not store endpoint XYZ'):
+        event_geometry(config,d,tmp_path)
+    assert not (tmp_path/'event_geometry.npz').exists()
+    # Cached diagnostic IDs remain exact int64 even when larger than 2**53.
+    d=dict(event_ids=np.array([eid,eid+1],dtype=np.int64))
+    geom=np.array([[1.,0.,1.],[np.nan,np.nan,np.nan]])
+    np.savez(tmp_path/'event_geometry.npz',geometry=geom,event_ids=d['event_ids'],database_hash=signature['database'])
+    np.testing.assert_array_equal(event_geometry(config,d,tmp_path),geom)
+    with pytest.raises(ValueError,match='provenance mismatch'):
+        event_geometry(config,dict(event_ids=np.array([eid+1],dtype=np.int64)),tmp_path)
 
 
 def test_cumulative_expectation_matches_bruteforce():

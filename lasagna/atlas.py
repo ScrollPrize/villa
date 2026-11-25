@@ -330,7 +330,7 @@ def build_atlas_init(
 	zero_col = int(metadata.get("zero_winding_column", 0))
 
 	base_xyz, base_valid, _base_meta = load_tifxyz(
-		str(base["path"]), device=device, store=store, volume=volume, target_scale=target_scale)
+		base["path"], device=device, store=store, volume=volume, target_scale=target_scale)
 	period_columns = _validate_wrapped_base(base_xyz, base_valid)
 	if int(metadata.get("period_columns", period_columns)) != period_columns:
 		raise ValueError(

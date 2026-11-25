@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 import torch
 
+from tests.zarr_utils import zarr_volume
+
 from vesuvius.neural_tracing.fiber_trace_3d.coarse_supervision import (
     CoarseGeometry, ellipse_offsets, normal_plane, projected_direction_error,
     background_mask, coarse_sample_statistics, center_rotation_frame, jittered_coarse_sites,
@@ -244,7 +246,7 @@ def test_loader_mixed_batch_counts_and_backward_without_remote_normals(device, u
     try:
         points = np.array([[80, 96, 96], [112, 96, 96]], np.float32)
         baked = {'baked_annotations': {'version': 1, 'normals_xyz': [[0, 0, 1], [0, 0, 1]]}}
-        records = [dict(volume=np.zeros((192,)*3, np.uint8),
+        records = [dict(volume_path=zarr_volume(np.zeros((192,)*3, np.uint8)),
                         fiber=Vc3dFiber(None, 1, points, points[:1], (None,), 0, metadata),
                         scroll_id='A', dense_supervision=True, supervision_mode=mode)
                    for mode, metadata in [('precise', baked), ('coarse_area',

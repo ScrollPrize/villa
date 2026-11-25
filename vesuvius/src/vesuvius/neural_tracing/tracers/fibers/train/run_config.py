@@ -12,7 +12,7 @@
       "model": {"type": "regression"},   # 'regression', 'flow' or 'sequence', plus any model field; frame_checkpoint
                                          # defaults to the frame model, null: CT structure-tensor crop frames
       "training": {...},                 # optimizer, schedule, losses, sampling, task shares, DAgger, diagnostics
-      "runtime": {...}                   # device, workers, threads, CT prefetch: settings of the machine
+      "runtime": {...}                   # device, workers, threads, CT cache: settings of the machine
     }
 
 Every omitted field takes its model type's default (DEFAULTS below and the model configuration classes): these
@@ -85,8 +85,6 @@ DEFAULTS = dict(
 # Per model type: runtime defaults where they differ from RUNTIME.
 RUNTIME_DEFAULTS = dict(regression={}, flow={}, sequence=dict(worker_cache_gb=1.))
 RUNTIME = dict(device='cuda', workers=10, worker_cache_gb=.5, threads=4, dagger_threads=4,
-               remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
-               remote_prefetch_timeout=120.,
                # Data-parallel processes, one GPU each (scripts/launch_train.sh starts torchrun when > 1;
                # shared/distributed.py). Batch and grad_steps are per process.
                gpus=1,
@@ -102,7 +100,9 @@ DERIVED_MODEL_FIELDS = ('model_type', 'frame_checkpoint_sha256')
 RETIRED = dict(model=RETIRED_FIELDS,
                training=dict(negative_bank_refresh_seconds=ANY, negative_bank_cache_mb=ANY, retry_threshold=None,
                              lr_step_offset=0, onpolicy=[], long_diag_every=0, long_diag_max_len=ANY),
-               runtime=dict(dagger_device=None))
+               # The trainer's remote CT prefetch process (speed only; vc_reader now fetches what reads touch).
+               runtime=dict(dagger_device=None, remote_prefetch_connections=ANY, remote_prefetch_queue_size=ANY,
+                            remote_prefetch_lookahead=ANY, remote_prefetch_timeout=ANY))
 
 
 def model_fields(model_type):
@@ -216,9 +216,6 @@ def validate(run):
                          '(which restarts the schedule at the resumed update)')
     if r['dagger_gpu'] is not None and (type(r['dagger_gpu']) is not int or r['dagger_gpu'] < 0):
         raise ValueError('dagger_gpu must be a nonnegative GPU index or null')
-    if (r['remote_prefetch_connections'] < 0 or r['remote_prefetch_queue_size'] < 1 or r['remote_prefetch_lookahead'] < 0
-            or not math.isfinite(r['remote_prefetch_timeout']) or r['remote_prefetch_timeout'] <= 0):
-        raise ValueError('Prefetch connections and lookahead must be nonnegative; queue size and timeout must be positive')
     if min(t['steps'], t['batch'], t['grad_steps'], t['log_every'], t['ckpt_every'], r['threads'], r['dagger_threads'],
            t['flow_calibration_states'], t['replay_keep'], t['dagger_fibers'], t['dagger_batch'], t['recovery_seeds']) < 1:
         raise ValueError('Positive counts required, including batch and grad steps')

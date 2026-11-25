@@ -1,7 +1,7 @@
 #pragma once
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <vc_object_store/Uuid.hpp>
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
 #include <QCryptographicHash>
 #include <QTemporaryDir>
 #include <filesystem>
@@ -34,7 +34,7 @@ inline std::map<std::string, std::filesystem::path> materializeJsonDocuments(
             // Named temporary files also work where a sandbox cannot publish
             // Qt's unnamed O_TMPFILE through /proc/self/fd. Keep atomic rename
             // and durability in the shared writer.
-            vc::core::util::atomicWriteString(path, document);
+            vcr::zarr::atomicWrite(path, document, vcr::zarr::Durability::Fsync);
         }
         paths.emplace(uuid, path);
     }

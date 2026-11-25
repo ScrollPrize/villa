@@ -157,14 +157,3 @@ async def vc3d_fiber_export(path: str) -> dict[str, Any]:
     `path` (headless; no dialog). Coordinates and their grid shape are preserved.
     Returns {"exported": count, "path"}."""
     return await _call("fiber.export", {"path": path})
-
-
-@mcp.tool()
-async def vc3d_fiber_import(path: str) -> dict[str, Any]:
-    """Import fibers from `path`: a single vc3d_fiber JSON, a
-    vc3d_fiber_collection bundle, or a directory of fiber JSONs (headless; no
-    dialog). Coordinates and grid shapes are preserved. Imported fibers are
-    committed to the attached writable object store. Only version-4 fibers with
-    explicit UUIDs are accepted; the fiber list reloads after the transaction.
-    Returns {"imported", "skipped"}."""
-    return await _call("fiber.import", {"path": path})

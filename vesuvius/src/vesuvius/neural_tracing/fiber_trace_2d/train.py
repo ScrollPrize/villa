@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import vc_reader.transforms as A
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     apply_value_augmentation_batch,
@@ -36,7 +37,7 @@ from vesuvius.neural_tracing.fiber_trace_2d.embedding import (
     embedding_similarity_to_cp,
     presence_loss,
 )
-from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DBatch, FiberStrip2DLoader, SamplerFactory, load_config
+from vesuvius.neural_tracing.fiber_trace_2d.loader import FiberStrip2DBatch, FiberStrip2DLoader, load_config
 from vesuvius.neural_tracing.fiber_trace_2d.model import (
     FiberStripDirectionModelConfig,
     FiberStripDirectionNet,
@@ -47,6 +48,9 @@ from vesuvius.neural_tracing.fiber_trace_2d.runner import (
     _predict_direction_field,
     _trace2cp_metric_bidirectional,
 )
+
+_MASKED_ZSCORE = A.Normalize("zscore", nonzero=False, masked=True, eps=1e-6)
+_MASKED_TARGETS = {"image": A.Image(valid="valid", refill=False), "valid": A.ValidMask()}
 
 
 @dataclass(frozen=True)
@@ -293,12 +297,8 @@ def _prepare_images(images_np: np.ndarray, valid_np: np.ndarray, *, device: torc
 def _normalize_image_tensor(images: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     if valid.ndim == 3:
         valid = valid.unsqueeze(1)
-    counts = valid.sum(dim=(2, 3), keepdim=True).clamp_min(1)
-    masked = torch.where(valid, images, torch.zeros_like(images))
-    mean = masked.sum(dim=(2, 3), keepdim=True) / counts
-    var = torch.where(valid, (images - mean) ** 2, torch.zeros_like(images)).sum(dim=(2, 3), keepdim=True) / counts
-    std = torch.sqrt(var.clamp_min(1.0e-6))
-    return torch.where(valid, (images - mean) / std, torch.zeros_like(images))
+    normalized = _MASKED_ZSCORE.batch({"image": images, "valid": valid}, targets=_MASKED_TARGETS)["image"]
+    return torch.where(valid, normalized, torch.zeros_like(images))
 
 
 def _batch_images_to_tensors(
@@ -1230,7 +1230,6 @@ def _print_benchmark_summary(summary: _BenchmarkSummary, *, profile: bool) -> No
 def run_benchmark(
     config_path: str | Path,
     *,
-    sampler_factory: SamplerFactory | None = None,
     batches: int = 100,
     profile: bool = False,
     load_only: bool = False,
@@ -1249,7 +1248,7 @@ def run_benchmark(
         )
         else None
     )
-    loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    loader = FiberStrip2DLoader(loader_config)
     device = resolve_torch_device(training.device)
     model: FiberStripDirectionNet | None = None
     top_model: FiberStripDirectionNet | None = None
@@ -1665,30 +1664,25 @@ def _evaluate_trace2cp_metric_fixed_set(
     )
 
 
-def _cache_scalars(cache_stats: Any | None) -> dict[str, float]:
-    if cache_stats is None:
-        return {}
-    return {
-        "cache/hits": float(getattr(cache_stats, "cache_hits", 0)),
-        "cache/downloads": float(getattr(cache_stats, "downloads", 0)),
-        "cache/misses": float(getattr(cache_stats, "missing", 0)) + float(getattr(cache_stats, "negative_hits", 0)),
-        "cache/hit_mib": float(getattr(cache_stats, "cache_hit_bytes", 0)) / (1024.0 * 1024.0),
-        "cache/download_mib": float(getattr(cache_stats, "download_bytes", 0)) / (1024.0 * 1024.0),
-        "cache/hit_ms": float(getattr(cache_stats, "cache_hit_ms", 0.0)),
-        "cache/download_ms": float(getattr(cache_stats, "download_ms", 0.0)),
-    }
+_SUMMED_PREFETCH_KEYS = (
+    "samples",
+    "skipped_samples",
+    "patches",
+    "valid_pixels",
+    "errors",
+    "remote_fetches",
+    "remote_bytes",
+)
 
 
-def _merge_prefetch_summaries(*summaries: dict[str, Any]) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for summary in summaries:
-        for key, value in summary.items():
-            if isinstance(value, bool):
-                merged[key] = value
-            elif isinstance(value, (int, float)):
-                merged[key] = merged.get(key, 0) + value
-            else:
-                merged.setdefault(key, value)
+def _merge_prefetch_summaries(train: dict[str, Any], *others: dict[str, Any]) -> dict[str, Any]:
+    """Totals of several loaders' prefetch summaries; the sample index and workers stay the training loader's."""
+    merged = dict(train)
+    for summary in others:
+        for key in _SUMMED_PREFETCH_KEYS:
+            merged[key] += summary[key]
+        for key in ("first_error", "first_sample_skip"):
+            merged[key] = merged[key] or summary[key]
     return merged
 
 
@@ -2001,7 +1995,6 @@ def _load_training_resume_checkpoint(
 def run_training(
     config_path: str | Path,
     *,
-    sampler_factory: SamplerFactory | None = None,
     resume_checkpoint: str | Path | None = None,
 ) -> Path:
     raw_config = _load_raw_config(config_path)
@@ -2017,12 +2010,12 @@ def run_training(
         )
         else None
     )
-    loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    loader = FiberStrip2DLoader(loader_config)
     test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
     test_loader = (
         None
         if test_loader_config is None
-        else FiberStrip2DLoader(test_loader_config, sampler_factory=sampler_factory)
+        else FiberStrip2DLoader(test_loader_config)
     )
     device = resolve_torch_device(training.device)
     model = FiberStripDirectionNet(
@@ -2301,8 +2294,6 @@ def run_training(
                 writer.add_scalar("timing/prep_wait_ms", prep_wait_ms, step)
                 writer.add_scalar("timing/prep_submit_ms", prep_submit_ms, step)
                 writer.add_scalar("timing/train_ms", train_ms, step)
-                for key, value in _cache_scalars(batch.cache_stats).items():
-                    writer.add_scalar(key, value, step)
                 wrote_tensorboard = True
             if writer is not None and test_result is not None:
                 writer.add_scalar("test/loss_direction", test_result.loss, step)
@@ -2323,8 +2314,6 @@ def run_training(
                     )
                     writer.add_scalar("test/trace2cp_segments", test_trace2cp_metric.segments, step)
                     writer.add_scalar("test/trace2cp_skipped_segments", test_trace2cp_metric.skipped_segments, step)
-                for key, value in _cache_scalars(test_result.batch.cache_stats).items():
-                    writer.add_scalar(f"test_{key}", value, step)
                 wrote_tensorboard = True
             if writer is not None and (
                 is_first_run_step or step == 1 or step % training.tensorboard_image_interval == 0
@@ -2554,7 +2543,6 @@ def prefetch_training(
     *,
     prefetch_steps: int | None = None,
     prefetch_start_step: int = 1,
-    sampler_factory: SamplerFactory | None = None,
 ) -> dict[str, Any]:
     raw_config = _load_raw_config(config_path)
     training = _training_config_from_raw(raw_config)
@@ -2564,7 +2552,7 @@ def prefetch_training(
         raise ValueError("--prefetch-steps must be >= 0")
 
     loader_config = load_config(config_path)
-    loader = FiberStrip2DLoader(loader_config, sampler_factory=sampler_factory)
+    loader = FiberStrip2DLoader(loader_config)
     sample_mode = "random"
     requested_prefetch_steps = None if prefetch_steps is None else int(prefetch_steps)
     prefetch_full_dataset = requested_prefetch_steps == 0 or (
@@ -2598,7 +2586,7 @@ def prefetch_training(
     if prefetch_full_dataset:
         test_loader_config = _test_loader_config_from_raw(raw_config, loader_config)
         if test_loader_config is not None:
-            test_loader = FiberStrip2DLoader(test_loader_config, sampler_factory=sampler_factory)
+            test_loader = FiberStrip2DLoader(test_loader_config)
             print(
                 "fiber_trace_2d prefetch test_datasets "
                 f"sample_mode={sample_mode} start_sample_index=0 samples={int(test_loader.sample_count)}",
@@ -2613,8 +2601,9 @@ def prefetch_training(
             summary = _merge_prefetch_summaries(summary, test_summary)
     print(
         "fiber_trace_2d prefetch complete "
-        f"generated={int(summary.get('generated', 0))} missing={int(summary.get('missing', 0))} "
-        f"downloaded={int(summary.get('downloaded', 0))} errors={int(summary.get('errors', 0))}",
+        f"samples={summary['samples']} skipped={summary['skipped_samples']} "
+        f"remote_fetches={summary['remote_fetches']} remote_bytes={summary['remote_bytes']} "
+        f"errors={summary['errors']}",
         flush=True,
     )
     return summary

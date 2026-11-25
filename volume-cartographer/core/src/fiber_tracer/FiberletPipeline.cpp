@@ -179,7 +179,7 @@ FiberletOnDemandConfig makeCanonicalFiberletOnDemandConfig(
     const FiberletPathConfig& paths,
     FiberStoredPredictionBatchSampler predictionSampler,
     std::shared_ptr<const vc::lasagna::NormalSampler> normalSampler,
-    const FiberletChunkCacheOptions& cacheOptions)
+    std::shared_ptr<vcr::MemoryCache> memoryCache)
 {
     FiberletOnDemandConfig config;
     config.anchorRoot = anchorRoot;
@@ -192,8 +192,7 @@ FiberletOnDemandConfig makeCanonicalFiberletOnDemandConfig(
     configureCanonicalFiberletGeneration(config);
     config.predictionSampler = std::move(predictionSampler);
     config.normalSampler = std::move(normalSampler);
-    config.anchorCacheOptions = cacheOptions;
-    config.fiberletCacheOptions = cacheOptions;
+    config.memoryCache = std::move(memoryCache);
     return config;
 }
 }

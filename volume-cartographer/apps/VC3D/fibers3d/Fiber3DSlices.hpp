@@ -3,6 +3,9 @@
 #include <memory>
 #include <optional>
 
+class OpenedVolumes;
+class Volume;
+
 namespace vc3d::fibers3d::slices
 {
 struct Plane {
@@ -28,7 +31,7 @@ struct Image {
 };
 using Images = std::vector<std::shared_ptr<const Image>>;
 
-std::shared_ptr<Image> sample(const Plane&, Volume&, const std::atomic_bool* cancelled = nullptr, int maxTextureEdge = 1024);
+std::shared_ptr<Image> sample(const Plane&, OpenedVolumes&, const Volume&, const std::atomic_bool* cancelled = nullptr, int maxTextureEdge = 1024);
 std::array<Point, 8> corners(const Image&);
 
 struct Vertex {

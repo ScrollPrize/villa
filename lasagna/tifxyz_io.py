@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import tifffile
+from vc_reader import tifxyz
 
 
 def surface_step_stats(xyz: torch.Tensor, valid: torch.Tensor) -> tuple[float, float, float, float]:
@@ -69,33 +69,26 @@ def load_tifxyz(path: str | Path, *, device: torch.device | str = "cpu",
 	  meta: dict from meta.json (or empty if missing); for a stored surface its record meta with
 	    uuid, name and the grid scale
 	"""
-	from stored_surfaces import parse_surface_ref, read_surface
-	if parse_surface_ref(path) is not None:
+	from stored_surfaces import is_surface_ref, read_surface
+	if is_surface_ref(path):
 		if store is None:
 			raise ValueError(f"stored surface {path} needs a store")
-		stored = read_surface(store, str(path), volume=volume, target_scale=target_scale)
+		stored = read_surface(store, path, volume=volume, target_scale=target_scale)
 		xyz = stored.xyz
+		valid = stored.valid
 		meta = stored.meta
 		label = stored.meta["name"]
 	else:
 		p = Path(path)
 		if not p.is_dir():
 			raise ValueError(f"tifxyz path is not a directory: {p}")
-		x = tifffile.imread(str(p / "x.tif")).astype(np.float32)
-		y = tifffile.imread(str(p / "y.tif")).astype(np.float32)
-		z = tifffile.imread(str(p / "z.tif")).astype(np.float32)
-		if x.shape != y.shape or x.shape != z.shape:
-			raise ValueError(f"tifxyz shape mismatch: x={x.shape} y={y.shape} z={z.shape}")
-		xyz = np.stack([x, y, z], axis=-1)  # (H, W, 3)
-		meta_path = p / "meta.json"
-		meta: dict = {}
-		if meta_path.exists():
-			meta = json.loads(meta_path.read_text(encoding="utf-8"))
+		surface = tifxyz.read(p, mask=False)
+		xyz, valid = surface.xyz, surface.valid
+		meta = json.loads((p / "meta.json").read_text(encoding="utf-8"))
 		label = p.name
 
-	xyz_t = torch.from_numpy(xyz)
-	# VC3D uses (-1, -1, -1) as invalid sentinel
-	valid = (xyz_t != -1.0).all(dim=-1)  # (H, W) bool
+	xyz_t = torch.from_numpy(np.array(xyz, copy=True))
+	valid = torch.from_numpy(np.array(valid, dtype=bool, copy=True))
 	# Zero out invalid vertices so they don't pollute pyramid construction
 	xyz_t[~valid] = 0.0
 

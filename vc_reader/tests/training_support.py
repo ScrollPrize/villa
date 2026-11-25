@@ -221,9 +221,9 @@ def augment_cpu_sample(augmentation, sample, *, seed):
     # here, keeping Dataset storage and host-to-device traffic compact.
     import numpy as np
     targets = {}
-    for key, declaration in augmentation.targets.items():
+    for key in augmentation.targets:
         value = sample[key]
-        if declaration._constructor.__name__ not in ('Label', 'ValidMask'):
+        if augmentation._engine.continuous(key):
             value = value.astype(np.float32, copy=False) if isinstance(value, np.ndarray) else value.float()
         targets[key] = value
     return augmentation(targets, seed=seed)

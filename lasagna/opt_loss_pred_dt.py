@@ -1780,11 +1780,8 @@ def _write_flow_gate_debug(
 ) -> None:
 	if out_dir is None:
 		return
-	try:
-		import tifffile
-	except Exception as exc:
-		print(f"[pred_dt_flow_gate] debug write skipped: tifffile import failed: {exc}", flush=True)
-		return
+	from vc_reader import images
+
 	out_dir.mkdir(parents=True, exist_ok=True)
 	pred_raw_u8 = pred_u8.astype(np.uint8, copy=True)
 	flow = (
@@ -1857,7 +1854,7 @@ def _write_flow_gate_debug(
 	pull_prefix = None if pull_prefix_hr is None else np.asarray(pull_prefix_hr, dtype=np.float32)
 	pull_root_weight = None if pull_root_weight_hr is None else np.asarray(pull_root_weight_hr, dtype=np.float32)
 	pull_overlay = None if pull_overlay_rgb is None else np.asarray(pull_overlay_rgb, dtype=np.float32)
-	def write_named_layer(tw, image: np.ndarray, *, name: str) -> None:
+	def write_named_layer(layers: list, image: np.ndarray, *, name: str) -> None:
 		arr = np.asarray(image)
 		if arr.ndim == 2:
 			arr = np.repeat(arr.astype(np.float32, copy=False)[..., None], 3, axis=2)
@@ -1865,123 +1862,91 @@ def _write_flow_gate_debug(
 			arr = arr.astype(np.float32, copy=False)
 		else:
 			raise ValueError(f"flow gate debug layer {name!r} has unsupported shape {arr.shape}")
-		tw.write(
-			arr,
-			photometric="rgb",
-			metadata=None,
-			extratags=[(285, "s", 0, name, False)],  # TIFFTAG_PAGENAME
-		)
+		layers.append((name, arr))
 	for suffix in (f"{stage_name}_{debug_index:06d}", stage_name):
 		layers_path = out_dir / f"pred_dt_flow_gate_{suffix}_layers.tif"
-		with tifffile.TiffWriter(str(layers_path)) as tw:
-			write_named_layer(tw, pred_raw_u8, name="pred_dt")
-			write_named_layer(tw, flow, name="raw_flow_bilinear")
-			if grid_flow is not None:
-				write_named_layer(tw, grid_flow, name="smooth_grid_flow")
-			if gate_basis is not None:
-				write_named_layer(tw, gate_basis, name="gate_basis_flow_normalized")
-			if graph_flow is not None:
-				write_named_layer(tw, graph_flow, name="graph_edge_flow")
-			if island_obstacle is not None:
-				write_named_layer(tw, island_obstacle, name="island_obstacle_factor")
-			if island_removed is not None:
-				write_named_layer(tw, island_removed, name="island_removed_mask")
-			if island_passability is not None:
-				write_named_layer(tw, island_passability, name="island_flow_passability")
-			if island_propagated is not None:
-				write_named_layer(tw, island_propagated, name="island_propagated_edge_flow")
-			if island_bonus is not None:
-				write_named_layer(tw, island_bonus, name="island_bonus_edge_flow")
-			if island_dense_no_backtrack is not None:
-				write_named_layer(
-					tw,
-					island_dense_no_backtrack,
-					name="island_tree_dense_flow_no_backtrack",
-				)
-			if island_dense_greedy is not None:
-				write_named_layer(
-					tw,
-					island_dense_greedy,
-					name="island_tree_dense_flow_greedy_ascent",
-				)
-			if source_edges is not None:
-				write_named_layer(tw, source_edges, name="graph_source_edges")
-			if source_components is not None:
-				write_named_layer(tw, source_components, name="source_components")
-			write_named_layer(tw, weights, name="flow_gate_weight")
-			if pull_weight is not None:
-				write_named_layer(tw, pull_weight, name="anticipatory_pull_weight")
-			if pull_prefix is not None:
-				write_named_layer(tw, pull_prefix, name="anticipatory_pull_prefix")
-			if pull_root_weight is not None:
-				write_named_layer(tw, pull_root_weight, name="anticipatory_pull_root_weight")
-			if pull_overlay is not None:
-				write_named_layer(tw, pull_overlay, name="anticipatory_pull_overlay")
-		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_pred_dt.tif"), pred_raw_u8)
-		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_raw_flow.tif"), flow)
+		tw: list = []
+		write_named_layer(tw, pred_raw_u8, name="pred_dt")
+		write_named_layer(tw, flow, name="raw_flow_bilinear")
 		if grid_flow is not None:
-			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_smooth_grid_flow.tif"), grid_flow)
+			write_named_layer(tw, grid_flow, name="smooth_grid_flow")
 		if gate_basis is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_gate_basis_flow_normalized.tif"),
-				gate_basis,
-			)
+			write_named_layer(tw, gate_basis, name="gate_basis_flow_normalized")
 		if graph_flow is not None:
-			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_graph_edge_flow.tif"), graph_flow)
+			write_named_layer(tw, graph_flow, name="graph_edge_flow")
 		if island_obstacle is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_obstacle_factor.tif"),
-				island_obstacle,
-			)
+			write_named_layer(tw, island_obstacle, name="island_obstacle_factor")
 		if island_removed is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_removed_mask.tif"),
-				island_removed,
-			)
+			write_named_layer(tw, island_removed, name="island_removed_mask")
 		if island_passability is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_flow_passability.tif"),
-				island_passability,
-			)
+			write_named_layer(tw, island_passability, name="island_flow_passability")
 		if island_propagated is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_propagated_edge_flow.tif"),
-				island_propagated,
-			)
+			write_named_layer(tw, island_propagated, name="island_propagated_edge_flow")
 		if island_bonus is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_bonus_edge_flow.tif"),
-				island_bonus,
-			)
+			write_named_layer(tw, island_bonus, name="island_bonus_edge_flow")
 		if island_dense_no_backtrack is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_tree_dense_flow_no_backtrack.tif"),
+			write_named_layer(
+				tw,
 				island_dense_no_backtrack,
+				name="island_tree_dense_flow_no_backtrack",
 			)
 		if island_dense_greedy is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_island_tree_dense_flow_greedy_ascent.tif"),
+			write_named_layer(
+				tw,
 				island_dense_greedy,
+				name="island_tree_dense_flow_greedy_ascent",
 			)
 		if source_edges is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_graph_source_edges.tif"),
-				source_edges,
-			)
+			write_named_layer(tw, source_edges, name="graph_source_edges")
 		if source_components is not None:
-			tifffile.imwrite(
-				str(out_dir / f"pred_dt_flow_gate_{suffix}_source_components.tif"),
-				source_components,
-			)
-		tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_weight.tif"), weights)
+			write_named_layer(tw, source_components, name="source_components")
+		write_named_layer(tw, weights, name="flow_gate_weight")
 		if pull_weight is not None:
-			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_weight.tif"), pull_weight)
+			write_named_layer(tw, pull_weight, name="anticipatory_pull_weight")
 		if pull_prefix is not None:
-			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_prefix.tif"), pull_prefix)
+			write_named_layer(tw, pull_prefix, name="anticipatory_pull_prefix")
 		if pull_root_weight is not None:
-			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_root_weight.tif"), pull_root_weight)
+			write_named_layer(tw, pull_root_weight, name="anticipatory_pull_root_weight")
 		if pull_overlay is not None:
-			tifffile.imwrite(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_overlay.tif"), pull_overlay)
+			write_named_layer(tw, pull_overlay, name="anticipatory_pull_overlay")
+		with images.TiffWriter(layers_path, tw[0][1].shape, np.float32, pages=len(tw)) as writer:
+			for name, arr in tw:
+				writer.write_page(arr, name=name)
+		images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_pred_dt.tif"), pred_raw_u8)
+		images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_raw_flow.tif"), flow)
+		if grid_flow is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_smooth_grid_flow.tif"), grid_flow)
+		if gate_basis is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_gate_basis_flow_normalized.tif"), gate_basis)
+		if graph_flow is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_graph_edge_flow.tif"), graph_flow)
+		if island_obstacle is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_island_obstacle_factor.tif"), island_obstacle)
+		if island_removed is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_island_removed_mask.tif"), island_removed)
+		if island_passability is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_island_flow_passability.tif"), island_passability)
+		if island_propagated is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_island_propagated_edge_flow.tif"), island_propagated)
+		if island_bonus is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_island_bonus_edge_flow.tif"), island_bonus)
+		if island_dense_no_backtrack is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_island_tree_dense_flow_no_backtrack.tif"), island_dense_no_backtrack)
+		if island_dense_greedy is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_island_tree_dense_flow_greedy_ascent.tif"), island_dense_greedy)
+		if source_edges is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_graph_source_edges.tif"), source_edges)
+		if source_components is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_source_components.tif"), source_components)
+		images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_weight.tif"), weights)
+		if pull_weight is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_weight.tif"), pull_weight)
+		if pull_prefix is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_prefix.tif"), pull_prefix)
+		if pull_root_weight is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_root_weight.tif"), pull_root_weight)
+		if pull_overlay is not None:
+			images.write_tiff(str(out_dir / f"pred_dt_flow_gate_{suffix}_anticipatory_pull_overlay.tif"), pull_overlay)
 
 
 def _write_flow_gate_weight_jpg(

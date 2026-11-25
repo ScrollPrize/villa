@@ -41,6 +41,13 @@ class _OverlayComposite(TypedDict, total=False):
     layersBehind: int
 
 
+class _ViewComposite(TypedDict, total=False):
+    enabled: bool
+    method: Literal["mean", "max", "min", "alpha", "beerLambert", "volumetric"]
+    layersFront: int
+    layersBehind: int
+
+
 _OverlayColormap = Literal[
     "",
     "fire",
@@ -226,6 +233,7 @@ async def vc3d_set_render_settings(
     normal_max_arrows: Optional[int] = None,
     segmentation_cursor_mirroring: Optional[bool] = None,
     z_scroll_sensitivity: Optional[float] = None,
+    composite: Optional[_ViewComposite] = None,
 ) -> dict[str, Any]:
     """Update the global viewer render settings; changes apply across all
     viewers. Every argument is optional -- omitted (None) fields are left
@@ -247,6 +255,11 @@ async def vc3d_set_render_settings(
     segmentation viewer from other panes.
     z_scroll_sensitivity: scroll-to-move-through-z sensitivity, clamped
     0.1..100.
+    composite: {"enabled", "method" ("mean"|"max"|"min"|"alpha"|
+    "beerLambert"|"volumetric"), "layersFront", "layersBehind"} -- any
+    subset, merged over the primary (segmentation) view's composite, the one
+    the composite panel edits; layer counts below 0 become 0. Fails with
+    "Viewer unavailable" when no segmentation viewer is open.
 
     The numeric/global fields (opacities, thickness, volume window,
     z-scroll sensitivity, cursor mirroring,
@@ -275,6 +288,7 @@ async def vc3d_set_render_settings(
                 "normalMaxArrows": normal_max_arrows,
                 "segmentationCursorMirroring": segmentation_cursor_mirroring,
                 "zScrollSensitivity": z_scroll_sensitivity,
+                "composite": composite,
             }
         ),
     )

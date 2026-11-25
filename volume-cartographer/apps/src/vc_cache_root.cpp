@@ -1,13 +1,16 @@
-#include "vc/core/util/GlobalCacheRoot.hpp"
-#include "vc/core/util/AtomicFile.hpp"
+#include <vc_reader/zarr.hpp>
+#include <nlohmann/json.hpp>
 #include <chrono>
+#include <filesystem>
 #include <iostream>
+#include <stdexcept>
+#include <string_view>
 
 int main(int argc, char** argv)
 {
     try {
         if (argc == 1) {
-            std::cout << vc::core::util::globalCacheRoot().string() << '\n';
+            std::cout << vcr::zarr::selectedVc3dCacheRoot().string() << '\n';
             return 0;
         }
         if (argc != 3 || std::string_view(argv[1]) != "--set")
@@ -22,7 +25,7 @@ int main(int argc, char** argv)
         if (!std::filesystem::create_directory(probe))
             throw std::runtime_error("cannot create cache write probe");
         try {
-            vc::core::util::atomicWriteString(probe / "probe", "write test\n");
+            vcr::zarr::atomicWrite(probe / "probe", "write test\n", vcr::zarr::Durability::Fsync);
             std::filesystem::remove(probe / "probe");
             std::filesystem::remove(probe);
         } catch (...) {
@@ -31,16 +34,16 @@ int main(int argc, char** argv)
             std::filesystem::remove(probe, ignored);
             throw;
         }
-        const auto directory = vc::core::util::vc3dConfigDirectory();
+        const auto directory = vcr::zarr::vc3dConfigDirectory();
         std::filesystem::create_directories(directory);
         const auto path = directory / "cache.json";
         if (std::filesystem::exists(path)) {
             const auto suffix = std::chrono::system_clock::now().time_since_epoch().count();
             std::filesystem::copy_file(path, directory / ("cache.json.backup-" + std::to_string(suffix)));
         }
-        vc::core::util::atomicWriteString(path, nlohmann::json{
-            {"version", 1}, {"root", root.lexically_normal().string()}}.dump(2) + "\n");
-        std::cout << vc::core::util::globalCacheRoot().string() << '\n';
+        vcr::zarr::atomicWrite(path, nlohmann::json{
+            {"version", 1}, {"root", root.lexically_normal().string()}}.dump(2) + "\n", vcr::zarr::Durability::Fsync);
+        std::cout << vcr::zarr::selectedVc3dCacheRoot().string() << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

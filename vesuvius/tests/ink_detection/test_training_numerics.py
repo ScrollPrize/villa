@@ -21,7 +21,7 @@ import vesuvius.ink_detection.training.dilation as dilation_module
 import vesuvius.ink_detection.training.train as train_module
 from vesuvius.ink_detection.training.dilation import (
     apply_label_dilation,
-    dilate_label_batch_with_cucim,
+    dilate_label_batch,
     resolve_dilation_distances,
 )
 from vesuvius.ink_detection.training.optimizers import (
@@ -35,11 +35,11 @@ from vesuvius.ink_detection.training.train import (
     stage_training_request,
 )
 
-from .test_model_foundation import _config_mapping
+from .helpers import config_mapping
 
 
 def _training_mapping() -> dict:
-    authored = _config_mapping(depth=1, side=4)
+    authored = config_mapping(depth=1, side=4)
     authored.update(
         {
             "num_iterations": 6,
@@ -258,7 +258,7 @@ def test_dilation_union_excludes_new_ink_from_background(monkeypatch):
     supervision[..., 0] = 1
 
     monkeypatch.setattr(
-        dilation_module, "dilate_label_batch_with_cucim", _fake_dilator
+        dilation_module, "dilate_label_batch", _fake_dilator
     )
     output = apply_label_dilation(
         {"inklabels": labels, "supervision_mask": supervision},
@@ -276,13 +276,18 @@ def test_dilation_union_excludes_new_ink_from_background(monkeypatch):
     )
 
 
-def test_zero_dilation_is_import_free_and_positive_cpu_fails_factually():
-    labels = torch.zeros(1, 1, 2, 2, 2)
-    valid = torch.ones_like(labels)
+def test_dilate_label_batch_within_valid_mask():
+    labels = torch.zeros(2, 1, 1, 1, 6)
+    labels[0, 0, 0, 0, 1] = 1
+    labels[0, 0, 0, 0, 5] = 2  # ignore labels are kept
+    valid = torch.ones(2, 1, 1, 1, 6)
+    valid[0, 0, 0, 0, 3] = 0
 
-    assert dilate_label_batch_with_cucim(labels, valid, 0) is labels
-    with pytest.raises(RuntimeError, match="CUDA.*CuPy.*cuCIM"):
-        dilate_label_batch_with_cucim(labels, valid, 1)
+    assert dilate_label_batch(labels, valid, 0) is labels
+    output = dilate_label_batch(labels, valid, 2)
+    torch.testing.assert_close(output[0, 0, 0, 0], torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 2.0]))
+    # A channel without label 1 is unchanged.
+    torch.testing.assert_close(output[1], labels[1])
 
 
 def test_dilation_level_scaling_and_mixed_positive_levels():

@@ -1,8 +1,6 @@
 #include "SettingsDialog.hpp"
 
 #include "VCSettings.hpp"
-#include "vc/core/render/PersistentZarrCacheBudget.hpp"
-#include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -33,14 +31,7 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     edtDefaultPathVolpkg->setText(settings.value(project::DEFAULT_PATH).toString());
     chkAutoOpenVolpkg->setChecked(settings.value(project::AUTO_OPEN, project::AUTO_OPEN_DEFAULT).toInt() != 0);
 
-    spinFwdBackStepMs->setValue(settings.value(viewer::FWD_BACK_STEP_MS, viewer::FWD_BACK_STEP_MS_DEFAULT).toInt());
-    chkCenterOnZoom->setChecked(settings.value(viewer::CENTER_ON_ZOOM, viewer::CENTER_ON_ZOOM_DEFAULT).toInt() != 0);
-    edtImpactRange->setText(settings.value(viewer::IMPACT_RANGE_STEPS, viewer::IMPACT_RANGE_STEPS_DEFAULT).toString());
-    edtScanRange->setText(settings.value(viewer::SCAN_RANGE_STEPS, viewer::SCAN_RANGE_STEPS_DEFAULT).toString());
-    spinScrollSpeed->setValue(settings.value(viewer::SCROLL_SPEED, viewer::SCROLL_SPEED_DEFAULT).toInt());
     spinZoomSensitivity->setValue(settings.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toDouble());
-    spinDisplayOpacity->setValue(settings.value(viewer::DISPLAY_SEGMENT_OPACITY, viewer::DISPLAY_SEGMENT_OPACITY_DEFAULT).toInt());
-    chkPlaySoundAfterSegRun->setChecked(settings.value(viewer::PLAY_SOUND_AFTER_SEG_RUN, viewer::PLAY_SOUND_AFTER_SEG_RUN_DEFAULT).toInt() != 0);
     edtUsername->setText(settings.value(viewer::USERNAME, viewer::USERNAME_DEFAULT).toString());
     chkResetViewOnSurfaceChange->setChecked(settings.value(viewer::RESET_VIEW_ON_SURFACE_CHANGE, viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toInt() != 0);
     if (auto* chk = findChild<QCheckBox*>("chkShowPlaneIntersectionLines")) {
@@ -56,20 +47,10 @@ SettingsDialog::SettingsDialog(QWidget *parent)
         spin->setValue(std::clamp(settings.value(viewer::AXIS_OVERLAY_OPACITY, viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt(), 0, 100));
     }
 
-    spinPreloadedSlices->setValue(settings.value(perf::PRELOADED_SLICES, perf::PRELOADED_SLICES_DEFAULT).toInt());
-    spinParallelProcesses->setValue(settings.value(perf::PARALLEL_PROCESSES, perf::PARALLEL_PROCESSES_DEFAULT).toInt());
-    spinIterationCount->setValue(settings.value(perf::ITERATION_COUNT, perf::ITERATION_COUNT_DEFAULT).toInt());
-    cmbDownscaleOverride->setCurrentIndex(settings.value(perf::DOWNSCALE_OVERRIDE, perf::DOWNSCALE_OVERRIDE_DEFAULT).toInt());
     chkEnableFileWatching->setChecked(settings.value(perf::ENABLE_FILE_WATCHING, perf::ENABLE_FILE_WATCHING_DEFAULT).toBool());
 
     // Cache settings
     spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
-    spinViewerSurfaceCacheGB->setValue(
-        settings.value(viewer_cache::SURFACE_CACHE_GB,
-                       viewer_cache::SURFACE_CACHE_GB_DEFAULT).toInt());
-    spinViewerOverlaySurfaceCacheGB->setValue(
-        settings.value(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
-                       viewer_cache::OVERLAY_SURFACE_CACHE_GB_DEFAULT).toInt());
     spinSurfaceGeometryCacheGB->setValue(
         settings.value(viewer_cache::SURFACE_GEOMETRY_CACHE_GB,
                        viewer_cache::SURFACE_GEOMETRY_CACHE_GB_DEFAULT).toInt());
@@ -113,10 +94,6 @@ SettingsDialog::SettingsDialog(QWidget *parent)
         }
     });
 
-    connect(btnHelpDownscaleOverride, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDownscaleOverride->toolTip()); });
-    connect(btnHelpScrollSpeed, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpScrollSpeed->toolTip()); });
-    connect(btnHelpDisplayOpacity, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDisplayOpacity->toolTip()); });
-    connect(btnHelpPreloadedSlices, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpPreloadedSlices->toolTip()); });
     connect(btnHelpRamCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpRamCacheSize->toolTip()); });
 }
 
@@ -133,6 +110,18 @@ void SettingsDialog::setupCacheActionControls()
 
     if (gridLayout_5)
         gridLayout_5->addWidget(_remoteCacheDelta3dCheckBox, 2, 0, 1, 3);
+
+#ifdef VC_READER_CUDA
+    _renderCudaCheckBox = new QCheckBox(tr("Sample volumes on the GPU (CUDA) in all viewers."), groupBox_5);
+    _renderCudaCheckBox->setObjectName(QStringLiteral("chkRenderCuda"));
+    _renderCudaCheckBox->setToolTip(tr("Requires restart. Covers the 2D viewers, overlays, the 3D scene and fiber views, and the seeding and push/pull tools. "
+                                     "uint8 volumes only; others keep sampling on the CPU, as does everything if the GPU fails."));
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    using namespace vc3d::settings;
+    _renderCudaCheckBox->setChecked(settings.value(perf::RENDER_CUDA, perf::RENDER_CUDA_DEFAULT).toBool());
+    if (gridLayout_5)
+        gridLayout_5->addWidget(_renderCudaCheckBox, 3, 0, 1, 3);
+#endif
 }
 
 void SettingsDialog::accept()
@@ -144,14 +133,7 @@ void SettingsDialog::accept()
     settings.setValue(project::DEFAULT_PATH, edtDefaultPathVolpkg->text());
     settings.setValue(project::AUTO_OPEN, chkAutoOpenVolpkg->isChecked() ? "1" : "0");
 
-    settings.setValue(viewer::FWD_BACK_STEP_MS, spinFwdBackStepMs->value());
-    settings.setValue(viewer::CENTER_ON_ZOOM, chkCenterOnZoom->isChecked() ? "1" : "0");
-    settings.setValue(viewer::IMPACT_RANGE_STEPS, edtImpactRange->text());
-    settings.setValue(viewer::SCAN_RANGE_STEPS, edtScanRange->text());
-    settings.setValue(viewer::SCROLL_SPEED, spinScrollSpeed->value());
     settings.setValue(viewer::ZOOM_SENSITIVITY, spinZoomSensitivity->value());
-    settings.setValue(viewer::DISPLAY_SEGMENT_OPACITY, spinDisplayOpacity->value());
-    settings.setValue(viewer::PLAY_SOUND_AFTER_SEG_RUN, chkPlaySoundAfterSegRun->isChecked() ? "1" : "0");
     settings.setValue(viewer::USERNAME, edtUsername->text());
     settings.setValue(viewer::RESET_VIEW_ON_SURFACE_CHANGE, chkResetViewOnSurfaceChange->isChecked() ? "1" : "0");
     if (auto* chk = findChild<QCheckBox*>("chkShowPlaneIntersectionLines")) {
@@ -167,17 +149,10 @@ void SettingsDialog::accept()
         settings.setValue(viewer::AXIS_OVERLAY_OPACITY, spin->value());
     }
 
-    settings.setValue(perf::PRELOADED_SLICES, spinPreloadedSlices->value());
-    settings.setValue(perf::PARALLEL_PROCESSES, spinParallelProcesses->value());
-    settings.setValue(perf::ITERATION_COUNT, spinIterationCount->value());
-    settings.setValue(perf::DOWNSCALE_OVERRIDE, cmbDownscaleOverride->currentIndex());
     settings.setValue(perf::ENABLE_FILE_WATCHING, chkEnableFileWatching->isChecked() ? "1" : "0");
 
     // Cache settings
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
-    settings.setValue(viewer_cache::SURFACE_CACHE_GB, spinViewerSurfaceCacheGB->value());
-    settings.setValue(viewer_cache::OVERLAY_SURFACE_CACHE_GB,
-                      spinViewerOverlaySurfaceCacheGB->value());
     settings.setValue(viewer_cache::SURFACE_GEOMETRY_CACHE_GB, spinSurfaceGeometryCacheGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text().trimmed());
     settings.setValue(
@@ -189,22 +164,12 @@ void SettingsDialog::accept()
         perf::REMOTE_DOWNLOAD_AUTOMATIC, automaticDownloads);
     settings.setValue(
         perf::REMOTE_DOWNLOAD_PARALLELISM, downloadParallelism);
-    vc::render::processChunkCacheService()->configureFetchConcurrency(
-        automaticDownloads
-            ? static_cast<std::size_t>(perf::REMOTE_DOWNLOAD_WORKER_CAPACITY)
-            : static_cast<std::size_t>(downloadParallelism),
-        automaticDownloads);
+#ifdef VC_READER_CUDA
+    settings.setValue(perf::RENDER_CUDA, _renderCudaCheckBox->isChecked());
+#endif
     settings.setValue(perf::REMOTE_CACHE_MAX_GIB, spinRemoteCacheMaximumGiB->value());
     settings.setValue(perf::REMOTE_CACHE_MIN_FREE_GIB, spinRemoteCacheMinimumFreeGiB->value());
     settings.sync();
-    constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
-    vc::render::PersistentZarrCacheBudget::Limits limits;
-    if (spinRemoteCacheMaximumGiB->value() > 0)
-        limits.maximumBytes = static_cast<std::uint64_t>(spinRemoteCacheMaximumGiB->value()) * gib;
-    limits.minimumFreeBytes =
-        static_cast<std::uint64_t>(spinRemoteCacheMinimumFreeGiB->value()) * gib;
-    vc::render::PersistentZarrCacheBudget::updateAllConfiguredLimits(limits);
-
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 
     QDialog::accept();

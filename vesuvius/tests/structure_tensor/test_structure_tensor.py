@@ -3,148 +3,14 @@
 import pytest
 import torch
 import numpy as np
-import zarr
 import os
 from math import isfinite
 
-from vesuvius.image_proc.geometry.structure_tensor import (
-    StructureTensorComputer,
-    components_to_matrix,
-    eigendecompose,
-    _get_gaussian_kernel_3d,
-    _get_pavel_kernels_3d,
-)
 from vesuvius.structure_tensor.create_st import (
-    StructureTensorInferer,
     _eigh_and_sanitize,
     _compute_eigenvectors,
     _finalize_structure_tensor_torch
 )
-
-
-@pytest.fixture
-def inferer_paths(tmp_path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    input_dir = tmp_path / "input"
-    input_dir.mkdir()
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-    return {
-        "model": model_dir,
-        "input": input_dir,
-        "output": output_dir,
-    }
-
-
-@pytest.fixture
-def cpu_inferer(inferer_paths):
-    """A small, CPU‐only inferer with no smoothing, fixed patch size."""
-    return StructureTensorInferer(
-        model_path=str(inferer_paths["model"]),
-        input_dir=str(inferer_paths["input"]),
-        output_dir=str(inferer_paths["output"]),
-        sigma=0.0,
-        smooth_components=False,
-        volume=None,
-        num_parts=1,
-        part_id=0,
-        overlap=0.0,
-        step_size=1.0,
-        batch_size=1,
-        patch_size=(5, 5, 5),
-        device="cpu",
-        verbose=False,
-        compressor_name="none",
-        compression_level=1,
-        num_dataloader_workers=0,
-    )
-
-
-def test_gaussian_kernel_normalizes_to_one():
-    kernel, radius = _get_gaussian_kernel_3d(torch.device("cpu"), torch.float32, sigma=1.0)
-    g3 = kernel.squeeze()
-    total = float(g3.sum().item())
-    assert total == pytest.approx(1.0, rel=1e-6)
-    assert radius == 3
-
-
-
-def test_pavel_kernel_shapes():
-    kz, ky, kx = _get_pavel_kernels_3d(torch.device("cpu"), torch.float32)
-    # Depth kernel is 9×5×5, height 5×9×5, width 5×5×9
-    assert tuple(kz.shape) == (1, 1, 9, 5, 5)
-    assert tuple(ky.shape) == (1, 1, 5, 9, 5)
-    assert tuple(kx.shape) == (1, 1, 5, 5, 9)
-
-
-def test_compute_structure_tensor_all_zero(cpu_inferer):
-    # Zero input ⇒ zero tensor
-    x = torch.zeros((1, 1, 5, 5, 5), dtype=torch.float32)
-    J = cpu_inferer.compute_structure_tensor(x)
-    assert J.shape == (1, 6, 5, 5, 5)
-    assert torch.allclose(J, torch.zeros_like(J))
-
-def test_structure_tensor_computer_matches_inferer(cpu_inferer):
-    computer = StructureTensorComputer(
-        sigma=cpu_inferer.sigma,
-        smooth_components=cpu_inferer.smooth_components,
-        device="cpu",
-    )
-    x = torch.rand((1, 1, 5, 5, 5), dtype=torch.float32)
-    J_inferer = cpu_inferer.compute_structure_tensor(x)
-    J_shared = computer.compute(x)
-    assert J_shared.shape == (1, 6, 5, 5, 5)
-    assert torch.allclose(J_shared, J_inferer, atol=1e-6)
-
-def test_structure_tensor_computer_accepts_numpy(cpu_inferer):
-    computer = StructureTensorComputer(
-        sigma=cpu_inferer.sigma,
-        smooth_components=cpu_inferer.smooth_components,
-        device="cpu",
-    )
-    x = np.random.rand(5, 5, 5).astype(np.float32)
-    J_shared = computer.compute(x, as_numpy=True)
-    assert isinstance(J_shared, np.ndarray)
-    assert J_shared.shape == (6, 5, 5, 5)
-    torch_result = cpu_inferer.compute_structure_tensor(torch.from_numpy(x).view(1, 1, 5, 5, 5))
-    np.testing.assert_allclose(J_shared, torch_result.squeeze(0).numpy(), rtol=1e-6, atol=1e-6)
-
-def test_structure_tensor_computer_2d_output_shape():
-    computer = StructureTensorComputer(sigma=0.0, smooth_components=False, device="cpu")
-    img = torch.linspace(0, 1, 25, dtype=torch.float32).view(1, 5, 5)
-    J = computer.compute(img, spatial_dims=2)
-    assert J.shape == (3, 5, 5)
-    # linear ramp along x ⇒ Jxx positive, others near zero in the centre
-    center = (2, 2)
-    assert J[2, center[0], center[1]] > 0
-
-def test_compute_structure_tensor_linear_x(cpu_inferer):
-    # Use a volume large enough that padding never reaches the center
-    D, H, W = 9, 9, 9
-    # Pure X‐ramp
-    ramp = torch.arange(W, dtype=torch.float32)
-    x = ramp.view(1, 1, 1, 1, W).expand(1, 1, D, H, W)
-
-    # Compute structure tensor, drop batch dim → [6, D, H, W]
-    J = cpu_inferer.compute_structure_tensor(x)[0]
-
-    # Channel 5 is Jxx
-    Jxx = J[5]
-    cz, cy, cx = D//2, H//2, W//2
-
-    # 1) At the exact center, Jxx must be positive
-    center_Jxx = Jxx[cz, cy, cx]
-    assert center_Jxx > 0, f"Jxx at center should be positive, got {center_Jxx.item()}"
-
-    # 2) And it must exceed the absolute value of every other component there
-    for c in range(5):
-        other = J[c, cz, cy, cx].abs()
-        assert center_Jxx > other, (
-            f"At center voxel, Jxx={center_Jxx:.4g} must exceed |J[{c}]|={other:.4g}"
-        )
-
-
 
 
 @pytest.mark.parametrize("mat", [
@@ -199,42 +65,6 @@ def test_compute_eigenvectors_constant_block():
     assert torch.all(comps[0] == 2), "smallest eigenvalue → x-axis (index 2)"
     assert torch.all(comps[1] == 1), "middle eigenvalue → y-axis (index 1)"
     assert torch.all(comps[2] == 0), "largest eigenvalue → z-axis (index 0)"
-
-
-def test_eigendecompose_2d_matches_torch():
-    computer = StructureTensorComputer(sigma=0.0, smooth_components=False, device="cpu")
-    img = torch.rand((1, 64, 64), dtype=torch.float32)
-    comps = computer.compute(img, spatial_dims=2)
-    mats = components_to_matrix(comps.unsqueeze(0))
-    w_torch, v_torch = torch.linalg.eigh(mats)
-    w_shared, v_shared = eigendecompose(comps.unsqueeze(0))
-    assert torch.allclose(w_shared, w_torch, atol=1e-6)
-    v_shared_cols = v_shared.squeeze(0)
-    v_torch_cols = v_torch.squeeze(0)
-    dots = torch.matmul(v_shared_cols.transpose(-2, -1), v_torch_cols)
-    abs_dots = torch.abs(dots)
-    row_max = abs_dots.max(dim=-1).values
-    col_max = abs_dots.max(dim=-2).values
-    assert torch.allclose(row_max, torch.ones_like(row_max), atol=1e-4)
-    assert torch.allclose(col_max, torch.ones_like(col_max), atol=1e-4)
-
-
-def test_eigendecompose_2d_deterministic():
-    computer = StructureTensorComputer(sigma=0.0, smooth_components=False, device="cpu")
-    h = torch.linspace(0, 1, steps=16)
-    img = h.view(1, 1, 16).repeat(1, 16, 1)
-    comps = computer.compute(img, spatial_dims=2)
-    mats = components_to_matrix(comps.unsqueeze(0))
-    w_torch, v_torch = torch.linalg.eigh(mats)
-    w_shared, v_shared = eigendecompose(comps.unsqueeze(0))
-    assert torch.allclose(w_shared, w_torch, atol=1e-6)
-    v_shared_cols = v_shared.squeeze(0)
-    v_torch_cols = v_torch.squeeze(0)
-    dots = torch.matmul(v_shared_cols.transpose(-2, -1), v_torch_cols)
-    row_max = torch.abs(dots).max(dim=-1).values
-    col_max = torch.abs(dots).max(dim=-2).values
-    assert torch.allclose(row_max, torch.ones_like(row_max), atol=1e-4)
-    assert torch.allclose(col_max, torch.ones_like(col_max), atol=1e-4)
 
 
 def test_border_trim_math_matches_patch_extent():

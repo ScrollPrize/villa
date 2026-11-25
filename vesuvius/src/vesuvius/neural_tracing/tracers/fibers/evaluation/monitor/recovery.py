@@ -4,9 +4,10 @@ import hashlib
 import json
 from pathlib import Path
 
+from vc_reader.reader import open_zarr
+
 from vesuvius.neural_tracing.tracers.fibers.data.replay import OnPolicyStates
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import FRAME_POLICY
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolume
 from vesuvius.neural_tracing.tracers.fibers.evaluation.monitor.recovery_fixtures import FIXTURE_STRATA, make_recovery_states, evaluate_recovery_states, recovery_counts
 from vesuvius.neural_tracing.tracers.fibers.data.observations import observation_builder
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer
@@ -47,18 +48,19 @@ def monitor_fixture(path, fibers, manifest, sample, spec, seed_count=8):
             path.replace(previous)
             return monitor_fixture(path, fibers, manifest, sample, spec, seed_count)
     else:
-        states = make_recovery_states(fibers, seeds, sample, provenance, CTVolume(spec, cache_bytes=256 << 20))
+        ct = open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir, memory_cache=256 << 20)
+        states = make_recovery_states(fibers, seeds, sample, provenance, ct, spec)
         states.save(path)
         # Use the memory-mapped representation on the first run and after resume alike.
         states = OnPolicyStates.load(path)
     return states, hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def evaluate_monitor(model, vol, states, fibers, sample, *, device, n_commit=4,
+def evaluate_monitor(model, ct, spec, states, fibers, sample, *, device, n_commit=4,
                      tolerance=1.5, recovery_length=32.):
     decisions = []
     thresholds = (.5,)
-    rows, _ = evaluate_recovery_states(model, vol, states, fibers, sample, device=device,
+    rows, _ = evaluate_recovery_states(model, ct, spec, states, fibers, sample, device=device,
         tracer_class=FiberTracer, batch_builder=observation_builder(model.cfg),
         n_commit=n_commit, tolerance=tolerance, thresholds=thresholds, recovery_length=recovery_length,
         on_prediction=lambda out, batch: decisions.extend(decision_rows(out, batch, model.cfg, n_commit, tolerance)))

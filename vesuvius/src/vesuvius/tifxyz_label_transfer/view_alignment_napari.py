@@ -19,7 +19,8 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 from scipy.spatial import cKDTree
-import tifffile
+from vc_reader import images
+from vc_reader import tifxyz
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -29,8 +30,8 @@ from .io import load_surface as load_full_surface
 from .prepare_canvas_offset_evidence import (
     DEFAULT_INK_ROOT,
     DEFAULT_OPEN_DATA_ROOT,
-    extract_composite as extract_rclone_composite,
-    inspect_zarr as inspect_rclone_zarr,
+    extract_composite,
+    inspect_zarr,
 )
 
 
@@ -361,12 +362,9 @@ def valid_coordinates(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray
 
 
 def load_surface(path: Path, max_points: int) -> Surface:
-    x = tifffile.imread(path / "x.tif")
-    y = tifffile.imread(path / "y.tif")
-    z = tifffile.imread(path / "z.tif")
-    if x.shape != y.shape or x.shape != z.shape:
-        raise ValueError(f"Coordinate shapes differ in {path}")
-    valid = valid_coordinates(x, y, z).ravel()
+    stored = tifxyz.read(path, mask=False)
+    x, y, z = stored.xyz[..., 0], stored.xyz[..., 1], stored.xyz[..., 2]
+    valid = stored.valid.ravel()
     indices = np.flatnonzero(valid)
     if indices.size > max_points:
         selection = np.linspace(
@@ -428,8 +426,8 @@ def preferred_annotation_image(paths: list[Path]) -> Path:
 
 def discover_case(
     root: Path,
-    ink_rclone_root: str | None = DEFAULT_INK_ROOT,
-    open_data_rclone_root: str = DEFAULT_OPEN_DATA_ROOT,
+    ink_root: str | None = DEFAULT_INK_ROOT,
+    open_data_root: str = DEFAULT_OPEN_DATA_ROOT,
 ) -> Case:
     selection_path = root / "selection.json"
     if not selection_path.exists():
@@ -497,7 +495,7 @@ def discover_case(
     )
     surface_urls = {
         float(volume["resolution_um"]): _remote_join(
-            open_data_rclone_root, volume["path"]
+            open_data_root, volume["path"]
         )
         for volume in surface_volumes
         if float(volume.get("resolution_um") or -1.0) in requested
@@ -518,8 +516,8 @@ def discover_case(
     # The ink dataset is private; without an explicit mirror the viewer can
     # still run from cached/prepared renders and only fails on a remote fetch.
     source_surface_url = (
-        _remote_join(ink_rclone_root, source_path)
-        if ink_rclone_root
+        _remote_join(ink_root, source_path)
+        if ink_root
         else None
     )
 
@@ -583,30 +581,30 @@ def read_render_tiff(path: Path) -> np.ndarray:
     """Open a cached render without copying the complete raster into RAM."""
 
     try:
-        return tifffile.memmap(path, mode="r")
+        return images.memmap(path)
     except (OSError, ValueError):
         # Externally supplied evidence may be tiled or compressed and therefore
         # cannot be memory-mapped.  Keep compatibility with those files.
-        return tifffile.imread(path)
+        return images.read(path)
+
+
+NEAREST_READ_ROWS = 1024
 
 
 def read_tiff_nearest(path: Path, shape: tuple[int, int]) -> np.ndarray:
     """Read a 2D TIFF directly at ``shape`` without materialising it whole.
 
     Transfer TIFFs can decode to several gigabytes even though the viewer only
-    needs a render-sized raster. Decode just the strips or tiles touched by the
-    nearest-neighbour output grid and discard each compressed segment
-    immediately.
+    needs a render-sized raster. Read bands of rows and keep only the
+    nearest-neighbour output grid of each.
     """
 
-    with tifffile.TiffFile(path) as tif:
-        series = tif.series[0]
-        if len(series.pages) != 1 or len(series.shape) != 2:
-            return resize_nearest(tif.asarray(), shape)
-        page = series.pages[0]
-        source_shape = tuple(int(value) for value in series.shape)
+    with images.open(path) as reader:
+        source_shape = tuple(int(value) for value in reader.shape)
+        if len(source_shape) != 2:
+            return resize_nearest(reader[...], shape)
         if source_shape == shape:
-            return tif.asarray()
+            return reader[...]
         rows = np.minimum(
             (
                 (np.arange(shape[0], dtype=np.float64) + 0.5)
@@ -623,51 +621,13 @@ def read_tiff_nearest(path: Path, shape: tuple[int, int]) -> np.ndarray:
             ).astype(np.int64),
             source_shape[1] - 1,
         )
-        output = np.empty(shape, dtype=series.dtype)
-        handle = tif.filehandle
-
-        if page.is_tiled:
-            tile_height = int(page.tilelength)
-            tile_width = int(page.tilewidth)
-            tiles_across = math.ceil(source_shape[1] / tile_width)
-            row_tiles = np.unique(rows // tile_height)
-            column_tiles = np.unique(columns // tile_width)
-            for tile_row in row_tiles:
-                output_rows = np.flatnonzero(rows // tile_height == tile_row)
-                source_rows = rows[output_rows] - tile_row * tile_height
-                for tile_column in column_tiles:
-                    output_columns = np.flatnonzero(
-                        columns // tile_width == tile_column
-                    )
-                    source_columns = (
-                        columns[output_columns] - tile_column * tile_width
-                    )
-                    index = int(tile_row * tiles_across + tile_column)
-                    handle.seek(page.dataoffsets[index])
-                    encoded = handle.read(page.databytecounts[index])
-                    decoded, _, _ = page.decode(encoded, index)
-                    tile = np.asarray(decoded).squeeze()
-                    output[np.ix_(output_rows, output_columns)] = tile[
-                        np.ix_(source_rows, source_columns)
-                    ]
-            return output
-
-        rows_per_strip = int(page.rowsperstrip)
-        if rows_per_strip > 0:
-            for strip in np.unique(rows // rows_per_strip):
-                output_rows = np.flatnonzero(rows // rows_per_strip == strip)
-                source_rows = rows[output_rows] - strip * rows_per_strip
-                index = int(strip)
-                handle.seek(page.dataoffsets[index])
-                encoded = handle.read(page.databytecounts[index])
-                decoded, _, _ = page.decode(encoded, index)
-                segment = np.asarray(decoded).squeeze()
-                if segment.ndim == 1:
-                    segment = segment[None, :]
-                output[output_rows] = segment[np.ix_(source_rows, columns)]
-            return output
-
-        return resize_nearest(tif.asarray(), shape)
+        output = np.empty(shape, dtype=reader.dtype)
+        for band in np.unique(rows // NEAREST_READ_ROWS):
+            output_rows = np.flatnonzero(rows // NEAREST_READ_ROWS == band)
+            first = int(rows[output_rows[0]])
+            window = reader[first : int(rows[output_rows[-1]]) + 1, :]
+            output[output_rows] = window[np.ix_(rows[output_rows] - first, columns)]
+        return output
 
 
 def read_label_display(path: Path, shape: tuple[int, int]) -> np.ndarray:
@@ -675,9 +635,9 @@ def read_label_display(path: Path, shape: tuple[int, int]) -> np.ndarray:
 
     zarr_path = path if path.suffix == ".zarr" else path.with_suffix(".zarr")
     if zarr_path.is_dir():
-        import zarr
+        from vc_reader.reader import open_group
 
-        group = zarr.open_group(str(zarr_path), mode="r")
+        group = open_group(zarr_path)
         levels = sorted((int(key) for key in group.array_keys()))
         candidates = [
             level
@@ -725,32 +685,23 @@ def load_middle_three_max(
     if cache_path.is_file():
         print(f"Using cached middle-{plane_count} max: {cache_path}")
         return read_render_tiff(cache_path)
-    if "://" not in root_url:
-        info = inspect_rclone_zarr(root_url, preferred_level)
-        middle = info.shape[0] // 2
-        radius = plane_count // 2
-        extract_rclone_composite(
-            info,
-            list(
-                range(
-                    max(0, middle - radius),
-                    min(info.shape[0], middle + radius + 1),
-                )
-            ),
-            cache_path,
-            workers=workers,
-            overwrite=False,
-        )
-        print(
-            f"Using rclone-backed middle-{plane_count} max: {cache_path}"
-        )
-        return read_render_tiff(cache_path)
-
-    raise ValueError(
-        "HTTP/URL zarr access is disabled; data must be read with "
-        f"rclone. Pass an rclone remote path (remote:bucket/path) "
-        f"instead of {root_url!r}"
+    info = inspect_zarr(root_url, preferred_level)
+    middle = info.shape[0] // 2
+    radius = plane_count // 2
+    extract_composite(
+        info,
+        list(
+            range(
+                max(0, middle - radius),
+                min(info.shape[0], middle + radius + 1),
+            )
+        ),
+        cache_path,
+        workers=workers,
+        overwrite=False,
     )
+    print(f"Using middle-{plane_count} max: {cache_path}")
+    return read_render_tiff(cache_path)
 
 
 def evidence_comparison_render(
@@ -918,8 +869,8 @@ def register_render(
         fill_seams=fill_seams,
     )
     cache.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(cache, registered)
-    tifffile.imwrite(cache.with_name(f"{cache.stem}.valid.tif"), valid)
+    images.write_tiff(cache, registered)
+    images.write_tiff(cache.with_name(f"{cache.stem}.valid.tif"), np.asarray(valid, dtype=np.uint8))
     cache_report_path.write_text(
         json.dumps(
             {
@@ -1282,7 +1233,7 @@ def prepare_case(
             if case.source_surface_volume_url is None:
                 raise ValueError(
                     f"{case.name}: no cached source render and no ink "
-                    "dataset mirror configured; pass --ink-rclone-root "
+                    "dataset mirror configured; pass --ink-root "
                     "to fetch it"
                 )
             source_render = load_middle_three_max(
@@ -2634,19 +2585,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--ink-rclone-root",
+        "--ink-root",
         default=DEFAULT_INK_ROOT,
         help=(
-            "rclone remote:path of your mirror of the private ink dataset; "
+            "location of your copy of the private ink dataset; "
             "needed only when a source CT render must be fetched remotely"
         ),
     )
     parser.add_argument(
-        "--open-data-rclone-root",
+        "--open-data-root",
         default=DEFAULT_OPEN_DATA_ROOT,
         help=(
-            "rclone remote:path of the public Vesuvius open-data bucket "
-            "(default: anonymous inline S3 remote, no rclone config needed)"
+            "location of the public Vesuvius open-data bucket"
         ),
     )
     parser.add_argument(
@@ -2679,8 +2629,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for path in args.case_dir:
         case = discover_case(
             path.resolve(),
-            ink_rclone_root=args.ink_rclone_root,
-            open_data_rclone_root=args.open_data_rclone_root,
+            ink_root=args.ink_root,
+            open_data_root=args.open_data_root,
         )
         if any(existing.name == case.name for existing in cases):
             raise ValueError(f"Duplicate case name: {case.name}")

@@ -2,18 +2,52 @@
 #include "statistics.cuh"
 #include "channel_statistics.cuh"
 namespace vcr::transforms::cuda {
-template<class T, bool Variance> __device__ void collect(KernelIndex vcr_launch, View<T> input, Partial* output, const float* weights, const Statistics* stats) {
+// Validity flags for one channel, counting valid voxels; with none valid,
+// statistics use every voxel (flags become all ones).
+template<class M> __device__ void select_valid(KernelIndex vcr_launch, const M* mask, std::uint8_t* valid, std::size_t n, unsigned long long* count) {
+    unsigned long long local = 0;
+    EACH_INDEX(n) { valid[i] = mask[i] != M(0); local += valid[i]; }
+    if (local) atomicAdd(count,local);
+}
+struct select_valid_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { select_valid(index,args...); }
+};
+__device__ void select_all_if_empty(KernelIndex vcr_launch, std::uint8_t* valid, std::size_t n, const unsigned long long* count) {
+    if (*count) return;
+    EACH_INDEX(n) valid[i] = 1;
+}
+struct select_all_if_empty_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { select_all_if_empty(index,args...); }
+};
+
+std::unique_ptr<Buffer<std::uint8_t>> valid_voxels(const Sample& s, const ChannelPlan& c, Session& session,
+                                                unsigned long long* selected) {
+    const auto& f = s.at(c.key);
+    if (!session.arrays.count(f.target.valid)) return {};
+    const auto& mask = session.arrays.at(f.target.valid);
+    const auto n = product(mask.spatial());
+    auto valid = std::make_unique<Buffer<std::uint8_t>>(n);
+    Buffer<unsigned long long> count(selected ? 0 : 1);
+    if (!selected) selected = count.ptr;
+    check(memset_async(selected, 0, sizeof(unsigned long long), vcr::device::stream()));
+    const std::size_t offset = (mask.shape[0] == 1 ? 0 : c.channel) * n;
+    mask.typed([&](auto m) { launch(blocks(n),256,0,vcr::device::stream(), select_valid_launch{}, m.ptr+offset,valid->ptr,n,selected); });
+    launch(blocks(n),256,0,vcr::device::stream(), select_all_if_empty_launch{}, valid->ptr,n,selected);
+    return valid;
+}
+template<class T, bool Variance> __device__ void collect(KernelIndex vcr_launch, View<T> input, Partial* output, const float* weights, const Statistics* stats, const std::uint8_t* valid) {
     __shared__ Partial values[256];
     Partial p{0,0,INFINITY,-INFINITY};
     // Versioned on the uniform weights test. Unweighted, the weight stays +0
     // exactly as when +0 was added per element.
     const auto each = [&](auto weighted) {
         EACH_INDEX(input.size) {
+            if (valid && !valid[i]) continue;
             const double x = to_double(input.ptr[i]);
             if constexpr (Variance) p.sum += (x-stats->mean)*(x-stats->mean);
             else {
                 if constexpr (decltype(weighted)::value) { p.sum += x*weights[i]; p.weight += weights[i]; }
-                else p.sum += x;
+                else { p.sum += x; if (valid) ++p.weight; }
                 p.low = fmin(p.low,x); p.high = fmax(p.high,x);
             }
         }
@@ -25,7 +59,7 @@ template<class T, bool Variance> __device__ void collect(KernelIndex vcr_launch,
 template<class T, bool Variance> struct collect_launch2 {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { collect<T,Variance>(index,args...); }
 };
-__device__ void finish_stats(KernelIndex vcr_launch, const Partial* input, unsigned count, std::size_t n, bool weighted, bool variance, Statistics* output) {
+__device__ void finish_stats(KernelIndex vcr_launch, const Partial* input, unsigned count, std::size_t n, bool weighted, bool variance, Statistics* output, bool masked) {
     __shared__ Partial values[256]; Partial p{0,0,INFINITY,-INFINITY};
     for (unsigned i = threadIdx.x; i < count; i += 256) {
         auto q = input[i]; p.sum += q.sum; p.weight += q.weight;
@@ -34,21 +68,24 @@ __device__ void finish_stats(KernelIndex vcr_launch, const Partial* input, unsig
     values[threadIdx.x] = p; reduce(values);
     if (!threadIdx.x) {
         auto q = values[0];
-        if (variance) output->deviation = n > 1 ? sqrt(q.sum/(n-1)) : 0;
-        else *output = {q.sum/(weighted ? q.weight+1e-8 : double(n)),q.low,q.high,0};
+        if (variance) output->deviation = output->count > 1 ? sqrt(q.sum/(output->count-1)) : 0;
+        else {
+            const double count = masked ? q.weight : double(n);
+            *output = {q.sum/(weighted ? q.weight+1e-8 : count),q.low,q.high,0,count};
+        }
     }
 }
 struct finish_stats_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { finish_stats(index,args...); }
 };
-template<class T> Buffer<Statistics> stats_impl(View<T> data, bool deviation, const float* weights) {
+template<class T> Buffer<Statistics> stats_impl(View<T> data, bool deviation, const float* weights, const std::uint8_t* valid) {
     const unsigned count = std::min(blocks(data.size),1024u);
     Buffer<Partial> partial(count); Buffer<Statistics> result(1);
-    launch(count,256,0,vcr::device::stream(), collect_launch2<T,false>{}, data,partial.ptr,weights,nullptr);
-    launch(1,256,0,vcr::device::stream(), finish_stats_launch{}, partial.ptr,count,data.size,weights != nullptr,false,result.ptr);
+    launch(count,256,0,vcr::device::stream(), collect_launch2<T,false>{}, data,partial.ptr,weights,nullptr,valid);
+    launch(1,256,0,vcr::device::stream(), finish_stats_launch{}, partial.ptr,count,data.size,weights != nullptr,false,result.ptr,valid != nullptr);
     if (deviation) {
-        launch(count,256,0,vcr::device::stream(), collect_launch2<T,true>{}, data,partial.ptr,nullptr,result.ptr);
-        launch(1,256,0,vcr::device::stream(), finish_stats_launch{}, partial.ptr,count,data.size,false,true,result.ptr);
+        launch(count,256,0,vcr::device::stream(), collect_launch2<T,true>{}, data,partial.ptr,nullptr,result.ptr,valid);
+        launch(1,256,0,vcr::device::stream(), finish_stats_launch{}, partial.ptr,count,data.size,false,true,result.ptr,valid != nullptr);
     }
     check(cudaGetLastError()); return result;
 }
@@ -74,6 +111,6 @@ template<class T> Buffer<Statistics> bounds_impl(View<T> input) {
 }
 Buffer<Statistics> bounds(View<float> v) { return bounds_impl(v); }
 Buffer<Statistics> bounds(View<double> v) { return bounds_impl(v); }
-Buffer<Statistics> statistics(View<float> v, bool d, const float* w) { return stats_impl(v,d,w); }
-Buffer<Statistics> statistics(View<double> v, bool d, const float* w) { return stats_impl(v,d,w); }
+Buffer<Statistics> statistics(View<float> v, bool d, const float* w, const std::uint8_t* valid) { return stats_impl(v,d,w,valid); }
+Buffer<Statistics> statistics(View<double> v, bool d, const float* w, const std::uint8_t* valid) { return stats_impl(v,d,w,valid); }
 } // namespace vcr::transforms::cuda

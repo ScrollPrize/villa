@@ -2,7 +2,7 @@ import numpy as np
 import json
 import pytest
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 from vesuvius.neural_tracing.fiber_trace_3d.inference_adapter import FiberTrace3DPredictAdapter
 from vesuvius.neural_tracing.fiber_trace_3d.inference_cache import validate_cached_model
 from vesuvius.neural_tracing.fiber_trace_3d.model import build_fiber_trace_3d_model
@@ -23,23 +23,16 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal,
     checkpoint = tmp_path / 'model.pt'
     torch.save({'config': cfg, 'step': 123}, checkpoint)
     source = tmp_path / 'input.zarr'
-    kwargs = dict(mode='w', shape=(16, 16, 16), chunks=(8, 8, 8), dtype='uint8')
-    try:
-        array = zarr.open_array(str(source), zarr_format=2, **kwargs)
-    except TypeError:  # Zarr 2 uses v2 by default.
-        array = zarr.open_array(str(source), **kwargs)
-    array[:] = 100
+    kwargs = dict(shape=(16, 16, 16), chunks=(8, 8, 8), dtype='uint8')
+    ZarrWriter.create(source, **kwargs)[:] = 100
     base = tmp_path / 'base.zarr'
     base_kwargs = dict(kwargs, shape=(16*input_scale,)*3)
-    try:
-        zarr.open_array(str(base), zarr_format=2, **base_kwargs)
-    except TypeError:
-        zarr.open_array(str(base), **base_kwargs)
+    ZarrWriter.create(base, **base_kwargs)
     for fmt in ('compact', 'legacy'):
         output = tmp_path / fmt / 'prediction.lasagna.json'
         infer.run_fiber_trace_3d_inference(
             input_path=str(source), output_path=output, checkpoint=checkpoint,
-            output_format=fmt, device='cpu', no_download=True, base_ref=str(base), base_scale=0,
+            output_format=fmt, device='cpu', base_ref=str(base), base_scale=0,
             tile_size=16, overlap=0, border=0,
             levels=3, ome_chunk=4, flush_workers=0, accumulator_workers=0,
             inference_precision='off',
@@ -48,8 +41,10 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal,
         channels = {c for group in manifest.groups.values() for c in group.channels}
         expected = {'presence', 'nx', 'ny', 'width'}
         if normal:
-            expected |= {'sheet_nx', 'sheet_ny', 'sheet_grad_mag'}
+            expected |= {'sheet_nx', 'sheet_ny'}
         assert channels == expected
+        assert manifest.validity_channel == 'chunks'
+        assert manifest.validity_by_chunks
         provenance = json.loads((output.parent / 'inference.json').read_text())
         schema = provenance['checkpoint']['output_schema']
         assert schema['annotations'] == cfg['annotations']
@@ -59,12 +54,14 @@ def test_volume_export_includes_available_normals(tmp_path, monkeypatch, normal,
         assert provenance['inference']['native_output_stride'] == 2
     if normal:
         level = 1 if input_scale == 1 else 2
-        array = zarr.open_array(str(tmp_path / f'compact/prediction.zarr/sd{level}/{level}'), mode='r')
+        array = open_zarr(tmp_path / f'compact/prediction.zarr/sd{level}/{level}')
         assert array.shape[1:] == (8,8,8)
-        assert array.shape[0] == array.chunks[0] == 7
-        assert np.any(array[-1] == 255)
+        assert array.shape[0] == array.chunks[0] == 6
         values = array[:]
-        assert np.all(values[:, values[0] == 0] == 0)
+        # Unblanked: encoded normal bytes are never 0 (round(n*127+128) >= 1), so a
+        # zero would only come from presence blanking, which is off by default.
+        assert not manifest.extra_fields['blank_invalid']
+        assert np.all(values[4:6] != 0)
 
 
 @pytest.mark.parametrize('width', [False, True])
@@ -88,7 +85,7 @@ def test_normals_are_explicit_and_preserve_other_outputs(width):
     nx,ny = encode_normal_nxny_u8(*expected[0].numpy())
     np.testing.assert_array_equal(values['sheet_nx'],nx)
     np.testing.assert_array_equal(values['sheet_ny'],ny)
-    assert np.all(values['sheet_grad_mag']==255)
+    assert set(values) == {'sheet_nx', 'sheet_ny'}
     with pytest.raises(ValueError,match='invalid normal'):
         new.finalize_product_slab(new.output_products[-1], np.full((6,2,2,2),np.nan))
 

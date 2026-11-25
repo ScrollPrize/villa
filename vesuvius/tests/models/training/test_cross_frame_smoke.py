@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-import zarr
+from vc_reader.reader import ZarrWriter
 from torch.utils.data import DataLoader
 
 from vesuvius.data import affine
@@ -17,7 +17,7 @@ from vesuvius.models.training.train import BaseTrainer
 
 
 def _write_zarr(path: Path, arr: np.ndarray, chunks: tuple) -> None:
-    z = zarr.open(str(path), mode="w", shape=arr.shape, dtype=arr.dtype, chunks=chunks)
+    z = ZarrWriter.create(path, shape=arr.shape, dtype=arr.dtype, chunks=chunks)
     z[...] = arr
 
 

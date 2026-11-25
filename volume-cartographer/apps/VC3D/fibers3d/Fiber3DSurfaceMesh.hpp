@@ -8,6 +8,7 @@ namespace vc3d::fibers3d { using scene3d::Point; using scene3d::Bounds; }
 #include <atomic>
 #include <memory>
 
+class OpenedVolumes;
 class Volume;
 
 namespace vc3d::fibers3d::surface
@@ -32,5 +33,5 @@ struct Mesh {
 // reconstruction, or modification of the source QuadSurface.
 std::shared_ptr<Mesh> build(const cv::Mat_<cv::Vec3f>& points, size_t maxBytes, const std::atomic_bool& cancelled);
 std::shared_ptr<Texture> sampleTexture(const cv::Mat_<cv::Vec3f>& points, cv::Vec2f scale,
-                                       Volume&, const std::atomic_bool& cancelled, int level, int maxEdge = 2048);
+                                       OpenedVolumes&, const Volume&, const std::atomic_bool& cancelled, int level, int maxEdge = 2048);
 }  // namespace vc3d::fibers3d::surface

@@ -1,10 +1,32 @@
 """Explicit build selection, including when an editable install redirects vc."""
 import importlib.abc
 import importlib.machinery
+import json
+import os
 from pathlib import Path
 import sys
 
 import pytest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolated_user_state(tmp_path_factory):
+    """VC3D's configuration, home and XDG directories under a scratch root.
+
+    cache.json names a scratch cache root, since an empty setting loses to the
+    /volpkgs and /ephemeral mount defaults. Nothing here reads or writes
+    ~/.VC3D or the real remote cache."""
+    root = tmp_path_factory.mktemp("vc3d-state")
+    config, cache, home = root / "config", root / "cache", root / "home"
+    for directory in (config, cache, home):
+        directory.mkdir()
+    (config / "cache.json").write_text(json.dumps({"version": 1, "root": str(cache)}))
+    with pytest.MonkeyPatch.context() as env:
+        env.setenv("VC3D_CONFIG_DIR", str(config))
+        env.setenv("HOME", str(home))
+        for name in ("CONFIG", "DATA", "CACHE", "STATE"):
+            env.setenv(f"XDG_{name}_HOME", str(root / "xdg" / name.lower()))
+        yield
 
 
 def pytest_addoption(parser):
@@ -23,6 +45,8 @@ def pytest_configure(config):
         raise pytest.UsageError(f"No built vc package in {root}")
     if any(name == "vc" or name.startswith("vc.") for name in sys.modules):
         raise pytest.UsageError("vc was imported before selecting the test build")
+    # Launchers the tests start (scripts/run_fiber_chunk_volume.py) load the same build.
+    os.environ["VC_BUILD_DIR"] = str(root.parent)
 
     class BuildFinder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path=None, target=None):

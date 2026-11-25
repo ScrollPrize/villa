@@ -228,5 +228,12 @@ after a drain, join and release/regrant precede automatic resume. Transient
 transport failure is not task termination and never releases reservations.
 
 Socket locks prevent concurrent servers; missing/corrupt journal with an existing
-initialized lock fails closed. Inventory changes require explicit reconciliation,
-not replacing the journal with an empty one.
+initialized lock fails closed. Startup reconciles verified-dead jobs before
+comparing inventories. A changed inventory can be adopted when no live jobs
+remain, preserving ownership history and retired task UUIDs, clearing stale
+manual splits, and applying the current constraints config. Reboot evidence
+(Linux boot ID, or a pre-boot journal write time for older journals) proves old
+processes dead without inspecting reused PIDs. Live jobs prevent an inventory
+change. Unverifiable process ownership fails startup loudly and leaves the
+journal unchanged; the auto-start caller receives the underlying diagnostic.
+These checks do not change client messages or release acknowledgements.

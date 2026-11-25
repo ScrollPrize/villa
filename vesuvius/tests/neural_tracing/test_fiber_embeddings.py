@@ -310,7 +310,7 @@ def test_combined_embedding_real_data_preflight():
             entry = {k:v for k,v in dataset.items() if k != "fiber_glob"}
             entry["fiber_paths"] = files
             probe = {**raw, "datasets": [entry], "batch_size": 1,
-                     "volume_io_threads": 1, "volume_decode_threads": 1, "volume_sample_threads": 1}
+                     "volume_io_threads": 1}
             if kind == "historical_test_datasets":
                 probe["sampling_strategy"] = "control_points"
                 probe["embedding"] = {"enabled": False}
@@ -477,7 +477,6 @@ def test_real_manifest_scales_and_actual_augmentation(tmp_path, monkeypatch):
     from test_fiber_trace_2d_loader import _write_fiber
     from vesuvius.neural_tracing.fiber_trace_3d import loader as module
     from vesuvius.neural_tracing.fiber_trace_3d.embedding import _nearest_by_scan
-    from vesuvius.neural_tracing.fiber_trace_2d.sampling import NumpyZarrCoordinateSampler
     volume = tmp_path / "volume.zarr"
     create_v2_group_array(volume, "0", shape=(64, 64, 64), chunks=(16, 16, 16), dtype="uint8")[:] = 80
     create_v2_array(volume / "1", shape=(32, 32, 32), chunks=(16, 16, 16), dtype="uint8")[:] = 80
@@ -502,8 +501,6 @@ def test_real_manifest_scales_and_actual_augmentation(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "load_fiber_file", load_spline_fixture)
     transform = np.eye(4)
     transform[:3, 3] = [0, 5, 3]
-    monkeypatch.setattr(module, "make_coordinate_sampler", lambda **kw: NumpyZarrCoordinateSampler(
-        kw["array"], level_spacing_base=kw["level_spacing_base"]))
     raw = {"patch_shape_zyx": [24, 24, 24], "embedding": {"enabled": True},
            "model_3d": {"output_stride": 2}, "geometry_backend": "eager", "seed": 73,
            "augment_enabled": True, "augment_rotation_degrees": 35,

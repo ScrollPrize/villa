@@ -6,9 +6,11 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <exception>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -22,6 +24,14 @@ struct LasagnaNormalAlignmentField;
 enum class FiberTraceParallelCorrespondence {
     Distance,
     PerpendicularGrid,
+};
+
+// Execution window only. Original curves, arc grids and scientific endpoints
+// are retained. Halo encounters supply refinement/deduplication context; only
+// final A attachments in the half-open core are emitted.
+struct FiberTraceConstraintWindow {
+    cv::Vec3d minimum, maximum;
+    double halo = 1024.;
 };
 
 struct FiberTraceConstraintConfig {
@@ -59,12 +69,17 @@ struct FiberTraceConstraintConfig {
     bool localOverlapPieces = false;
     bool localScorerOnly = false;
     bool binaryOrientationScore = false;
+    // Validation of sampled evidence only; geometric refinement never depends
+    // on measured winding categories, signs or prediction validity.
     std::optional<bool> certifyWinding;
     std::optional<bool> closestParallelEstimator;
     bool localNormalizeEvidence = true;
     bool localOnePerPair = false;
     bool localReplicateOverlap = false;
     bool localIncludeParallel = true;
+    // Whole input prefix queried only against the suffix. Zero disables this
+    // native bipartite mode; unlike arbitrary callbacks it stays parallel.
+    std::size_t crossQueryPrefix = 0;
     double localMinimumPieceLengthBaseVoxels = 0.0;
     double localSpacingBaseVoxels = 64.0;
     double localTangentSpanBaseVoxels = 16.0;
@@ -81,6 +96,16 @@ struct FiberTraceConstraintConfig {
     // Optional arc boundaries per input trace; geometry/continuity is preserved.
     std::vector<std::vector<double>> extraPieceCutsBaseVoxels;
     std::size_t parallelThreads = 0;
+    // Coarse CPU/output batch target and maximum spatial measurement batch.
+    std::size_t candidateBatchSize = 65536;
+    // Scheduling only: spatially group complete scoring jobs for chunk reuse.
+    // Zero retains source order for performance comparisons; no math changes.
+    double scoringRegionBaseVoxels = 4096.;
+    std::optional<FiberTraceConstraintWindow> spatialWindow;
+    // Experimental geometry scheduling: complete pair-owned hash shards run
+    // scoring/refinement/deduplication/normalization independently. Requires
+    // the unsigned whole-fiber geometry handoff; scientific rules unchanged.
+    bool pairOwnedGeometry = false;
 };
 
 struct FiberTraceConstraintPiece {
@@ -158,6 +183,12 @@ struct FiberTraceConstraintReport {
     std::size_t resampledPoints = 0;
     std::size_t spatialHits = 0;
     std::size_t measuredCandidates = 0;
+    std::size_t scoringBatches = 0;
+    std::size_t maximumBatchCandidates = 0;
+    std::size_t scoringRegions = 0;
+    std::size_t windingBatches = 0;
+    std::size_t windingRegions = 0;
+    std::size_t maximumWindingBatchCandidates = 0;
     std::size_t rejectedTangents = 0;
     std::size_t rejectedWinding = 0;
     std::size_t rejectedWindingCutoff = 0;
@@ -166,6 +197,7 @@ struct FiberTraceConstraintReport {
     std::size_t skippedSignedWindingConstraints = 0;
     double prepareSeconds = 0.0;
     double searchSeconds = 0.0;
+    // Sum of worker durations for overlapping sub-stages, not elapsed wall time.
     double orientationScoreSeconds = 0.0;
     double windingScoreSeconds = 0.0;
     double scoreSeconds = 0.0;
@@ -232,6 +264,8 @@ using FiberTraceWindingDistance = std::function<double(
     const cv::Vec3d& bBaseXYZ,
     double stepBaseVoxels)>;
 
+// Winding callbacks can be invoked concurrently by independent pair workers.
+// Batch callbacks receive the requested inner parallelism (one in the pool).
 using FiberTraceWindingDistanceBatch = std::function<std::vector<double>(
     const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectorsBaseXYZ,
     double stepBaseVoxels,
@@ -254,13 +288,63 @@ struct FiberTraceConstraintObjReport {
     std::size_t parallelSeparateWinding = 0;
 };
 
+// Observational only. Callbacks may arrive from query workers and must be
+// thread-safe; they must not throw or modify extraction inputs.
+struct FiberTraceConstraintProgress {
+    std::string_view phase;
+    std::size_t completed = 0;
+    std::size_t total = 0;
+    std::size_t candidates = 0;
+};
+using FiberTraceConstraintProgressCallback =
+    std::function<void(const FiberTraceConstraintProgress&)>;
+
+// Optional whole-fiber export hooks. Prepared is called once before scoring;
+// finalized batches have deterministic job IDs but may arrive concurrently and
+// out of order. Spans are borrowed only for the call. A blocking consumer applies
+// backpressure; exceptions abort extraction. Unsupported splitting/filtering
+// modes reject before invoking either hook, rather than exporting provisional data.
+struct FiberTraceConstraintStream {
+    std::function<void(std::span<const FiberTraceConstraintPiece>)> prepared;
+    std::function<void(std::size_t worker,std::size_t job,std::span<const FiberTraceConstraint>)> batch;
+    // Must not throw; unblock all consumers/producers immediately on failure.
+    std::function<void(std::exception_ptr)> failed;
+    // Synchronous geometry-to-spatial handoff. The driver partitions these
+    // finalized encounter positions, then calls measure on disjoint index sets
+    // from its workers (one call per worker at a time). All calls must finish
+    // before the driver returns; spans and the callable are borrowed. The
+    // returned extraction report has counts but no materialized constraints.
+    // Whole-fiber mode only.
+    // Evidence support is normalized BEFORE sampling, so invalid predictions
+    // discard observations without changing neighboring geometric support.
+    using Measure = std::function<std::vector<FiberTraceConstraint>(
+        std::span<const std::size_t>, std::size_t worker)>;
+    std::function<void(std::span<const FiberTraceConstraintPiece>,
+        std::span<const cv::Vec3d>, const Measure&)> geometryReady;
+    // Optional synchronous observer of normalized geometry, before ANY volume
+    // measurement. Borrowed pointers, valid only during this call. Diagnostics
+    // must not modify records. Also enables geometry-only benchmark checks.
+    std::function<void(std::span<const FiberTraceConstraint* const>)> inspectGeometry;
+};
+
 [[nodiscard]] FiberTraceConstraintReport extractFiberTraceConstraints(
     const std::vector<FiberletCropTraceLine>& lines,
     const FiberTraceConstraintConfig& config,
     const FiberTraceWindingDistance& windingDistance,
     const FiberTraceWindingDistanceBatch& windingDistanceBatch = {},
     const FiberTraceConstraintTracePairFilter& tracePairFilter = {},
-    const LasagnaNormalAlignmentField* alignedNormals = nullptr);
+    const LasagnaNormalAlignmentField* alignedNormals = nullptr,
+    const FiberTraceConstraintProgressCallback& progress = {});
+
+[[nodiscard]] FiberTraceConstraintReport extractFiberTraceConstraints(
+    const std::vector<FiberletCropTraceLine>& lines,
+    const FiberTraceConstraintConfig& config,
+    const FiberTraceWindingDistance& windingDistance,
+    const FiberTraceWindingDistanceBatch& windingDistanceBatch,
+    const FiberTraceConstraintTracePairFilter& tracePairFilter,
+    const LasagnaNormalAlignmentField* alignedNormals,
+    const FiberTraceConstraintProgressCallback& progress,
+    const FiberTraceConstraintStream& stream);
 
 [[nodiscard]] double dominantFiberTraceConstraintWindingDistance(
     const FiberTraceConstraint& constraint) noexcept;

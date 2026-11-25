@@ -7,7 +7,10 @@ auxiliary tasks from source segmentation targets.
 
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
-from scipy.ndimage import distance_transform_edt
+import vc_reader.transforms as A
+
+_SIGNED_DISTANCE = A.DistanceTransform(implicit_background=True)
+_INSIDE_DISTANCE = A.DistanceTransform(mode="inside", implicit_background=True)
 
 
 def create_distance_transform_config(aux_task_name: str, aux_config: Dict[str, Any], 
@@ -92,18 +95,16 @@ def compute_distance_transform(source_patch: np.ndarray, needs_sdt: bool = False
             distance_map = np.where(sdt < 0, -sdt, 0)
         else:
             if needs_sdt and np.any(binary_mask):
-                # Compute signed distance transform
-                inside_dist = distance_transform_edt(binary_mask)
-                outside_dist = distance_transform_edt(1 - binary_mask)
-                sdt = outside_dist - inside_dist
+                # Signed distance: negative inside, positive outside
+                sdt = _SIGNED_DISTANCE(binary_mask[None])[0]
                 sdt_cache[cache_key] = sdt
                 # For distance transform, use the inside distance
-                distance_map = inside_dist
+                distance_map = np.where(sdt < 0, -sdt, 0)
             else:
                 # Regular distance transform
                 if np.any(binary_mask):
                     # Compute distance transform from foreground pixels
-                    distance_map = distance_transform_edt(binary_mask)
+                    distance_map = _INSIDE_DISTANCE(binary_mask[None])[0]
                 else:
                     # No foreground pixels, return zeros
                     distance_map = np.zeros_like(channel_data)

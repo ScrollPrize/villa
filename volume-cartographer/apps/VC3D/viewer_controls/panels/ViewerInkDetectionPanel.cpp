@@ -4,7 +4,7 @@
 #include "elements/LabeledControlRow.hpp"
 #include "overlays/InkDetectionOverlayController.hpp"
 
-#include "vc/core/render/Colormaps.hpp"
+#include "Colormaps.hpp"
 
 #include <QComboBox>
 #include <QLabel>

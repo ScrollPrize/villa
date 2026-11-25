@@ -1,0 +1,335 @@
+// Computed arrays: a derived field (a max filter with a border) computed per chunk
+// from region reads of a stored array; a memory cache serves repeated reads; chunks
+// persist on disk and are reused by a later open of the same identity; mismatched
+// persisted arrays are refused; fill chunks; point sampling of the computed array;
+// concurrent readers of an uncached chunk compute it once; caller-thread-only arrays
+// compute every chunk on the reading thread; arrays asking for as many workers share
+// them, nested reads on a shared pool from concurrent callers finish, and concurrent
+// jobs share a pool's workers rather than the first one taking them all.
+#include "vc_reader/computed.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
+#include "vc_reader/zarr_write.hpp"
+#include "vc_reader/native/thread_pool.hpp"
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <future>
+#include <thread>
+#include <vector>
+
+namespace fs = std::filesystem;
+using namespace vcr;
+
+namespace {
+void require(bool condition, const std::string& message)
+{
+    if (!condition)
+        throw std::runtime_error(message);
+}
+
+constexpr int Z = 30, Y = 26, X = 22, C = 8, B = 2;  // array, chunk and border sizes
+
+std::uint8_t field(std::int64_t z, std::int64_t y, std::int64_t x)
+{
+    if (z < 0 || y < 0 || x < 0 || z >= Z || y >= Y || x >= X || z >= 16)
+        return 0;  // fill: outside, and the stored array's top slabs are never written
+    return std::uint8_t((z * 37 + y * 11 + x * 5) % 200 + 1);
+}
+
+// The maximum over the (2B+1)^3 neighbourhood, fill outside the array.
+std::uint8_t maxFiltered(std::int64_t z, std::int64_t y, std::int64_t x)
+{
+    std::uint8_t m = 0;
+    for (int dz = -B; dz <= B; ++dz)
+        for (int dy = -B; dy <= B; ++dy)
+            for (int dx = -B; dx <= B; ++dx)
+                m = std::max(m, field(z + dz, y + dy, x + dx));
+    return m;
+}
+
+struct Fixture {
+    fs::path root;
+    std::shared_ptr<Array> stored;
+    Fixture()
+        : root(fs::temp_directory_path() /
+               ("vc-reader-computed-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())))
+    {
+        zarr::CreateOptions create;
+        create.shape = {Z, Y, X};
+        create.chunks = {C, C, C};
+        create.compressor = "zstd";
+        auto writer = zarr::Writer::create(root / "input.zarr", create);
+        std::vector<std::uint8_t> data(std::size_t(16) * Y * X);
+        for (int z = 0; z < 16; ++z)
+            for (int y = 0; y < Y; ++y)
+                for (int x = 0; x < X; ++x)
+                    data[(std::size_t(z) * Y + y) * X + x] = field(z, y, x);
+        writer.writeRegion({0, 0, 0}, {16, Y, X}, data.data());
+        stored = std::shared_ptr<Array>(zarr::openArray((root / "input.zarr").string(), {}).array.release());
+    }
+    ~Fixture()
+    {
+        std::error_code ec;
+        fs::remove_all(root, ec);
+    }
+};
+
+// A max-filter computed array reading its input with region reads.
+struct Filter {
+    Array& input;
+    std::atomic<int> computed{0};
+    bool operator()(const Index& chunk, std::uint8_t* out)
+    {
+        ++computed;
+        const std::int64_t S = C + 2 * B;
+        std::vector<std::uint8_t> region(std::size_t(S * S * S));
+        input.read_many({{chunk[0] * C - B, chunk[1] * C - B, chunk[2] * C - B}}, {{S, S, S}}, {region.data()});
+        bool any = false;
+        for (int z = 0; z < C; ++z)
+            for (int y = 0; y < C; ++y)
+                for (int x = 0; x < C; ++x) {
+                    std::uint8_t m = 0;
+                    for (int dz = 0; dz <= 2 * B; ++dz)
+                        for (int dy = 0; dy <= 2 * B; ++dy)
+                            for (int dx = 0; dx <= 2 * B; ++dx)
+                                m = std::max(m, region[((z + dz) * S + (y + dy)) * S + (x + dx)]);
+                    out[(z * C + y) * C + x] = m;
+                    any |= m != 0;
+                }
+        return any;
+    }
+};
+
+computed::Options options(const fs::path& cache)
+{
+    computed::Options o;
+    o.shape = {Z, Y, X};
+    o.chunks = {C, C, C};
+    o.identity = "max-filter radius 2 of input.zarr";
+    o.cacheDir = cache;
+    return o;
+}
+
+void computedArrays(const Fixture& f)
+{
+    const fs::path cache = f.root / "cache";
+    Filter filter{*f.stored};
+    auto withMemory = options(cache);
+    withMemory.memoryCache = std::make_shared<MemoryCache>(1 << 20);
+    auto array = computed::open(withMemory, [&](const Index& c, std::uint8_t* out) { return filter(c, out); });
+    std::vector<std::uint8_t> all(std::size_t(Z) * Y * X);
+    array->read_many({{0, 0, 0}}, {{Z, Y, X}}, {all.data()});
+    for (int z = 0; z < Z; ++z)
+        for (int y = 0; y < Y; ++y)
+            for (int x = 0; x < X; ++x)
+                require(all[(std::size_t(z) * Y + y) * X + x] == maxFiltered(z, y, x), "computed chunk values");
+    const int grid = ((Z + C - 1) / C) * ((Y + C - 1) / C) * ((X + C - 1) / C);
+    require(filter.computed == grid, "each chunk computed once");
+    require(!array->chunk({3, 0, 0}), "an all-fill chunk is not stored");
+
+    // A second read is served by the memory cache.
+    std::vector<std::uint8_t> direct(all.size());
+    array->read_many({{0, 0, 0}}, {{Z, Y, X}}, {direct.data()});
+    require(direct == all && filter.computed == grid, "cached computed chunks are not recomputed");
+    array->flush();
+    require(array->stats().write_errors == 0, "persisted without errors");
+
+    // Point sampling of the computed array.
+    const double zyx[] = {5.0, 4.25, 3.5, 10, 10, 10};
+    float values[2];
+    array->sample_linear(zyx, 2, ElementType{'u', 1, false}, false, values);
+    const float y0 = maxFiltered(5, 4, 3) + 0.25f * (maxFiltered(5, 5, 3) - maxFiltered(5, 4, 3));
+    const float y1 = maxFiltered(5, 4, 4) + 0.25f * (maxFiltered(5, 5, 4) - maxFiltered(5, 4, 4));
+    require(std::abs(values[0] - (y0 + 0.5f * (y1 - y0))) < 1e-4f, "a sample interpolates computed voxels");
+    require(values[1] == float(maxFiltered(10, 10, 10)), "a voxel sample is the voxel");
+
+    // A later open of the same identity reads every chunk from disk.
+    auto reopened = computed::open(options(cache), [](const Index&, std::uint8_t*) -> bool {
+        throw std::runtime_error("persisted chunks are not recomputed");
+    });
+    std::vector<std::uint8_t> again(all.size());
+    reopened->read_many({{0, 0, 0}}, {{Z, Y, X}}, {again.data()});
+    require(again == all, "persisted chunks reused");
+    require(fs::exists(computed::cachePath(options(cache)) / "3.0.0.missing"), "fill chunks persist as markers");
+
+    auto other = options(cache);
+    other.dtype = "<u2";
+    bool refused = false;
+    try {
+        computed::open(other, [](const Index&, std::uint8_t*) { return false; });
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    require(refused, "a persisted identity with another dtype is refused");
+    other = options(cache);
+    other.identity = "max-filter radius 3 of input.zarr";
+    require(computed::cachePath(other) != computed::cachePath(options(cache)), "identities persist apart");
+
+    // Lossless compressed persistence.
+    auto packed = options(f.root / "packed");
+    packed.compressCache = true;
+    Filter again2{*f.stored};
+    {
+        auto a = computed::open(packed, [&](const Index& c, std::uint8_t* out) { return again2(c, out); });
+        a->read_many({{0, 0, 0}}, {{Z, Y, X}}, {again.data()});
+        require(again == all, "compressed persistence values");
+    }
+    auto b = computed::open(packed, [](const Index&, std::uint8_t*) -> bool { throw std::runtime_error("recomputed"); });
+    b->read_many({{0, 0, 0}}, {{Z, Y, X}}, {again.data()});
+    require(again == all, "compressed persisted chunks reused");
+}
+// Readers racing for one chunk that is not cached yet: one computes it, the others
+// wait for it or find it in the memory cache, never computing it again.
+void concurrentReadersComputeOnce()
+{
+    for (int round = 0; round < 200; ++round) {
+        computed::Options o;
+        o.shape = {C, C, C};
+        o.chunks = {C, C, C};
+        o.identity = "round " + std::to_string(round);
+        o.memoryCache = std::make_shared<MemoryCache>(1 << 20);
+        std::atomic<int> computed{0};
+        auto array = computed::open(o, [&](const Index&, std::uint8_t* out) {
+            ++computed;
+            std::memset(out, 7, std::size_t(C) * C * C);
+            return true;
+        });
+        std::atomic<bool> go{false};
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 8; ++t)
+            readers.emplace_back([&] {
+                while (!go) {}
+                const std::int64_t at[] = {1, 2, 3};
+                std::uint8_t value = 0;
+                array->read_points(at, 1, &value);
+                require(value == 7, "a raced read sees the computed chunk");
+            });
+        go = true;
+        for (auto& reader : readers)
+            reader.join();
+        require(computed == 1, "a chunk raced by concurrent readers is computed once");
+    }
+}
+void callerThreadOnly()
+{
+    computed::Options o;
+    o.shape = {4 * C, C, C};
+    o.chunks = {C, C, C};
+    o.identity = "caller thread";
+    o.memoryCache = std::make_shared<MemoryCache>(1 << 20);
+    o.callerThreadOnly = true;
+    const auto reader = std::this_thread::get_id();
+    std::atomic<int> elsewhere{0}, computed{0};
+    auto array = computed::open(o, [&](const Index& c, std::uint8_t* out) {
+        elsewhere += std::this_thread::get_id() != reader;
+        ++computed;
+        std::memset(out, int(c[0]) + 1, std::size_t(C) * C * C);
+        return true;
+    });
+    std::vector<std::uint8_t> all(std::size_t(4) * C * C * C);
+    array->read_many({{0, 0, 0}}, {{4 * C, C, C}}, {all.data()});
+    require(computed == 4 && elsewhere == 0, "caller-thread-only chunks are computed on the reading thread");
+    require(all.front() == 1 && all.back() == 4, "caller-thread-only values");
+
+    // A read never waits for another read's computation of the same chunk: the first
+    // computation finishes only after a second read of that chunk has returned.
+    o.identity = "caller thread, overlapping reads";
+    std::promise<void> secondDone;
+    auto second = secondDone.get_future().share();
+    std::atomic<int> calls{0};
+    auto overlapping = computed::open(o, [&](const Index&, std::uint8_t* out) {
+        if (++calls == 1 && second.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+            throw std::runtime_error("the second read waited for the first computation");
+        std::memset(out, 3, std::size_t(C) * C * C);
+        return true;
+    });
+    const std::int64_t at[] = {0, 0, 0};
+    auto first = std::async(std::launch::async, [&] {
+        std::uint8_t v = 0;
+        overlapping->read_points(at, 1, &v);
+        return v;
+    });
+    while (calls == 0) std::this_thread::yield();
+    std::uint8_t v = 0;
+    overlapping->read_points(at, 1, &v);
+    secondDone.set_value();
+    require(v == 3 && first.get() == 3 && calls == 2, "overlapping caller-thread-only reads compute independently");
+}
+// Arrays asking for as many workers share one pool. A computed array and the stored
+// array its chunks read from, both on a two-worker pool, read by four callers at once:
+// every nested read finishes and the values are right.
+void sharedWorkers(const Fixture& f)
+{
+    require(sharedPool(3) == sharedPool(3) && sharedPool(3) != sharedPool(4), "pools are shared by worker count");
+    zarr::OpenOptions open;
+    open.threads = 2;
+    auto stored = zarr::openArray((f.root / "input.zarr").string(), open).array;
+    Filter filter{*stored};
+    computed::Options o;
+    o.shape = {Z, Y, X};
+    o.chunks = {C, C, C};
+    o.identity = "shared workers";
+    o.threads = 2;
+    o.memoryCache = std::make_shared<MemoryCache>(1 << 20);
+    auto array = computed::open(o, [&](const Index& c, std::uint8_t* out) { return filter(c, out); });
+    std::vector<std::future<std::vector<std::uint8_t>>> reads;
+    for (int t = 0; t < 4; ++t)
+        reads.push_back(std::async(std::launch::async, [&] {
+            std::vector<std::uint8_t> all(std::size_t(Z) * Y * X);
+            array->read_many({{0, 0, 0}}, {{Z, Y, X}}, {all.data()});
+            return all;
+        }));
+    for (auto& read : reads) {
+        require(read.wait_for(std::chrono::seconds(20)) == std::future_status::ready, "nested reads on a shared pool finish");
+        const auto all = read.get();
+        for (int z = 0; z < Z; ++z)
+            for (int y = 0; y < Y; ++y)
+                for (int x = 0; x < X; ++x)
+                    require(all[(std::size_t(z) * Y + y) * X + x] == maxFiltered(z, y, x), "shared-pool computed values");
+    }
+}
+// A long job on a two-worker pool does not keep the workers from a second job:
+// some of the second job's items run on workers, not only on its caller.
+void fairWorkers()
+{
+    ThreadPool pool(2);
+    std::atomic<bool> longStarted{false};
+    auto longJob = std::async(std::launch::async, [&] {
+        pool.parallel_for(2000, [&](std::size_t) {
+            longStarted = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        });
+    });
+    while (!longStarted) std::this_thread::yield();
+    const auto caller = std::this_thread::get_id();
+    std::atomic<int> onWorkers{0};
+    pool.parallel_for(50, [&](std::size_t) {
+        onWorkers += std::this_thread::get_id() != caller;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    longJob.get();
+    require(onWorkers > 0, "a concurrent job gets items run by the pool's workers");
+}
+}  // namespace
+
+int main()
+{
+    try {
+        Fixture f;
+        computedArrays(f);
+        concurrentReadersComputeOnce();
+        callerThreadOnly();
+        sharedWorkers(f);
+        fairWorkers();
+        std::cout << "computed arrays passed\n";
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return 1;
+    }
+}

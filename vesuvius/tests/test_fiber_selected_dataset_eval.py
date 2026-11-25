@@ -42,9 +42,13 @@ def test_prepared_soft_run_does_not_rebuild_graph(tmp_path,monkeypatch):
     tensor=tmp_path/'tensors.npz';np.savez(tensor,family=np.array([0]))
     monkeypatch.setattr(soft,'validate',lambda c:None)
     monkeypatch.setattr(soft.uv,'prepare',lambda c:pytest.fail('Must not rebuild selected graph'))
-    monkeypatch.setattr(soft,'prepare_samples',lambda c,d:dict(sample=np.array([1])))
+    source={'store':'selected', 'commit_sequence':3}
+    def prepare(c,d,*,source_version):
+        assert source_version==source
+        return dict(sample=np.array([1]))
+    monkeypatch.setattr(soft,'prepare_samples',prepare)
     monkeypatch.setattr(soft.uv,'launch_tensor_solve',lambda c,*args:c)
-    result=soft.run_prepared(dict(output_root=str(tmp_path/'run'),tensor_cache=str(tensor)))
+    result=soft.run_prepared(dict(output_root=str(tmp_path/'run'),tensor_cache=str(tensor)),source_version=source)
     assert result['tensor_sha256'] and result['samples_sha256']
 
 

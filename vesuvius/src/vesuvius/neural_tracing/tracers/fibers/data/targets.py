@@ -32,7 +32,7 @@ def plane_targets(p, s, t, t_end, pos, frame, planes):
     return ab, m
 
 
-def resolve_trace_seed(item, vol):
+def resolve_trace_seed(item, ct, spec):
     """Give a simulated trace the tracer's CT seed heading before its image is built.
 
     Sets the seed tangent. A path still holding the seed heading (< 12 voxels) also
@@ -46,7 +46,7 @@ def resolve_trace_seed(item, vol):
     if family is None:
         return item
     item['fiber_family'] = family
-    heading = oriented_seed_heading(vol, item['seed_pos'], family, item['seed_tangent'])
+    heading = oriented_seed_heading(ct, spec, item['seed_pos'], family, item['seed_tangent'])
     item['seed_tangent'] = heading
     if pending is not None:
         fiber, t, reverse, cfg = pending

@@ -1,8 +1,7 @@
 # create_vf.py
 import torch
-import zarr
 import numpy as np
-from vesuvius.data.utils import open_zarr, open_zarr_group, require_zarr_array
+from vc_reader.reader import create_group, open_zarr
 from typing import Dict, Tuple, Optional
 from tqdm.auto import tqdm
 
@@ -10,12 +9,12 @@ try:
     # Module execution (recommended)
     from .smooth_vf import VectorFieldModule
     from .vf_io import load_density_mask, load_eigenvector_field
-    from .vf_format import OMEU8VectorWriter
+    from .vf_format import OMEU8VectorWriter, require_array
 except ImportError:
     # Script execution fallback
     from smooth_vf import VectorFieldModule
     from vf_io import load_density_mask, load_eigenvector_field
-    from vf_format import OMEU8VectorWriter
+    from vf_format import OMEU8VectorWriter, require_array
 
 class VectorFieldComputer:
     def __init__(
@@ -37,7 +36,7 @@ class VectorFieldComputer:
         self,
         output_zarr: str,
         chunk_size: Tuple[int,int,int],
-        compressor=None,
+        codec=None,
         *,
         ome_u8: bool = True,
         group_name: str = "horizontal",   # semantic name per Paul's spec
@@ -48,19 +47,18 @@ class VectorFieldComputer:
         export_field: str = "V",          # which vector to export to OME-u8: "U" | "V" |
     ):
         # open input to get shape
-        inp = open_zarr(self.input_zarr, mode='r')
+        inp = open_zarr(self.input_zarr)
         Z, Y, X = inp.shape[-3:]
         cz, cy, cx = chunk_size
 
         # prepare outputs
-        root = open_zarr_group(output_zarr, mode='a')
+        root = create_group(output_zarr)
+        codec = codec or {}
         if not ome_only:
-            U_ds = require_zarr_array(root, 'U', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                      dtype=np.float32, compressor=compressor, overwrite=True)
-            V_ds = require_zarr_array(root, 'V', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                      dtype=np.float32, compressor=compressor, overwrite=True)
-            N_ds = require_zarr_array(root, 'N', shape=(3,Z,Y,X), chunks=(3,cz,cy,cx),
-                                      dtype=np.float32, compressor=compressor, overwrite=True)
+            U_ds, V_ds, N_ds = (
+                require_array(root, name, shape=(3,Z,Y,X), chunks=(3,cz,cy,cx), dtype=np.float32, **codec)
+                for name in ('U', 'V', 'N')
+            )
         # OME-ish uint8 writer (writes component groups z/y/x at scale)
         writer = None
         if ome_u8:
@@ -69,7 +67,7 @@ class VectorFieldComputer:
                 group_name=group_name,
                 vol_shape_zyx=(Z, Y, X),
                 chunks_zyx=(cz, cy, cx),
-                compressor=compressor,
+                codec=codec or None,
                 scale_name=output_ome_scale,
                 downsample=output_downsample,
                 make_confidence=write_confidence,

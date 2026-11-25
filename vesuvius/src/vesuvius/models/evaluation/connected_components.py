@@ -1,5 +1,5 @@
 import numpy as np
-import cc3d
+from vc_reader.geometry import label_components
 import torch
 from typing import Dict, Optional
 from .base_metric import BaseMetric
@@ -135,8 +135,8 @@ def get_connected_components_difference(
             gt_mask = ((gt_np[i] == c) & current_valid).astype(np.uint8)
             pred_mask = ((pred_np[i] == c) & current_valid).astype(np.uint8)
 
-            cc_gt = cc3d.connected_components(gt_mask, connectivity=connectivity)
-            cc_pred = cc3d.connected_components(pred_mask, connectivity=connectivity)
+            cc_gt, _ = label_components(gt_mask, connectivity=connectivity)
+            cc_pred, _ = label_components(pred_mask, connectivity=connectivity)
 
             num_cc_gt = int(cc_gt.max())
             num_cc_pred = int(cc_pred.max())

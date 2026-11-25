@@ -144,7 +144,7 @@ TEST_CASE("cacheStats / resetCacheStats on in-memory store")
 TEST_CASE("meta member is a usable JSON object")
 {
     GridStore gs(cv::Rect(0, 0, 100, 100), 10);
-    gs.meta = utils::Json::object();
+    gs.meta = nlohmann::json::object();
     gs.meta["scroll"] = "1";
     CHECK(gs.meta.is_object());
 }

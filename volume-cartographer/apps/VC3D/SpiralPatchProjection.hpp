@@ -19,8 +19,10 @@ inline std::optional<QPointF> projectPatchPoint(
 {
     if (!from || !to) return std::nullopt;
     if (from == to) return point;
-    const auto sample = from->sampleAtSurface({point.x(), point.y()});
-    const auto volume = sample ? std::optional<cv::Vec3f>(sample.volume) : std::nullopt;
+    const cv::Vec2f grid(from->surfaceToGrid({point.x(), point.y()}));
+    cv::Vec3f position;
+    from->pointSurface()->pointsAt(grid.val, 1, position.val, nullptr);
+    const auto volume = std::isfinite(cv::norm(position)) ? std::optional<cv::Vec3f>(position) : std::nullopt;
     if (!volume || !locate) return std::nullopt;
     const auto ptr = locate(*to, *volume, tolerance);
     if (!ptr) return std::nullopt;

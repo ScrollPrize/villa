@@ -8,21 +8,20 @@
 #include <optional>
 #include <system_error>
 
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 #include <omp.h>
 #include <QLoggingCategory>
 #include <QString>
 
-#include "vc/core/types/VcDataset.hpp"
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/ChunkedTensor.hpp"
-#include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
+#include "vc_reader/zarr.hpp"
+#include "vc_reader/array.hpp"
 #include "vc/ui/VCCollection.hpp"
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
@@ -69,64 +68,6 @@ QString directionToString(SegmentationGrowthDirection direction)
     }
 }
 
-bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
-                          const QString& cacheRoot,
-                          std::vector<DirectionField>& out,
-                          QString& error)
-{
-    if (!config.isValid()) {
-        return true;
-    }
-
-    const QString path = config.path.trimmed();
-    if (path.isEmpty()) {
-        return true;
-    }
-
-    const std::string zarrPath = path.toStdString();
-    std::error_code fsError;
-    if (!std::filesystem::exists(zarrPath, fsError)) {
-        const QString reason = fsError ? QString::fromStdString(fsError.message()) : QString();
-        error = reason.isEmpty()
-            ? QStringLiteral("Direction field directory does not exist: %1").arg(path)
-            : QStringLiteral("Direction field directory error (%1): %2").arg(path, reason);
-        return false;
-    }
-
-    try {
-        const int scaleLevel = std::clamp(config.scale, 0, 5);
-
-        std::vector<std::unique_ptr<vc::VcDataset>> datasets;
-        datasets.reserve(3);
-        for (char axis : std::string("xyz")) {
-            auto dsPath = std::filesystem::path(zarrPath) / std::string(1, axis) / std::to_string(scaleLevel);
-            datasets.push_back(std::make_unique<vc::VcDataset>(dsPath));
-        }
-
-        const float scaleFactor = std::pow(2.0f, -static_cast<float>(scaleLevel));
-        const std::string uniqueId = std::to_string(std::hash<std::string>{}(zarrPath + std::to_string(scaleLevel)));
-        const std::string cacheRootStr = cacheRoot.toStdString();
-
-        const float weight = static_cast<float>(std::clamp(config.weight, 0.0, 10.0));
-
-        out.emplace_back(segmentationDirectionFieldOrientationKey(config.orientation).toStdString(),
-                         std::make_unique<Chunked3dVec3fFromUint8>(std::move(datasets),
-                                                                   scaleFactor,
-                                                                   cacheRootStr,
-                                                                   uniqueId),
-                         std::unique_ptr<Chunked3dFloatFromUint8>(),
-                         weight);
-    } catch (const std::exception& ex) {
-        error = QStringLiteral("Failed to load direction field at %1: %2").arg(path, QString::fromStdString(ex.what()));
-        return false;
-    } catch (...) {
-        error = QStringLiteral("Failed to load direction field at %1: unknown error").arg(path);
-        return false;
-    }
-
-    return true;
-}
-
 void populateCorrectionsCollection(const SegmentationCorrectionsPayload& payload, VCCollection& collection)
 {
     for (const auto& entry : payload.collections) {
@@ -147,51 +88,9 @@ void populateCorrectionsCollection(const SegmentationCorrectionsPayload& payload
     }
 }
 
-void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
+nlohmann::json buildTracerParams(const SegmentationGrowthRequest& request)
 {
-    if (!surface || !volume) {
-        return;
-    }
-    cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return;
-    }
-
-    const int centerRow = std::clamp(points->rows / 2, 0, points->rows - 1);
-    const int centerCol = std::clamp(points->cols / 2, 0, points->cols - 1);
-    const int nextCol = std::clamp(centerCol + 1, 0, points->cols - 1);
-    const int nextRow = std::clamp(centerRow + 1, 0, points->rows - 1);
-
-    const cv::Vec3f p = (*points)(centerRow, centerCol);
-    const cv::Vec3f px = (*points)(centerRow, nextCol);
-    const cv::Vec3f py = (*points)(nextRow, centerCol);
-
-    cv::Vec3f normal = (px - p).cross(py - p);
-    if (cv::norm(normal) < 1e-5f) {
-        return;
-    }
-    cv::normalize(normal, normal);
-
-    auto [w, h, d] = volume->shapeXyz();
-    cv::Vec3f volumeCenter(w * 0.5f, h * 0.5f, d * 0.5f);
-    cv::Vec3f toCenter = volumeCenter - p;
-    toCenter[2] = 0.0f;
-
-    if (normal.dot(toCenter) >= 0.0f) {
-        return; // already inward
-    }
-
-    cv::Mat normals = surface->channel("normals");
-    if (!normals.empty()) {
-        cv::Mat_<cv::Vec3f> adjusted = normals;
-        adjusted *= -1.0f;
-        surface->setChannel("normals", adjusted);
-    }
-}
-
-utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
-{
-    utils::Json params = utils::Json::object();
+    nlohmann::json params = nlohmann::json::object();
     params["rewind_gen"] = -1;
     params["grow_mode"] = directionToString(request.direction).toStdString();
     params["grow_steps"] = std::max(0, request.steps);
@@ -247,11 +146,11 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
     const int allowedCount = static_cast<int>(allowUp) + static_cast<int>(allowDown) +
                              static_cast<int>(allowLeft) + static_cast<int>(allowRight);
     if (allowedCount > 0 && allowedCount < 4) {
-        utils::Json allowedArr = utils::Json::array();
-        if (allowDown) allowedArr.push_back(utils::Json("down"));
-        if (allowRight) allowedArr.push_back(utils::Json("right"));
-        if (allowUp) allowedArr.push_back(utils::Json("up"));
-        if (allowLeft) allowedArr.push_back(utils::Json("left"));
+        nlohmann::json allowedArr = nlohmann::json::array();
+        if (allowDown) allowedArr.push_back(nlohmann::json("down"));
+        if (allowRight) allowedArr.push_back(nlohmann::json("right"));
+        if (allowUp) allowedArr.push_back(nlohmann::json("up"));
+        if (allowLeft) allowedArr.push_back(nlohmann::json("left"));
         params["growth_directions"] = std::move(allowedArr);
     }
     if (!request.customParams.is_null()) {
@@ -298,18 +197,8 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         result.error = QStringLiteral("Segmentation surface lacks a generations channel");
         return result;
     }
-    ensureNormalsInward(context.resumeSurface, context.volume);
 
-    if (!context.cacheRoot.isEmpty()) {
-        std::error_code ec;
-        std::filesystem::create_directories(context.cacheRoot.toStdString(), ec);
-        if (ec) {
-            result.error = QStringLiteral("Failed to create cache directory: %1").arg(QString::fromStdString(ec.message()));
-            return result;
-        }
-    }
-
-    utils::Json params = buildTracerParams(request);
+    nlohmann::json params = buildTracerParams(request);
 
     int startGen = 0;
     {
@@ -326,7 +215,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             if (meta.contains("max_gen")) {
                 const auto& v = meta["max_gen"];
                 if (v.is_number()) {
-                    const int metaGen = static_cast<int>(std::round(v.get_double()));
+                    const int metaGen = static_cast<int>(std::round(v.get<double>()));
                     startGen = std::max(startGen, metaGen);
                 }
             }
@@ -371,7 +260,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     if (!params.contains("rewind_gen")) {
         params["rewind_gen"] = -1;
     }
-    params["cache_root"] = context.cacheRoot.toStdString();
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();
     }
@@ -390,42 +278,14 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         populateCorrectionsCollection(request.corrections, correctionCollection);
     }
 
-    std::vector<DirectionField> directionFields;
-    for (const auto& config : request.directionFields) {
-        if (!config.isValid()) {
-            continue;
-        }
-
-        QString loadError;
-        if (!appendDirectionField(config, context.cacheRoot, directionFields, loadError)) {
-            result.error = loadError;
-            return result;
-        }
-    }
-
     try {
         qCInfo(lcSegGrowth) << "Calling tracer()";
-        qCInfo(lcSegGrowth) << "  cacheRoot:" << context.cacheRoot;
         qCInfo(lcSegGrowth) << "  voxelSize:" << context.voxelSize;
         qCInfo(lcSegGrowth) << "  resumeSurface:" << (context.resumeSurface ? context.resumeSurface->id.c_str() : "<null>");
         const auto collectionCount = correctionCollection.getAllCollections().size();
         qCInfo(lcSegGrowth) << "  corrections collections:" << collectionCount;
         if (request.correctionsZRange) {
             qCInfo(lcSegGrowth) << "  corrections z-range:" << request.correctionsZRange->first << request.correctionsZRange->second;
-        }
-        if (!directionFields.empty()) {
-            int idx = 0;
-            for (const auto& config : request.directionFields) {
-                if (!config.isValid()) {
-                    continue;
-                }
-                qCInfo(lcSegGrowth)
-                    << "  direction field[#" << idx << "] path:" << config.path
-                    << "orientation:" << segmentationDirectionFieldOrientationKey(config.orientation)
-                    << "scale:" << config.scale
-                    << "weight:" << config.weight;
-                ++idx;
-            }
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
 
@@ -435,17 +295,20 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             qCInfo(lcSegGrowth) << "  regular tracer OpenMP threads forced to 1";
         }
 
-        QuadSurface* surface = tracer(*context.volume,
+        // The tracer samples the working level point by point from its memory cache
+        // (the tracer's cache_size parameter, as for vc_grow_seg_from_seed).
+        auto options = context.volume->sourceOpenOptions();
+        options.memoryCache = std::make_shared<vcr::MemoryCache>(size_t(params.value("cache_size", 1e9)));
+        auto level = vcr::zarr::openPyramidLevel(
+            context.volume->sourceLocation(), context.volume->baseScaleLevel(), options);
+        QuadSurface* surface = tracer(*level.array,
                                       1.0f,
-                                      context.level,
                                       origin,
                                       params,
-                                      context.cacheRoot.toStdString(),
                                       static_cast<float>(context.voxelSize),
-                                      directionFields,
                                       context.resumeSurface,
                                       std::filesystem::path(),
-                                      utils::Json{},
+                                      nlohmann::json{},
                                       correctionCollection,
                                       context.allowedGrowthMask.empty() ? nullptr : &context.allowedGrowthMask);
 

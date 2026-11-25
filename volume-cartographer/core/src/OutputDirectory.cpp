@@ -1,0 +1,114 @@
+#include "vc/core/util/OutputDirectory.hpp"
+
+#include <algorithm>
+#include <stdexcept>
+#include <system_error>
+#include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
+namespace vc::core::util {
+
+namespace {
+
+bool isAtomicWriteTemporaryName(std::string_view name)
+{
+    const auto marker = name.rfind(".tmp.");
+    if (marker == std::string_view::npos)
+        return false;
+    auto suffix = name.substr(marker + 5);
+    const auto separator = suffix.find('.');
+    if (separator == std::string_view::npos || separator == 0 || separator + 1 == suffix.size())
+        return false;
+    const auto isUnsignedInteger = [](std::string_view value) {
+        return std::all_of(
+            value.begin(), value.end(), [](char character) {
+                return character >= '0' && character <= '9';
+            });
+    };
+    return isUnsignedInteger(suffix.substr(0, separator)) &&
+        isUnsignedInteger(suffix.substr(separator + 1));
+}
+
+} // namespace
+
+struct ExclusiveDirectoryLock::Impl {
+#if defined(_WIN32)
+    HANDLE handle = INVALID_HANDLE_VALUE;
+#else
+    int descriptor = -1;
+#endif
+};
+
+ExclusiveDirectoryLock::ExclusiveDirectoryLock(
+    const std::filesystem::path& directory)
+    : impl_(std::make_unique<Impl>())
+{
+    std::filesystem::create_directories(directory);
+#if defined(_WIN32)
+    impl_->handle = ::CreateFileW(
+        directory.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (impl_->handle == INVALID_HANDLE_VALUE) {
+        throw std::filesystem::filesystem_error(
+            "cannot exclusively lock directory", directory,
+            std::error_code(
+                static_cast<int>(::GetLastError()), std::system_category()));
+    }
+#else
+    impl_->descriptor = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    if (impl_->descriptor < 0 || ::flock(impl_->descriptor, LOCK_EX | LOCK_NB) != 0) {
+        const std::error_code error(errno, std::generic_category());
+        if (impl_->descriptor >= 0)
+            ::close(impl_->descriptor);
+        impl_->descriptor = -1;
+        throw std::filesystem::filesystem_error(
+            "cannot exclusively lock directory", directory, error);
+    }
+#endif
+}
+
+ExclusiveDirectoryLock::~ExclusiveDirectoryLock()
+{
+#if defined(_WIN32)
+    if (impl_ && impl_->handle != INVALID_HANDLE_VALUE)
+        ::CloseHandle(impl_->handle);
+#else
+    if (impl_ && impl_->descriptor >= 0) {
+        (void)::flock(impl_->descriptor, LOCK_UN);
+        ::close(impl_->descriptor);
+    }
+#endif
+}
+
+std::size_t cleanupAtomicWriteTemporaryFiles(
+    const std::filesystem::path& root)
+{
+    if (!std::filesystem::exists(root))
+        return 0;
+    std::vector<std::filesystem::path> abandoned;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             root, std::filesystem::directory_options::skip_permission_denied)) {
+        if (entry.is_regular_file() &&
+            isAtomicWriteTemporaryName(entry.path().filename().string())) {
+            abandoned.push_back(entry.path());
+        }
+    }
+    for (const auto& path : abandoned)
+        std::filesystem::remove(path);
+    return abandoned.size();
+}
+
+} // namespace vc::core::util

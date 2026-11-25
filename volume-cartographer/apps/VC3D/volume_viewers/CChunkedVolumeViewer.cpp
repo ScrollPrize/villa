@@ -1,20 +1,17 @@
+#include <vc_reader/display.hpp>
 #include "CChunkedVolumeViewer.hpp"
-#include "SurfaceRenderPolicy.hpp"
 
 #include <atomic>
 
 #include "CState.hpp"
-#include "elements/DownloadQueueDebugOverlay.hpp"
-#include "elements/DownloadQueueStats.hpp"
+#include "OpenedVolumes.hpp"
 #include "CameraGizmoWidget.hpp"
 #include "VolumetricCompositor.hpp"
 #include "elements/ViewerStatsBar.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
-#include "vc/core/render/Colormaps.hpp"
-#include "vc/core/render/PostProcess.hpp"
-#include "vc/core/render/ChunkCache.hpp"
-#include "vc/core/render/SurfaceCache.hpp"
+#include "Colormaps.hpp"
+#include "DisplayPalette.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -23,7 +20,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/ui/VCCollection.hpp"
 
-#include <QApplication>
+#include <QCoreApplication>
 #include <QCursor>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -40,92 +37,33 @@
 #include <QPointer>
 #include <QSettings>
 #include <QTimer>
-#include <QTransform>
 #include <QVBoxLayout>
-#include <QVector3D>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
-#include <filesystem>
 #include <limits>
 #include <map>
-#include <mutex>
 #include <optional>
-#include <queue>
 #include <source_location>
-#include <sstream>
-#include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 
-#include <opencv2/imgproc.hpp>
 
 namespace {
 
-std::atomic<std::uint64_t> g_nextChunkViewId{1};
-
-std::vector<std::array<float, 2>> stratifiedViewportSamples(
-    int width, int height, std::uint64_t version, int step = 8)
-{
-    std::vector<std::array<float, 2>> result;
-    if (width <= 0 || height <= 0)
-        return result;
-    step = std::max(1, step);
-    result.reserve(std::size_t((width + step - 1) / step) *
-                   std::size_t((height + step - 1) / step));
-    auto hash = [version](std::uint64_t value) {
-        value ^= version + 0x9e3779b97f4a7c15ULL + (value << 6) + (value >> 2);
-        value ^= value >> 30;
-        value *= 0xbf58476d1ce4e5b9ULL;
-        value ^= value >> 27;
-        value *= 0x94d049bb133111ebULL;
-        return value ^ (value >> 31);
-    };
-    for (int y = 0; y < height; y += step) {
-        for (int x = 0; x < width; x += step) {
-            const std::uint64_t cell = std::uint64_t(y / step) *
-                std::uint64_t((width + step - 1) / step) + std::uint64_t(x / step);
-            const auto random = hash(cell);
-            const int cellWidth = std::min(step, width - x);
-            const int cellHeight = std::min(step, height - y);
-            result.push_back({
-                float(x + int(random % std::uint64_t(cellWidth))),
-                float(y + int((random >> 32) % std::uint64_t(cellHeight)))});
-        }
-    }
-    return result;
-}
-
 constexpr float kMinScale = 0.002f;
 constexpr float kMaxScale = 128.0f;
-// Global clock is ~16ms/tick. Durations expressed in ticks for serviceRenderTick.
-constexpr int kGlobalTickMs = 16;
-constexpr int kStatusRefreshTicks = 5000 / kGlobalTickMs;           // ~313 ticks (5s)
-// Non-interactive chunk-ready coalescing. Chunks for one viewpoint trickle in
-// over many milliseconds; the default 16ms render debounce re-renders the whole
-// frame per chunk (~9-11x per viewpoint). Debounce chunk-ready re-renders on a
-// longer window so a burst collapses into ~1 render once chunks stop arriving.
 constexpr float kResolutionLodZoomBias = 0.5f;
 constexpr float kSegmentationResolutionLodZoomBias = 1.0f;
 constexpr int kSurfaceResolutionLevelBias = 1;
 constexpr int kInitialSegmentationSurfaceLevel = 5;
-constexpr std::size_t kOverlayTargetPageMaximumBytes = 128ULL * 1024ULL * 1024ULL;
-constexpr int kSurfaceTileRenderDebounceMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
 
 constexpr const char* kMeasurementOverlayKey = "segmentation_measurement";
 
 constexpr float kFocusProjectionThreshold = 4.0f;
-
-bool isSupportedStreamingCompositeMethod(const std::string& method)
-{
-    return method == "mean" || method == "max" || method == "min" ||
-           method == "alpha" || method == "volumetric";
-}
 
 bool finiteVec2(const cv::Vec2f& v)
 {
@@ -245,7 +183,8 @@ SafeFocusProjection validateSafeFocusProjection(
         result.reason = "invalid_nearest_point";
         return result;
     }
-    const cv::Vec3f normal = surface.gridNormal(result.nearestRow, result.nearestCol);
+    cv::Vec3f normal;
+    surface.pointAt(float(result.nearestCol), float(result.nearestRow), nullptr, normal.val);
     if (!finiteVec3(normal)) {
         result.reason = "non_finite_grid_normal";
         return result;
@@ -333,31 +272,6 @@ private:
     std::string details_;
 };
 
-void applyPerPixelNormalOffset(cv::Mat_<cv::Vec3f>& coords,
-                               const cv::Mat_<cv::Vec3f>& normals,
-                               float zOff)
-{
-    if (zOff == 0.0f || coords.empty() || normals.empty())
-        return;
-
-    const int h = std::min(coords.rows, normals.rows);
-    const int w = std::min(coords.cols, normals.cols);
-    for (int y = 0; y < h; ++y) {
-        auto* coordRow = coords.ptr<cv::Vec3f>(y);
-        const auto* normalRow = normals.ptr<cv::Vec3f>(y);
-        for (int x = 0; x < w; ++x) {
-            cv::Vec3f& p = coordRow[x];
-            const cv::Vec3f& n = normalRow[x];
-            if (!vc::geometry::validSurfacePoint(p) ||
-                !std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
-                continue;
-            }
-            p += n * zOff;
-        }
-    }
-}
-
-
 QString formatVec3(const cv::Vec3f& v)
 {
     return QString("(%1, %2, %3)")
@@ -391,30 +305,26 @@ QString formatByteSize(std::size_t bytes)
     return QString("%1 B").arg(bytes);
 }
 
-float scaleForSurfaceRenderStartLevel(int renderLevel, int numLevels)
+// The view scale (pixels per working level-0 voxel) at which `level` of the opened
+// levels is the source level: 0.75 pixels per voxel of that level. With no opened levels
+// there is only a nominal level 0.
+float scaleForRenderLevel(const vc3d::ViewerLevels* levels, int level, float lodZoomBias)
 {
-    const int maxLevel = std::max(0, numLevels - 1);
-    const int clampedRenderLevel = std::clamp(renderLevel, 0, maxLevel);
-    int dsLevel = clampedRenderLevel + kSurfaceResolutionLevelBias;
-    if (dsLevel > maxLevel)
-        dsLevel = maxLevel;
-
-    const float dsScale = static_cast<float>(std::uint64_t{1} << dsLevel);
-    return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
+    const int count = levels ? levels->count() : 1;
+    const int clamped = std::clamp(level, 0, std::max(0, count - 1));
+    double extent = 1.0;
+    if (levels && levels->has(clamped)) {
+        const auto e = vcr::grid::voxelExtent(levels->gridLevel(clamped));
+        extent = *std::max_element(e.begin(), e.end());
+    }
+    if (!std::isfinite(extent) || extent <= 0.0)
+        extent = 1.0;
+    return std::clamp(0.75f / (static_cast<float>(extent) * lodZoomBias), kMinScale, kMaxScale);
 }
 
-float scaleForCoarsestPlaneRenderLevel(int numLevels)
+float scaleForCoarsestRenderLevel(const vc3d::ViewerLevels* levels, float lodZoomBias)
 {
-    const int coarsestLevel = std::max(0, numLevels - 1);
-    const float dsScale = static_cast<float>(std::uint64_t{1} << coarsestLevel);
-    return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
-}
-
-float scaleForCoarsestSegmentationRenderLevel(int numLevels)
-{
-    const int coarsestLevel = std::max(0, numLevels - 1);
-    const float dsScale = static_cast<float>(std::uint64_t{1} << coarsestLevel);
-    return std::clamp(0.75f / (dsScale * kSegmentationResolutionLodZoomBias), kMinScale, kMaxScale);
+    return scaleForRenderLevel(levels, (levels ? levels->count() : 1) - 1, lodZoomBias);
 }
 
 float fitScaleForExtent(float extentU, float extentV, int viewportW, int viewportH)
@@ -429,38 +339,13 @@ float fitScaleForExtent(float extentU, float extentV, int viewportW, int viewpor
     return std::clamp(std::min(scaleU, scaleV) * kFitPadding, kMinScale, kMaxScale);
 }
 
-std::shared_ptr<vc::render::ChunkCache> sharedOverlayChunkCacheForVolume(
-    const std::shared_ptr<Volume>& volume,
-    const CState*)
-{
-    if (!volume)
-        return nullptr;
-    return volume->sharedChunkCache();
-}
-
 } // namespace
-
-struct CChunkedVolumeViewer::GeneratedSurfaceCache {
-    std::mutex mutex;
-    bool valid = false;
-    Surface* surface = nullptr;
-    int fbW = 0;
-    int fbH = 0;
-    float scale = 0.0f;
-    cv::Vec3f offset{0, 0, 0};
-    float zOff = 0.0f;
-    cv::Vec3f zOffWorldDir{0, 0, 0};
-    cv::Mat_<cv::Vec3f> coords;
-    cv::Mat_<cv::Vec3f> normals;
-};
 
 CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager, QWidget* parent)
     : QWidget(parent)
     , _state(state)
     , _viewerManager(manager)
-    , _genSurfaceCache(std::make_shared<GeneratedSurfaceCache>())
 {
-    _chunkViewId = g_nextChunkViewId.fetch_add(1, std::memory_order_relaxed);
     _view = new CVolumeViewerView(this);
     _view->setFrameShape(QFrame::NoFrame);
     _view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -468,7 +353,6 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setTransformationAnchor(QGraphicsView::NoAnchor);
     _view->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     _view->setRenderHint(QPainter::Antialiasing, false);
-    _view->setScrollPanDisabled(true);
     _view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
 
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CChunkedVolumeViewer::onVolumeClicked);
@@ -514,9 +398,8 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 
     // No per-viewer timers: render requests submit immediately. ViewerManager's
     // global clock still drains intersection requests and status refreshes.
-    _statusRefreshTicks = kStatusRefreshTicks;
 
-    reloadPerfSettings();
+    CChunkedVolumeViewer::reloadPerfSettings();
 
     auto* layout = new QVBoxLayout;
     layout->setContentsMargins(0, 0, 0, 0);
@@ -548,23 +431,6 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
 CChunkedVolumeViewer::~CChunkedVolumeViewer()
 {
     quiesceForClose();
-    if (_chunkRemoteFetchCbId != 0 && _chunkArray) {
-        _chunkArray->removeRemoteFetchActivityListener(_chunkRemoteFetchCbId);
-        _chunkRemoteFetchCbId = 0;
-    }
-    if (_chunkCbId != 0 && _chunkArray) {
-        _chunkArray->removeChunkReadyListener(_chunkCbId);
-        _chunkCbId = 0;
-    }
-    if (_overlayChunkCbId != 0 && _overlayChunkArray) {
-        _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
-        _overlayChunkCbId = 0;
-    }
-    if (_overlayRemoteFetchCbId != 0 && _overlayChunkArray) {
-        _overlayChunkArray->removeRemoteFetchActivityListener(
-            _overlayRemoteFetchCbId);
-        _overlayRemoteFetchCbId = 0;
-    }
 }
 
 void CChunkedVolumeViewer::showEvent(QShowEvent* event)
@@ -613,34 +479,14 @@ void CChunkedVolumeViewer::quiesceForClose()
     _activeRenderJob.reset();
     _pendingRenderJob.reset();
     _displayedRenderJob.reset();
-    _pendingRenderDirty = false;
     ++_renderSerial;
 
-    if (_chunkArray)
-        _chunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
-    else if (_overlayChunkArray)
-        _overlayChunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
-
-    if (_chunkCbId != 0 && _chunkArray) {
-        _chunkArray->removeChunkReadyListener(_chunkCbId);
-        _chunkCbId = 0;
-    }
-    if (_chunkRemoteFetchCbId != 0 && _chunkArray) {
-        _chunkArray->removeRemoteFetchActivityListener(_chunkRemoteFetchCbId);
-        _chunkRemoteFetchCbId = 0;
-    }
-    if (_overlayChunkCbId != 0 && _overlayChunkArray) {
-        _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
-        _overlayChunkCbId = 0;
-    }
-    if (_overlayRemoteFetchCbId != 0 && _overlayChunkArray) {
-        _overlayChunkArray->removeRemoteFetchActivityListener(
-            _overlayRemoteFetchCbId);
-        _overlayRemoteFetchCbId = 0;
-    }
-    _overlayChunkArray.reset();
-    // Frees tiles and joins any in-flight fill before the widget goes away.
-    dropSurfaceCaches();
+    // A running background read finishes the chunks it started and stops.
+    _pendingLoad.reset();
+    if (_loadSuperseded)
+        _loadSuperseded->store(true);
+    _levels.reset();
+    _overlayLevels.reset();
 }
 
 void CChunkedVolumeViewer::reloadPerfSettings()
@@ -655,15 +501,8 @@ void CChunkedVolumeViewer::reloadPerfSettings()
         s.value(viewer::POINT_COLLECTION_VIEW_TOLERANCE,
                 viewer::POINT_COLLECTION_VIEW_TOLERANCE_DEFAULT).toFloat());
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, perf::INTERPOLATION_METHOD_DEFAULT).toInt();
-    const vc::Sampling sampling = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
-    if (sampling != _samplingMethod) {
-        _samplingMethod = sampling;
-        // Stored samples were produced with the previous interpolation method.
-        if (_surfaceCache) {
-            dropSurfaceCaches();
-            ensureSurfaceCaches();
-        }
-    }
+    const int sampling = static_cast<int>(std::clamp(interpIdx, 0, 1));
+    _samplingMethod = sampling;
     _maxDisplayedResolution = std::clamp(
         s.value(viewer::MAX_DISPLAYED_RESOLUTION, viewer::MAX_DISPLAYED_RESOLUTION_DEFAULT).toInt(),
         0,
@@ -699,7 +538,6 @@ CChunkedVolumeViewer::CameraState CChunkedVolumeViewer::cameraState() const
     state.surfacePtrY = _surfacePtrY;
     state.scale = _scale;
     state.zOffset = _zOff;
-    state.zOffsetWorldDir = _zOffWorldDir;
     return state;
 }
 
@@ -708,7 +546,7 @@ float CChunkedVolumeViewer::clampCameraScale(float scale)
     return std::clamp(scale, kMinScale, kMaxScale);
 }
 
-void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool forceRender)
+void CChunkedVolumeViewer::applyCameraState(const CameraState& state)
 {
     if (_closing) {
         return;
@@ -717,14 +555,9 @@ void CChunkedVolumeViewer::applyCameraState(const CameraState& state, bool force
     _surfacePtrY = state.surfacePtrY;
     _scale = state.scale;
     setZOffset(state.zOffset);
-    _zOffWorldDir = state.zOffsetWorldDir;
     recalcPyramidLevel();
-    _genCacheDirty = true;
-    if (forceRender) {
-        renderVisible(true, "annotation camera state applied");
-    } else {
-        submitRender("annotation camera state applied");
-    }
+    _geometryDirty = true;
+    submitRender("annotation camera state applied");
     refreshMeasurementOverlay();
     emit overlaysUpdated();
 }
@@ -738,296 +571,80 @@ void CChunkedVolumeViewer::setPinnedSurfaceY(std::optional<float> surfaceY)
     if (_closing || !_pinnedSurfacePtrY || _surfacePtrY == *_pinnedSurfacePtrY) {
         return;
     }
-    _genCacheDirty = true;
+    _geometryDirty = true;
     // submitRender's syncCameraTransform moves the camera onto the pin and
     // refreshes the measurement overlay.
     submitRender("camera pinned");
     emit overlaysUpdated();
 }
 
-void CChunkedVolumeViewer::rebuildChunkArray()
+void CChunkedVolumeViewer::openLevels()
 {
-    if (_chunkArray)
-        _chunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
-    if (_chunkCbId != 0 && _chunkArray) {
-        _chunkArray->removeChunkReadyListener(_chunkCbId);
-        _chunkCbId = 0;
-    }
-    if (_chunkRemoteFetchCbId != 0 && _chunkArray) {
-        _chunkArray->removeRemoteFetchActivityListener(_chunkRemoteFetchCbId);
-        _chunkRemoteFetchCbId = 0;
-    }
-    _chunkArray.reset();
+    _levels.reset();
+    _gridSurface.reset();  // its normals follow the levels' voxel spacing
     _lastRenderResult.reset();
-    if (!_volume)
+    if (!_volume || !_state || !_state->openedVolumes())
         return;
-
     try {
-        _chunkArray = _volume->sharedChunkCache();
+        _levels = std::make_shared<const vc3d::ViewerLevels>(
+            vc3d::openViewerLevels(*_state->openedVolumes(), *_volume));
     } catch (const std::exception& e) {
         if (_statsBar)
-            _statsBar->setItems({QString("Streaming unavailable: %1").arg(e.what())});
-        return;
+            _statsBar->setItems({QString("Volume unavailable: %1").arg(e.what())});
+        _levels.reset();
     }
+}
 
-    if (!_chunkArray)
+void CChunkedVolumeViewer::startPendingLoad()
+{
+    if (_closing || _loadRunning || !_pendingLoad)
         return;
-
+    auto load = std::make_shared<const vc3d::ViewerLoad>(std::move(*_pendingLoad));
+    _pendingLoad.reset();
+    _loadRunning = true;
+    _sharedCacheStatsThrottle.invalidate();
+    updateStatusLabel();
+    _loadSuperseded = std::make_shared<std::atomic<bool>>(false);
     QPointer<CChunkedVolumeViewer> guard(this);
-    std::weak_ptr<Volume> volumeWeak = _volume;
-    // Coalesce: chunks resolve in bursts (a landing re-fetches a strip's
-    // whole tile set), and one queued submitRender per chunk made the GUI
-    // thread grind through dozens of back-to-back render kicks - each paying
-    // the synchronous prelude (focus marker projection etc.) - before it
-    // could service input. One kick per burst repaints just as correctly.
-    auto renderKickQueued = std::make_shared<std::atomic<bool>>(false);
-    _chunkCbId = _chunkArray->addChunkReadyListener(
-        [guard, volumeWeak, renderKickQueued]() {
-        if (renderKickQueued->exchange(true, std::memory_order_acq_rel)) {
-            return;
+    (void)QtConcurrent::run([guard, load, superseded = _loadSuperseded]() {
+        // Each part's arrival repaints; a newer waiting request cancels this one's
+        // chunk reads not yet started.
+        const auto loaded = [guard]() {
+            QMetaObject::invokeMethod(qApp, [guard]() {
+                if (!guard || guard->_closing)
+                    return;
+                ++guard->_loadedDataEpoch;
+                guard->submitRender("volume data loaded");
+            }, Qt::QueuedConnection);
+        };
+        QString error;
+        try {
+            vc3d::loadPending(*load, loaded, superseded.get());
+        } catch (const std::exception& e) {
+            error = QString::fromUtf8(e.what());
         }
-        QMetaObject::invokeMethod(qApp, [guard, volumeWeak, renderKickQueued]() {
-            renderKickQueued->store(false, std::memory_order_release);
+        QMetaObject::invokeMethod(qApp, [guard, error]() {
             if (!guard)
                 return;
-            auto volume = volumeWeak.lock();
-            if (!volume || guard->_volume != volume || guard->_closing)
+            guard->_loadRunning = false;
+            guard->_loadError = error;
+            if (guard->_closing)
                 return;
-            ++guard->_chunkContentEpoch;
-            guard->submitRender("chunk ready");
-        }, Qt::QueuedConnection);
-    });
-    if (_state && _state->debugDownloadQueueEnabled()) {
-        _chunkRemoteFetchCbId =
-            _chunkArray->addRemoteFetchActivityListener(
-                [guard, volumeWeak](const vc::render::ChunkKey&, bool) {
-                    QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
-                        if (!guard)
-                            return;
-                        auto volume = volumeWeak.lock();
-                        if (!volume || guard->_volume != volume || guard->_closing)
-                            return;
-                        guard->refreshDownloadQueueDebugOverlay();
-                    }, Qt::QueuedConnection);
-                });
-    }
-}
-
-void CChunkedVolumeViewer::setSurfaceCacheBudgets(std::size_t baseBytes,
-                                                  std::size_t overlayBytes)
-{
-    if (_closing)
-        return;
-    if (_surfaceCacheBudgetBytes == baseBytes &&
-        _overlaySurfaceCacheBudgetBytes == overlayBytes) {
-        return;
-    }
-    const bool baseDisabled = baseBytes == 0 && _surfaceCacheBudgetBytes != 0;
-    const bool overlayDisabled = overlayBytes == 0 && _overlaySurfaceCacheBudgetBytes != 0;
-    _surfaceCacheBudgetBytes = baseBytes;
-    _overlaySurfaceCacheBudgetBytes = overlayBytes;
-
-    // A byte capacity is adjustable in place, so a budget change never has to
-    // rebuild tiles; only switching a channel off drops them.
-    if (baseDisabled)
-        dropSurfaceCaches();
-    else if (_surfaceCache)
-        _surfaceCache->setByteCapacity(baseBytes);
-    if (overlayDisabled)
-        dropOverlaySurfaceCache();
-    else if (_overlaySurfaceCache)
-        _overlaySurfaceCache->setByteCapacity(overlayBytes);
-
-    ensureSurfaceCaches();
-    submitRender("surface cache budget changed");
-    updateStatusLabel();
-}
-
-void CChunkedVolumeViewer::setPreferSurfaceTileFills(bool enabled)
-{
-    if (_closing || _preferSurfaceTileFills == enabled)
-        return;
-    _preferSurfaceTileFills = enabled;
-    submitRender("prefer surface tile fills changed");
-}
-
-void CChunkedVolumeViewer::dropOverlaySurfaceCache()
-{
-    if (!_overlaySurfaceCache) {
-        _overlaySurfaceCacheVolume = nullptr;
-        return;
-    }
-    if (_overlaySurfaceTileCbId != 0) {
-        _overlaySurfaceCache->removeTileReadyListener(_overlaySurfaceTileCbId);
-        _overlaySurfaceTileCbId = 0;
-    }
-    // shutdown() waits for in-flight fills so no worker outlives the cache; an
-    // obsolete render job still holding it keeps its tiles alive until it ends.
-    _overlaySurfaceCache->shutdown();
-    _overlaySurfaceCache.reset();
-    _overlaySurfaceCacheVolume = nullptr;
-    ++_surfaceCacheEpoch;
-}
-
-void CChunkedVolumeViewer::dropSurfaceCaches()
-{
-    dropOverlaySurfaceCache();
-    if (_surfaceCache) {
-        if (_surfaceTileCbId != 0) {
-            _surfaceCache->removeTileReadyListener(_surfaceTileCbId);
-            _surfaceTileCbId = 0;
-        }
-        _surfaceCache->shutdown();
-        _surfaceCache.reset();
-    }
-    _surfaceGeometryTiles.reset();
-    _surfaceCacheVolume = nullptr;
-    _surfaceCacheSurface = nullptr;
-    _surfaceCacheGeometryEpoch = 0;
-    _surfaceCacheOutOfBand = false;
-    ++_surfaceCacheEpoch;
-}
-
-void CChunkedVolumeViewer::ensureSurfaceCaches()
-{
-    if (_closing)
-        return;
-
-    // Only the flattened segmentation pane resamples surface space; plane views
-    // read the volume directly and could not use tiles of (u, v, w).
-    auto surf = _surfWeak.lock();
-    auto quad = std::dynamic_pointer_cast<QuadSurface>(surf);
-    const bool eligible = _surfaceCacheBudgetBytes > 0 && quad && _volume && _chunkArray &&
-                          _surfName == "segmentation";
-    if (!eligible) {
-        if (_surfaceCache)
-            dropSurfaceCaches();
-        return;
-    }
-
-    if (_surfaceCache && _surfaceCacheVolume == _volume.get() &&
-        _surfaceCacheSurface == surf.get() &&
-        _surfaceCacheGeometryEpoch == _surfaceGeometryEpoch) {
-        // Identity unchanged; only the overlay channel may need work.
-    } else {
-        dropSurfaceCaches();
-        // Derived surface tiles remain separate; raw source chunks use the
-        // application-wide regular cache.
-        auto fillerArray = _chunkArray;
-        vc::render::SurfaceCache::Options options;
-        options.byteCapacity = _surfaceCacheBudgetBytes;
-        options.sampling = _samplingMethod;
-        try {
-            _surfaceCache = std::make_shared<vc::render::SurfaceCache>(fillerArray, quad,
-                                                                      options);
-        } catch (const std::exception& e) {
-            Logger()->warn("surface cache unavailable: {}", e.what());
-            _surfaceCache.reset();
-            return;
-        }
-        _surfaceGeometryTiles = _surfaceCache->geometryTiles();
-        _surfaceCacheVolume = _volume.get();
-        _surfaceCacheSurface = surf.get();
-        _surfaceCacheGeometryEpoch = _surfaceGeometryEpoch;
-        ++_surfaceCacheEpoch;
-        QPointer<CChunkedVolumeViewer> guard(this);
-        std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _surfaceCache;
-        auto notificationQueued = std::make_shared<std::atomic_bool>(false);
-        _surfaceTileCbId = _surfaceCache->addTileReadyListener(
-            [guard, cacheWeak, notificationQueued]() {
-                // notifyTileReady() runs on fill workers. Gate here so a large tile
-                // publish burst posts only one event to Qt's UI queue.
-                if (notificationQueued->exchange(true, std::memory_order_acq_rel))
-                    return;
-                QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued]() {
-                    const auto source = cacheWeak.lock();
-                    if (!guard || !source || guard->_surfaceCache != source) {
-                        notificationQueued->store(false, std::memory_order_release);
-                        return;
-                    }
-                    QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
-                                       [guard, cacheWeak, notificationQueued]() {
-                        notificationQueued->store(false, std::memory_order_release);
-                        const auto source = cacheWeak.lock();
-                        if (!guard || !source || guard->_surfaceCache != source)
-                            return;
-                        if (guard->_closing)
-                            return;
-                        // One epoch represents the whole burst. The render reads
-                        // every tile resident at the time it starts.
-                        ++guard->_chunkContentEpoch;
-                        guard->submitRender("surface tile batch ready");
-                    });
-                }, Qt::QueuedConnection);
-            });
-    }
-
-    // Overlay channel: its own instance with its own budget over the overlay
-    // volume's chunk array, sharing this surface's coords/normals tiles so each
-    // tile's gen() runs once and fills both.
-    const bool overlayEligible = _overlaySurfaceCacheBudgetBytes > 0 && _overlayVolume &&
-                                 _overlayChunkArray && _surfaceCache;
-    if (!overlayEligible) {
-        if (_overlaySurfaceCache)
-            dropOverlaySurfaceCache();
-        return;
-    }
-    if (_overlaySurfaceCache && _overlaySurfaceCacheVolume == _overlayVolume.get())
-        return;
-
-    dropOverlaySurfaceCache();
-    vc::render::SurfaceCache::Options overlayOptions;
-    overlayOptions.byteCapacity = _overlaySurfaceCacheBudgetBytes;
-    overlayOptions.sampling = _overlaySamplingMethod;
-    overlayOptions.geometry = _surfaceGeometryTiles;
-    auto overlayFillerArray = _overlayChunkArray;
-    try {
-        _overlaySurfaceCache = std::make_shared<vc::render::SurfaceCache>(
-            overlayFillerArray, quad, overlayOptions);
-    } catch (const std::exception& e) {
-        Logger()->warn("overlay surface cache unavailable: {}", e.what());
-        _overlaySurfaceCache.reset();
-        return;
-    }
-    _overlaySurfaceCacheVolume = _overlayVolume.get();
-    ++_surfaceCacheEpoch;
-
-    QPointer<CChunkedVolumeViewer> guard(this);
-    std::weak_ptr<vc::render::SurfaceCache> cacheWeak = _overlaySurfaceCache;
-    auto notificationQueued = std::make_shared<std::atomic_bool>(false);
-    _overlaySurfaceTileCbId = _overlaySurfaceCache->addTileReadyListener(
-        [guard, cacheWeak, notificationQueued]() {
-            // Keep overlay tile bursts bounded to one queued UI notification too.
-            if (notificationQueued->exchange(true, std::memory_order_acq_rel))
-                return;
-            if (!guard) {
-                notificationQueued->store(false, std::memory_order_release);
+            guard->_sharedCacheStatsThrottle.invalidate();
+            guard->updateStatusLabel();
+            if (error.isEmpty()) {
+                guard->startPendingLoad();
                 return;
             }
-            const auto generation = guard->_overlayGeneration.load(
-                std::memory_order_acquire);
-            QMetaObject::invokeMethod(qApp, [guard, cacheWeak, notificationQueued, generation]() {
-                const auto source = cacheWeak.lock();
-                if (!guard || !source || guard->_overlaySurfaceCache != source ||
-                    guard->_overlayOpacity <= 0.0f ||
-                    guard->_overlayGeneration.load(std::memory_order_acquire) != generation) {
-                    notificationQueued->store(false, std::memory_order_release);
-                    return;
-                }
-                QTimer::singleShot(kSurfaceTileRenderDebounceMs, guard,
-                                   [guard, cacheWeak, notificationQueued, generation]() {
-                    notificationQueued->store(false, std::memory_order_release);
-                    const auto source = cacheWeak.lock();
-                    if (!guard || !source || guard->_overlaySurfaceCache != source)
-                        return;
-                    if (guard->_closing || guard->_overlayOpacity <= 0.0f ||
-                        guard->_overlayGeneration.load(std::memory_order_acquire) != generation)
-                        return;
-                    ++guard->_chunkContentEpoch;
-                    guard->submitRender("surface tile batch ready");
-                });
-            }, Qt::QueuedConnection);
-        });
+            // A failed read is retried by the next frame's request, no sooner than in a second.
+            Logger()->warn("viewer: reading volume data failed: {}", error.toStdString());
+            guard->updateStatusLabel();
+            QTimer::singleShot(1000, guard, [guard]() {
+                if (guard)
+                    guard->startPendingLoad();
+            });
+        }, Qt::QueuedConnection);
+    });
 }
 
 void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
@@ -1040,25 +657,17 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _surfWeak.reset();
         _defaultSurface.reset();
     }
-    _genCacheDirty = true;
-    if (_genSurfaceCache) {
-        std::lock_guard lock(_genSurfaceCache->mutex);
-        _genSurfaceCache->valid = false;
-        _genSurfaceCache->coords.release();
-        _genSurfaceCache->normals.release();
-    }
-    _zOffWorldDir = {0, 0, 0};
+    _geometryDirty = true;
     if (_cursorCrosshair)
         _cursorCrosshair->hide();
     clearLineAnnotationPlacementMarker();
     if (_focusMarker)
         _focusMarker->hide();
 
-    // A different volume means every stored sample is wrong.
-    dropSurfaceCaches();
     _volume = std::move(vol);
-    rebuildChunkArray();
-    ensureSurfaceCaches();
+    _pendingLoad.reset();
+    _loadError.clear();
+    openLevels();
     if (!_volume) {
         // No volume means submitRender() below will skip; drop the previous
         // volume's framebuffer so the view goes blank instead of showing it.
@@ -1066,9 +675,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     }
     ensureDefaultSurface();
     if (_volume && isAxisAlignedView() && !hadVolume) {
-        const int n = _chunkArray ? _chunkArray->numLevels()
-                                  : static_cast<int>(_volume->numScales());
-        _scale = scaleForCoarsestPlaneRenderLevel(n);
+        _scale = scaleForCoarsestRenderLevel(_levels.get(), kResolutionLodZoomBias);
     }
     recalcPyramidLevel();   // also pushes the scalebar µm/px (updateScalebarScale)
     updateContentBounds();
@@ -1082,34 +689,12 @@ void CChunkedVolumeViewer::invalidateVis()
     if (_closing) {
         return;
     }
-    _genCacheDirty = true;
-    // A full visual invalidation means cached samples from both channels are
-    // stale as well. Invalidate the shared geometry through the base last.
-    if (_overlaySurfaceCache)
-        _overlaySurfaceCache->invalidateAll();
-    if (_surfaceCache)
-        _surfaceCache->invalidateAll();
-    if (_surfName == "segmentation")
-        _surfaceEditInvalidationPending = true;
-}
-
-void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
-{
-    if (changedCells.empty() || name != _surfName || _surfName != "segmentation") {
-        invalidateVis();
-        return;
-    }
-
-    // A brush edit moves geometry, so the samples over the edited cells are
-    // stale -- but only those. Both channels share one coords/normals cache, so
-    // drop the base tiles last.
-    if (_overlaySurfaceCache)
-        _overlaySurfaceCache->invalidateSurfaceRegion(changedCells);
-    if (_surfaceCache)
-        _surfaceCache->invalidateSurfaceRegion(changedCells);
-
-    _genCacheDirty = true;
-    _surfaceEditInvalidationPending = true;
+    _geometryDirty = true;
+    ++_surfaceGeometryEpoch;
+    ++_surfaceEditEpoch;
+    _gridSurface.reset();
+    if (auto* quad = dynamic_cast<QuadSurface*>(currentSurface()))
+        quad->dropPointSurface();
 }
 
 void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
@@ -1140,10 +725,10 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     const bool isCurrentSurface = (_surfName == name);
     const auto previousSurface = _surfWeak.lock();
     const bool isSameCurrentSurface = isCurrentSurface && previousSurface && previousSurface == surf;
-    const bool hadExplicitEditInvalidation =
-        isSameCurrentSurface && isEditUpdate && _surfaceEditInvalidationPending;
     if (isCurrentSurface)
-        _surfaceEditInvalidationPending = false;
+        _gridSurface.reset();  // edited or replaced: its grid is rebuilt for the next frame
+    if (isCurrentSurface && isEditUpdate)
+        if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) quad->dropPointSurface();
     if (!isCurrentSurface) {
         return;
     }
@@ -1190,42 +775,19 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     // reach syncCameraTransform(); refresh the plane's frame here instead.
     updateCoordinateFrame();
     if (isSameCurrentSurface && isEditUpdate) {
-        _genCacheDirty = true;
+        _geometryDirty = true;
         ++_surfaceEditEpoch;
-        // A plane mutated in place (axis-aligned slice rotation/tilt, line
-        // annotation cut planes) leaves nothing for the render-job identity in
-        // renderJobsSameGeometry() to compare: same object, same camera. Without
-        // a fresh epoch the submit below is discarded as a duplicate of the
-        // displayed frame and the new orientation is never drawn.
-        if (dynamic_cast<PlaneSurface*>(surf.get())) {
-            ++_surfaceGeometryEpoch;
-        }
-        // Tools with a known edit region invalidate it before sending this
-        // signal. Other same-object edits (brush/reset/etc.) need a conservative
-        // full tile invalidation so stale geometry is never sampled.
-        if (!hadExplicitEditInvalidation) {
-            if (_overlaySurfaceCache)
-                _overlaySurfaceCache->invalidateAll();
-            if (_surfaceCache)
-                _surfaceCache->invalidateAll();
-        }
-        _zOffWorldDir = {0, 0, 0};
+        // Both planes and quads can mutate without changing their address.
+        // Every edit must differ from an in-flight or displayed render.
+        ++_surfaceGeometryEpoch;
         updateContentBounds();
         updateFocusMarker();
-        if (_suppressNextSurfaceEditRender) {
-            _suppressNextSurfaceEditRender = false;
-        } else {
-            submitRender("current surface edit update");
-        }
+        submitRender("current surface edit update");
         return;
     }
 
-    _genCacheDirty = true;
-    _zOffWorldDir = {0, 0, 0};
+    _geometryDirty = true;
     if (!surf) {
-        // Deselecting the active surface must release its memory immediately;
-        // returning to it later starts with a cold cache.
-        dropSurfaceCaches();
         _measurement = {};
         // Forget the overlay groups before the scene deletes their items, so
         // no group ever names a freed item (translateOverlayGroup walks them).
@@ -1279,19 +841,16 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
             (void)setSegmentationPointerFromFocus();
         }
         setZOffset(0.0f);
-        const int n = _chunkArray ? _chunkArray->numLevels()
-                                  : (_volume ? static_cast<int>(_volume->numScales()) : 1);
         if (_resetViewOnSurfaceChange) {
-            _scale = scaleForCoarsestSegmentationRenderLevel(n);
+            _scale = scaleForCoarsestRenderLevel(_levels.get(), kSegmentationResolutionLodZoomBias);
             recalcPyramidLevel();
         }
         _initializedFirstSegmentationSurface = true;
     } else if (!isEditUpdate && _resetViewOnSurfaceChange && isSegmentationQuadSurface) {
         (void)setSegmentationPointerFromFocus();
         setZOffset(0.0f);
-        const int n = _chunkArray ? _chunkArray->numLevels()
-                                  : (_volume ? static_cast<int>(_volume->numScales()) : 1);
-        _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
+        _scale = scaleForRenderLevel(_levels.get(), kInitialSegmentationSurfaceLevel + kSurfaceResolutionLevelBias,
+                                     kResolutionLodZoomBias);
         recalcPyramidLevel();
     } else if (preservedViewCenter) {
         if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
@@ -1358,9 +917,6 @@ void CChunkedVolumeViewer::onSurfaceChangedImpl(const std::string& name, const s
     }
 
     updateFocusMarker();
-    // A new preview generation installs a new surface pointer, which retires
-    // the tiles built for the previous one.
-    ensureSurfaceCaches();
     submitRender("current surface changed");
 }
 
@@ -1370,10 +926,8 @@ void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std:
         return;
     }
     auto current = _surfWeak.lock();
-    if (current && current == surf) {
+    if (current && current == surf)
         _surfWeak.reset();
-        dropSurfaceCaches();
-    }
 }
 
 void CChunkedVolumeViewer::onVolumeClosing()
@@ -1381,18 +935,8 @@ void CChunkedVolumeViewer::onVolumeClosing()
     if (_closing) {
         return;
     }
-    dropSurfaceCaches();
-    if (_chunkArray)
-        _chunkArray->clearViewDemand(_chunkViewId, _renderRequestSerial);
-    if (_chunkCbId != 0 && _chunkArray) {
-        _chunkArray->removeChunkReadyListener(_chunkCbId);
-        _chunkCbId = 0;
-    }
-    if (_chunkRemoteFetchCbId != 0 && _chunkArray) {
-        _chunkArray->removeRemoteFetchActivityListener(_chunkRemoteFetchCbId);
-        _chunkRemoteFetchCbId = 0;
-    }
-    _chunkArray.reset();
+    _pendingLoad.reset();
+    _levels.reset();
     _volume.reset();
     clearDisplayedFramebuffer();
     onSurfaceChanged(_surfName, nullptr);
@@ -1428,7 +972,7 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
         if (cv::norm(poi->n) > 0.5f)
             plane->setNormal(poi->n);
         updateContentBounds();
-        _genCacheDirty = true;
+        _geometryDirty = true;
     }
 
     updateFocusMarker(poi);
@@ -1487,23 +1031,6 @@ void CChunkedVolumeViewer::updateContentBounds()
 
 void CChunkedVolumeViewer::recalcPyramidLevel()
 {
-    const float lodZoomBias = _surfName == "segmentation"
-        ? kSegmentationResolutionLodZoomBias
-        : kResolutionLodZoomBias;
-    if (_chunkArray) {
-        _dsScaleIdx = vc::render::ChunkedPlaneSampler::sourceLevelForView(
-            *_chunkArray, _scale, lodZoomBias);
-        const double extent = vc::render::ChunkedPlaneSampler::maximumBaseVoxelExtent(
-            *_chunkArray, _dsScaleIdx);
-        _dsScale = std::isfinite(extent) ? static_cast<float>(extent) : 1.0f;
-    } else {
-        const int n = _volume ? static_cast<int>(_volume->numScales()) : 1;
-        const float lodScale = std::max(_scale * lodZoomBias, 1e-6f);
-        _dsScaleIdx = std::clamp(
-            static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
-            0, std::max(0, n - 1));
-        _dsScale = static_cast<float>(std::uint64_t{1} << _dsScaleIdx);
-    }
     updateScalebarScale();
 }
 
@@ -1524,7 +1051,7 @@ void CChunkedVolumeViewer::updateScalebarScale()
     if (!physical)
         voxel = 1.0;
     const double unitsPerScenePx = voxel / static_cast<double>(_scale);
-    _view->setVoxelSize(unitsPerScenePx, unitsPerScenePx, physical);
+    _view->setVoxelSize(unitsPerScenePx, physical);
 }
 
 void CChunkedVolumeViewer::setShowCoordinateFrame(bool show)
@@ -1567,24 +1094,16 @@ void CChunkedVolumeViewer::resizeFramebuffer()
 
 void CChunkedVolumeViewer::requestRender(const char* reason, std::source_location caller)
 {
-    if (reason && std::string_view(reason) == "push/pull active viewer refresh") {
-        _suppressNextSurfaceEditRender = true;
-    }
     submitRender(reason, caller);
 }
 
 // Driven by ViewerManager's single global clock (~60Hz). Rendering is submitted
 // immediately by view/data updates; this tick only drains non-render maintenance.
-void CChunkedVolumeViewer::serviceRenderTick()
+void CChunkedVolumeViewer::refreshStatus()
 {
     if (_closing)
         return;
-
-    // Periodic status refresh (background download progress).
-    if (--_statusRefreshTicks <= 0) {
-        _statusRefreshTicks = kStatusRefreshTicks;
-        updateStatusLabel();
-    }
+    updateStatusLabel();  // background download progress
 }
 
 void CChunkedVolumeViewer::syncCameraTransform()
@@ -1615,69 +1134,45 @@ void CChunkedVolumeViewer::requestDirectPaint()
     _view->viewport()->update();
 }
 
+float CChunkedVolumeViewer::pixelsPerVoxel() const
+{
+    auto* quad = dynamic_cast<QuadSurface*>(currentSurface());
+    if (!quad || !_view) return _scale;
+    const auto size = _view->viewport()->size();
+    const auto raster = quad->gridRaster(_surfacePtrX - size.width() * 0.5 / _scale,
+                                         _surfacePtrY - size.height() * 0.5 / _scale,
+                                         _scale, {size.width(), size.height()});
+    return vc3d::surfacePixelsPerVoxel(*quad, raster, _scale);
+}
+
 int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
 {
-    if (!_chunkArray)
+    if (!_levels || _levels->count() == 0)
         return 0;
-
-    // A SurfaceCache may store fewer levels than the volume has; beyond its
-    // coarsest level the view keeps zooming out and sampleView resamples the
-    // coarsest tiles rather than falling through to the volume.
-    const int levelCount = _surfaceCache
-        ? std::min(_surfaceCache->levels(), _chunkArray->numLevels())
-        : _chunkArray->numLevels();
-
     const float lodZoomBias = _surfName == "segmentation"
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
-    int level = vc::render::ChunkedPlaneSampler::sourceLevelForView(
-        *_chunkArray, _scale, lodZoomBias);
-    // The direct surface renderer benefits from one finer source level because
-    // it resamples volume chunks straight into the framebuffer. SurfaceCache
-    // levels already match their screen-space footprint; applying the same
-    // bias there selects four times as many tiles with no added display detail.
-    if (preferSurfaceResolution && !_surfaceCache && level < levelCount - 1)
+    int level = vcr::grid::levelForView(_levels->gridLevels(), pixelsPerVoxel(), lodZoomBias);
+    // The surface renderer resamples volume data straight into the
+    // framebuffer and benefits from one finer source level.
+    if (preferSurfaceResolution)
         level -= kSurfaceResolutionLevelBias;
     level = std::max(level, _maxDisplayedResolution);
-    return std::clamp(level, 0, levelCount - 1);
+    return std::clamp(level, 0, _levels->count() - 1);
 }
 
 int CChunkedVolumeViewer::overlayRenderStartLevel(bool preferSurfaceResolution) const
 {
-    if (!_overlayChunkArray) {
+    if (!_overlayLevels || _overlayLevels->count() == 0)
         return 0;
-    }
-
     const float lodZoomBias = _surfName == "segmentation"
         ? kSegmentationResolutionLodZoomBias
         : kResolutionLodZoomBias;
-    int level = vc::render::ChunkedPlaneSampler::sourceLevelForView(
-        *_overlayChunkArray, _scale, lodZoomBias);
-    if (preferSurfaceResolution && !_overlaySurfaceCache &&
-        level < _overlayChunkArray->numLevels() - 1) {
+    int level = vcr::grid::levelForView(_overlayLevels->gridLevels(), pixelsPerVoxel(), lodZoomBias);
+    if (preferSurfaceResolution)
         level -= kSurfaceResolutionLevelBias;
-    }
     level = std::max(level, _overlayMaxDisplayedResolution);
-    return std::clamp(level, 0, _overlayChunkArray->numLevels() - 1);
-}
-
-void CChunkedVolumeViewer::markInteractiveMotion(double)
-{
-    // Interactions schedule a normal full-quality render directly (scheduleRender in
-    // the handler). The old interactive-preview + settle-timer fast path is gone.
-}
-
-void CChunkedVolumeViewer::markChunkRequestViewActive()
-{
-    if (_chunkArray)
-        _chunkArray->markViewActive(_chunkViewId);
-    else if (_overlayChunkArray)
-        _overlayChunkArray->markViewActive(_chunkViewId);
-}
-
-bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
-{
-    return !isSupportedStreamingCompositeMethod(_compositeSettings.params.method);
+    return std::clamp(level, 0, _overlayLevels->count() - 1);
 }
 
 void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSettings& s)
@@ -1687,11 +1182,14 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
     // The slice-plane owner folds this view's azimuth into the plane itself,
     // so it must hear about anything that changes the effective camera —
     // including method/enable flips that implicitly zero it.
+    const bool methodChanged =
+        _compositeSettings.params.volumetric != s.params.volumetric ||
+        _compositeSettings.params.options.method != s.params.options.method;
     const bool cameraChanged =
         _compositeSettings.params.camAzimuthDeg != s.params.camAzimuthDeg ||
         _compositeSettings.params.camTiltDeg != s.params.camTiltDeg ||
         _compositeSettings.params.camPerspective != s.params.camPerspective ||
-        _compositeSettings.params.method != s.params.method ||
+        methodChanged ||
         _compositeSettings.planeEnabled != s.planeEnabled ||
         _compositeSettings.enabled != s.enabled;
     // Plane viewers draw the flattened viewer's slab bounds as dashed
@@ -1701,7 +1199,7 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
         _compositeSettings.layersFront != s.layersFront ||
         _compositeSettings.layersBehind != s.layersBehind ||
         _compositeSettings.reverseDirection != s.reverseDirection ||
-        _compositeSettings.params.method != s.params.method;
+        methodChanged;
     _compositeSettings = s;
     updateCameraGizmo();
     if (cameraChanged)
@@ -1714,7 +1212,7 @@ void CChunkedVolumeViewer::setCompositeRenderSettings(const CompositeRenderSetti
 bool CChunkedVolumeViewer::volumetricCameraActive() const
 {
     auto surf = _surfWeak.lock();
-    if (!surf || _compositeSettings.params.method != "volumetric")
+    if (!surf || !_compositeSettings.params.volumetric)
         return false;
     // Plane (slice) views gate on the per-plane composite toggle, the
     // flattened view on the main one — matching the render dispatch.
@@ -1803,34 +1301,28 @@ struct CChunkedVolumeViewer::RenderContext {
     float surfacePtrY = 0.0f;
     float scale = 1.0f;
     float zOff = 0.0f;
-    cv::Vec3f zOffWorldDir{0, 0, 0};
     int startLevel = 0;
     int overlayStartLevel = 0;
-    vc::Sampling samplingMethod = vc::Sampling::Trilinear;
-    vc::Sampling overlaySamplingMethod = vc::Sampling::Nearest;
+    int samplingMethod = 1;
+    int overlaySamplingMethod = 0;
     CompositeRenderSettings compositeSettings;
     float windowLow = 0.0f;
     float windowHigh = 255.0f;
     std::shared_ptr<Surface> surf;
-    std::shared_ptr<vc::render::ChunkCache> chunkArray;
+    std::shared_ptr<const vc3d::ViewerLevels> levels;
     std::shared_ptr<Volume> overlayVolume;
-    std::shared_ptr<vc::render::ChunkCache> overlayChunkArray;
+    std::shared_ptr<const vc3d::ViewerLevels> overlayLevels;
     float overlayOpacity = 0.0f;
     std::string overlayColormapId;
     float overlayWindowLow = 0.0f;
     float overlayWindowHigh = 255.0f;
     bool overlayIntensityAsAlpha = false;
     OverlayCompositeSettings overlayComposite;
-    std::shared_ptr<vc::render::SurfaceCache> surfaceCache;
-    std::shared_ptr<vc::render::SurfaceCache> overlaySurfaceCache;
-    std::shared_ptr<GeneratedSurfaceCache> genCache;
-    bool genCacheDirty = false;
+    std::shared_ptr<const vcr::grid::Surface> gridSurface;
+    bool geometryDirty = false;
     std::shared_ptr<const RenderResult> prevResult;
     std::string profileReason;
     std::string profileCaller;
-    bool debugDownloadQueue = false;
-    bool preferSurfaceTileFills = false;
-    bool annotationView = false;
 };
 
 struct CChunkedVolumeViewer::RenderResult {
@@ -1838,7 +1330,7 @@ struct CChunkedVolumeViewer::RenderResult {
     PendingRenderJob renderJob;
     QImage framebuffer;
     // Pre-LUT sample values and their coverage, kept so the next
-    // same-geometry render can fill chunk holes from this frame.
+    // same-geometry render can fill holes from this frame.
     cv::Mat_<uint8_t> values;
     cv::Mat_<uint8_t> coverage;
     // Volumetric composite output (already colormapped, RGB channel order).
@@ -1846,82 +1338,50 @@ struct CChunkedVolumeViewer::RenderResult {
     cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
-    // Pixels already sampled at overlayStartLevel. Unlike overlayCoverage,
-    // this excludes coarse fallback pixels so a static view can progressively
-    // complete without needing its entire 3D overlay working set resident.
-    cv::Mat_<uint8_t> overlayTargetCoverage;
-    float surfacePtrX = 0.0f;
-    float surfacePtrY = 0.0f;
-    float scale = 1.0f;
-    // The frame's layer stack reached outside the SurfaceCache band, so it fell
-    // back to direct volume sampling. Surfaced in the status bar because the
-    // performance cliff is otherwise invisible.
-    bool surfaceCacheOutOfBand = false;
-    std::vector<vc::render::ChunkedPlaneSampler::ChunkPixelLookupLevel>
-        debugBaseLookup;
-    std::vector<vc::render::ChunkedPlaneSampler::ChunkPixelLookupLevel>
-        debugOverlayLookup;
+    // What this frame could not sample from the caches.
+    vc3d::ViewerLoad load;
     double renderFrameElapsedMs = 0.0;
     std::chrono::steady_clock::time_point submittedAt;
     std::chrono::steady_clock::time_point workerStartedAt;
     std::chrono::steady_clock::time_point workerFinishedAt;
 };
 
-void CChunkedVolumeViewer::refreshDownloadQueueDebugOverlay()
+namespace {
+// The border a flattened volumetric frame samples beyond the screen window.
+vc3d::volumetric::SlabMargins flattenedSlabMargins(const CompositeRenderSettings& cs, float scale, int width, int height)
 {
-    if (_closing || !_state || !_state->debugDownloadQueueEnabled() ||
-        !_lastRenderResult || _lastRenderResult->framebuffer.isNull()) {
-        return;
-    }
-
-    _framebuffer = _lastRenderResult->framebuffer;
-    cv::Mat_<uint8_t> paintedPixels;
-    if (_chunkArray) {
-        const auto active = _chunkArray->activeRemoteFetches();
-        std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>
-            activeSet(active.begin(), active.end());
-        vc3d::applyDownloadQueueDebugOverlay(
-            _framebuffer, _lastRenderResult->debugBaseLookup, activeSet,
-            &paintedPixels);
-    }
-    if (_overlayChunkArray) {
-        const auto active = _overlayChunkArray->activeRemoteFetches();
-        std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>
-            activeSet(active.begin(), active.end());
-        vc3d::applyDownloadQueueDebugOverlay(
-            _framebuffer, _lastRenderResult->debugOverlayLookup, activeSet,
-            &paintedPixels);
-    }
-    if (_view && _view->viewport())
-        _view->viewport()->update();
+    vc3d::volumetric::CameraParams cam;
+    cam.azimuthDeg = cs.params.camAzimuthDeg;
+    cam.tiltDeg = cs.params.camTiltDeg;
+    cam.perspective = cs.params.camPerspective;
+    const int front = std::max(0, cs.layersFront);
+    const int behind = std::max(0, cs.layersBehind);
+    return vc3d::volumetric::computeSlabMargins(cam, front + behind + 1, -behind,
+                                                scale * std::max(cs.params.wScale, 0.01f), width, height);
+}
 }
 
 CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
 {
     QElapsedTimer renderTimer;
     renderTimer.start();
-    // Sub-phase timing (only meaningful under --profile). gen = surface coords,
-    // sample = chunk sample/decode, blit = colormap LUT + framebuffer write.
+    // Sub-phase timing (only meaningful under --profile). sample = volume
+    // sampling along the view, blit = colormap LUT + framebuffer write.
     const bool profilePhases = ProfileLoggingEnabled();
-    qint64 phaseGenMs = -1, phasePrepassMs = -1, phaseSampleMs = 0, phaseBlitMs = 0;
-    std::size_t prepassOccurrences = 0;
-    std::size_t prepassChunks = 0;
-    bool phaseGenCached = false;
+    qint64 phaseSampleMs = 0, phaseBlitMs = 0;
     QElapsedTimer phaseTimer;
+    const bool overlayActive = ctx.overlayLevels && ctx.overlayVolume && ctx.overlayOpacity > 0.0f;
     if (ProfileLoggingEnabled()) {
         Logger()->info("[vc3d-profile] renderFrame begin reason='{}' caller='{}' serial={} surf='{}' size={}x{} level={} overlay_level={} overlay={} composite={} planeComposite={}",
                        ctx.profileReason, ctx.profileCaller, ctx.serial,
                        ctx.surf ? ctx.surf->id : std::string(""),
                        ctx.fbW, ctx.fbH, ctx.startLevel, ctx.overlayStartLevel,
-                       bool(ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f),
+                       overlayActive,
                        ctx.compositeSettings.enabled, ctx.compositeSettings.planeEnabled);
     }
     RenderResult result;
     result.serial = ctx.serial;
     result.renderJob = ctx.renderJob;
-    result.surfacePtrX = ctx.surfacePtrX;
-    result.surfacePtrY = ctx.surfacePtrY;
-    result.scale = ctx.scale;
     result.submittedAt = ctx.renderJob.submittedAt;
     result.workerStartedAt = std::chrono::steady_clock::now();
     result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
@@ -1931,262 +1391,34 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         result.workerFinishedAt = std::chrono::steady_clock::now();
         if (!ProfileLoggingEnabled())
             return;
-        Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} gen_ms={} genCached={} prepass_ms={} prepass_occurrences={} prepass_chunks={} sample_ms={} blit_ms={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
-                       result.renderFrameElapsedMs, phaseGenMs, phaseGenCached,
-                       phasePrepassMs, prepassOccurrences, prepassChunks,
-                       phaseSampleMs, phaseBlitMs, ctx.profileReason, ctx.profileCaller,
+        Logger()->info("[vc3d-profile] renderFrame end elapsed_ms={} sample_ms={} blit_ms={} load_coarse={} load_target={} reason='{}' caller='{}' serial={} framebuffer={}x{}",
+                       result.renderFrameElapsedMs, phaseSampleMs, phaseBlitMs,
+                       result.load.pending.coarse.size(), result.load.pending.target.size(),
+                       ctx.profileReason, ctx.profileCaller,
                        result.serial, result.framebuffer.width(), result.framebuffer.height());
     };
 
-    if (!ctx.surf || !ctx.chunkArray || ctx.fbW <= 0 || ctx.fbH <= 0) {
+    if (!ctx.surf || !ctx.levels || ctx.fbW <= 0 || ctx.fbH <= 0) {
         finishRenderFrameProfile();
         return result;
     }
-
     cv::Mat_<uint8_t> values(ctx.fbH, ctx.fbW, uint8_t(0));
     cv::Mat_<uint8_t> coverage(ctx.fbH, ctx.fbW, uint8_t(0));
     cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
-    cv::Mat_<uint8_t> overlayTargetCoverage;
+    std::vector<std::int8_t> missingBase, missingOverlay;
     cv::Mat_<uint8_t> focusBoundsInside;
     if (ctx.renderJob.focusBoundsBase) {
         focusBoundsInside = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
     }
-    const bool continuingSameGeometry =
-        ctx.prevResult && !ctx.genCacheDirty &&
-        renderJobsSameGeometry(ctx.renderJob, ctx.prevResult->renderJob);
-    const bool planeView = dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
-    // Every renderable surface declares parameter coordinates in level-0/base
-    // voxels, so camera scale has one view-wide meaning for planes and generated
-    // surfaces alike.
-    const std::optional<float> pixelsPerLevel0VolumeVoxel = ctx.scale;
-    vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
-    vc::render::ChunkedPlaneSampler::Options overlayOptions(
-        ctx.overlaySamplingMethod, options.tileSize);
-    options.request = ctx.renderJob.chunkRequest;
-    overlayOptions.request = ctx.renderJob.chunkRequest;
-    // Keep enough coarse demand for a useful whole-view preview, stopping once
-    // a source chunk spans the viewport in declared base-voxel units.
-    options.queuedFallbackLevels =
-        vc::render::ChunkedPlaneSampler::fallbackLevelCountForViewport(
-            *ctx.chunkArray, ctx.startLevel, ctx.fbW, ctx.fbH,
-            pixelsPerLevel0VolumeVoxel);
-    overlayOptions.queuedFallbackLevels =
-        ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f
-        ? vc::render::ChunkedPlaneSampler::fallbackLevelCountForViewport(
-              *ctx.overlayChunkArray, ctx.overlayStartLevel,
-              ctx.fbW, ctx.fbH, pixelsPerLevel0VolumeVoxel)
-        : 0;
-    auto generatedSurfaceCoords = [&](bool needNormals) {
-        cv::Mat_<cv::Vec3f> coords;
-        cv::Mat_<cv::Vec3f> normals;
-        const cv::Vec3f offset(
-            ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f,
-            ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f, 0.0f);
-        bool cacheHit = false;
-        if (ctx.genCache) {
-            std::lock_guard lock(ctx.genCache->mutex);
-            if (ctx.genCacheDirty) {
-                ctx.genCache->valid = false;
-                ctx.genCache->coords.release();
-                ctx.genCache->normals.release();
-            }
-            cacheHit = ctx.genCache->valid &&
-                ctx.genCache->surface == ctx.surf.get() &&
-                ctx.genCache->fbW == ctx.fbW && ctx.genCache->fbH == ctx.fbH &&
-                ctx.genCache->scale == ctx.scale && ctx.genCache->offset == offset &&
-                ctx.genCache->zOff == ctx.zOff &&
-                ctx.genCache->zOffWorldDir == ctx.zOffWorldDir &&
-                !ctx.genCache->coords.empty() &&
-                (!needNormals || !ctx.genCache->normals.empty());
-            if (cacheHit) {
-                coords = ctx.genCache->coords;
-                if (needNormals)
-                    normals = ctx.genCache->normals;
-            }
-        }
-        if (phaseGenMs < 0)
-            phaseGenCached = cacheHit;
-        if (!cacheHit) {
-            if (profilePhases)
-                phaseTimer.restart();
-            ctx.surf->gen(&coords, needNormals ? &normals : nullptr,
-                          cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0},
-                          ctx.scale, offset);
-            applyPerPixelNormalOffset(coords, normals, ctx.zOff);
-            if (profilePhases)
-                phaseGenMs = phaseTimer.elapsed();
-            if (ctx.genCache && !coords.empty()) {
-                std::lock_guard lock(ctx.genCache->mutex);
-                ctx.genCache->valid = true;
-                ctx.genCache->surface = ctx.surf.get();
-                ctx.genCache->fbW = ctx.fbW;
-                ctx.genCache->fbH = ctx.fbH;
-                ctx.genCache->scale = ctx.scale;
-                ctx.genCache->offset = offset;
-                ctx.genCache->zOff = ctx.zOff;
-                ctx.genCache->zOffWorldDir = ctx.zOffWorldDir;
-                ctx.genCache->coords = coords;
-                ctx.genCache->normals = normals;
-            }
-        }
-        ctx.genCacheDirty = false;
-        return std::pair(std::move(coords), std::move(normals));
-    };
-
-    if (ctx.debugDownloadQueue) {
-        cv::Mat_<cv::Vec3f> debugCoords;
-        const bool debugPlaneView =
-            dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
-        if (auto* plane = dynamic_cast<PlaneSurface*>(ctx.surf.get())) {
-            const cv::Vec3f vx = plane->basisX();
-            const cv::Vec3f vy = plane->basisY();
-            const cv::Vec3f normal = plane->normal({0, 0, 0});
-            const float halfW = static_cast<float>(ctx.fbW) * 0.5f / ctx.scale;
-            const float halfH = static_cast<float>(ctx.fbH) * 0.5f / ctx.scale;
-            const cv::Vec3f origin = vx * (ctx.surfacePtrX - halfW)
-                                   + vy * (ctx.surfacePtrY - halfH)
-                                   + plane->origin() + normal * ctx.zOff;
-            const cv::Vec3f vxStep = vx / ctx.scale;
-            const cv::Vec3f vyStep = vy / ctx.scale;
-            debugCoords.create(ctx.fbH, ctx.fbW);
-            for (int y = 0; y < ctx.fbH; ++y) {
-                auto* row = debugCoords.ptr<cv::Vec3f>(y);
-                const cv::Vec3f rowOrigin = origin + vyStep * float(y);
-                for (int x = 0; x < ctx.fbW; ++x)
-                    row[x] = rowOrigin + vxStep * float(x);
-            }
-        } else {
-            debugCoords = generatedSurfaceCoords(true).first;
-        }
-        if (!debugCoords.empty()) {
-            result.debugBaseLookup =
-                vc::render::ChunkedPlaneSampler::buildChunkPixelLookup(
-                    *ctx.chunkArray, ctx.chunkArray->sourceId(), ctx.startLevel,
-                    options.queuedFallbackLevels, debugCoords,
-                    ctx.samplingMethod, !debugPlaneView);
-            if (ctx.overlayChunkArray && ctx.overlayVolume &&
-                ctx.overlayOpacity > 0.0f) {
-                result.debugOverlayLookup =
-                    vc::render::ChunkedPlaneSampler::buildChunkPixelLookup(
-                        *ctx.overlayChunkArray, ctx.overlayChunkArray->sourceId(),
-                        ctx.overlayStartLevel,
-                        overlayOptions.queuedFallbackLevels, debugCoords,
-                        ctx.overlaySamplingMethod, !debugPlaneView);
-            }
-        }
+    const bool planeView = ctx.renderJob.plane.has_value();
+    if (!planeView && !ctx.gridSurface) {
+        finishRenderFrameProfile();
+        return result;
     }
 
-    auto initializeOverlayProgress = [&]() {
-        overlayValues.create(ctx.fbH, ctx.fbW);
-        overlayCoverage.create(ctx.fbH, ctx.fbW);
-        overlayTargetCoverage.create(ctx.fbH, ctx.fbW);
-        overlayValues.setTo(0);
-        overlayCoverage.setTo(0);
-        overlayTargetCoverage.setTo(0);
-
-        const RenderResult* prev = ctx.prevResult.get();
-        if (!continuingSameGeometry || !prev ||
-            prev->overlayValues.size() != overlayValues.size() ||
-            prev->overlayCoverage.size() != overlayCoverage.size() ||
-            prev->overlayTargetCoverage.size() != overlayTargetCoverage.size()) {
-            return;
-        }
-
-        for (int y = 0; y < overlayValues.rows; ++y) {
-            auto* dstValue = overlayValues.ptr<uint8_t>(y);
-            auto* dstCoverage = overlayCoverage.ptr<uint8_t>(y);
-            auto* dstTarget = overlayTargetCoverage.ptr<uint8_t>(y);
-            const auto* srcValue = prev->overlayValues.ptr<uint8_t>(y);
-            const auto* srcCoverage = prev->overlayCoverage.ptr<uint8_t>(y);
-            const auto* srcTarget = prev->overlayTargetCoverage.ptr<uint8_t>(y);
-            for (int x = 0; x < overlayValues.cols; ++x) {
-                if (!srcTarget[x])
-                    continue;
-                dstValue[x] = srcValue[x];
-                dstCoverage[x] = srcCoverage[x];
-                dstTarget[x] = 1;
-            }
-        }
-    };
-
-    auto overlayFallbackOptions = [&]() {
-        auto fallback = overlayOptions;
-        fallback.queueMisses = false;
-        fallback.queuedFallbackLevels = 0;
-        return fallback;
-    };
-
-    auto overlayResidentOptions = overlayOptions;
-    overlayResidentOptions.queueMisses = false;
-
-    std::size_t overlayRequestBytesRemaining = 0;
-    if (ctx.overlayChunkArray) {
-        const std::size_t capacity =
-            ctx.overlayChunkArray->stats().decodedByteCapacity;
-        overlayRequestBytesRemaining = std::min(
-            kOverlayTargetPageMaximumBytes, capacity / 8);
-    }
-    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>
-        overlayRequestsThisFrame;
-    auto queueOverlayTargetPage =
-        [&](const std::vector<vc::render::ChunkKey>& dependencies) {
-            if (!ctx.overlayChunkArray || overlayRequestBytesRemaining == 0)
-                return;
-
-            auto orderedDependencies = dependencies;
-            std::sort(
-                orderedDependencies.begin(), orderedDependencies.end(),
-                [](const vc::render::ChunkKey& lhs,
-                   const vc::render::ChunkKey& rhs) {
-                    return std::tie(lhs.level, lhs.iz, lhs.iy, lhs.ix) <
-                           std::tie(rhs.level, rhs.iz, rhs.iy, rhs.ix);
-                });
-            std::vector<vc::render::ChunkKey> page;
-            for (const auto& key : orderedDependencies) {
-                if (!overlayRequestsThisFrame.insert(key).second)
-                    continue;
-                const auto chunkShape = ctx.overlayChunkArray->chunkShape(key.level);
-                std::size_t chunkBytes =
-                    ctx.overlayChunkArray->dtype() == vc::render::ChunkDtype::UInt16 ? 2 : 1;
-                for (const int dimension : chunkShape) {
-                    if (dimension <= 0 ||
-                        chunkBytes > std::numeric_limits<std::size_t>::max() /
-                                         static_cast<std::size_t>(dimension)) {
-                        chunkBytes = std::numeric_limits<std::size_t>::max();
-                        break;
-                    }
-                    chunkBytes *= static_cast<std::size_t>(dimension);
-                }
-                if (chunkBytes > overlayRequestBytesRemaining) {
-                    if (!page.empty())
-                        break;
-                    // A single valid chunk must be admitted even if its decoded
-                    // size exceeds the normal page target.
-                    page.push_back(key);
-                    overlayRequestBytesRemaining = 0;
-                    break;
-                }
-                page.push_back(key);
-                overlayRequestBytesRemaining -= chunkBytes;
-                if (overlayRequestBytesRemaining == 0)
-                    break;
-            }
-            if (!page.empty())
-                ctx.overlayChunkArray->prefetchChunks(
-                    page, false, 0, ctx.renderJob.chunkRequest);
-        };
-
-    auto streamingCompositeUnsupported = [&]() {
-        return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method);
-    };
-    const bool volumetricMethod = ctx.compositeSettings.params.method == "volumetric";
-    // Selecting the method does not itself enable compositing. In particular,
-    // the flattened SurfaceCache path must return to its ordinary single-slice
-    // sample as soon as the flattened composite checkbox is cleared.
-    const bool flattenedVolumetricActive =
-        volumetricMethod && ctx.compositeSettings.enabled;
+    const bool volumetricMethod = ctx.compositeSettings.params.volumetric;
 
     // Volumetric mode: composite a sampled layer stack front-to-back along
     // tilted view rays with a transfer function. Output is an already-
@@ -2202,13 +1434,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     };
 
     auto flattenedVolumetricMargins = [&](int outW, int outH) {
-        const auto& cs = ctx.compositeSettings;
-        const int front = std::max(0, cs.layersFront);
-        const int behind = std::max(0, cs.layersBehind);
-        const float wScale = std::max(cs.params.wScale, 0.01f);
-        return vc3d::volumetric::computeSlabMargins(
-            volumetricCamera(), front + behind + 1, -behind,
-            ctx.scale * wScale, outW, outH);
+        return flattenedSlabMargins(ctx.compositeSettings, ctx.scale, outW, outH);
     };
 
     auto compositeVolumetricStack = [&](const std::vector<cv::Mat_<uint8_t>>& layerValues,
@@ -2222,14 +1448,14 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         const auto cam = volumetricCamera();
 
         std::array<uint32_t, 256> colorLut{};
-        vc::buildWindowLevelLut(colorLut, ctx.windowLow, ctx.windowHigh);
+        vcr::display::windowLevelLut(colorLut, ctx.windowLow, ctx.windowHigh);
         // Ray-segment length correction 1/|d_w| so tilted views don't look
         // artificially transparent (per-frame constant: parallel rays).
         const auto dir = vc3d::volumetric::viewDirection(cam);
         const float segLen = 1.0f / std::max(dir[2], 1e-3f);
-        const auto opacityLut = vc3d::volumetric::buildOpacityLut(
-            cs.params.alphaMin, cs.params.alphaMax, cs.params.alphaOpacity,
-            cs.params.tfGamma, cs.params.isoCutoff, segLen);
+        const auto opacityLut = vcr::display::opacityLut(
+            cs.params.options.alphaMin, cs.params.options.alphaMax, cs.params.options.alphaOpacity,
+            cs.params.tfGamma, uint8_t(std::clamp(cs.params.options.isoCutoff, 0.0f, 255.0f)), segLen);
 
         // W scaling exaggerates the relief: the layer planes spread apart
         // along the normal before the rotated render (the in-plane content
@@ -2248,757 +1474,149 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                                               lightingStrength);
     };
 
-    QElapsedTimer prepassTimer;
-    prepassTimer.start();
-    const bool overlayActive =
-        ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f;
-    const auto viewportSamples = stratifiedViewportSamples(
-        ctx.fbW, ctx.fbH, ctx.renderJob.chunkRequest.viewVersion);
-    std::vector<cv::Vec3f> prepassCoords;
-    std::vector<cv::Vec3f> prepassNormals;
-    prepassCoords.reserve(viewportSamples.size());
-    prepassNormals.reserve(viewportSamples.size());
-
-    bool baseCacheUsableForPrepass = false;
-    bool overlayCacheUsableForPrepass = false;
-    double prepassUMin = 0.0;
-    double prepassVMin = 0.0;
-    if (auto* plane = dynamic_cast<PlaneSurface*>(ctx.surf.get())) {
-        const cv::Vec3f vx = plane->basisX();
-        const cv::Vec3f vy = plane->basisY();
-        const cv::Vec3f normal = plane->normal({0, 0, 0});
-        const float halfW = static_cast<float>(ctx.fbW) * 0.5f / ctx.scale;
-        const float halfH = static_cast<float>(ctx.fbH) * 0.5f / ctx.scale;
-        const cv::Vec3f origin = vx * (ctx.surfacePtrX - halfW)
-                               + vy * (ctx.surfacePtrY - halfH)
-                               + plane->origin() + normal * ctx.zOff;
-        const cv::Vec3f vxStep = vx / ctx.scale;
-        const cv::Vec3f vyStep = vy / ctx.scale;
-        for (const auto& viewport : viewportSamples) {
-            prepassCoords.push_back(
-                origin + vxStep * viewport[0] + vyStep * viewport[1]);
-            prepassNormals.push_back(normal);
+    // The frame's geometry, grown by `margins` pixels on each side: the plane
+    // through the view, or the raster of the view over the surface's grid.
+    auto frameGeometry = [&](const vc3d::volumetric::SlabMargins& margins) {
+        vcr::grid::Frame geometry;
+        const int width = ctx.fbW + margins.left + margins.right;
+        const int height = ctx.fbH + margins.top + margins.bottom;
+        if (planeView) {
+            geometry.plane = ctx.renderJob.plane;
+            auto& plane = *geometry.plane;
+            for (int axis = 0; axis < 3; ++axis)
+                plane.origin[axis] -= plane.dx[axis] * margins.left + plane.dy[axis] * margins.top;
+            plane.width = width;
+            plane.height = height;
+            return geometry;
         }
-    } else {
-        prepassUMin = double(ctx.surfacePtrX) -
-            double(ctx.fbW) / (2.0 * double(ctx.scale));
-        prepassVMin = double(ctx.surfacePtrY) -
-            double(ctx.fbH) / (2.0 * double(ctx.scale));
-        CompositeRenderSettings cacheComposite = ctx.compositeSettings;
-        if (streamingCompositeUnsupported())
-            cacheComposite.enabled = false;
-        if (ctx.surfaceCache) {
-            double low = 0.0, high = 0.0;
-            vc::render::SurfaceCache::compositeWRange(
-                cacheComposite, double(ctx.zOff), low, high);
-            baseCacheUsableForPrepass = ctx.surfaceCache->bandCovers(low, high);
-        }
-        const bool overlayWantsComposite =
-            overlayActive && ctx.overlayComposite.enabled &&
-            (ctx.overlayComposite.method == "max" ||
-             ctx.overlayComposite.method == "mean" ||
-             ctx.overlayComposite.method == "min") &&
-            (ctx.overlayComposite.layersFront > 0 ||
-             ctx.overlayComposite.layersBehind > 0);
-        if (overlayActive && ctx.overlaySurfaceCache) {
-            const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
-            double low = 0.0, high = 0.0;
-            vc::render::SurfaceCache::overlayCompositeWRange(
-                overlayWantsComposite ? ctx.overlayComposite
-                                      : OverlayCompositeSettings{},
-                double(ctx.zOff), double(zStep), low, high);
-            overlayCacheUsableForPrepass =
-                ctx.overlaySurfaceCache->bandCovers(low, high);
-        }
-
-        const bool needDirectCoords =
-            !baseCacheUsableForPrepass ||
-            (overlayActive && !overlayCacheUsableForPrepass);
-        if (needDirectCoords) {
-            auto [fullCoords, fullNormals] = generatedSurfaceCoords(true);
-            if (!fullCoords.empty() && !fullNormals.empty()) {
-                for (const auto& viewport : viewportSamples) {
-                    const int x = std::clamp(int(viewport[0]), 0, fullCoords.cols - 1);
-                    const int y = std::clamp(int(viewport[1]), 0, fullCoords.rows - 1);
-                    prepassCoords.push_back(fullCoords(y, x));
-                    prepassNormals.push_back(fullNormals(y, x));
-                }
-            }
-        } else if (!ctx.preferSurfaceTileFills) {
-            // These coords exist only to collect raw-path viewport demand
-            // below; a tile-fill-preferring frame with every usable channel
-            // cached skips both, so it must not stall here generating
-            // geometry tiles either.
-            const auto geometry = ctx.surfaceCache
-                ? ctx.surfaceCache->geometryTiles()
-                : ctx.overlaySurfaceCache->geometryTiles();
-            geometry->sampleView(
-                ctx.startLevel, prepassUMin, prepassVMin, double(ctx.scale),
-                viewportSamples, prepassCoords, &prepassNormals);
-            for (std::size_t i = 0; i < prepassCoords.size(); ++i) {
-                if (std::isfinite(prepassNormals[i][0]))
-                    prepassCoords[i] += prepassNormals[i] * ctx.zOff;
-            }
-        }
-    }
-
-    auto expandedSamples = [&](bool enabled, int front, int behind, float direction) {
-        std::vector<cv::Vec3f> coords;
-        std::vector<std::array<float, 2>> viewports;
-        const int first = enabled ? -std::max(0, behind) : 0;
-        const int last = enabled ? std::max(0, front) : 0;
-        coords.reserve(prepassCoords.size() * std::size_t(last - first + 1));
-        viewports.reserve(coords.capacity());
-        for (int layer = first; layer <= last; ++layer) {
-            for (std::size_t i = 0; i < prepassCoords.size(); ++i) {
-                cv::Vec3f coord = prepassCoords[i];
-                if (layer != 0 && std::isfinite(prepassNormals[i][0]))
-                    coord += prepassNormals[i] * (float(layer) * direction);
-                coords.push_back(coord);
-                viewports.push_back(viewportSamples[i]);
-            }
-        }
-        return std::pair(std::move(coords), std::move(viewports));
+        // QuadSurface::gen's view: surface UV (ptr - half the viewport) at `scale`
+        // framebuffer pixels per surface unit, in grid units.
+        geometry.surface = ctx.gridSurface;
+        geometry.raster = ctx.renderJob.raster;
+        geometry.raster.x0 -= margins.left * geometry.raster.sx;
+        geometry.raster.y0 -= margins.top * geometry.raster.sy;
+        geometry.raster.x0 -= ctx.renderJob.gridWindow.x;
+        geometry.raster.y0 -= ctx.renderJob.gridWindow.y;
+        geometry.raster.width = width;
+        geometry.raster.height = height;
+        return geometry;
     };
+    const auto geometry = frameGeometry({});
 
-    const bool baseComposite = planeView
-        ? ctx.compositeSettings.planeEnabled && !streamingCompositeUnsupported()
-        : ctx.compositeSettings.enabled && !streamingCompositeUnsupported();
-    const int baseFront = planeView ? ctx.compositeSettings.planeLayersFront
-                                    : ctx.compositeSettings.layersFront;
-    const int baseBehind = planeView ? ctx.compositeSettings.planeLayersBehind
-                                     : ctx.compositeSettings.layersBehind;
-    const bool baseReverse = planeView ? ctx.compositeSettings.planeReverseDirection
-                                       : ctx.compositeSettings.reverseDirection;
-    const float direction = baseReverse ? -1.0f : 1.0f;
-    // When a channel's SurfaceCache band covers this frame, the raw sampling
-    // path for that channel never executes (see the sampleView/sampleCoords
-    // selection below), so its viewport demand would only compete with the
-    // tile fills that actually paint the frame: fills are background work the
-    // shared scheduler serves at most once per interactive burst while any
-    // interactive demand is queued. A tile-fill-preferring viewer therefore
-    // withholds the unused demand; a frame that falls back to raw sampling
-    // (band exit, no cache yet) publishes it as before.
-    // Apply the workspace preference per channel, only after resolving whether
-    // its cache can serve this frame. Uncached surfaces need all fallback levels;
-    // neighboring plane views retain the workspace cap so they cannot flood the
-    // shared interactive queue ahead of background surface fills.
-    options.queuedFallbackLevels = vc::render::surfaceQueuedFallbackLevels(
-        options.queuedFallbackLevels, ctx.preferSurfaceTileFills,
-        baseCacheUsableForPrepass, planeView, ctx.annotationView);
-    overlayOptions.queuedFallbackLevels = vc::render::surfaceQueuedFallbackLevels(
-        overlayOptions.queuedFallbackLevels, ctx.preferSurfaceTileFills,
-        overlayCacheUsableForPrepass, planeView, ctx.annotationView);
+    // Layer offsets along the normal: the plane's origin already carries zOff.
+    const float zBase = planeView ? 0.0f : ctx.zOff;
+    auto layerOffsets = [&](int front, int behind, float zStep) {
+        std::vector<float> offsets;
+        for (int i = -std::max(0, behind); i <= std::max(0, front); ++i)
+            offsets.push_back(zBase + float(i) * zStep);
+        return offsets;
+    };
+    // Coarser levels fill holes until one source chunk spans the viewport.
+    auto base = ctx.levels->request(ctx.startLevel,
+                                    vcr::grid::fallbackLevels(ctx.levels->gridLevels(), ctx.startLevel, ctx.fbW, ctx.fbH, ctx.scale));
+    base.order = ctx.samplingMethod;
+    base.offsets = {zBase};
+    const auto& cs = ctx.compositeSettings;
+    const bool baseComposite = planeView ? cs.planeEnabled : cs.enabled;
+    const int front = planeView ? cs.planeLayersFront : cs.layersFront;
+    const int behind = planeView ? cs.planeLayersBehind : cs.layersBehind;
+    const float zStep = (planeView ? cs.planeReverseDirection : cs.reverseDirection) ? -1.0f : 1.0f;
 
-    const bool skipBaseViewDemand =
-        ctx.preferSurfaceTileFills && !planeView && baseCacheUsableForPrepass;
-    const bool skipOverlayViewDemand =
-        ctx.preferSurfaceTileFills && !planeView && overlayCacheUsableForPrepass;
-    std::vector<vc::render::ChunkViewportSample> baseDemand;
-    if (!skipBaseViewDemand) {
-        auto [baseCoords, baseViewports] = expandedSamples(
-            baseComposite, baseFront, baseBehind, direction);
-        baseDemand = vc::render::ChunkedPlaneSampler::collectViewportDependencies(
-            *ctx.chunkArray, ctx.startLevel, baseCoords, baseViewports,
-            ctx.scale, options);
-    }
-
-    std::vector<vc::render::ChunkViewportSample> overlayDemand;
-    if (overlayActive && !skipOverlayViewDemand) {
-        const bool overlayComposite = ctx.overlayComposite.enabled &&
-            (ctx.overlayComposite.method == "max" ||
-             ctx.overlayComposite.method == "mean" ||
-             ctx.overlayComposite.method == "min");
-        auto [overlayCoords, overlayViewports] = expandedSamples(
-            overlayComposite, ctx.overlayComposite.layersFront,
-            ctx.overlayComposite.layersBehind, direction);
-        overlayDemand = vc::render::ChunkedPlaneSampler::collectViewportDependencies(
-            *ctx.overlayChunkArray, ctx.overlayStartLevel,
-            overlayCoords, overlayViewports, ctx.scale, overlayOptions);
-    }
-    prepassOccurrences = baseDemand.size() + overlayDemand.size();
-    {
-        std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> chunks;
-        std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> overlayChunks;
-        chunks.reserve(baseDemand.size());
-        overlayChunks.reserve(overlayDemand.size());
-        for (const auto& sample : baseDemand)
-            chunks.insert(sample.key);
-        for (const auto& sample : overlayDemand)
-            overlayChunks.insert(sample.key);
-        if (overlayActive &&
-            ctx.overlayChunkArray->sourceId() == ctx.chunkArray->sourceId()) {
-            chunks.insert(overlayChunks.begin(), overlayChunks.end());
-            prepassChunks = chunks.size();
-        } else {
-            prepassChunks = chunks.size() + overlayChunks.size();
-        }
-    }
-    if (overlayActive &&
-        ctx.overlayChunkArray->sourceId() == ctx.chunkArray->sourceId()) {
-        baseDemand.insert(baseDemand.end(), overlayDemand.begin(), overlayDemand.end());
-        if (skipBaseViewDemand && baseDemand.empty()) {
-            // Nothing withheld may linger either: retire the previous frame's
-            // demand so its interactive fetches stop outranking tile fills.
-            ctx.chunkArray->clearSourceViewDemand(
-                ctx.renderJob.chunkRequest.viewId,
-                ctx.renderJob.chunkRequest.viewVersion);
-        } else {
-            ctx.chunkArray->replaceViewDemand(
-                ctx.renderJob.chunkRequest, ctx.renderJob.renderFocus,
-                std::move(baseDemand));
-        }
-    } else {
-        if (skipBaseViewDemand) {
-            ctx.chunkArray->clearSourceViewDemand(
-                ctx.renderJob.chunkRequest.viewId,
-                ctx.renderJob.chunkRequest.viewVersion);
-        } else {
-            ctx.chunkArray->replaceViewDemand(
-                ctx.renderJob.chunkRequest, ctx.renderJob.renderFocus,
-                std::move(baseDemand));
-        }
-        if (overlayActive) {
-            if (skipOverlayViewDemand) {
-                ctx.overlayChunkArray->clearSourceViewDemand(
-                    ctx.renderJob.chunkRequest.viewId,
-                    ctx.renderJob.chunkRequest.viewVersion);
-            } else {
-                ctx.overlayChunkArray->replaceViewDemand(
-                    ctx.renderJob.chunkRequest, ctx.renderJob.renderFocus,
-                    std::move(overlayDemand));
-            }
-        }
-    }
-
-    if ((ctx.surfaceCache || ctx.overlaySurfaceCache) && ctx.scale > 0.0f) {
-        if (ctx.surfaceCache) {
-            auto margins = vc3d::volumetric::SlabMargins{};
-            if (flattenedVolumetricActive)
-                margins = flattenedVolumetricMargins(ctx.fbW, ctx.fbH);
-            ctx.surfaceCache->requestView(
-                ctx.startLevel,
-                prepassUMin - double(margins.left) / double(ctx.scale),
-                prepassVMin - double(margins.top) / double(ctx.scale),
-                double(ctx.scale),
-                ctx.fbW + margins.left + margins.right,
-                ctx.fbH + margins.top + margins.bottom);
-        }
-        if (overlayActive && ctx.overlaySurfaceCache) {
-            ctx.overlaySurfaceCache->requestView(
-                ctx.overlayStartLevel, prepassUMin, prepassVMin,
-                double(ctx.scale), ctx.fbW, ctx.fbH);
-        }
-    }
-    phasePrepassMs = prepassTimer.elapsed();
-
-    auto samplePlane = [&](const cv::Vec3f& origin,
-                           const cv::Vec3f& vxStep,
-                           const cv::Vec3f& vyStep,
-                           const cv::Vec3f& normal,
-                           cv::Mat_<uint8_t>& dst,
-                           cv::Mat_<uint8_t>& cov,
-                           vc::render::ChunkCache& array) {
-        const bool wantComposite = ctx.compositeSettings.planeEnabled &&
-                                   !streamingCompositeUnsupported();
-        if (!wantComposite) {
-            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-                array, ctx.startLevel, origin, vxStep, vyStep, dst, cov, options);
-            return;
-        }
-
-        const int front = std::max(0, ctx.compositeSettings.planeLayersFront);
-        const int behind = std::max(0, ctx.compositeSettings.planeLayersBehind);
-        const int numLayers = front + behind + 1;
-        const int zStart = -behind;
-        const float zStep = ctx.compositeSettings.planeReverseDirection ? -1.0f : 1.0f;
-        auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
-            vc::Sampling::Nearest, options.tileSize);
-        compositeOptions.queuedFallbackLevels = options.queuedFallbackLevels;
-        compositeOptions.request = options.request;
-        std::vector<cv::Mat_<uint8_t>> layerValues;
-        std::vector<cv::Mat_<uint8_t>> layerCoverage;
-        layerValues.reserve(numLayers);
-        layerCoverage.reserve(numLayers);
+    if (profilePhases) phaseTimer.restart();
+    // Pixels this frame could not sample from the caches are recorded in
+    // result.load; the viewer reads them in the background and renders again.
+    if (baseComposite && volumetricMethod) {
         // Tilted/perspective rays read the slab outside the screen window near
-        // the edges; sample the layer stack with the exact extra border the
-        // camera needs (zero for the scalar methods and untilted ortho).
-        vc3d::volumetric::SlabMargins margins;
-        if (volumetricMethod) {
-            margins = vc3d::volumetric::computeSlabMargins(
-                volumetricCamera(), numLayers, zStart, ctx.scale, dst.cols, dst.rows);
+        // the edges: sample the layer stack over the exact extra border the
+        // camera needs, then composite it to the screen.
+        const int numLayers = std::max(0, front) + std::max(0, behind) + 1;
+        const int zStart = -std::max(0, behind);
+        const auto margins = planeView
+            ? vc3d::volumetric::computeSlabMargins(volumetricCamera(), numLayers, zStart, ctx.scale, ctx.fbW, ctx.fbH)
+            : flattenedVolumetricMargins(ctx.fbW, ctx.fbH);
+        const auto stack = frameGeometry(margins);
+        base.order = 0;
+        base.offsets = layerOffsets(front, behind, zStep);
+        const auto sampled = vc3d::sampleCached(ctx.levels, stack, base, &result.load);
+        std::vector<cv::Mat_<uint8_t>> layerValues, layerCoverage;
+        for (int k = 0; k < numLayers; ++k) {
+            layerValues.emplace_back(stack.height(), stack.width(), uint8_t(0));
+            layerCoverage.emplace_back(stack.height(), stack.width(), uint8_t(0));
+            if (!sampled.values.empty())
+                vcr::display::toUint8(sampled.values.data() + std::size_t(k) * sampled.width * sampled.height, std::size_t(sampled.width) * sampled.height, layerValues.back().ptr(), layerCoverage.back().ptr());
         }
-        const int sampleRows = dst.rows + margins.top + margins.bottom;
-        const int sampleCols = dst.cols + margins.left + margins.right;
-        const cv::Vec3f sampleOrigin = origin - vxStep * float(margins.left)
-                                              - vyStep * float(margins.top);
-        for (int i = 0; i < numLayers; ++i) {
-            layerValues.emplace_back(sampleRows, sampleCols, uint8_t(0));
-            layerCoverage.emplace_back(sampleRows, sampleCols, uint8_t(0));
-            const cv::Vec3f layerOrigin = sampleOrigin + normal * (float(zStart + i) * zStep);
-            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-                array, ctx.startLevel, layerOrigin, vxStep, vyStep,
-                layerValues.back(), layerCoverage.back(), compositeOptions);
-        }
-        if (volumetricMethod) {
-            // The plane slab is a genuinely rigid stack, so the tilted
-            // orthographic/pinhole render is exact here (no bendy-slab
-            // approximation).
-            compositeVolumetricStack(layerValues, layerCoverage, zStart,
-                                     /*isFlattenedView=*/false, margins,
-                                     colorValues, cov);
-            return;
-        }
-        LayerStack stack;
-        stack.values.resize(numLayers);
-        for (int y = 0; y < dst.rows; ++y) {
-            auto* dstRow = dst.ptr<uint8_t>(y);
-            auto* covRow = cov.ptr<uint8_t>(y);
-            for (int x = 0; x < dst.cols; ++x) {
-                stack.validCount = 0;
-                for (int i = 0; i < numLayers; ++i) {
-                    if (!layerCoverage[i](y, x))
-                        continue;
-                    const float value = static_cast<float>(layerValues[i](y, x));
-                    if (value < static_cast<float>(ctx.compositeSettings.params.isoCutoff))
-                        continue;
-                    stack.values[stack.validCount++] = value;
-                }
-                if (stack.validCount > 0) {
-                    dstRow[x] = static_cast<uint8_t>(std::clamp(
-                        compositeLayerStack(stack, ctx.compositeSettings.params), 0.0f, 255.0f));
-                    covRow[x] = 1;
-                }
-            }
-        }
-    };
-
-    // Sample the slab layer stack: layer i sits at offset (zStart + i) * zStep
-    // along the per-pixel surface normal. Shared by the scalar composite
-    // methods and the volumetric mode. When targetResolved is given, per-layer
-    // overlay-target coverage is tracked (with dependency queueing and a
-    // coarser-level fallback) instead of plain fine-to-coarse sampling.
-    auto generateLayerStack = [&](const cv::Mat_<cv::Vec3f>& coords,
-                                  const cv::Mat_<cv::Vec3f>& normals,
-                                  vc::render::ChunkCache& array,
-                                  int startLevel,
-                                  int numLayers,
-                                  int zStart,
-                                  float zStep,
-                                  const vc::render::ChunkedPlaneSampler::Options& samplingOptions,
-                                  cv::Mat_<uint8_t>* targetResolved,
-                                  const vc::render::ChunkedPlaneSampler::Options* fallbackOptions,
-                                  const cv::Mat_<uint8_t>& resolvedBefore,
-                                  std::vector<cv::Mat_<uint8_t>>& layerValues,
-                                  std::vector<cv::Mat_<uint8_t>>& layerCoverage,
-                                  std::vector<cv::Mat_<uint8_t>>& layerTargetCoverage) {
-        cv::Mat_<cv::Vec3f> layerCoords(coords.rows, coords.cols);
-        layerValues.reserve(numLayers);
-        layerCoverage.reserve(numLayers);
-        if (targetResolved)
-            layerTargetCoverage.reserve(numLayers);
-        for (int i = 0; i < numLayers; ++i) {
-            const float offset = float(zStart + i) * zStep;
-            for (int y = 0; y < coords.rows; ++y) {
-                const auto* src = coords.ptr<cv::Vec3f>(y);
-                const auto* nrow = normals.ptr<cv::Vec3f>(y);
-                auto* dstRow = layerCoords.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < coords.cols; ++x) {
-                    if (!vc::geometry::validSurfacePoint(src[x]))
-                        dstRow[x] = src[x];
-                    else
-                        dstRow[x] = src[x] + nrow[x] * offset;
-                }
-            }
-            layerValues.emplace_back(coords.rows, coords.cols, uint8_t(0));
-            layerCoverage.emplace_back(coords.rows, coords.cols, uint8_t(0));
-            if (targetResolved) {
-                layerTargetCoverage.push_back(resolvedBefore.clone());
-                vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
-                    array, startLevel, layerCoords,
-                    layerValues.back(), layerTargetCoverage.back(), samplingOptions);
-                queueOverlayTargetPage(
-                    vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
-                        array, startLevel, layerCoords,
-                        layerTargetCoverage.back(), samplingOptions));
-                layerCoverage.back() = layerTargetCoverage.back().clone();
-                if (fallbackOptions && startLevel + 1 < array.numLevels()) {
-                    vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                        array, startLevel + 1, layerCoords,
-                        layerValues.back(), layerCoverage.back(), *fallbackOptions);
-                }
-            } else {
-                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                    array, startLevel, layerCoords,
-                    layerValues.back(), layerCoverage.back(), samplingOptions);
-            }
-        }
-    };
-
-    auto sampleCoordsComposite = [&](const cv::Mat_<cv::Vec3f>& coords,
-                                     const cv::Mat_<cv::Vec3f>& normals,
-                                     cv::Mat_<uint8_t>& dst,
-                                     cv::Mat_<uint8_t>& cov,
-                                     vc::render::ChunkCache& array,
-                                     int startLevel,
-                                     int layersFront,
-                                     int layersBehind,
-                                     float zStep,
-                                     const CompositeParams& params,
-                                     const vc::render::ChunkedPlaneSampler::Options& samplingOptions,
-                                     cv::Mat_<uint8_t>* targetResolved,
-                                     const vc::render::ChunkedPlaneSampler::Options* fallbackOptions) {
-        const int front = std::max(0, layersFront);
-        const int behind = std::max(0, layersBehind);
-        const int numLayers = front + behind + 1;
-        const int zStart = -behind;
-        std::vector<cv::Mat_<uint8_t>> layerValues;
-        std::vector<cv::Mat_<uint8_t>> layerCoverage;
-        std::vector<cv::Mat_<uint8_t>> layerTargetCoverage;
-        cv::Mat_<uint8_t> resolvedBefore;
-        if (targetResolved)
-            resolvedBefore = targetResolved->clone();
-        generateLayerStack(coords, normals, array, startLevel,
-                           numLayers, zStart, zStep, samplingOptions,
-                           targetResolved, fallbackOptions, resolvedBefore,
-                           layerValues, layerCoverage, layerTargetCoverage);
-        LayerStack stack;
-        stack.values.resize(numLayers);
-        for (int y = 0; y < dst.rows; ++y) {
-            auto* dstRow = dst.ptr<uint8_t>(y);
-            auto* covRow = cov.ptr<uint8_t>(y);
-            for (int x = 0; x < dst.cols; ++x) {
-                if (targetResolved && resolvedBefore(y, x))
-                    continue;
-                stack.validCount = 0;
-                bool allLayersAtTarget = targetResolved != nullptr;
-                for (int i = 0; i < numLayers; ++i) {
-                    if (targetResolved && !layerTargetCoverage[i](y, x))
-                        allLayersAtTarget = false;
-                    if (!layerCoverage[i](y, x))
-                        continue;
-                    const float value = static_cast<float>(layerValues[i](y, x));
-                    if (value < static_cast<float>(params.isoCutoff))
-                        continue;
-                    stack.values[stack.validCount++] = value;
-                }
-                if (stack.validCount > 0) {
-                    dstRow[x] = static_cast<uint8_t>(std::clamp(
-                        compositeLayerStack(stack, params), 0.0f, 255.0f));
-                    covRow[x] = 1;
-                }
-                if (allLayersAtTarget)
-                    (*targetResolved)(y, x) = 1;
-            }
-        }
-    };
-
-    // Volumetric mode, flattened-surface path: same layer stack as the scalar
-    // composite, handed to the shared volumetric compositing tail.
-    auto sampleCoordsVolumetric = [&](const cv::Mat_<cv::Vec3f>& coords,
-                                      const cv::Mat_<cv::Vec3f>& normals,
-                                      cv::Mat_<cv::Vec3b>& colorDst,
-                                      cv::Mat_<uint8_t>& cov,
-                                      vc::render::ChunkCache& array) {
-        const auto& cs = ctx.compositeSettings;
-        const int front = std::max(0, cs.layersFront);
-        const int behind = std::max(0, cs.layersBehind);
-        const int numLayers = front + behind + 1;
-        const int zStart = -behind;
-        const float zStep = cs.reverseDirection ? -1.0f : 1.0f;
-        auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
-            vc::Sampling::Nearest, options.tileSize);
-        compositeOptions.queuedFallbackLevels = options.queuedFallbackLevels;
-        std::vector<cv::Mat_<uint8_t>> layerValues;
-        std::vector<cv::Mat_<uint8_t>> layerCoverage;
-        std::vector<cv::Mat_<uint8_t>> layerTargetCoverage;
-        // Tilted/perspective rays read the slab outside the screen window
-        // near the edges. Generate and sample the layer stack over the
-        // exact expanded border the camera needs; the composite output stays
-        // screen-sized. (The extra gen only happens when the border is
-        // nonzero, i.e. the camera is actually tilted or perspective.)
-        const auto margins = flattenedVolumetricMargins(coords.cols, coords.rows);
-        cv::Mat_<cv::Vec3f> stackCoords = coords;
-        cv::Mat_<cv::Vec3f> stackNormals = normals;
-        if (margins.any()) {
-            const cv::Size expanded(coords.cols + margins.left + margins.right,
-                                    coords.rows + margins.top + margins.bottom);
-            const cv::Vec3f expandedOffset(
-                ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f - float(margins.left),
-                ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f - float(margins.top),
-                0.0f);
-            stackCoords.release();
-            stackNormals.release();
-            ctx.surf->gen(&stackCoords, &stackNormals, expanded, {0, 0, 0},
-                          ctx.scale, expandedOffset);
-            applyPerPixelNormalOffset(stackCoords, stackNormals, ctx.zOff);
-        }
-        generateLayerStack(stackCoords, stackNormals, array, ctx.startLevel,
-                           numLayers, zStart, zStep, compositeOptions,
-                           nullptr, nullptr, cv::Mat_<uint8_t>(),
-                           layerValues, layerCoverage, layerTargetCoverage);
-        compositeVolumetricStack(layerValues, layerCoverage, zStart,
-                                 /*isFlattenedView=*/true, margins, colorDst, cov);
-    };
-
-    auto sampleCoords = [&](const cv::Mat_<cv::Vec3f>& coords,
-                            const cv::Mat_<cv::Vec3f>& normals,
-                            cv::Mat_<uint8_t>& dst,
-                            cv::Mat_<uint8_t>& cov,
-                            vc::render::ChunkCache& array) {
-        const bool wantComposite = ctx.compositeSettings.enabled &&
-                                   !streamingCompositeUnsupported() &&
-                                   !normals.empty();
-        if (!wantComposite) {
-            vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                array, ctx.startLevel, coords, dst, cov, options);
-            return;
-        }
-        if (volumetricMethod) {
-            sampleCoordsVolumetric(coords, normals, colorValues, cov, array);
-            return;
-        }
-
-        const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
-        auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(
-            vc::Sampling::Nearest, options.tileSize);
-        compositeOptions.queuedFallbackLevels = options.queuedFallbackLevels;
-        compositeOptions.request = options.request;
-        sampleCoordsComposite(coords, normals, dst, cov, array, ctx.startLevel,
-                              ctx.compositeSettings.layersFront,
-                              ctx.compositeSettings.layersBehind,
-                              zStep, ctx.compositeSettings.params, compositeOptions,
-                              nullptr, nullptr);
-    };
-
-    if (auto* plane = dynamic_cast<PlaneSurface*>(ctx.surf.get())) {
-        const cv::Vec3f vx = plane->basisX();
-        const cv::Vec3f vy = plane->basisY();
-        const cv::Vec3f n = plane->normal({0, 0, 0});
-        const float halfW = static_cast<float>(ctx.fbW) * 0.5f / ctx.scale;
-        const float halfH = static_cast<float>(ctx.fbH) * 0.5f / ctx.scale;
-        const cv::Vec3f origin = vx * (ctx.surfacePtrX - halfW)
-                               + vy * (ctx.surfacePtrY - halfH)
-                               + plane->origin()
-                               + n * ctx.zOff;
-        const cv::Vec3f vxStep = vx / ctx.scale;
-        const cv::Vec3f vyStep = vy / ctx.scale;
-        if (!focusBoundsInside.empty()) {
-            for (int y = 0; y < ctx.fbH; ++y) {
-                auto* inside = focusBoundsInside.ptr<uint8_t>(y);
-                const cv::Vec3f rowOrigin = origin + vyStep * static_cast<float>(y);
-                for (int x = 0; x < ctx.fbW; ++x) {
-                    inside[x] = contains_point(
-                        *ctx.renderJob.focusBoundsBase,
-                        rowOrigin + vxStep * static_cast<float>(x));
-                }
-            }
-        }
-        if (profilePhases) phaseTimer.restart();
-        samplePlane(origin, vxStep, vyStep, n, values, coverage, *ctx.chunkArray);
-        if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
-        if (ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
-            initializeOverlayProgress();
-            const int level = std::clamp(ctx.overlayStartLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
-            vc::render::ChunkedPlaneSampler::samplePlaneLevel(
-                *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
-                overlayValues, overlayTargetCoverage, overlayResidentOptions);
-            queueOverlayTargetPage(
-                vc::render::ChunkedPlaneSampler::collectPlaneDependencies(
-                    *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
-                    overlayTargetCoverage, overlayResidentOptions));
-            overlayCoverage.setTo(1, overlayTargetCoverage);
-            if (level + 1 < ctx.overlayChunkArray->numLevels()) {
-                const auto fallback = overlayFallbackOptions();
-                vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
-                    *ctx.overlayChunkArray, level + 1, origin, vxStep, vyStep,
-                    overlayValues, overlayCoverage, fallback);
-            }
-        }
+        compositeVolumetricStack(layerValues, layerCoverage, zStart, !planeView, margins, colorValues, coverage);
     } else {
-        cv::Mat_<cv::Vec3f> coords;
-        cv::Mat_<cv::Vec3f> normals;
-        const bool overlayWantsComposite =
-            overlayActive && ctx.overlayComposite.enabled &&
-            (ctx.overlayComposite.method == "max" ||
-             ctx.overlayComposite.method == "mean" ||
-             ctx.overlayComposite.method == "min") &&
-            (ctx.overlayComposite.layersFront > 0 || ctx.overlayComposite.layersBehind > 0);
-        const bool needSurfaceNormals =
-            ctx.zOff != 0.0f ||
-            (ctx.compositeSettings.enabled && !streamingCompositeUnsupported()) ||
-            overlayWantsComposite;
-
-        // --- SurfaceCache eligibility ---
-        //
-        // The stored band is exactly [wMin, wMin + wCount - 1] and never grows,
-        // so a frame whose layer stack reaches outside it drops to the legacy
-        // path for that frame and stores nothing. No zOff clamp: scrolling past
-        // the band stays legal, it just stops being cheap.
-        CompositeRenderSettings cacheComposite = ctx.compositeSettings;
-        if (streamingCompositeUnsupported())
-            cacheComposite.enabled = false;
-        const double uMin = double(ctx.surfacePtrX) - double(ctx.fbW) / (2.0 * double(ctx.scale));
-        const double vMin = double(ctx.surfacePtrY) - double(ctx.fbH) / (2.0 * double(ctx.scale));
-
-        bool baseCacheUsable = false;
-        if (ctx.surfaceCache) {
-            double wLow = 0.0, wHigh = 0.0;
-            vc::render::SurfaceCache::compositeWRange(cacheComposite, double(ctx.zOff), wLow,
-                                                      wHigh);
-            baseCacheUsable = ctx.surfaceCache->bandCovers(wLow, wHigh);
+        if (baseComposite) {
+            base.order = 0;
+            base.offsets = layerOffsets(front, behind, zStep);
+            base.composite = (cs.params.volumetric ? std::nullopt : std::optional(cs.params.options));
         }
+        const auto sampled = vc3d::sampleCached(ctx.levels, geometry, base, &result.load);
+        missingBase = sampled.level;
+        if (!sampled.values.empty())
+            vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, values.ptr(), coverage.ptr());
+    }
+    if (overlayActive) {
+        overlayValues = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
+        overlayCoverage = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
+        auto overlay = ctx.overlayLevels->request(
+            ctx.overlayStartLevel,
+            vcr::grid::fallbackLevels(ctx.overlayLevels->gridLevels(), ctx.overlayStartLevel, ctx.fbW, ctx.fbH, ctx.scale));
+        overlay.order = ctx.overlaySamplingMethod;
+        overlay.offsets = {zBase};
+        const auto& oc = ctx.overlayComposite;
+        if (!planeView && oc.enabled && (oc.method == "max" || oc.method == "mean" || oc.method == "min") &&
+            (oc.layersFront > 0 || oc.layersBehind > 0)) {
+            // Keep "front" pointing the same physical direction as the primary composite.
+            CompositeParams overlayParams;
+            setCompositeMethod(overlayParams, oc.method);
+            overlay.offsets = layerOffsets(oc.layersFront, oc.layersBehind, cs.reverseDirection ? -1.0f : 1.0f);
+            overlay.composite = (overlayParams.volumetric ? std::nullopt : std::optional(overlayParams.options));
+        }
+        const auto sampled = vc3d::sampleCached(ctx.overlayLevels, geometry, overlay, &result.load);
+        missingOverlay = sampled.level;
+        if (!sampled.values.empty())
+            vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, overlayValues.ptr(), overlayCoverage.ptr());
+    }
+    if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
 
-        const OverlayCompositeSettings overlayCacheComposite =
-            overlayWantsComposite ? ctx.overlayComposite : OverlayCompositeSettings{};
-        bool overlayCacheUsable = false;
-        if (overlayActive && ctx.overlaySurfaceCache) {
-            const double zStep = ctx.compositeSettings.reverseDirection ? -1.0 : 1.0;
-            double wLow = 0.0, wHigh = 0.0;
-            vc::render::SurfaceCache::overlayCompositeWRange(overlayCacheComposite,
-                                                            double(ctx.zOff), zStep, wLow, wHigh);
-            overlayCacheUsable = ctx.overlaySurfaceCache->bandCovers(wLow, wHigh);
+    if (!focusBoundsInside.empty()) {
+        std::vector<float> xyz(std::size_t(ctx.fbW) * std::size_t(ctx.fbH) * 3);
+        if (geometry.plane) {
+            const auto& pl = *geometry.plane;
+            for (int y = 0; y < ctx.fbH; ++y)
+                for (int x = 0; x < ctx.fbW; ++x)
+                    for (int a = 0; a < 3; ++a)
+                        xyz[(std::size_t(y) * ctx.fbW + x) * 3 + a] =
+                            pl.origin[a] + pl.dy[a] * float(y) + pl.dx[a] * float(x);
+        } else {
+            geometry.surface->resample(geometry.raster, xyz.data(), nullptr);
         }
-        result.surfaceCacheOutOfBand =
-            (ctx.surfaceCache && !baseCacheUsable) ||
-            (overlayActive && ctx.overlaySurfaceCache && !overlayCacheUsable);
-
-        // With both channels cached and an in-band w there is no gen() and no 3D
-        // volume sampling in the frame at all. GeneratedSurfaceCache is still
-        // needed whenever either channel falls back.
-        const bool needGen = !baseCacheUsable ||
-            (overlayActive && !overlayCacheUsable) ||
-            ctx.renderJob.focusBoundsBase.has_value();
-        if (needGen)
-            std::tie(coords, normals) = generatedSurfaceCoords(needSurfaceNormals);
-        if (!focusBoundsInside.empty() && !coords.empty()) {
-            for (int y = 0; y < ctx.fbH; ++y) {
-                auto* inside = focusBoundsInside.ptr<uint8_t>(y);
-                const auto* coord = coords.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < ctx.fbW; ++x) {
-                    inside[x] = contains_point(
-                        *ctx.renderJob.focusBoundsBase, coord[x]);
-                }
-            }
-        }
-        if (baseCacheUsable) {
-            if (profilePhases) phaseTimer.restart();
-            if (flattenedVolumetricActive) {
-                // SurfaceCache stores the raw (u,v,w) slab. Resample each
-                // requested w plane over the camera's expanded input window,
-                // then use the same RGB ray compositor as the direct-volume
-                // path. Camera/TF changes now reuse cached voxels; only an
-                // out-of-band slab falls back to volume chunks below.
-                const auto& cs = ctx.compositeSettings;
-                const int front = std::max(0, cs.layersFront);
-                const int behind = std::max(0, cs.layersBehind);
-                const int numLayers = front + behind + 1;
-                const int zStart = -behind;
-                const double zStep = cs.reverseDirection ? -1.0 : 1.0;
-                const auto margins = flattenedVolumetricMargins(ctx.fbW, ctx.fbH);
-                const int sampleRows = ctx.fbH + margins.top + margins.bottom;
-                const int sampleCols = ctx.fbW + margins.left + margins.right;
-                const double sampleUMin = uMin - double(margins.left) / double(ctx.scale);
-                const double sampleVMin = vMin - double(margins.top) / double(ctx.scale);
-
-                CompositeRenderSettings singleLayer;
-                std::vector<cv::Mat_<uint8_t>> layerValues;
-                std::vector<cv::Mat_<uint8_t>> layerCoverage;
-                layerValues.reserve(numLayers);
-                layerCoverage.reserve(numLayers);
-                for (int i = 0; i < numLayers; ++i) {
-                    layerValues.emplace_back(sampleRows, sampleCols, uint8_t(0));
-                    layerCoverage.emplace_back(sampleRows, sampleCols, uint8_t(0));
-                    const double w = double(ctx.zOff) + double(zStart + i) * zStep;
-                    ctx.surfaceCache->sampleView(
-                        ctx.startLevel, sampleUMin, sampleVMin, double(ctx.scale), w,
-                        singleLayer, layerValues.back(), layerCoverage.back());
-                }
-                compositeVolumetricStack(layerValues, layerCoverage, zStart,
-                                         /*isFlattenedView=*/true, margins,
-                                         colorValues, coverage);
-            } else {
-                // A bilinear resample in (u, v) plus a linear blend across two w
-                // slices. Composite is a reduction over slices that are already
-                // resident, so it costs no extra fetches and no extra tiles.
-                ctx.surfaceCache->sampleView(ctx.startLevel, uMin, vMin, double(ctx.scale),
-                                             double(ctx.zOff), cacheComposite,
-                                             values, coverage);
-            }
-            if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
-        }
-        if (overlayActive && overlayCacheUsable) {
-            overlayValues.create(ctx.fbH, ctx.fbW);
-            overlayCoverage.create(ctx.fbH, ctx.fbW);
-            overlayTargetCoverage.create(ctx.fbH, ctx.fbW);
-            overlayValues.setTo(0);
-            overlayCoverage.setTo(0);
-            overlayTargetCoverage.setTo(0);
-            // No carry-forward of previously resolved pixels: unlike the
-            // resident-only overlay sampler this resamples the whole frame from
-            // tiles every time, which is cheap.
-            const int overlayLevel = std::clamp(
-                ctx.overlayStartLevel, 0,
-                std::min(ctx.overlaySurfaceCache->levels(),
-                         ctx.overlayChunkArray->numLevels()) - 1);
-            const double zStep = ctx.compositeSettings.reverseDirection ? -1.0 : 1.0;
-            ctx.overlaySurfaceCache->sampleViewOverlay(
-                overlayLevel, uMin, vMin, double(ctx.scale), double(ctx.zOff),
-                overlayCacheComposite, zStep, overlayValues, overlayTargetCoverage);
-            overlayCoverage.setTo(1, overlayTargetCoverage);
-        }
-        if (!coords.empty()) {
-            if (profilePhases) phaseTimer.restart();
-            if (!baseCacheUsable)
-                sampleCoords(coords, normals, values, coverage, *ctx.chunkArray);
-            if (profilePhases) phaseSampleMs += phaseTimer.elapsed();
-            if (overlayActive && !overlayCacheUsable) {
-                initializeOverlayProgress();
-                const int level = std::clamp(ctx.overlayStartLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
-                if (overlayWantsComposite && !normals.empty()) {
-                    // Keep "front" pointing the same physical direction as the primary composite.
-                    const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
-                    CompositeParams overlayParams;
-                    overlayParams.method = ctx.overlayComposite.method;
-                    const auto fallback = overlayFallbackOptions();
-                    sampleCoordsComposite(coords, normals, overlayValues, overlayCoverage,
-                                          *ctx.overlayChunkArray, level,
-                                          ctx.overlayComposite.layersFront,
-                                          ctx.overlayComposite.layersBehind,
-                                          zStep, overlayParams, overlayResidentOptions,
-                                          &overlayTargetCoverage, &fallback);
-                } else {
-                    vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
-                        *ctx.overlayChunkArray, level, coords, overlayValues,
-                        overlayTargetCoverage, overlayResidentOptions);
-                    queueOverlayTargetPage(
-                        vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
-                            *ctx.overlayChunkArray, level, coords,
-                            overlayTargetCoverage, overlayResidentOptions));
-                    overlayCoverage.setTo(1, overlayTargetCoverage);
-                    if (level + 1 < ctx.overlayChunkArray->numLevels()) {
-                        const auto fallback = overlayFallbackOptions();
-                        vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                            *ctx.overlayChunkArray, level + 1, coords,
-                            overlayValues, overlayCoverage, fallback);
-                    }
-                }
+        for (int y = 0; y < ctx.fbH; ++y) {
+            auto* inside = focusBoundsInside.ptr<uint8_t>(y);
+            for (int x = 0; x < ctx.fbW; ++x) {
+                const float* p = &xyz[(std::size_t(y) * ctx.fbW + x) * 3];
+                inside[x] = contains_point(*ctx.renderJob.focusBoundsBase, cv::Vec3f(p[0], p[1], p[2]));
             }
         }
     }
 
     // Carry forward the previous frame's pixels where this frame has no
-    // chunk data yet (evicted or still in flight). Chunk-ready re-renders
-    // arrive constantly while streaming, and presenting a from-scratch
-    // frame that lost a chunk flashes the region blank until the refetch
-    // lands. Sampling above always runs first, so refined data still
-    // replaces carried pixels as soon as it exists.
+    // data yet (still loading). Re-renders arrive as volume data loads, and
+    // presenting a from-scratch frame that lacks a chunk flashes the region
+    // blank until it lands. Sampling above always runs first, so refined data
+    // still replaces carried pixels as soon as it exists.
     if (const RenderResult* prev = ctx.prevResult.get();
-        prev && !ctx.genCacheDirty &&
-        renderJobsSameGeometry(ctx.renderJob, prev->renderJob)) {
+        prev && renderJobsSameView(ctx.renderJob, prev->renderJob) &&
+        (ctx.gridSurface || renderJobsSameGeometry(ctx.renderJob, prev->renderJob))) {
+        const bool sameGeometry = renderJobsSameGeometry(ctx.renderJob, prev->renderJob);
+        // During an edit, keep old pixels only where a new valid point is waiting
+        // for chunks. Invalid/deleted geometry must still clear immediately.
         auto fillFromPrev = [](cv::Mat_<uint8_t>& dst, cv::Mat_<uint8_t>& cov,
                                const cv::Mat_<uint8_t>& prevDst,
-                               const cv::Mat_<uint8_t>& prevCov) {
+                               const cv::Mat_<uint8_t>& prevCov,
+                               const std::vector<std::int8_t>& missing) {
             if (dst.empty() || prevDst.empty() ||
                 dst.size() != prevDst.size() || cov.size() != prevCov.size())
                 return;
@@ -3008,7 +1626,9 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                 const uint8_t* prevDstRow = prevDst.ptr<uint8_t>(y);
                 const uint8_t* prevCovRow = prevCov.ptr<uint8_t>(y);
                 for (int x = 0; x < dst.cols; ++x) {
-                    if (!covRow[x] && prevCovRow[x]) {
+                    const auto q = std::size_t(y) * dst.cols + x;
+                    if (!covRow[x] && prevCovRow[x] && q < missing.size() &&
+                        missing[q] == vcr::grid::Result::kMissing) {
                         dstRow[x] = prevDstRow[x];
                         covRow[x] = 1;
                     }
@@ -3036,22 +1656,21 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         };
         // Same geometry implies the same composite method (compositeSettings
         // compares ==), so exactly one of these applies per frame.
-        if (!colorValues.empty())
+        if (!colorValues.empty() && sameGeometry && !ctx.geometryDirty)
             fillFromPrevColor(colorValues, coverage, prev->colorValues, prev->coverage);
         else
-            fillFromPrev(values, coverage, prev->values, prev->coverage);
+            fillFromPrev(values, coverage, prev->values, prev->coverage, missingBase);
         fillFromPrev(overlayValues, overlayCoverage,
-                     prev->overlayValues, prev->overlayCoverage);
+                     prev->overlayValues, prev->overlayCoverage, missingOverlay);
     }
     result.values = values;
     result.coverage = coverage;
     result.colorValues = colorValues;
     result.overlayValues = overlayValues;
     result.overlayCoverage = overlayCoverage;
-    result.overlayTargetCoverage = overlayTargetCoverage;
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
-    vc::buildWindowLevelLut(lut, ctx.windowLow, ctx.windowHigh);
+    vcr::display::windowLevelLut(lut, ctx.windowLow, ctx.windowHigh);
     std::array<uint32_t, 256> overlayLut{};
     const bool hasOverlay = !overlayValues.empty() && !overlayCoverage.empty() &&
                             ctx.overlayOpacity > 0.0f;
@@ -3083,7 +1702,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
                        (uint32_t(colorSrc[x][1]) << 8) | uint32_t(colorSrc[x][2]))
                     : lut[src[x]];
             if (hasOverlay && overlayCov[x]) {
-                pixel = vc::blendOverlayArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
+                pixel = vcr::display::blendArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
             }
             if (focusInside && !focusInside[x]) {
                 pixel = (pixel & 0xFF000000u) |
@@ -3105,26 +1724,18 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     int fbH,
     std::chrono::steady_clock::time_point submittedAt)
 {
-    if (!surf || !_volume || !_chunkArray || fbW <= 0 || fbH <= 0) {
+    if (!surf || !_volume || !_levels || fbW <= 0 || fbH <= 0) {
         return std::nullopt;
     }
 
     PendingRenderJob job;
     job.requestId = ++_renderRequestSerial;
-    job.chunkRequest = {_chunkViewId, job.requestId};
-    const QPointF focus = _haveChunkFocus
-        ? _lastScenePos
-        : QPointF(double(fbW) * 0.5, double(fbH) * 0.5);
-    job.renderFocus = {
-        std::clamp(static_cast<float>(focus.x()), 0.0f, float(std::max(0, fbW - 1))),
-        std::clamp(static_cast<float>(focus.y()), 0.0f, float(std::max(0, fbH - 1)))};
     job.fbW = fbW;
     job.fbH = fbH;
     job.surfacePtrX = _surfacePtrX;
     job.surfacePtrY = _surfacePtrY;
     job.scale = _scale;
     job.zOff = _zOff;
-    job.zOffWorldDir = _zOffWorldDir;
     const bool preferSurfaceResolution = dynamic_cast<PlaneSurface*>(surf.get()) == nullptr;
     job.startLevel = renderStartLevel(preferSurfaceResolution);
     job.overlayStartLevel = overlayRenderStartLevel(preferSurfaceResolution);
@@ -3139,28 +1750,64 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.windowHigh = _windowHigh;
     job.surf = surf;
     job.surfaceName = _surfName;
-    job.chunkArray = _chunkArray;
+    job.levels = _levels;
     job.overlayVolume = _overlayVolume;
-    job.overlayChunkArray = _overlayChunkArray;
+    job.overlayLevels = _overlayLevels;
     job.overlayOpacity = _overlayOpacity;
     job.overlayColormapId = _overlayColormapId;
     job.overlayWindowLow = _overlayWindowLow;
     job.overlayWindowHigh = _overlayWindowHigh;
     job.overlayIntensityAsAlpha = _overlayIntensityAsAlpha;
     job.overlayComposite = _overlayComposite;
-    job.chunkContentEpoch = _chunkContentEpoch;
+    job.loadedDataEpoch = _loadedDataEpoch;
     job.surfaceGeometryEpoch = _surfaceGeometryEpoch;
-    job.surfaceCache = _surfaceCache;
-    job.overlaySurfaceCache = _overlaySurfaceCache;
-    job.surfaceCacheEpoch = _surfaceCacheEpoch;
     // Focus bounds are in volume base coordinates for every view, including
     // segment QuadSurfaces. Mask the generated coordinates, not UVs;
     // the underlying surface and its cached tiles remain unchanged.
     if (_state) {
         job.focusBoundsBase = _state->activeFocusBounds();
     }
-    job.genCache = _genSurfaceCache;
-    job.genCacheDirty = _genCacheDirty;
+    // The vertices this frame interpolates, rebuilt after every edit of the surface and
+    // when the view leaves them: a grid can hold far more vertices than a frame shows.
+    if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+        job.raster = quad->gridRaster(job.surfacePtrX - double(fbW) * 0.5 / job.scale,
+                                      job.surfacePtrY - double(fbH) * 0.5 / job.scale,
+                                      job.scale, {fbW, fbH});
+        vc3d::volumetric::SlabMargins margins{};
+        if (job.compositeSettings.enabled && job.compositeSettings.params.volumetric)
+            margins = flattenedSlabMargins(job.compositeSettings, job.scale, fbW, fbH);
+        const auto needed = vc3d::gridWindowFor(*quad, job.raster, margins.left, margins.top, margins.right, margins.bottom);
+        if (!_gridSurface || _gridSurfaceFor != quad || (needed & _gridWindow) != needed) {
+            // Room to pan in, unless the next edit will replace it anyway.
+            const cv::Size room = _geometryDirty ? cv::Size(0, 0) : cv::Size(needed.width / 4, needed.height / 4);
+            const auto* points = quad->rawPointsPtr();
+            const cv::Rect grid(0, 0, points->cols, points->rows);
+            _gridWindow = (needed.empty() ? cv::Rect(0, 0, 2, 2)
+                                          : cv::Rect(needed.x - room.width, needed.y - room.height,
+                                                     needed.width + 2 * room.width, needed.height + 2 * room.height)) & grid;
+            _gridSurface = _gridWindow.empty()
+                ? nullptr
+                : quad->gridWindow(_gridWindow, _levels ? _levels->vertexSpacing() : std::array<float, 3>{1, 1, 1});
+        }
+        _gridSurfaceFor = quad;
+        job.gridWindow = _gridWindow;
+    } else {
+        _gridSurface.reset();
+        _gridSurfaceFor = nullptr;
+    }
+    job.gridSurface = _gridSurface;
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        const cv::Vec3f vx = plane->basisX(), vy = plane->basisY();
+        const cv::Vec3f n = plane->normal({0, 0, 0});
+        const cv::Vec3f dx = vx / job.scale, dy = vy / job.scale;
+        const cv::Vec3f origin = plane->origin() + n * job.zOff +
+            vx * (job.surfacePtrX - float(fbW) * 0.5f / job.scale) +
+            vy * (job.surfacePtrY - float(fbH) * 0.5f / job.scale);
+        job.plane = vcr::grid::Plane{{origin[0], origin[1], origin[2]},
+                                    {dx[0], dx[1], dx[2]}, {dy[0], dy[1], dy[2]},
+                                    {n[0], n[1], n[2]}, fbW, fbH};
+    }
+    job.geometryDirty = _geometryDirty;
     job.profileReason = reason ? reason : "";
     if (ProfileLoggingEnabled()) {
         job.profileCaller = profileCaller(caller);
@@ -3181,26 +1828,35 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
         return !lhs || (lhs->low == rhs->low && lhs->high == rhs->high);
     };
     return renderJobsSameGeometry(a, b) &&
-           a.chunkContentEpoch == b.chunkContentEpoch &&
-           a.genCacheDirty == b.genCacheDirty &&
+           a.loadedDataEpoch == b.loadedDataEpoch &&
+           a.geometryDirty == b.geometryDirty &&
            boundsEqual(a.focusBoundsBase, b.focusBoundsBase);
 }
 
 bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
                                                   const PendingRenderJob& b)
 {
-    auto vecEqual = [](const cv::Vec3f& lhs, const cv::Vec3f& rhs) {
-        return lhs[0] == rhs[0] && lhs[1] == rhs[1] && lhs[2] == rhs[2];
-    };
+    return renderJobsSameView(a, b) &&
+           a.startLevel == b.startLevel && a.overlayStartLevel == b.overlayStartLevel &&
+           a.surfaceGeometryEpoch == b.surfaceGeometryEpoch &&
+           a.gridSurface == b.gridSurface;
+}
+
+bool CChunkedVolumeViewer::renderSettled() const
+{
+    return !_renderWorkerBusy.load(std::memory_order_acquire) && !_pendingRenderJob &&
+           !_loadRunning && !_pendingLoad && (!_lastRenderResult || _lastRenderResult->load.empty());
+}
+
+bool CChunkedVolumeViewer::renderJobsSameView(const PendingRenderJob& a,
+                                            const PendingRenderJob& b)
+{
     return a.fbW == b.fbW &&
            a.fbH == b.fbH &&
            a.surfacePtrX == b.surfacePtrX &&
            a.surfacePtrY == b.surfacePtrY &&
            a.scale == b.scale &&
            a.zOff == b.zOff &&
-           vecEqual(a.zOffWorldDir, b.zOffWorldDir) &&
-           a.startLevel == b.startLevel &&
-           a.overlayStartLevel == b.overlayStartLevel &&
            a.samplingMethod == b.samplingMethod &&
            a.overlaySamplingMethod == b.overlaySamplingMethod &&
            a.compositeSettings == b.compositeSettings &&
@@ -3208,19 +1864,15 @@ bool CChunkedVolumeViewer::renderJobsSameGeometry(const PendingRenderJob& a,
            a.windowHigh == b.windowHigh &&
            a.surf.get() == b.surf.get() &&
            a.surfaceName == b.surfaceName &&
-           a.chunkArray.get() == b.chunkArray.get() &&
+           a.levels.get() == b.levels.get() &&
            a.overlayVolume.get() == b.overlayVolume.get() &&
-           a.overlayChunkArray.get() == b.overlayChunkArray.get() &&
+           a.overlayLevels.get() == b.overlayLevels.get() &&
            a.overlayOpacity == b.overlayOpacity &&
            a.overlayColormapId == b.overlayColormapId &&
            a.overlayWindowLow == b.overlayWindowLow &&
            a.overlayWindowHigh == b.overlayWindowHigh &&
            a.overlayIntensityAsAlpha == b.overlayIntensityAsAlpha &&
-           a.overlayComposite == b.overlayComposite &&
-           a.surfaceGeometryEpoch == b.surfaceGeometryEpoch &&
-           a.surfaceCache.get() == b.surfaceCache.get() &&
-           a.overlaySurfaceCache.get() == b.overlaySurfaceCache.get() &&
-           a.surfaceCacheEpoch == b.surfaceCacheEpoch;
+           a.overlayComposite == b.overlayComposite;
 }
 
 void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
@@ -3254,25 +1906,22 @@ void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
 
 void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
 {
-    if (_closing || !job.chunkArray) {
+    if (_closing || !job.levels) {
         return;
     }
 
     _renderWorkerBusy.store(true, std::memory_order_release);
     _activeRenderJob = job;
-    _pendingRenderDirty = false;
 
     RenderContext ctx;
     ctx.renderJob = job;
     ctx.serial = ++_renderSerial;
-    emit renderFrameSubmitted(ctx.serial);
     ctx.fbW = job.fbW;
     ctx.fbH = job.fbH;
     ctx.surfacePtrX = job.surfacePtrX;
     ctx.surfacePtrY = job.surfacePtrY;
     ctx.scale = job.scale;
     ctx.zOff = job.zOff;
-    ctx.zOffWorldDir = job.zOffWorldDir;
     ctx.startLevel = job.startLevel;
     ctx.overlayStartLevel = job.overlayStartLevel;
     ctx.samplingMethod = job.samplingMethod;
@@ -3281,26 +1930,21 @@ void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)
     ctx.windowLow = job.windowLow;
     ctx.windowHigh = job.windowHigh;
     ctx.surf = job.surf;
-    ctx.chunkArray = job.chunkArray;
+    ctx.levels = job.levels;
     ctx.overlayVolume = job.overlayVolume;
-    ctx.overlayChunkArray = job.overlayChunkArray;
+    ctx.overlayLevels = job.overlayLevels;
     ctx.overlayOpacity = job.overlayOpacity;
     ctx.overlayColormapId = job.overlayColormapId;
     ctx.overlayWindowLow = job.overlayWindowLow;
     ctx.overlayWindowHigh = job.overlayWindowHigh;
     ctx.overlayIntensityAsAlpha = job.overlayIntensityAsAlpha;
     ctx.overlayComposite = job.overlayComposite;
-    ctx.surfaceCache = job.surfaceCache;
-    ctx.overlaySurfaceCache = job.overlaySurfaceCache;
-    ctx.genCache = job.genCache;
-    ctx.genCacheDirty = job.genCacheDirty;
+    ctx.gridSurface = job.gridSurface;
+    ctx.geometryDirty = job.geometryDirty;
     ctx.prevResult = _lastRenderResult;
     ctx.profileReason = job.profileReason;
     ctx.profileCaller = job.profileCaller;
-    ctx.debugDownloadQueue = _state && _state->debugDownloadQueueEnabled();
-    ctx.preferSurfaceTileFills = _preferSurfaceTileFills;
-    ctx.annotationView = property("vc_viewer_role").toString() == QStringLiteral("annotation");
-    _genCacheDirty = false;
+    _geometryDirty = false;
 
     QPointer<CChunkedVolumeViewer> guard(this);
     (void)QtConcurrent::run([guard, ctx = std::move(ctx)]() mutable {
@@ -3319,7 +1963,6 @@ void CChunkedVolumeViewer::submitPendingRenderJobIfNeeded()
         return;
     }
     if (!_pendingRenderJob) {
-        _pendingRenderDirty = false;
         return;
     }
 
@@ -3327,7 +1970,6 @@ void CChunkedVolumeViewer::submitPendingRenderJobIfNeeded()
     _pendingRenderJob.reset();
     if (_displayedRenderJob &&
         renderJobsEquivalentForDisplay(job, *_displayedRenderJob)) {
-        _pendingRenderDirty = false;
         return;
     }
     startRenderJob(std::move(job));
@@ -3338,8 +1980,8 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     ProfileScope profile("submitRender", reason, caller);
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "surf='{}' volume={} chunkArray={} busy={} pending={}",
-            _surfName, bool(_volume), bool(_chunkArray),
+            "surf='{}' volume={} levels={} busy={} pending={}",
+            _surfName, bool(_volume), bool(_levels),
             _renderWorkerBusy.load(std::memory_order_acquire),
             _pendingRenderJob.has_value()));
     }
@@ -3357,7 +1999,7 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
     }
 
     auto surf = _surfWeak.lock();
-    if (!surf || !_volume || !_chunkArray) {
+    if (!surf || !_volume || !_levels) {
         profile.setDetails("action=skip missing_input");
         return;
     }
@@ -3392,12 +2034,10 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
         }
         if (_pendingRenderJob &&
             renderJobsEquivalentForDisplay(*job, *_pendingRenderJob)) {
-            _pendingRenderDirty = true;
             profile.setDetails("action=skip_duplicate_pending");
             return;
         }
         _pendingRenderJob = std::move(*job);
-        _pendingRenderDirty = true;
         updateStatusLabel();
         profile.setDetails("action=queued_latest_after_worker");
         return;
@@ -3405,7 +2045,6 @@ void CChunkedVolumeViewer::submitRender(const char* reason, std::source_location
 
     if (_displayedRenderJob &&
         renderJobsEquivalentForDisplay(*job, *_displayedRenderJob)) {
-        _pendingRenderDirty = false;
         profile.setDetails("action=skip_duplicate_displayed");
         return;
     }
@@ -3440,18 +2079,27 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
         profile.setDetails("action=drop_empty_result");
         return;
     }
+    if (result->renderJob.surf != _surfWeak.lock() || result->renderJob.levels != _levels) {
+        // A level/surface switch can finish while this worker is still running.
+        // Never flash geometry from the old coordinate frame after the switch.
+        submitPendingRenderJobIfNeeded();
+        return;
+    }
 
-    const bool debugDownloadQueue =
-        _state && _state->debugDownloadQueueEnabled();
-    if (debugDownloadQueue)
-        _framebuffer = result->framebuffer;
-    else
-        _framebuffer = std::move(result->framebuffer);
+    _framebuffer = std::move(result->framebuffer);
     _displayedRenderJob = result->renderJob;
     _lastRenderResult = result;
-    if (debugDownloadQueue)
-        refreshDownloadQueueDebugOverlay();
-    _surfaceCacheOutOfBand = result->surfaceCacheOutOfBand;
+    // Read what this frame lacked; it replaces an older waiting request. A moved
+    // view cancels the running read; a repaint of the same view (one a read's own
+    // arrival asked for) lets it finish, or a GPU load would discard its bricks.
+    if (!result->load.empty()) {
+        const bool viewMoved = !_loadJob || !renderJobsSameGeometry(*_loadJob, result->renderJob);
+        _pendingLoad = std::move(result->load);
+        _loadJob = result->renderJob;
+        if (viewMoved && _loadSuperseded)
+            _loadSuperseded->store(true);
+        startPendingLoad();
+    }
     syncCameraTransform();
     emit overlaysUpdated();
     _view->viewport()->update();
@@ -3460,11 +2108,10 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     if (_pendingRenderJob &&
         renderJobsEquivalentForDisplay(*_pendingRenderJob, result->renderJob)) {
         _pendingRenderJob.reset();
-        _pendingRenderDirty = false;
     }
     if (!_pendingRenderJob) {
         auto surf = _surfWeak.lock();
-        if (surf && _volume && _chunkArray) {
+        if (surf && _volume && _levels) {
             // Viewport size, not _framebuffer: the framebuffer was just replaced
             // by this result, so sizing the staleness check from it would make a
             // stale-size result always look "equivalent" and never catch up.
@@ -3483,7 +2130,6 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
             if (latest &&
                 !renderJobsEquivalentForDisplay(*latest, result->renderJob)) {
                 _pendingRenderJob = std::move(*latest);
-                _pendingRenderDirty = true;
             }
         }
     }
@@ -3497,19 +2143,19 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     }
 }
 
-void CChunkedVolumeViewer::renderVisible(bool force, const char* reason, std::source_location caller)
+void CChunkedVolumeViewer::renderVisible(const char* reason, std::source_location caller)
 {
     ProfileScope profile("renderVisible", reason, caller);
     if (profile.enabled()) {
         profile.setDetails(std::format(
-            "surf='{}' force={} scale={:.4f} zOff={:.3f}",
-            _surfName, force, _scale, _zOff));
+            "surf='{}' scale={:.4f} zOff={:.3f}",
+            _surfName, _scale, _zOff));
     }
     if (_closing) {
         profile.setDetails("action=skip closing");
         return;
     }
-    submitRender(reason ? reason : (force ? "renderVisible force" : "renderVisible non-force"), caller);
+    submitRender(reason ? reason : "renderVisible", caller);
     profile.setDetails("action=submit");
 }
 
@@ -3535,78 +2181,16 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
     if (_closing) {
         return;
     }
-    _overlayGeneration.fetch_add(1, std::memory_order_acq_rel);
-    if (_overlayChunkArray && (!_chunkArray ||
-        _overlayChunkArray->sourceId() != _chunkArray->sourceId()))
-        _overlayChunkArray->clearSourceViewDemand(
-            _chunkViewId, _renderRequestSerial);
-    if (_overlayChunkCbId != 0 && _overlayChunkArray) {
-        _overlayChunkArray->removeChunkReadyListener(_overlayChunkCbId);
-        _overlayChunkCbId = 0;
-    }
-    if (_overlayRemoteFetchCbId != 0 && _overlayChunkArray) {
-        _overlayChunkArray->removeRemoteFetchActivityListener(
-            _overlayRemoteFetchCbId);
-        _overlayRemoteFetchCbId = 0;
-    }
-    // Only the overlay channel's tiles are wrong; the base cache is untouched.
-    dropOverlaySurfaceCache();
     _overlayVolume = std::move(volume);
-    _overlayChunkArray.reset();
-    if (_overlayVolume) {
+    _overlayLevels.reset();
+    if (_overlayVolume && _state && _state->openedVolumes()) {
         try {
-            _overlayChunkArray =
-                sharedOverlayChunkCacheForVolume(_overlayVolume, _state);
-        } catch (const std::exception&) {
-            _overlayChunkArray.reset();
-        }
-        if (_overlayChunkArray) {
-            QPointer<CChunkedVolumeViewer> guard(this);
-            std::weak_ptr<Volume> overlayVolumeWeak = _overlayVolume;
-            _overlayChunkCbId = _overlayChunkArray->addChunkReadyListener([guard, overlayVolumeWeak]() {
-                if (!guard)
-                    return;
-                const auto generation = guard->_overlayGeneration.load(
-                    std::memory_order_acquire);
-                QMetaObject::invokeMethod(qApp, [guard, overlayVolumeWeak, generation]() {
-                    if (!guard)
-                        return;
-                    auto volume = overlayVolumeWeak.lock();
-                    if (!volume || guard->_overlayVolume != volume || guard->_closing ||
-                        guard->_overlayOpacity <= 0.0f ||
-                        guard->_overlayGeneration.load(std::memory_order_acquire) != generation)
-                        return;
-                    ++guard->_chunkContentEpoch;
-                    guard->submitRender("overlay chunk ready");
-                }, Qt::QueuedConnection);
-            });
-            if (_state && _state->debugDownloadQueueEnabled()) {
-                _overlayRemoteFetchCbId =
-                    _overlayChunkArray->addRemoteFetchActivityListener(
-                        [guard, overlayVolumeWeak](
-                            const vc::render::ChunkKey&, bool) {
-                            if (!guard)
-                                return;
-                            const auto generation = guard->_overlayGeneration.load(
-                                std::memory_order_acquire);
-                            QMetaObject::invokeMethod(
-                                qApp, [guard, overlayVolumeWeak, generation]() {
-                                    if (!guard)
-                                        return;
-                                    auto volume = overlayVolumeWeak.lock();
-                                    if (!volume || guard->_overlayVolume != volume ||
-                                        guard->_closing || guard->_overlayOpacity <= 0.0f ||
-                                        guard->_overlayGeneration.load(
-                                            std::memory_order_acquire) != generation) {
-                                        return;
-                                    }
-                                    guard->refreshDownloadQueueDebugOverlay();
-                                }, Qt::QueuedConnection);
-                        });
-            }
+            _overlayLevels = std::make_shared<const vc3d::ViewerLevels>(
+                vc3d::openViewerLevels(*_state->openedVolumes(), *_overlayVolume));
+        } catch (const std::exception& e) {
+            Logger()->warn("overlay volume unavailable: {}", e.what());
         }
     }
-    ensureSurfaceCaches();
     submitRender("overlay volume changed");
 }
 
@@ -3618,14 +2202,7 @@ void CChunkedVolumeViewer::setOverlayOpacity(float opacity)
     const float nextOpacity = std::clamp(opacity, 0.0f, 1.0f);
     if (_overlayOpacity == nextOpacity)
         return;
-    if ((_overlayOpacity > 0.0f) != (nextOpacity > 0.0f))
-        _overlayGeneration.fetch_add(1, std::memory_order_acq_rel);
     _overlayOpacity = nextOpacity;
-    if (_overlayOpacity <= 0.0f && _overlayChunkArray &&
-        (!_chunkArray || _overlayChunkArray->sourceId() != _chunkArray->sourceId())) {
-        _overlayChunkArray->clearSourceViewDemand(
-            _chunkViewId, _renderRequestSerial);
-    }
     submitRender("overlay opacity changed");
 }
 
@@ -3638,25 +2215,17 @@ void CChunkedVolumeViewer::setOverlayColormap(const std::string& colormapId)
     submitRender("overlay colormap changed");
 }
 
-void CChunkedVolumeViewer::setOverlaySamplingMethod(vc::Sampling method)
+void CChunkedVolumeViewer::setOverlaySamplingMethod(int method)
 {
     if (_closing) {
         return;
     }
 
-    const vc::Sampling sanitized = method == vc::Sampling::Trilinear
-        ? vc::Sampling::Trilinear
-        : vc::Sampling::Nearest;
-    if (_overlaySamplingMethod == sanitized) {
+    if (_overlaySamplingMethod == method) {
         return;
     }
 
-    _overlaySamplingMethod = sanitized;
-    // Stored overlay samples were produced with the previous method.
-    if (_overlaySurfaceCache) {
-        dropOverlaySurfaceCache();
-        ensureSurfaceCaches();
-    }
+    _overlaySamplingMethod = method;
     submitRender("overlay sampling changed");
 }
 
@@ -3713,7 +2282,6 @@ void CChunkedVolumeViewer::setOverlayComposite(const OverlayCompositeSettings& s
 
 void CChunkedVolumeViewer::panByF(float dx, float dy)
 {
-    markInteractiveMotion(std::hypot(double(dx), double(dy)));
     const float invScale = _panSensitivity / _scale;
     // Pan deltas are screen-space; under the volumetric camera the UV view
     // center must move along the (rotated/foreshortened) screen directions.
@@ -3754,7 +2322,7 @@ void CChunkedVolumeViewer::zoomByFactorAt(float factor, const QPointF& scenePos)
     }
     _scale = newScale;
     recalcPyramidLevel();
-    _genCacheDirty = true;
+    _geometryDirty = true;
     resizeFramebuffer();
     submitRender("zoom");
     refreshSameWrapAnnotationOverlay();
@@ -3766,10 +2334,6 @@ void CChunkedVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
     if (steps == 0)
         return;
-    const double zoomMotionPx = std::hypot(double(_view->viewport()->width()),
-                                          double(_view->viewport()->height())) *
-                                0.08 * std::abs(double(steps));
-    markInteractiveMotion(zoomMotionPx);
     const float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
     zoomByFactorAt(factor, scenePos);
 }
@@ -3778,28 +2342,18 @@ void CChunkedVolumeViewer::adjustZoomByFactor(float factor)
 {
     if (!std::isfinite(factor) || factor <= 0.0f || factor == 1.0f)
         return;
-    // Apply the true scale multiplier directly, centered on the viewport, and
-    // mark motion proportionally so cache/LOD heuristics treat a large
-    // programmatic zoom like a large wheel zoom.
+    // Apply the true scale multiplier directly, centered on the viewport.
     const QPointF center(_view->viewport()->width() * 0.5,
                          _view->viewport()->height() * 0.5);
-    const double mag = std::abs(std::log(double(factor)) / std::log(1.05));
-    if (mag > 0.0) {
-        const double motionPx = std::hypot(double(_view->viewport()->width()),
-                                           double(_view->viewport()->height())) *
-                                0.08 * mag;
-        markInteractiveMotion(motionPx);
-    }
     zoomByFactorAt(factor, center);
 }
 
-void CChunkedVolumeViewer::notifyInteractiveViewChange(double motionPx)
+void CChunkedVolumeViewer::notifyInteractiveViewChange()
 {
-    if (!_volume || !_chunkArray)
+    if (!_volume || !_levels)
         return;
 
-    markInteractiveMotion(motionPx);
-    _genCacheDirty = true;
+    _geometryDirty = true;
     submitRender("interactive view change");
     emit overlaysUpdated();
 }
@@ -3812,7 +2366,7 @@ void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
         maxZ = static_cast<float>(std::max({w, h, d}));
     }
     setZOffset(std::clamp(_zOff + delta, -maxZ, maxZ));
-    _genCacheDirty = true;
+    _geometryDirty = true;
     submitRender("surface offset changed");
     updateStatusLabel();
 }
@@ -3822,8 +2376,7 @@ void CChunkedVolumeViewer::resetSurfaceOffsets()
     _surfacePtrX = 0.0f;
     _surfacePtrY = 0.0f;
     setZOffset(0.0f);
-    _zOffWorldDir = {0, 0, 0};
-    _genCacheDirty = true;
+    _geometryDirty = true;
     submitRender("surface offsets reset");
 }
 
@@ -3860,11 +2413,11 @@ void CChunkedVolumeViewer::fitSurfaceInView()
     _surfacePtrY = 0.0f;
     _scale = 0.5f;
     recalcPyramidLevel();
-    _genCacheDirty = true;
+    _geometryDirty = true;
     submitRender("fit surface in view");
 }
 
-void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
+void CChunkedVolumeViewer::resetViewForCurrentContent()
 {
     if (_closing || !_view) {
         return;
@@ -3923,20 +2476,15 @@ void CChunkedVolumeViewer::resetViewForCurrentContent(bool forceRender)
                                viewportSize.width(),
                                viewportSize.height());
     setZOffset(0.0f);
-    _zOffWorldDir = {0, 0, 0};
     recalcPyramidLevel();
-    _genCacheDirty = true;
+    _geometryDirty = true;
     updateFocusMarker();
-    if (forceRender) {
-        renderVisible(true, "reset view for current content");
-    } else {
-        submitRender("reset view for current content");
-    }
+    submitRender("reset view for current content");
     refreshSameWrapAnnotationOverlay();
     emit overlaysUpdated();
 }
 
-void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forceRender)
+void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point)
 {
     auto surf = _surfWeak.lock();
     if (!surf)
@@ -3961,28 +2509,18 @@ void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forc
         return;
     }
 
-    centerOnSurfacePoint(surfacePoint, forceRender);
+    centerOnSurfacePoint(surfacePoint);
 }
 
-void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender)
+void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point)
 {
     if (!std::isfinite(point[0]) || !std::isfinite(point[1]))
         return;
 
-    const float oldSurfacePtrX = _surfacePtrX;
-    const float oldSurfacePtrY = _surfacePtrY;
     _surfacePtrX = point[0];
     _surfacePtrY = point[1];
-    _genCacheDirty = true;
-    if (forceRender) {
-        renderVisible(true, "center on surface point");
-    } else {
-        const double motionPx = std::hypot(double(_surfacePtrX - oldSurfacePtrX),
-                                          double(_surfacePtrY - oldSurfacePtrY)) *
-                                double(std::max(_scale, kMinScale));
-        markInteractiveMotion(motionPx);
-        submitRender("center on surface point");
-    }
+    _geometryDirty = true;
+    submitRender("center on surface point");
     emit overlaysUpdated();
 }
 
@@ -4004,20 +2542,19 @@ void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMod
                 auto shiftedPlane = std::make_shared<PlaneSurface>(*plane);
                 shiftedPlane->setOrigin(plane->origin() + normal * (delta + _zOff));
                 setZOffset(0.0f);
-                _zOffWorldDir = {0, 0, 0};
                 if (_state) {
                     _state->setSurface(_surfName, shiftedPlane, false, true);
                 } else {
                     _defaultSurface = shiftedPlane;
                     _surfWeak = _defaultSurface;
                     updateContentBounds();
-                    _genCacheDirty = true;
+                    _geometryDirty = true;
                     submitRender("plane slice mouse wheel");
                 }
             }
         } else {
             setZOffset(_zOff + static_cast<float>(steps) * _zScrollSensitivity);
-            _genCacheDirty = true;
+            _geometryDirty = true;
             submitRender("z offset mouse wheel");
         }
         refreshCursorPositionAt(scenePoint);
@@ -4034,7 +2571,7 @@ void CChunkedVolumeViewer::onResized()
         return;
     }
     resizeFramebuffer();
-    _genCacheDirty = true;
+    _geometryDirty = true;
     submitRender("resized");
     refreshMeasurementOverlay();
     _view->viewport()->update();
@@ -4043,8 +2580,6 @@ void CChunkedVolumeViewer::onResized()
 void CChunkedVolumeViewer::onCursorMove(QPointF scenePos)
 {
     _lastScenePos = scenePos;
-    _haveChunkFocus = true;
-    markChunkRequestViewActive();
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateLocalCursorCrosshair(scenePos);
     updateStatusLabel();
@@ -4075,7 +2610,6 @@ void CChunkedVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
     _panSmoothingInitialized = false;
     _smoothedPanDx = 0.0f;
     _smoothedPanDy = 0.0f;
-    markInteractiveMotion(0.0);
     _lastPanSceneF = _view->mapToScene(_view->mapFromGlobal(QCursor::pos()));
 }
 
@@ -4101,7 +2635,6 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
                 scenePos,
                 appendToPreview,
                 _scale,
-                _pointCollection,
                 [this](const QPointF& point) { return sceneToVolume(point); },
                 [this](const cv::Vec3f& point) { return volumeToScene(point); },
                 [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
@@ -4261,8 +2794,6 @@ void CChunkedVolumeViewer::refreshSameWrapAnnotationOverlay()
 void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
-    _haveChunkFocus = true;
-    markChunkRequestViewActive();
     _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateLocalCursorCrosshair(scenePos);
     updateStatusLabel();
@@ -4383,7 +2914,6 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
         _sameWrapAnnotation.appendManualPreview(
             scenePos,
             _scale,
-            _pointCollection,
             [this](const QPointF& point) { return sceneToVolume(point); },
             [this](const cv::Vec3f& point) { return volumeToScene(point); },
             [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
@@ -4431,7 +2961,6 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
         _sameWrapAnnotation.appendManualPreview(
             scenePos,
             _scale,
-            _pointCollection,
             [this](const QPointF& point) { return sceneToVolume(point); },
             [this](const cv::Vec3f& point) { return volumeToScene(point); },
             [this](const std::string& key, const std::vector<QGraphicsItem*>& items) {
@@ -4615,13 +3144,14 @@ CChunkedVolumeViewer::projectVolumePoint(const cv::Vec3f& volPoint,
         // depth band the view actually displays accepts the point.
         float w = _zOff;
         float distance = dist;
-        const cv::Vec3f surfCoord = quad->coord(ptr);
-        const cv::Vec3f surfNormal = quad->normal(ptr);
-        if (vc::geometry::validSurfacePoint(surfCoord) && finiteVec3(surfNormal)) {
-            w = (volPoint - surfCoord).dot(surfNormal);
+        const cv::Vec2d grid = quad->surfaceToGrid({double(ptr[0]) / quad->scale()[0], double(ptr[1]) / quad->scale()[1]});
+        cv::Vec3f position, normal;
+        framePointAt(*quad, float(grid[0]), float(grid[1]), position.val, normal.val);
+        if (std::isfinite(position[0]) && std::isfinite(normal[0])) {
+            w = (volPoint - position).dot(normal) / normal.dot(normal);
             if (w < depthLo - depthTolerance || w > depthHi + depthTolerance)
                 return std::nullopt;
-            distance = depthBandDistance(volPoint, surfCoord, surfNormal, depthLo, depthHi);
+            distance = float(cv::norm(volPoint - (position + normal * std::clamp(w, depthLo, depthHi))));
         }
         const cv::Vec3f loc = quad->loc(ptr);
         return SurfaceProjection{loc[0], loc[1], w, true, distance};
@@ -4749,11 +3279,8 @@ void CChunkedVolumeViewer::markSurfaceGeometryChanged()
         return;
     }
     ++_surfaceGeometryEpoch;
-    _genCacheDirty = true;
-    // The geometry moved without a known region, so every stored sample is
-    // suspect. ensureSurfaceCaches() rebuilds against the new epoch.
-    dropSurfaceCaches();
-    ensureSurfaceCaches();
+    _geometryDirty = true;
+    _gridSurface.reset();
 }
 
 void CChunkedVolumeViewer::updateLineAnnotationPlacementMarker(const QPointF& scenePos)
@@ -4963,11 +3490,34 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
         p += plane->normal({0, 0, 0}) * _zOff;
     } else if (_zOff != 0.0f) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
-        const cv::Vec3f n = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
-        if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2]))
-            p += n * _zOff;
+        // Where the frame's layer at _zOff lies, in the levels' voxel spacing.
+        if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+            const auto grid = quad->surfaceToGrid({sp[0], sp[1]});
+            cv::Vec3f position, normal;
+            framePointAt(*quad, float(grid[0]), float(grid[1]), position.val, normal.val);
+            if (std::isfinite(position[0]) && std::isfinite(normal[0])) p += normal * _zOff;
+        } else {
+            const cv::Vec3f n = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
+            if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2]))
+                p += n * _zOff;
+        }
     }
     return p;
+}
+
+bool CChunkedVolumeViewer::framePointAt(const QuadSurface& quad, float column, float row, float* xyz, float* normal) const
+{
+    const int pad = QuadSurface::kGridWindowPad + 1;
+    if (_gridSurface && _gridSurfaceFor == &quad && std::isfinite(column) && std::isfinite(row) &&
+        _gridWindow.contains(cv::Point(int(std::floor(column)) - pad, int(std::floor(row)) - pad)) &&
+        _gridWindow.contains(cv::Point(int(std::floor(column)) + pad, int(std::floor(row)) + pad))) {
+        const float xy[]{column - float(_gridWindow.x), row - float(_gridWindow.y)};
+        _gridSurface->pointsAt(xy, 1, xyz, normal);
+    } else {
+        quad.pointAt(column, row, xyz, normal, nullptr, nullptr,
+                     _levels ? _levels->vertexSpacing() : std::array<float, 3>{1, 1, 1});
+    }
+    return true;
 }
 
 void CChunkedVolumeViewer::refreshCursorPositionAt(const QPointF& scenePos)
@@ -5420,6 +3970,17 @@ const std::map<std::string, cv::Vec3b>& CChunkedVolumeViewer::surfaceOverlays() 
     return _surfaceOverlays;
 }
 
+QString CChunkedVolumeViewer::loadingStatus() const
+{
+    if (!_volume || _closing) return {};
+    if (!_loadError.isEmpty())
+        return QString::fromStdString(_surfName) + tr(": read failed: ") + _loadError;
+    if (!_loadRunning && !_pendingLoad) return {};
+    const int level = _volume ? _volume->baseScaleLevel() + renderStartLevel(
+        dynamic_cast<QuadSurface*>(currentSurface()) != nullptr) : 0;
+    return tr("%1: loading L%2").arg(QString::fromStdString(_surfName)).arg(level);
+}
+
 void CChunkedVolumeViewer::updateStatusLabel()
 {
     // Piggyback on the status refresh: it runs on every surface/settings
@@ -5434,14 +3995,12 @@ void CChunkedVolumeViewer::updateStatusLabel()
     // The stats group (mip level, label, scale, framebuffer, composite) can be
     // routed to the right-anchored bar or dropped per viewer.
     QStringList statsItems;
-    statsItems << QString("L%1").arg(_dsScaleIdx);
+    statsItems << QString("L%1").arg(renderStartLevel(dynamic_cast<QuadSurface*>(currentSurface()) != nullptr));
     if (const QString viewerLabel = property("vc_viewer_label").toString(); !viewerLabel.isEmpty())
         statsItems << viewerLabel;
     statsItems << QString("scale %1").arg(_scale, 0, 'f', 2);
 
-    if ((_compositeSettings.enabled || _compositeSettings.planeEnabled) && streamingCompositeUnsupported()) {
-        statsItems << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
-    } else if (volumetricCameraActive()) {
+    if (volumetricCameraActive()) {
         QString volumetric = QString("composite volumetric az %1 tilt %2")
                                  .arg(_compositeSettings.params.camAzimuthDeg, 0, 'f', 0)
                                  .arg(_compositeSettings.params.camTiltDeg, 0, 'f', 0);
@@ -5454,7 +4013,7 @@ void CChunkedVolumeViewer::updateStatusLabel()
             volumetric += QString(" w×%1").arg(_compositeSettings.params.wScale, 0, 'f', 1);
         statsItems << volumetric;
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {
-        statsItems << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        statsItems << QString("composite %1").arg(QString::fromStdString(compositeMethodName(_compositeSettings.params)));
     }
 
     const bool showStats = !property("vc_hide_status_stats").toBool();
@@ -5462,55 +4021,22 @@ void CChunkedVolumeViewer::updateStatusLabel()
     if (showStats && !statsTopRight) {
         items << statsItems;
     }
-    // Cache/scheduler statistics are informational; refresh them at most
-    // every 250 ms (see _sharedCacheStatsThrottle) instead of taking the
-    // shared cache and scheduler mutexes on every mouse move.
+    // Cache statistics are informational; refresh them at most every 250 ms
+    // (see _sharedCacheStatsThrottle), not on every mouse move.
     constexpr qint64 kSharedCacheStatsRefreshMs = 250;
     if (!_sharedCacheStatsThrottle.isValid() ||
         _sharedCacheStatsThrottle.elapsed() >= kSharedCacheStatsRefreshMs) {
         _sharedCacheStatsThrottle.restart();
         QStringList freshItems;
-        if (_chunkArray) {
-            const auto stats = _chunkArray->stats();
-            freshItems << vc3d::formatCacheStorageStats(stats);
-            if (stats.persistentCacheEnabled && stats.persistentCacheLowSpace) {
-                freshItems << QString("⚠ low disk: %1 free")
-                    .arg(formatByteSize(stats.persistentCacheFreeBytes));
-            }
-            if (!stats.persistentCacheWarning.empty()) {
-                freshItems << QStringLiteral("⚠ disk cache disabled: ") +
-                    QString::fromStdString(stats.persistentCacheWarning);
-            }
-            const QString network = vc3d::formatNetworkDownloadStats(
-                stats, _volume && _volume->isRemote());
-            if (!network.isEmpty())
-                freshItems << network;
+        if (_state && _state->openedVolumes()) {
+            const auto cache = _state->openedVolumes()->cacheStats();
+            freshItems << QString("RAM %1/%2")
+                .arg(formatByteSize(cache.bytes))
+                .arg(formatByteSize(cache.capacity));
+            const auto transfer = _state->openedVolumes()->transferStats();
+            freshItems << tr("Downloaded %1 (%2 chunks)")
+                .arg(formatByteSize(transfer.bytes)).arg(transfer.chunks);
         }
-
-        // The RAM figure above already reports the *effective* chunk-cache
-        // capacity, so a floor raised above the configured setting is visible
-        // rather than silent.
-        auto appendSurfaceCacheStats = [&freshItems](const char* label,
-                                                     const vc::render::SurfaceCache* cache) {
-            if (!cache)
-                return;
-            const auto stats = cache->stats();
-            QString item = QString("%1 %2/%3 (%4 tiles")
-                .arg(QString::fromUtf8(label))
-                .arg(formatByteSize(stats.bytes))
-                .arg(formatByteSize(stats.capacity))
-                .arg(stats.tiles);
-            if (stats.tilesInFlight > 0)
-                item += QString(", %1 filling").arg(stats.tilesInFlight);
-            if (stats.tilesIncomplete > 0)
-                item += QString(", %1 partial").arg(stats.tilesIncomplete);
-            item += QStringLiteral(")");
-            freshItems << item;
-        };
-        appendSurfaceCacheStats("surface", _surfaceCache.get());
-        appendSurfaceCacheStats("surface overlay", _overlaySurfaceCache.get());
-        if (_surfaceCacheOutOfBand)
-            freshItems << QStringLiteral("surface: out of band");
         _cachedSharedCacheItems = std::move(freshItems);
     }
     sharedCacheItems = _cachedSharedCacheItems;

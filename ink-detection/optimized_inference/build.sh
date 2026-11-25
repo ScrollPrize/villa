@@ -11,12 +11,14 @@ fi
 
 VERSION=$1
 DIR=$(readlink -f $(dirname $0))
+# vc_reader is built from the monorepo inside both images.
+VC_READER=$(readlink -f $DIR/../../vc_reader)
 
-docker build $DIR \
+docker build $DIR --build-context vc_reader=$VC_READER \
     --progress plain --builder kube --platform linux/amd64 --target gpu --push \
     --tag 585768151128.dkr.ecr.us-east-1.amazonaws.com/scrollprize/ink-detection:$VERSION
 
-docker build $DIR \
+docker build $DIR --build-context vc_reader=$VC_READER \
     --progress plain --builder kube --platform linux/amd64,linux/arm64 --target cpu --push \
     --tag 585768151128.dkr.ecr.us-east-1.amazonaws.com/scrollprize/ink-detection:$VERSION-cpu
 

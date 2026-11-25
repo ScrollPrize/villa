@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import vc
+from vc_reader.reader import MemoryCache, open_zarr
 
 
 @dataclass(frozen=True)
@@ -54,7 +53,6 @@ class VolumeSlabExtractor:
         ray_length: int = 384,
         spacing: float = 1.0,
         sampling: str = "trilinear",
-        tile_size: int = 32,
         cache_bytes: int = 0,
         io_threads: int = 0,
         segment_to_volume_xyz: list[np.ndarray] | None = None,
@@ -65,17 +63,12 @@ class VolumeSlabExtractor:
             raise ValueError("spacing must be finite and positive")
         if sampling not in {"nearest", "trilinear"}:
             raise ValueError("sampling must be 'nearest' or 'trilinear'")
-        if tile_size <= 0:
-            raise ValueError("tile_size must be positive")
 
         self.volume_paths = [Path(path) for path in volume_paths]
         self.transverse_size = int(transverse_size)
         self.ray_length = int(ray_length)
         self.spacing = float(spacing)
-        self.sampling = sampling
-        self.tile_size = int(tile_size)
-        self.cache_bytes = int(cache_bytes)
-        self.io_threads = int(io_threads)
+        self.order = 1 if sampling == "trilinear" else 0
         if segment_to_volume_xyz is None:
             segment_to_volume_xyz = [np.eye(4) for _ in volume_paths]
         if len(segment_to_volume_xyz) != len(volume_paths):
@@ -86,7 +79,17 @@ class VolumeSlabExtractor:
         ]
         if any(transform.shape != (4, 4) for transform in self.segment_to_volume_xyz):
             raise ValueError("segment-to-volume transforms must have shape [4, 4]")
-        self._volume_handles: dict[tuple[int, int], vc.Volume] = {}
+        # One memory budget shared by every volume's reader. Readers rebuild
+        # their threads in forked DataLoader workers, so they are opened once here.
+        memory_cache = MemoryCache(int(cache_bytes)) if cache_bytes > 0 else None
+        self.readers = [
+            open_zarr(
+                path,
+                memory_cache=memory_cache,
+                threads=int(io_threads) if io_threads > 0 else None,
+            )
+            for path in self.volume_paths
+        ]
 
     @staticmethod
     def scaled_volume_path(path: Path, scale: int) -> Path:
@@ -134,20 +137,6 @@ class VolumeSlabExtractor:
         transform[:3, 3] = -inverse_linear @ values[:, 3] / target_downscale
         return transform
 
-    def _volume(self, volume_idx: int) -> vc.Volume:
-        # DataLoader workers must not inherit another process's cache and I/O
-        # thread pool, so handles are deliberately opened lazily per process.
-        key = (os.getpid(), volume_idx)
-        volume = self._volume_handles.get(key)
-        if volume is None:
-            volume = vc.Volume.open(str(self.volume_paths[volume_idx]))
-            if self.cache_bytes > 0:
-                vc.set_chunk_cache_budget(self.cache_bytes)
-            if self.io_threads > 0:
-                vc.set_chunk_cache_io_threads(self.io_threads)
-            self._volume_handles[key] = volume
-        return volume
-
     def slab_frame(
         self, direction: np.ndarray, ray_origin: np.ndarray
     ) -> SlabFrame:
@@ -178,44 +167,36 @@ class VolumeSlabExtractor:
     ) -> tuple[np.ndarray, np.ndarray, SlabFrame]:
         """Sample the slab image and validity, both [H, W, L], plus the frame.
 
-        The slab is realized as H parallel planes of shape [W, L] offset
-        along axis_a, so one fused sample_planes call owns all I/O.
+        Slab voxel (i, j, k) samples ``frame.to_world((i, j, k))`` mapped
+        into the volume array; validity is that point lying inside the array.
         """
         frame = self.slab_frame(direction, ray_origin)
-        size = self.transverse_size
-        origins = frame.origin[None] + (
-            self.spacing * np.arange(size, dtype=np.float64)[:, None]
-            * frame.axis_a[None]
-        )
-        x_steps = np.broadcast_to(self.spacing * frame.direction, (size, 3))
-        y_steps = np.broadcast_to(self.spacing * frame.axis_b, (size, 3))
-
         transform = self.segment_to_volume_xyz[volume_idx]
-        linear = transform[:3, :3]
-        images, valid, _ = self._volume(volume_idx).sample_planes(
-            np.ascontiguousarray(
-                origins @ linear.T + transform[:3, 3], dtype=np.float32
-            ),
-            np.ascontiguousarray(x_steps @ linear.T, dtype=np.float32),
-            np.ascontiguousarray(y_steps @ linear.T, dtype=np.float32),
-            (size, self.ray_length),
-            sampling=self.sampling,
-            tile_size=self.tile_size,
+        linear_zyx = transform[:3, :3].T[:, ::-1]
+        origin_zyx = (frame.origin @ transform[:3, :3].T + transform[:3, 3])[::-1]
+        steps = self.spacing * np.stack(
+            [frame.axis_a, frame.axis_b, frame.direction]
+        ) @ linear_zyx
+        size = self.transverse_size
+        ij = np.arange(size, dtype=np.float32)
+        points_zyx = (
+            origin_zyx.astype(np.float32)
+            + ij[:, None, None, None] * steps[0].astype(np.float32)
+            + ij[None, :, None, None] * steps[1].astype(np.float32)
+            + np.arange(self.ray_length, dtype=np.float32)[None, None, :, None]
+            * steps[2].astype(np.float32)
         )
-        # Boolean validity: downstream boolean masking must never degrade
-        # into integer fancy indexing.
-        return np.asarray(images), np.asarray(valid, dtype=bool), frame
+        reader = self.readers[volume_idx]
+        images = reader.sample(points_zyx, order=self.order)
+        valid = np.all(
+            (points_zyx >= 0) & (points_zyx < np.asarray(reader.shape, np.float32)),
+            axis=-1,
+        )
+        return images, valid, frame
 
     def sample_points(self, volume_idx: int, points_xyz: np.ndarray) -> np.ndarray:
         """Sample volume intensities at display/segment-space XYZ points."""
         transform = self.segment_to_volume_xyz[volume_idx]
         coords = np.asarray(points_xyz, dtype=np.float64) @ transform[:3, :3].T
         coords += transform[:3, 3]
-        coords = np.ascontiguousarray(coords[np.newaxis], dtype=np.float32)
-        values, _, _ = self._volume(volume_idx).sample_coords(
-            coords,
-            np.ones(coords.shape[:2], dtype=bool),
-            sampling=self.sampling,
-            tile_size=self.tile_size,
-        )
-        return np.asarray(values).reshape(-1)
+        return self.readers[volume_idx].sample(coords[:, ::-1], order=self.order)

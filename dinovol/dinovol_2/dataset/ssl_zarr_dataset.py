@@ -1,29 +1,21 @@
-import asyncio
 import atexit
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-import json
 import math
 import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-import sys
-import time
 from typing import Any
 
-import aiohttp
-import fsspec
 import numpy as np
 import torch
 import torch.nn.functional as F
-import zarr
-from fsspec.asyn import sync
 from scipy import ndimage as ndi
 from scipy.ndimage import binary_dilation
 from torch.utils.data import Dataset
+from vc_reader.reader import load_basic_auth, open_zarr
 
-from dinovol_2.augmentation.pipelines import create_training_transforms
 from dinovol_2.dataset.object_labels import (
     FIBER_KIND,
     INK_KIND,
@@ -34,6 +26,7 @@ from dinovol_2.dataset.object_labels import (
     distinct_fiber_pairs,
     fiber_objects,
     load_or_build_volume_meshes,
+    s3_auth,
     slab_objects,
 )
 from dinovol_2.dataset.normalization import get_normalization
@@ -42,29 +35,7 @@ from dinovol_2.dataset.point_annotations import (
     map_scale0_voxel_centers,
     xyz_to_zyx,
 )
-
-
-# Dropped connections, truncated bodies, timeouts and throttling from remote stores.
-# Missing chunks surface as FileNotFoundError inside zarr and never reach this.
-TRANSIENT_READ_ERRORS = (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError)
-
-
-def read_with_retries(read, retries, backoff=1.0):
-    """Call read(), retrying transient network errors with exponential backoff."""
-    for attempt in range(retries + 1):
-        try:
-            return read()
-        except TRANSIENT_READ_ERRORS as exc:
-            if attempt == retries:
-                raise
-            delay = backoff * 2 ** attempt
-            print(
-                f"ssl_zarr_dataset: transient read error ({type(exc).__name__}: {exc}); "
-                f"retry {attempt + 1}/{retries} in {delay:g}s",
-                file=sys.stderr,
-                flush=True,
-            )
-            time.sleep(delay)
+from dinovol_2.dataset.training_transforms import create_training_transforms
 
 
 def _otsu_threshold(values: np.ndarray, bins: int = 256) -> float:
@@ -187,42 +158,6 @@ class SourcePlan:
     mesh_anchor: np.ndarray | None = None
 
 
-@dataclass
-class ZarrHandle:
-    array: Any
-    fs: Any | None = None
-
-    def close(self) -> None:
-        if self.fs is None:
-            return
-        session = getattr(self.fs, "_session", None)
-        if session is None:
-            return
-        loop = getattr(self.fs, "loop", None)
-        if loop is not None and not loop.is_closed():
-            try:
-                sync(loop, session.close, timeout=1.0)
-            except Exception:
-                close_session = getattr(type(self.fs), "close_session", None)
-                if callable(close_session):
-                    close_session(loop, session)
-        else:
-            close_session = getattr(type(self.fs), "close_session", None)
-            if callable(close_session):
-                close_session(loop, session)
-        connector = getattr(session, "_connector", None)
-        if connector is not None and not connector.closed:
-            connector._close()
-        try:
-            session._connector = None
-        except AttributeError:
-            pass
-        try:
-            self.fs._session = None
-        except AttributeError:
-            pass
-
-
 @dataclass(frozen=True)
 class SampledCropRegion:
     starts: tuple[int, int, int]
@@ -253,70 +188,21 @@ def _max_3tuple(*values):
     return tuple(max(int(value[axis]) for value in filtered) for axis in range(3))
 
 
-def load_volume_auth(auth_json_path):
-    if auth_json_path is None:
-        return None, None
-
-    with open(str(auth_json_path), "r", encoding="utf-8") as f:
-        auth = json.load(f)
-    return str(auth["username"]), str(auth["password"])
+def _draw_seed() -> int:
+    """A transform seed, from torch's generator: it follows the run's seed and differs per DataLoader worker."""
+    return int(torch.randint(2**63 - 1, ()))
 
 
-def open_zarr_handle(path, resolution, auth=None, s3_storage_options=None):
+def open_volume_level(path, resolution, auth=None, s3_storage_options=None):
+    """Level `resolution` of the volume at `path`; `auth` is a JSON credentials file for https volumes."""
     path_str = str(path)
-    user, password = load_volume_auth(auth)
     if path_str.startswith("s3://"):
-        storage_options = {"anon": True}
-        if s3_storage_options is not None:
-            storage_options.update(dict(s3_storage_options))
-        try:
-            return ZarrHandle(
-                array=zarr.open(
-                    path_str,
-                    path=str(resolution),
-                    mode="r",
-                    storage_options=storage_options,
-                )
-            )
-        except ImportError as exc:
-            raise ModuleNotFoundError(
-                "Opening s3:// zarr volumes requires the optional dependency `s3fs`."
-            ) from exc
-    use_https_auth = path_str.startswith("https://") and bool(user) and bool(password)
-    if use_https_auth:
-        fs = fsspec.filesystem(
-            "https",
-            asynchronous=True,
-            client_kwargs={"auth": aiohttp.BasicAuth(user, password)},
-        )
-        if hasattr(zarr.storage, "FsspecStore"):
-            store = zarr.storage.FsspecStore(
-                fs=fs,
-                path=path_str.rstrip("/"),
-                read_only=True,
-                allowed_exceptions=(
-                    KeyError,
-                    FileNotFoundError,
-                    PermissionError,
-                    OSError,
-                    aiohttp.ClientResponseError,
-                ),
-            )
-        else:
-            store = zarr.storage.FSStore(
-                path_str.rstrip("/"),
-                fs=fs,
-                mode="r",
-                check=False,
-                create=False,
-                exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
-            )
-        return ZarrHandle(array=zarr.open(store, path=str(resolution), mode="r"), fs=fs)
-    return ZarrHandle(array=zarr.open(path_str, path=str(resolution), mode="r"))
-
-
-def open_zarr(path, resolution, auth=None, s3_storage_options=None):
-    return open_zarr_handle(path, resolution, auth=auth, s3_storage_options=s3_storage_options).array
+        access = s3_auth(s3_storage_options)
+    elif path_str.startswith("https://") and auth is not None:
+        access = load_basic_auth(auth)
+    else:
+        access = None
+    return open_zarr(path_str, level=str(resolution), auth=access)
 
 
 class SSLZarrDataset(Dataset):
@@ -403,13 +289,7 @@ class SSLZarrDataset(Dataset):
         self.read_ahead = int(self.config.get("read_ahead", 0))
         if self.read_ahead < 0:
             raise ValueError(f"read_ahead must be non-negative, got {self.read_ahead}")
-        # read_retries: transient network errors are retried this many times with
-        # backoff doubling from read_retry_backoff seconds; the same window is re-read.
-        self.read_retries = int(self.config.get("read_retries", 5))
-        self.read_retry_backoff = float(self.config.get("read_retry_backoff", 1.0))
-        if self.read_retries < 0:
-            raise ValueError(f"read_retries must be non-negative, got {self.read_retries}")
-        self._volume_handles: dict[tuple[str, int], ZarrHandle] = {}
+        self._volume_arrays: dict[tuple[str, int], Any] = {}
         self._handle_pid: int | None = None
         self._atexit_pid: int | None = None
         self._read_executor: ThreadPoolExecutor | None = None
@@ -505,9 +385,7 @@ class SSLZarrDataset(Dataset):
         for dataset in self.config["datasets"]:
             volume_path = dataset["volume_path"]
             volume_scale = dataset["volume_scale"]
-            handle = open_zarr_handle(volume_path, volume_scale, self.volume_auth, self.s3_storage_options)
-            try:
-                d_zarr = handle.array
+            with open_volume_level(volume_path, volume_scale, self.volume_auth, self.s3_storage_options) as d_zarr:
                 z, y, x = d_zarr.shape
                 if self.object_mask_enabled:
                     z0 = int(math.ceil(z * self.object_mask_z_trim_pct))
@@ -587,8 +465,6 @@ class SSLZarrDataset(Dataset):
                     ink_anchor_weight=float(dataset.get("ink_anchor_weight", 1.0)),
                     oversample=oversample,
                 ))
-            finally:
-                handle.close()
 
         if self.occupancy_level is not None:
             # Windows inside the object mask are fully occupied: the occupancy check is moot.
@@ -666,51 +542,43 @@ class SSLZarrDataset(Dataset):
 
         volume_path = dataset_config["volume_path"]
         volume_scale = int(dataset_config["volume_scale"])
-        scale0_handle = None
-        try:
-            if volume_scale == 0:
-                scale0_shape = selected_shape
-            else:
-                scale0_handle = open_zarr_handle(
-                    volume_path,
-                    0,
-                    self.volume_auth,
-                    self.s3_storage_options,
-                )
-                scale0_shape = tuple(int(value) for value in scale0_handle.array.shape)
+        if volume_scale == 0:
+            scale0_shape = selected_shape
+        else:
+            scale0_shape = tuple(
+                int(value)
+                for value in open_volume_level(volume_path, 0, self.volume_auth, self.s3_storage_options).shape
+            )
 
-            all_coordinates = []
-            all_type_ids = []
-            usable_start = np.asarray(usable_bbox[:3], dtype=np.float64)
-            usable_stop = np.asarray(usable_bbox[3:], dtype=np.float64)
-            for entry_index, entry in enumerate(entries):
-                if not isinstance(entry, dict) or "path" not in entry or "type" not in entry:
-                    raise ValueError(
-                        f"point_collections entry {entry_index} for {volume_path} must contain path and type."
-                    )
-                type_name = entry["type"]
-                if not isinstance(type_name, str) or not type_name:
-                    raise ValueError("Point collection types must be non-empty strings.")
-                points = map_scale0_voxel_centers(
-                    xyz_to_zyx(load_point_collection(entry["path"])),
-                    scale0_shape,
-                    selected_shape,
+        all_coordinates = []
+        all_type_ids = []
+        usable_start = np.asarray(usable_bbox[:3], dtype=np.float64)
+        usable_stop = np.asarray(usable_bbox[3:], dtype=np.float64)
+        for entry_index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or "path" not in entry or "type" not in entry:
+                raise ValueError(
+                    f"point_collections entry {entry_index} for {volume_path} must contain path and type."
                 )
-                usable = np.all((points >= usable_start) & (points < usable_stop), axis=1)
-                points = points[usable]
-                if points.shape[0] == 0:
-                    raise ValueError(
-                        f"Point collection {entry['path']} has no annotations usable in the trimmed bounds "
-                        f"of volume {volume_path} at scale {volume_scale}."
-                    )
-                all_coordinates.append(points)
-                all_type_ids.append(
-                    np.full((points.shape[0],), self.point_type_to_id[type_name], dtype=np.int64)
+            type_name = entry["type"]
+            if not isinstance(type_name, str) or not type_name:
+                raise ValueError("Point collection types must be non-empty strings.")
+            points = map_scale0_voxel_centers(
+                xyz_to_zyx(load_point_collection(entry["path"])),
+                scale0_shape,
+                selected_shape,
+            )
+            usable = np.all((points >= usable_start) & (points < usable_stop), axis=1)
+            points = points[usable]
+            if points.shape[0] == 0:
+                raise ValueError(
+                    f"Point collection {entry['path']} has no annotations usable in the trimmed bounds "
+                    f"of volume {volume_path} at scale {volume_scale}."
                 )
-            return np.concatenate(all_coordinates), np.concatenate(all_type_ids)
-        finally:
-            if scale0_handle is not None:
-                scale0_handle.close()
+            all_coordinates.append(points)
+            all_type_ids.append(
+                np.full((points.shape[0],), self.point_type_to_id[type_name], dtype=np.int64)
+            )
+        return np.concatenate(all_coordinates), np.concatenate(all_type_ids)
 
     def _load_occupancy(self, volume: Volume) -> None:
         level = int(self.occupancy_level)
@@ -723,23 +591,17 @@ class SSLZarrDataset(Dataset):
         factor = read_factor * pool
         bbox_lo = np.asarray(volume.usable_bbox[:3]) // factor
         bbox_hi = -(-np.asarray(volume.usable_bbox[3:]) // factor)
-        handle = open_zarr_handle(volume.path, level, self.volume_auth, self.s3_storage_options)
-        try:
-            array = handle.array
+        with open_volume_level(volume.path, level, self.volume_auth, self.s3_storage_options) as array:
             # Read one extra cell on each side for the dilation below.
             read_lo = np.maximum((bbox_lo - 1) * pool, 0)
             read_hi = np.minimum((bbox_hi + 1) * pool, array.shape)
             fine = np.zeros(tuple((bbox_hi - bbox_lo + 2) * pool), dtype=bool)
             selection = tuple(slice(int(a), int(b)) for a, b in zip(read_lo, read_hi))
-            values = read_with_retries(
-                lambda: np.asarray(array[selection]), self.read_retries, self.read_retry_backoff
-            )
+            values = np.asarray(array[selection])
             offset = read_lo - (bbox_lo - 1) * pool
             fine[tuple(slice(int(o), int(o) + n) for o, n in zip(offset, values.shape))] = values > 0
             shape = bbox_hi - bbox_lo + 2
             coarse = fine.reshape(shape[0], pool, shape[1], pool, shape[2], pool).any(axis=(1, 3, 5))
-        finally:
-            handle.close()
         # Downsampling can round sparse cells to zero; one cell of dilation keeps every
         # nonzero selected-scale voxel inside an occupied cell.
         coarse = binary_dilation(coarse, structure=np.ones((3, 3, 3), dtype=bool))
@@ -757,17 +619,13 @@ class SSLZarrDataset(Dataset):
         # Same cells as the occupancy grid: 2**occupancy_level selected-scale voxels.
         pool = max(1, 2 ** level // read_factor)
         factor = read_factor * pool
-        handle = open_zarr_handle(volume.path, level, self.volume_auth, self.s3_storage_options)
-        try:
-            array = handle.array
+        with open_volume_level(volume.path, level, self.volume_auth, self.s3_storage_options) as array:
             cells = -(-np.asarray(array.shape) // pool)
             means = np.zeros(tuple(cells), dtype=np.float32)
             nonzero = np.zeros(tuple(cells), dtype=bool)
             slab = 64 * pool  # z planes per read: the finest levels are too large to hold at once
             for z in range(0, array.shape[0], slab):
-                values = read_with_retries(
-                    lambda z=z: np.asarray(array[z:z + slab]), self.read_retries, self.read_retry_backoff
-                )
+                values = np.asarray(array[z:z + slab])
                 padded = np.zeros(tuple(-(-n // pool) * pool for n in values.shape), dtype=values.dtype)
                 padded[tuple(slice(0, n) for n in values.shape)] = values
                 blocks = padded.reshape(
@@ -776,8 +634,6 @@ class SSLZarrDataset(Dataset):
                 rows = slice(z // pool, z // pool + blocks.shape[0])
                 means[rows] = blocks.mean(axis=(1, 3, 5), dtype=np.float32)
                 nonzero[rows] = (blocks > 0).any(axis=(1, 3, 5))
-        finally:
-            handle.close()
         if volume.object_mask_source == "sam2":
             # The published (SAM2) mask as-is, air margin included. Cells count as nonzero if any
             # voxel is, so edge cells straddle the mask: erode by one cell to keep windows off it.
@@ -840,7 +696,7 @@ class SSLZarrDataset(Dataset):
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["_volume_handles"] = {}
+        state["_volume_arrays"] = {}
         state["_handle_pid"] = None
         state["_atexit_pid"] = None
         state["_read_executor"] = None
@@ -861,7 +717,7 @@ class SSLZarrDataset(Dataset):
         self.close()
         self._read_executor = None
         self._pending_reads = deque()
-        self._volume_handles = {}
+        self._volume_arrays = {}
         self._handle_pid = pid
         self._register_close_hook()
 
@@ -871,15 +727,15 @@ class SSLZarrDataset(Dataset):
     def _get_array(self, path, level):
         self._ensure_process_local_handles()
         key = (str(path), int(level))
-        handle = self._volume_handles.get(key)
-        if handle is None:
-            handle = open_zarr_handle(path, level, self.volume_auth, self.s3_storage_options)
-            self._volume_handles[key] = handle
-        return handle.array
+        array = self._volume_arrays.get(key)
+        if array is None:
+            array = open_volume_level(path, level, self.volume_auth, self.s3_storage_options)
+            self._volume_arrays[key] = array
+        return array
 
     def _read_region(self, array, lo, hi):
         selection = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
-        return read_with_retries(lambda: np.asarray(array[selection]), self.read_retries, self.read_retry_backoff)
+        return np.asarray(array[selection])
 
     def _read_coarse_region(self, array, lo, hi, factor):
         """Read [lo, hi) of the selected-scale grid from an array `factor` times coarser."""
@@ -1073,9 +929,7 @@ class SSLZarrDataset(Dataset):
             executor.shutdown(wait=True, cancel_futures=True)
             self._read_executor = None
             self._pending_reads.clear()
-        for handle in self._volume_handles.values():
-            handle.close()
-        self._volume_handles.clear()
+        self._volume_arrays.clear()
 
     def __del__(self):
         try:
@@ -1125,7 +979,7 @@ class SSLZarrDataset(Dataset):
             slice(y_start, y_start + crop_h),
             slice(x_start, x_start + crop_w),
         )
-        return read_with_retries(lambda: np.asarray(d_zarr[selection]), self.read_retries, self.read_retry_backoff)
+        return np.asarray(d_zarr[selection])
 
     def _read_source_crop_3d(self, d_zarr, usable_bbox):
         return self._read_source_window(d_zarr, self._sample_source_start(usable_bbox))
@@ -1216,37 +1070,10 @@ class SSLZarrDataset(Dataset):
             target_size,
         )
 
-    @staticmethod
-    def _capture_rng_state():
-        state = {
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-            "torch": torch.get_rng_state(),
-        }
-        if torch.cuda.is_available():
-            state["cuda"] = torch.cuda.get_rng_state_all()
-        return state
-
-    @staticmethod
-    def _restore_rng_state(state):
-        random.setstate(state["python"])
-        np.random.set_state(state["numpy"])
-        torch.set_rng_state(state["torch"])
-        if "cuda" in state and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(state["cuda"])
-
     def _apply_paired_global_transform(self, transform, global_view, gram_teacher_view):
-        if gram_teacher_view is None or self.gram_teacher_no_augmentations:
-            transformed = transform(image=global_view, paired_spatial_image=gram_teacher_view)
-            return transformed["image"], transformed["paired_spatial_image"]
-
-        state_before = self._capture_rng_state()
-        augmented_global = transform(image=global_view)["image"]
-        state_after = self._capture_rng_state()
-        self._restore_rng_state(state_before)
-        augmented_gram_teacher = transform(image=gram_teacher_view)["image"]
-        self._restore_rng_state(state_after)
-        return augmented_global, augmented_gram_teacher
+        seed = _draw_seed()
+        augmented_global = transform.full({"image": global_view}, seed=seed)["image"]
+        return augmented_global, self._transform_gram_teacher(transform, gram_teacher_view, seed)
 
     def _apply_paired_global_transform_with_points(
         self,
@@ -1255,23 +1082,17 @@ class SSLZarrDataset(Dataset):
         gram_teacher_view,
         point_coordinates,
     ):
-        transform_input = {
-            "image": global_view,
-            "keypoints": point_coordinates,
-            "crop_shape": tuple(int(value) for value in self.global_crop_size),
-        }
-        if gram_teacher_view is None or self.gram_teacher_no_augmentations:
-            transform_input["paired_spatial_image"] = gram_teacher_view
-            transformed = transform(**transform_input)
-            return transformed["image"], transformed["paired_spatial_image"], transformed["keypoints"]
+        seed = _draw_seed()
+        transformed = transform.full({"image": global_view, "keypoints": point_coordinates}, seed=seed)
+        gram_teacher = self._transform_gram_teacher(transform, gram_teacher_view, seed)
+        return transformed["image"], gram_teacher, transformed["keypoints"]
 
-        state_before = self._capture_rng_state()
-        transformed = transform(**transform_input)
-        state_after = self._capture_rng_state()
-        self._restore_rng_state(state_before)
-        augmented_gram_teacher = transform(image=gram_teacher_view)["image"]
-        self._restore_rng_state(state_after)
-        return transformed["image"], augmented_gram_teacher, transformed["keypoints"]
+    def _transform_gram_teacher(self, transform, gram_teacher_view, seed):
+        """The Gram teacher's view with the geometry of its global view, and its intensity changes if configured."""
+        if gram_teacher_view is None:
+            return None
+        pipeline = transform.geometry if self.gram_teacher_no_augmentations else transform.full
+        return pipeline({"image": gram_teacher_view}, seed=seed)["image"]
 
     @staticmethod
     def _map_points_to_view(points, crop_region, target_size):
@@ -1476,7 +1297,7 @@ class SSLZarrDataset(Dataset):
                 self.global_crop_size,
             )
             if self.do_augmentations:
-                crop = self.global_transforms[0](image=crop)["image"]
+                crop = self.global_transforms[0].full({"image": crop}, seed=_draw_seed())["image"]
             return crop
 
         global_views = []
@@ -1589,7 +1410,7 @@ class SSLZarrDataset(Dataset):
             ]
             if self.do_augmentations:
                 local_views = [
-                    transform(image=view)["image"]
+                    transform.full({"image": view}, seed=_draw_seed())["image"]
                     for transform, view in zip(self.local_transforms, local_views)
                 ]
 
