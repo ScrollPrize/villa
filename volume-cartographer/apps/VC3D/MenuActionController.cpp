@@ -220,8 +220,12 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
         QObject::tr("Histogram"),
         QObject::tr("Histogram of the gray values in each slice view, with 1st and 99th percentiles and the share clipped to black or white"));
     _hudLineProfileAct = makeHudAction(
-        QObject::tr("Line Profile (drag in a slice view)"),
-        QObject::tr("A left drag draws a line and plots the gray values along it; peaks mark bright crossings such as papyrus layers. A click clears it."));
+        QObject::tr("Line Profile"),
+        QObject::tr("Plots the 8-bit samples along the profile line, before the display window; peaks mark bright crossings such as papyrus layers. Draw the line with Draw Profile Line."));
+    _hudDrawProfileAct = new QAction(QObject::tr("Draw Profile Line"), this);
+    _hudDrawProfileAct->setToolTip(
+        QObject::tr("The next left drag in a slice view draws the profile line (a click clears it, Escape cancels); other clicks stay with the active tool"));
+    connect(_hudDrawProfileAct, &QAction::triggered, this, [] { ViewerManager::armFleetProfileLine(); });
     _hudGridAct = makeHudAction(
         QObject::tr("Coordinate Grid"),
         QObject::tr("Labeled lines at round volume coordinates on plane views"));
@@ -291,6 +295,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _measurementMenu->setToolTipsVisible(true);
     _measurementMenu->addAction(_hudHistogramAct);
     _measurementMenu->addAction(_hudLineProfileAct);
+    _measurementMenu->addAction(_hudDrawProfileAct);
     _measurementMenu->addAction(_hudGridAct);
     _measurementMenu->addAction(_hudLoupeAct);
     _viewMenu->addSeparator();
@@ -1451,17 +1456,13 @@ void MenuActionController::toggleDrawBBox(bool enabled)
 
 void MenuActionController::applyMeasurementOverlays()
 {
-    vc3d::hud::Options options;
+    // Same scope as viewer.set_hud: every manager's viewers, keeping the grid step.
+    vc3d::hud::Options options = ViewerManager::fleetHudOptions();
     options.histogram = _hudHistogramAct && _hudHistogramAct->isChecked();
     options.lineProfile = _hudLineProfileAct && _hudLineProfileAct->isChecked();
     options.grid = _hudGridAct && _hudGridAct->isChecked();
     options.loupe = _hudLoupeAct && _hudLoupeAct->isChecked();
-    for (auto* manager : ViewerManager::allManagers()) {
-        if (manager) {
-            options.gridStep = manager->hudOptions().gridStep;
-            manager->setHudOptions(options);
-        }
-    }
+    ViewerManager::setFleetHudOptions(options);
 }
 
 void MenuActionController::toggleCursorMirroring(bool enabled)

@@ -112,8 +112,9 @@ class ViewerBridge(FakeBridgeServer):
             result = {"hud": {k: params.get(k, False) for k in ("histogram", "lineProfile", "grid", "loupe")}}
             if "profileLine" in params:
                 result["viewer"] = params.get("viewer") or "v1"
-                result["profile"] = {"samples": 3, "values": [10.0, 200.0, 10.0], "peaks": [0.5],
-                                     "length": 28.1, "lengthUnit": "um"}
+                result["profile"] = {"available": True, "samples": 3, "values": [10.0, 200.0, None],
+                                     "valueKind": "sample8", "peaks": [0.5], "length": 28.1,
+                                     "lengthAlong": "plane", "lengthUnit": "um"}
         elif method == "viewer.set_intersects":
             ids = sorted(set(params.get("surfaceIds", [])) | {"segmentation"})
             applied = [params["viewer"]] if params.get("viewer") else ["v1", "v2"]
@@ -242,6 +243,8 @@ class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
         result = await vc3d_set_hud(viewer="xy plane", profile_line=line)
         self.assertEqual(self._last_params(), {"viewer": "xy plane", "profileLine": line})
         self.assertEqual(result["profile"]["peaks"], [0.5])
+        self.assertTrue(result["profile"]["available"])
+        self.assertIsNone(result["profile"]["values"][2])
 
     async def test_set_intersects_with_viewer_sends_camel_case(self) -> None:
         result = await vc3d_set_intersects(surface_ids=["seg xz", "seg yz"], viewer="v1")

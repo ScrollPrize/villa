@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <optional>
 
@@ -53,21 +54,46 @@ public:
     // Line for the intensity profile, in viewport pixels; nullopt clears it.
     void setProfileLine(std::optional<QLineF> line);
     std::optional<QLineF> profileLine() const { return _profileLine; }
-    // How the overlays find volume positions: `sceneToVolume` gives NaN when the viewer
-    // shows nothing; `planar` says whether that map is affine (a plane view), which the
-    // grid needs; `extent` is the volume size in voxels (x, y, z), so the histogram and
-    // profile can leave out what lies outside the volume.
-    struct VolumeMapping {
-        std::function<cv::Vec3f(const QPointF&)> sceneToVolume;
-        std::function<bool()> planar;
-        std::function<std::optional<cv::Vec3d>()> extent;
+    // Drawing a profile line takes one left drag after it is armed (View > Measurement
+    // Overlays > Draw Profile Line), so the overlay never takes clicks from the tools
+    // and embedded controls that own them. The drag, or Escape, disarms it.
+    void armProfileLine(bool armed);
+    bool profileLineArmed() const { return _profileArmed; }
+
+    // The rendered frame the overlays measure. Only a frame that shows the live view is
+    // measured: one still drawn for an earlier pan, zoom, offset or surface is not.
+    struct MeasurementFrame {
+        std::uint64_t serial = 0;
+        cv::Mat_<std::uint8_t> values;    // base-volume samples, 8-bit, before the display window
+        cv::Mat_<std::uint8_t> coverage;  // nonzero where the frame sampled the volume
+        int windowLow = 0;
+        int windowHigh = 255;
+        bool overlayBlended = false;      // a colored overlay volume is drawn over these samples
+        // Frame pixel to volume position (level-0 voxels), including the normal offset
+        // (Ctrl+. and Ctrl+,); NaN where the pixel is off the surface.
+        std::function<cv::Vec3f(const QPointF&)> toVolume;
+        // Set on plane views, where toVolume is affine; the grid needs it.
+        std::optional<vc3d::hud::AffineMap> planeMap;
+        double voxelSizeUm = 0.0;  // > 0 only when the volume states its voxel size
     };
-    void setVolumeMapping(VolumeMapping mapping);
-    // Numbers behind the line profile as last drawn, for scripts and tests.
+    struct FrameResult {
+        std::optional<MeasurementFrame> frame;
+        QString unavailable;  // why there is no frame to measure, shown in place of a readout
+    };
+    void setMeasurementFrameSource(std::function<FrameResult()> source);
+
+    // Numbers behind the line profile, for scripts and tests.
     struct ProfileReadout {
-        std::vector<float> values;
+        bool available = false;
+        QString unavailable;          // why not, when !available
+        std::vector<float> values;    // 8-bit samples before the window; NaN where not sampled
         std::vector<int> peaks;
-        double lengthUnits = 0.0;  // in the scalebar's units (µm, or voxels)
+        std::vector<double> arc;      // length from the start to each sample; NaN once a position is missing
+        std::optional<double> length; // arc.back() when every position is known
+        bool physical = false;        // lengths in µm (true) or level-0 voxels
+        bool alongSurface = false;    // along a curved surface rather than a plane
+        std::optional<std::array<double, 3>> start;
+        std::optional<std::array<double, 3>> end;
     };
     ProfileReadout profileReadout() const;
 
@@ -103,6 +129,8 @@ signals:
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void sendTiltHandleChanged(QPointF tilt);
     void sendTiltHandleReset();
+    // A drag began drawing the profile line, which disarms the other views.
+    void profileLineDrawStarted();
     
 protected:
     bool _regular_pan = false;
@@ -139,11 +167,7 @@ private:
     void drawLineProfile(QPainter* painter) const;
     void drawGrid(QPainter* painter) const;
     void drawLoupe(QPainter* painter) const;
-    QPointF viewportToFramebuffer(const QPointF& vp) const;
-    std::optional<vc3d::hud::AffineMap> viewportToVolumeMap() const;
-    bool showsVolume() const;
-    // True for viewport points inside the volume; empty when that cannot be told.
-    std::function<bool(QPointF)> insideVolume() const;
+    FrameResult measurementFrame() const;
     bool pointInSceneWidget(const QPointF& viewportPos) const;
 
     // µm (or voxels, when !m_physicalUnits) per scene-unit (pixel)
@@ -170,9 +194,10 @@ private:
 
     vc3d::hud::Options _hud;
     std::optional<QLineF> _profileLine;
+    bool _profileArmed = false;
     bool _profileDragging = false;
     QPointF _lastCursorVp{-1.0, -1.0};
-    VolumeMapping _mapping;
-    mutable qint64 _histogramKey = 0;
+    std::function<FrameResult()> _frameSource;
+    mutable std::uint64_t _histogramSerial = 0;
     mutable vc3d::hud::Histogram _histogram;
 };

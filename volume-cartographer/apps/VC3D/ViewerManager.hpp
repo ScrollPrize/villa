@@ -170,9 +170,15 @@ public:
     // --- Fleet setters: apply a viewer preference to every viewer ---
     void setShowSurfaceNormals(bool show);
     void setShowCoordinateFrames(bool show);
-    // Measurement overlays: on-screen histogram, line profile, volume grid, loupe.
+    // Measurement overlays: histogram, line profile, volume grid, loupe. They are
+    // switched for every manager at once (setFleetHudOptions), from the View menu and
+    // the agent bridge alike; setHudOptions applies them to this manager's viewers.
     void setHudOptions(const vc3d::hud::Options& options);
     const vc3d::hud::Options& hudOptions() const { return _hudOptions; }
+    static const vc3d::hud::Options& fleetHudOptions();
+    static void setFleetHudOptions(const vc3d::hud::Options& options);
+    // Turn the line profile on and arm every slice view for one left drag that draws it.
+    static void armFleetProfileLine();
     void setPlaneIntersectionLinesVisible(bool visible);
 
     // --- Reset-view-on-surface-change policy ---

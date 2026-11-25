@@ -690,6 +690,30 @@ target_link_libraries(test_viewer_hud PRIVATE
 add_test(NAME viewer_hud COMMAND test_viewer_hud)
 vc_register_test_target(test_viewer_hud)
 vc_register_ctest(viewer_hud test_viewer_hud)
+
+# The overlays inside a real view: click ownership, gap handling, stale frames and
+# painting in tiny panes. Standard-library assertions catch inverted clamp bounds.
+add_executable(test_viewer_hud_view
+    test_viewer_hud_view.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/ViewerHud.hpp)
+set_target_properties(test_viewer_hud_view PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_compile_definitions(test_viewer_hud_view PRIVATE _GLIBCXX_ASSERTIONS)
+target_include_directories(test_viewer_hud_view PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_viewer_hud_view PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Test
+    vc_core)
+add_test(NAME viewer_hud_view COMMAND test_viewer_hud_view)
+vc_register_test_target(test_viewer_hud_view)
+vc_register_ctest(viewer_hud_view test_viewer_hud_view)
+set_tests_properties(viewer_hud_view PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 # Exercise the production controller publication paths after Qt/state cleanup.
 # The VC3D app target only exists with VC_BUILD_APPS; CI runs these tests from
 # the VC3D compile-and-smoke job.

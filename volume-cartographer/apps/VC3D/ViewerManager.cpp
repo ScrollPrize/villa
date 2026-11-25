@@ -103,6 +103,14 @@ cv::Vec3f clampToVolumeBounds(cv::Vec3f point, const std::shared_ptr<Volume>& vo
     return point;
 }
 
+// Measurement overlay switches shared by every manager (main and Spiral), so the View
+// menu and the agent bridge always act on the same set of viewers.
+vc3d::hud::Options& sharedHudOptions()
+{
+    static vc3d::hud::Options options;
+    return options;
+}
+
 std::vector<ViewerManager*>& managerRegistry()
 {
     static std::vector<ViewerManager*> registry;
@@ -119,6 +127,7 @@ ViewerManager::ViewerManager(CState* state,
     , _points(points)
 {
     managerRegistry().push_back(this);
+    _hudOptions = fleetHudOptions();
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     const int savedOpacityPercent = settings.value(viewer::INTERSECTION_OPACITY, viewer::INTERSECTION_OPACITY_DEFAULT).toInt();
@@ -254,6 +263,19 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     }
     chunkedViewer->setShowCoordinateFrame(_showCoordinateFrames);
     chunkedViewer->graphicsView()->setHudOptions(_hudOptions);
+    // A drag that starts a profile line in one view disarms the others.
+    connect(chunkedViewer->graphicsView(), &CVolumeViewerView::profileLineDrawStarted, this,
+            [view = chunkedViewer->graphicsView()]() {
+                for (auto* manager : ViewerManager::allManagers()) {
+                    manager->forEachBaseViewer([view](VolumeViewerBase* viewer) {
+                        if (auto* other = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
+                            if (other->graphicsView() != view) {
+                                other->graphicsView()->armProfileLine(false);
+                            }
+                        }
+                    });
+                }
+            });
 
     {
         using namespace vc3d::settings;
@@ -696,6 +718,38 @@ void ViewerManager::setHudOptions(const vc3d::hud::Options& options)
         }
     });
     emit hudOptionsChanged(options);
+}
+
+const vc3d::hud::Options& ViewerManager::fleetHudOptions()
+{
+    return sharedHudOptions();
+}
+
+void ViewerManager::setFleetHudOptions(const vc3d::hud::Options& options)
+{
+    sharedHudOptions() = options;
+    for (auto* manager : allManagers()) {
+        if (manager) {
+            manager->setHudOptions(options);
+        }
+    }
+}
+
+void ViewerManager::armFleetProfileLine()
+{
+    vc3d::hud::Options options = fleetHudOptions();
+    options.lineProfile = true;
+    setFleetHudOptions(options);
+    for (auto* manager : allManagers()) {
+        if (!manager) {
+            continue;
+        }
+        manager->forEachBaseViewer([](VolumeViewerBase* viewer) {
+            if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
+                chunkedViewer->graphicsView()->armProfileLine(true);
+            }
+        });
+    }
 }
 
 void ViewerManager::setPlaneIntersectionLinesVisible(bool visible)

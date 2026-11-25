@@ -1,16 +1,21 @@
 #pragma once
 
-// Measurements drawn over a volume viewer (the "HUD"): a histogram of what is on screen,
-// an intensity profile along a line, a volume-coordinate grid and a magnifying loupe.
+// Measurements drawn over a volume viewer (the "HUD"): a histogram of the visible
+// samples, an intensity profile along a line, a volume-coordinate grid and a
+// magnifying loupe.
 //
-// Everything here works on the viewer's rendered framebuffer and on an affine
-// viewport-to-volume map, so it needs nothing from the surface, fiber or segment code
-// and is header-only so the view's tests can use it directly.
+// Everything here works on one rendered frame: its 8-bit base-volume samples before the
+// display window, the mask of pixels that frame actually sampled (coverage), and a map
+// from frame pixels to volume positions. Pixels the frame did not sample (loading gaps,
+// holes in a flattened surface, the background) never enter a measurement. The code
+// needs nothing from the surface, fiber or segment code and is header-only so the
+// view's tests can use it directly.
 
-#include <QImage>
 #include <QLineF>
 #include <QPointF>
+#include <QRect>
 #include <QRectF>
+#include <QSizeF>
 #include <QString>
 
 #include "FiberMapRulerMath.hpp"
@@ -18,8 +23,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <limits>
 #include <optional>
 #include <vector>
@@ -37,12 +42,32 @@ struct Options {
     bool operator==(const Options&) const = default;
 };
 
-inline int grayAt(const QImage& img, int x, int y)
-{
-    if (img.format() == QImage::Format_Grayscale8) {
-        return img.constScanLine(y)[x];
+// One frame's 8-bit samples and the mask of the pixels it sampled. `coverage` may be
+// null, meaning every pixel was sampled. Strides are in bytes.
+struct Raster {
+    const std::uint8_t* values = nullptr;
+    const std::uint8_t* coverage = nullptr;
+    int width = 0;
+    int height = 0;
+    std::size_t valuesStride = 0;
+    std::size_t coverageStride = 0;
+
+    bool empty() const { return !values || width <= 0 || height <= 0; }
+    bool contains(int x, int y) const { return x >= 0 && y >= 0 && x < width && y < height; }
+    bool covered(int x, int y) const
+    {
+        return contains(x, y) && (!coverage || coverage[std::size_t(y) * coverageStride + std::size_t(x)] != 0);
     }
-    return qGray(img.pixel(x, y));
+    int at(int x, int y) const { return values[std::size_t(y) * valuesStride + std::size_t(x)]; }
+};
+
+// std::clamp requires lo <= hi; panes can be smaller than what is placed in them.
+inline double clampInto(double v, double lo, double hi)
+{
+    if (hi < lo) {
+        return lo;
+    }
+    return std::min(std::max(v, lo), hi);
 }
 
 struct Histogram {
@@ -51,38 +76,47 @@ struct Histogram {
     double mean = 0.0;
     int low = 0;    // 1st percentile
     int high = 0;   // 99th percentile
-    double black = 0.0;  // fraction at 0
-    double white = 0.0;  // fraction at 255
+    double belowWindow = 0.0;  // fraction the display window maps to black (value <= windowLow)
+    double aboveWindow = 0.0;  // fraction it maps to white (value >= windowHigh)
 };
 
-// Histogram of the displayed gray values, reading every `stride`-th pixel in x and y,
-// and only pixels for which `include(x, y)` holds when it is given.
-inline Histogram computeHistogram(const QImage& img, int stride = 2,
-                                  const std::function<bool(int, int)>& include = {})
+// Histogram of the sampled values inside `region`, reading every `stride`-th pixel in x
+// and y. Pixels the frame did not sample are left out. `windowLow`/`windowHigh` is the
+// display window, so the result can say how much of the view it clips.
+inline Histogram computeHistogram(const Raster& r, QRect region, int stride = 2,
+                                  int windowLow = 0, int windowHigh = 255)
 {
     Histogram h;
-    if (img.isNull()) {
+    if (r.empty()) {
+        return h;
+    }
+    region = region.intersected(QRect(0, 0, r.width, r.height));
+    if (region.isEmpty()) {
         return h;
     }
     stride = std::max(1, stride);
     double sum = 0.0;
-    for (int y = 0; y < img.height(); y += stride) {
-        for (int x = 0; x < img.width(); x += stride) {
-            if (include && !include(x, y)) {
+    std::uint64_t below = 0;
+    std::uint64_t above = 0;
+    for (int y = region.top(); y <= region.bottom(); y += stride) {
+        for (int x = region.left(); x <= region.right(); x += stride) {
+            if (!r.covered(x, y)) {
                 continue;
             }
-            const int v = grayAt(img, x, y);
+            const int v = r.at(x, y);
             ++h.bins[static_cast<std::size_t>(v)];
             sum += v;
             ++h.count;
+            below += v <= windowLow ? 1 : 0;
+            above += v >= windowHigh ? 1 : 0;
         }
     }
     if (h.count == 0) {
         return h;
     }
     h.mean = sum / static_cast<double>(h.count);
-    h.black = static_cast<double>(h.bins[0]) / static_cast<double>(h.count);
-    h.white = static_cast<double>(h.bins[255]) / static_cast<double>(h.count);
+    h.belowWindow = static_cast<double>(below) / static_cast<double>(h.count);
+    h.aboveWindow = static_cast<double>(above) / static_cast<double>(h.count);
     const std::uint64_t lowTarget = h.count / 100;
     const std::uint64_t highTarget = h.count - h.count / 100;
     std::uint64_t seen = 0;
@@ -101,32 +135,57 @@ inline Histogram computeHistogram(const QImage& img, int stride = 2,
     return h;
 }
 
-// Gray values along a line in image pixel coordinates, bilinear, one sample per pixel of
-// length (at least two). Samples outside the image are NaN.
-inline std::vector<float> sampleLine(const QImage& img, QPointF a, QPointF b)
+// Position of sample i of n along a line, at least two samples.
+inline QPointF samplePoint(QPointF a, QPointF b, int i, int n)
 {
-    const double length = QLineF(a, b).length();
-    const int n = std::max(2, static_cast<int>(std::ceil(length)) + 1);
+    const double t = n > 1 ? static_cast<double>(i) / (n - 1) : 0.0;
+    return a + (b - a) * t;
+}
+
+inline int sampleCount(QPointF a, QPointF b)
+{
+    return std::max(2, static_cast<int>(std::ceil(QLineF(a, b).length())) + 1);
+}
+
+// Values along a line in frame pixel coordinates, bilinear, one sample per pixel of
+// length (at least two). A sample is NaN unless every pixel that contributes to it
+// (has a nonzero weight) was sampled by the frame, so loading gaps and surface holes
+// read as missing rather than as gray.
+inline std::vector<float> sampleLine(const Raster& r, QPointF a, QPointF b)
+{
+    const int n = sampleCount(a, b);
     std::vector<float> out(static_cast<std::size_t>(n), std::numeric_limits<float>::quiet_NaN());
-    if (img.isNull()) {
+    if (r.empty()) {
         return out;
     }
     for (int i = 0; i < n; ++i) {
-        const double t = static_cast<double>(i) / (n - 1);
-        const double x = a.x() + (b.x() - a.x()) * t;
-        const double y = a.y() + (b.y() - a.y()) * t;
-        const int x0 = static_cast<int>(std::floor(x));
-        const int y0 = static_cast<int>(std::floor(y));
-        if (x0 < 0 || y0 < 0 || x0 >= img.width() || y0 >= img.height()) {
-            continue;
+        const QPointF p = samplePoint(a, b, i, n);
+        const int x0 = static_cast<int>(std::floor(p.x()));
+        const int y0 = static_cast<int>(std::floor(p.y()));
+        const double fx = p.x() - x0;
+        const double fy = p.y() - y0;
+        double value = 0.0;
+        bool ok = true;
+        for (int dy = 0; dy < 2 && ok; ++dy) {
+            const double wy = dy ? fy : 1.0 - fy;
+            if (wy <= 0.0) {
+                continue;
+            }
+            for (int dx = 0; dx < 2; ++dx) {
+                const double wx = dx ? fx : 1.0 - fx;
+                if (wx <= 0.0) {
+                    continue;
+                }
+                if (!r.covered(x0 + dx, y0 + dy)) {
+                    ok = false;
+                    break;
+                }
+                value += wx * wy * r.at(x0 + dx, y0 + dy);
+            }
         }
-        const int x1 = std::min(x0 + 1, img.width() - 1);
-        const int y1 = std::min(y0 + 1, img.height() - 1);
-        const double fx = x - x0;
-        const double fy = y - y0;
-        const double top = grayAt(img, x0, y0) * (1 - fx) + grayAt(img, x1, y0) * fx;
-        const double bottom = grayAt(img, x0, y1) * (1 - fx) + grayAt(img, x1, y1) * fx;
-        out[static_cast<std::size_t>(i)] = static_cast<float>(top * (1 - fy) + bottom * fy);
+        if (ok) {
+            out[static_cast<std::size_t>(i)] = static_cast<float>(value);
+        }
     }
     return out;
 }
@@ -177,7 +236,29 @@ inline std::vector<int> findPeaks(const std::vector<float>& v, float minProminen
     return peaks;
 }
 
-// Volume position as an affine function of viewport position: v = origin + dx * x + dy * y.
+// Distance along a path of volume positions: entry i is the length from the first
+// position to position i. Once a position is missing (NaN) the length is unknown, so
+// that entry and every later one are NaN.
+inline std::vector<double> cumulativeLength(const std::vector<std::array<double, 3>>& positions)
+{
+    std::vector<double> out(positions.size(), std::numeric_limits<double>::quiet_NaN());
+    double total = 0.0;
+    for (std::size_t i = 0; i < positions.size(); ++i) {
+        const auto& p = positions[i];
+        if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) {
+            break;
+        }
+        if (i > 0) {
+            const auto& q = positions[i - 1];
+            total += std::sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) +
+                               (p[2] - q[2]) * (p[2] - q[2]));
+        }
+        out[i] = total;
+    }
+    return out;
+}
+
+// Volume position as an affine function of frame pixel position: v = origin + dx * x + dy * y.
 struct AffineMap {
     std::array<double, 3> origin{};
     std::array<double, 3> dx{};
@@ -198,12 +279,13 @@ struct GridLine {
 };
 
 // Lines where a volume coordinate is a multiple of `step`, clipped to `rect`. Coordinates
-// that barely change across the view (the slice axis of a plane) get no lines.
+// that barely change across the view (the slice axis of a plane) get no lines, nor do
+// axes that would need more than `maxLinesPerAxis`.
 inline std::vector<GridLine> gridLines(const AffineMap& map, const QRectF& rect, double step,
                                        int maxLinesPerAxis = 60)
 {
     std::vector<GridLine> out;
-    if (!(step > 0.0) || rect.isEmpty()) {
+    if (!(step > 0.0) || !std::isfinite(step) || rect.isEmpty()) {
         return out;
     }
     const std::array<QPointF, 4> corners{rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft()};
@@ -221,11 +303,14 @@ inline std::vector<GridLine> gridLines(const AffineMap& map, const QRectF& rect,
             lo = std::min(lo, v);
             hi = std::max(hi, v);
         }
-        const double first = std::ceil(lo / step) * step;
-        if ((hi - first) / step > maxLinesPerAxis) {
+        const double firstIndex = std::ceil(lo / step);
+        const double lastIndex = std::floor(hi / step);
+        if (!(lastIndex - firstIndex <= maxLinesPerAxis)) {
             continue;
         }
-        for (double value = first; value <= hi; value += step) {
+        for (double k = firstIndex; k <= lastIndex; k += 1.0) {
+            // Multiply rather than accumulate, so every value is an exact multiple.
+            const double value = k * step;
             // Points on the rectangle's edges where the coordinate equals value.
             std::vector<QPointF> hits;
             for (int e = 0; e < 4; ++e) {
@@ -246,10 +331,55 @@ inline std::vector<GridLine> gridLines(const AffineMap& map, const QRectF& rect,
     return out;
 }
 
-inline QString axisName(int axis)
+// Decimals that show every multiple of `step` exactly enough to tell neighbours apart:
+// 0 for whole steps, 1 for 0.5 or 2.5, 2 for 0.25, up to 6.
+inline int gridLabelDecimals(double step)
+{
+    if (!(step > 0.0) || !std::isfinite(step)) {
+        return 0;
+    }
+    double scale = 1.0;
+    for (int d = 0; d < 6; ++d) {
+        const double scaled = step * scale;
+        if (std::abs(scaled - std::round(scaled)) <= 1e-6 * std::max(1.0, scaled)) {
+            return d;
+        }
+        scale *= 10.0;
+    }
+    return 6;
+}
+
+inline QString gridLabel(int axis, double value, double step)
 {
     static const char* names[] = {"x", "y", "z"};
-    return QString::fromLatin1(names[std::clamp(axis, 0, 2)]);
+    const int decimals = gridLabelDecimals(step);
+    // Avoid "-0" for values that round to zero.
+    const double shown = std::abs(value) < 0.5 * std::pow(10.0, -decimals) ? 0.0 : value;
+    return QString::fromLatin1(names[std::clamp(axis, 0, 2)]) + QStringLiteral("=") +
+           QString::number(shown, 'f', decimals);
+}
+
+// Where a square loupe of up to `preferred` pixels goes in a `pane`, up and to the right
+// of `cursor` and fully inside the pane with `margin` pixels to spare and `below` pixels
+// under it for a label. Smaller panes get a smaller loupe; none below `minimum`.
+inline std::optional<QRectF> loupeRect(QSizeF pane, QPointF cursor, double preferred,
+                                       double minimum = 48.0, double margin = 4.0, double below = 22.0)
+{
+    const double size = std::min({preferred, pane.width() - 2 * margin, pane.height() - 2 * margin - below});
+    if (!(size >= minimum)) {
+        return std::nullopt;
+    }
+    const double half = size / 2.0;
+    const QPointF wanted = cursor + QPointF(size * 0.75, -size * 0.75);
+    const QPointF center(clampInto(wanted.x(), margin + half, pane.width() - margin - half),
+                         clampInto(wanted.y(), margin + half, pane.height() - margin - below - half));
+    return QRectF(center - QPointF(half, half), QSizeF(size, size));
+}
+
+// Whether a panel of `size` with `margin` around it fits in a pane.
+inline bool panelFits(QSizeF pane, QSizeF size, double margin = 10.0)
+{
+    return pane.width() >= size.width() + 2 * margin && pane.height() >= size.height() + 2 * margin;
 }
 
 }  // namespace vc3d::hud

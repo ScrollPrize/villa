@@ -313,24 +313,32 @@ async def vc3d_set_hud(
     clear_profile: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Turn the slice viewers' measurement overlays on or off, and measure
-    gray values along a line. Same as View > Measurement Overlays; every
-    argument is optional and omitted ones are left unchanged.
+    samples along a line. Same as View > Measurement Overlays, for every
+    viewer; every argument is optional and omitted ones are left unchanged.
+    A bad `viewer` with profile_line or clear_profile changes nothing.
 
-    histogram: histogram of the gray values on screen, with the 1st/99th
-    percentiles and the share clipped to black or white.
-    line_profile: profile mode (a left drag in a slice view draws the line).
+    histogram: histogram of the visible base-volume samples (8-bit, before
+    the display window), with the 1st/99th percentiles and the share the
+    window shows as black or white.
+    line_profile: profile overlay (View > Measurement Overlays > Draw Profile
+    Line arms one left drag to draw the line).
     grid: labeled lines at round volume coordinates on plane views;
     grid_step sets their spacing in voxels (0 picks one from the zoom).
     loupe: magnifier that follows the mouse.
     profile_line: {"x1", "y1", "x2", "y2"} in fractions (0..1) of `viewer`'s
-    viewport; draws the line, turns profile mode on and returns the profile.
+    viewport; draws the line, turns the profile on and returns the profile.
     clear_profile: remove `viewer`'s line.
 
     Returns {"hud": {...current switches}} and, with profile_line,
-    "viewer" and "profile": {"samples", "values" (gray 0..255 per pixel of
-    length, null outside the volume), "peaks" (fractions along the line where
-    a bright crossing such as a papyrus layer peaks), "length",
-    "lengthUnit" ("um" or "vx"), "min", "max", "mean"}."""
+    "viewer" and "profile": {"available", and when false "unavailable" (why:
+    "updating", "loading", "no volume shown", volumetric mode); otherwise
+    "samples", "values" (8-bit samples before the window per pixel of
+    length, null where the frame did not sample the volume), "valueKind"
+    ("sample8"), "peaks" (fractions along the line where a bright crossing
+    such as a papyrus layer peaks), "length" (along "lengthAlong": "plane"
+    or "surface"; null when the line leaves the surface), "lengthUnit" ("um"
+    only when the volume states its voxel size, else "vx"), "start"/"end"
+    (volume positions), "min", "max", "mean"}."""
     return await _call(
         "viewer.set_hud",
         _strip_none(

@@ -546,16 +546,32 @@ QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
         throw AgentBridgeError{-32010, "Viewer manager unavailable", data};
     }
     const QJsonObject p = params.toObject();
+    const bool wantsLine = p.contains("profileLine");
+    const bool clearProfile = p.value("clearProfile").toBool();
 
-    // The overlay switches apply to every viewer, like the View menu items.
-    vc3d::hud::Options options = mgr->hudOptions();
+    // Resolve the profile's viewer before changing anything, so a bad target leaves
+    // every switch as it was.
+    CVolumeViewerView* view = nullptr;
+    CChunkedVolumeViewer* chunked = nullptr;
+    if (wantsLine || clearProfile) {
+        chunked = dynamic_cast<CChunkedVolumeViewer*>(resolveViewer(p.value("viewer")));
+        if (!chunked || !chunked->graphicsView()) {
+            QJsonObject data;
+            data["detail"] = "the profile line needs a slice viewer";
+            throw AgentBridgeError{-32002, "Viewer not found", data};
+        }
+        view = chunked->graphicsView();
+    }
+
+    // The switches apply to every viewer of every manager, like View > Measurement Overlays.
+    vc3d::hud::Options options = ViewerManager::fleetHudOptions();
     if (p.contains("histogram")) options.histogram = p.value("histogram").toBool();
     if (p.contains("lineProfile")) options.lineProfile = p.value("lineProfile").toBool();
     if (p.contains("grid")) options.grid = p.value("grid").toBool();
     if (p.contains("loupe")) options.loupe = p.value("loupe").toBool();
     if (p.contains("gridStep")) options.gridStep = std::max(0.0, p.value("gridStep").toDouble());
-    if (p.contains("profileLine")) options.lineProfile = true;
-    mgr->setHudOptions(options);
+    if (wantsLine) options.lineProfile = true;
+    ViewerManager::setFleetHudOptions(options);
 
     QJsonObject hud;
     hud["histogram"] = options.histogram;
@@ -565,20 +581,13 @@ QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
     hud["gridStep"] = options.gridStep;
     QJsonObject out;
     out["hud"] = hud;
-
-    // The profile line belongs to one viewer, given in fractions of its viewport.
-    if (!p.contains("profileLine") && !p.value("clearProfile").toBool()) {
+    if (!view) {
         return out;
     }
-    auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(resolveViewer(p.value("viewer")));
-    if (!chunked || !chunked->graphicsView()) {
-        QJsonObject data;
-        data["detail"] = "the profile line needs a slice viewer";
-        throw AgentBridgeError{-32002, "Viewer not found", data};
-    }
-    CVolumeViewerView* view = chunked->graphicsView();
+
+    // The profile line belongs to one viewer, given in fractions of its viewport.
     out["viewer"] = viewerIdFor(chunked);
-    if (p.value("clearProfile").toBool()) {
+    if (clearProfile && !wantsLine) {
         view->setProfileLine(std::nullopt);
         return out;
     }
@@ -593,6 +602,13 @@ QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
     view->viewport()->repaint();
 
     const CVolumeViewerView::ProfileReadout r = view->profileReadout();
+    QJsonObject profile;
+    profile["available"] = r.available;
+    if (!r.available) {
+        profile["unavailable"] = r.unavailable;
+        out["profile"] = profile;
+        return out;
+    }
     const int n = static_cast<int>(r.values.size());
     QJsonArray values;
     double lo = 255, hi = 0, sum = 0;
@@ -612,12 +628,18 @@ QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
     for (int idx : r.peaks) {
         peaks.append(n > 1 ? double(idx) / (n - 1) : 0.0);
     }
-    QJsonObject profile;
     profile["samples"] = n;
     profile["values"] = values;
+    profile["valueKind"] = QStringLiteral("sample8");
     profile["peaks"] = peaks;
-    profile["length"] = r.lengthUnits;
-    profile["lengthUnit"] = view->physicalUnits() ? QStringLiteral("um") : QStringLiteral("vx");
+    profile["lengthAlong"] = r.alongSurface ? QStringLiteral("surface") : QStringLiteral("plane");
+    profile["lengthUnit"] = r.physical ? QStringLiteral("um") : QStringLiteral("vx");
+    profile["length"] = r.length ? QJsonValue(*r.length) : QJsonValue(QJsonValue::Null);
+    auto point = [](const std::array<double, 3>& v) {
+        return QJsonArray{v[0], v[1], v[2]};
+    };
+    if (r.start) profile["start"] = point(*r.start);
+    if (r.end) profile["end"] = point(*r.end);
     if (finite > 0) {
         profile["min"] = lo;
         profile["max"] = hi;

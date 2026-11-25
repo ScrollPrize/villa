@@ -438,6 +438,8 @@ private:
     vc3d::volumetric::CameraParams volumetricPointMapCamera() const;
     float volumetricHalfSpan() const;
     std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
+    // The presented frame for the measurement overlays, or why it cannot be measured.
+    CVolumeViewerView::FrameResult measurementFrame() const;
     void refreshCursorPositionAt(const QPointF& scenePos);
     // projected=true draws the greyed-out variant used when a linked cursor
     // point lies off this pane's plane (e.g. after a normal-offset scroll).

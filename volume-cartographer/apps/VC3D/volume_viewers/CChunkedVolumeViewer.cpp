@@ -354,25 +354,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     _view->setRenderHint(QPainter::Antialiasing, false);
     _view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
-    // The measurement overlays (histogram, profile, grid, loupe) read volume positions
-    // through these; the grid only draws on planes, where the mapping is affine.
-    _view->setVolumeMapping({
-        .sceneToVolume = [this](const QPointF& scenePoint) {
-            if (!currentSurface()) {
-                const float nan = std::numeric_limits<float>::quiet_NaN();
-                return cv::Vec3f(nan, nan, nan);
-            }
-            return sceneToVolume(scenePoint);
-        },
-        .planar = [this] { return dynamic_cast<PlaneSurface*>(currentSurface()) != nullptr; },
-        .extent = [this]() -> std::optional<cv::Vec3d> {
-            if (!_volume) {
-                return std::nullopt;
-            }
-            const auto xyz = _volume->shapeXyz();
-            return cv::Vec3d(xyz[0], xyz[1], xyz[2]);
-        },
-    });
+    // The measurement overlays (histogram, profile, grid, loupe) measure the presented
+    // frame, and only while it shows the live view.
+    _view->setMeasurementFrameSource([this] { return measurementFrame(); });
 
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CChunkedVolumeViewer::onVolumeClicked);
     connect(_view, &CVolumeViewerView::sendZoom, this, &CChunkedVolumeViewer::onZoom);
@@ -1921,6 +1905,70 @@ void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
         currentHalfH + static_cast<qreal>(screenDelta[1]) * static_cast<qreal>(_scale) -
             renderedHalfH * ratio);
     _view->setDirectFramebufferMapping(ratio, offset);
+}
+
+CVolumeViewerView::FrameResult CChunkedVolumeViewer::measurementFrame() const
+{
+    CVolumeViewerView::FrameResult out;
+    const auto surf = _surfWeak.lock();
+    if (!_volume || !surf) {
+        out.unavailable = tr("no volume shown");
+        return out;
+    }
+    if (!_lastRenderResult || !_displayedRenderJob) {
+        out.unavailable = tr("loading");
+        return out;
+    }
+    const auto& job = *_displayedRenderJob;
+    const auto& result = *_lastRenderResult;
+    // The frame on screen must be the one rendered for the live view: same size, pan,
+    // zoom, normal offset and surface geometry. Otherwise it is a retained frame
+    // standing in until the next render arrives.
+    const QSize vp = _view->viewport()->size();
+    if (job.fbW != vp.width() || job.fbH != vp.height() || job.surf != surf ||
+        job.levels != _levels || job.surfacePtrX != _surfacePtrX || job.surfacePtrY != _surfacePtrY ||
+        job.scale != _scale || job.zOff != _zOff || job.surfaceGeometryEpoch != _surfaceGeometryEpoch) {
+        out.unavailable = tr("updating");
+        return out;
+    }
+    if (!result.colorValues.empty()) {
+        out.unavailable = tr("not measured in volumetric mode");
+        return out;
+    }
+    if (result.values.empty() || result.values.cols != job.fbW || result.values.rows != job.fbH) {
+        out.unavailable = tr("loading");
+        return out;
+    }
+    CVolumeViewerView::MeasurementFrame frame;
+    frame.serial = result.serial;
+    frame.values = result.values;
+    frame.coverage = result.coverage;
+    frame.windowLow = static_cast<int>(std::lround(job.windowLow));
+    frame.windowHigh = static_cast<int>(std::lround(job.windowHigh));
+    frame.overlayBlended = !result.overlayValues.empty() && job.overlayOpacity > 0.0f;
+    if (job.plane) {
+        // Exactly the map the frame was sampled with, normal offset included.
+        const auto& pl = *job.plane;
+        vc3d::hud::AffineMap map;
+        for (int k = 0; k < 3; ++k) {
+            map.origin[std::size_t(k)] = pl.origin[std::size_t(k)];
+            map.dx[std::size_t(k)] = pl.dx[std::size_t(k)];
+            map.dy[std::size_t(k)] = pl.dy[std::size_t(k)];
+        }
+        frame.planeMap = map;
+    }
+    frame.toVolume = [this](const QPointF& framePx) {
+        // Frame pixels are scene pixels for the live frame.
+        if (const auto p = cursorVolumePosition(framePx)) {
+            return *p;
+        }
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        return cv::Vec3f(nan, nan, nan);
+    };
+    const double voxel = _volume->voxelSize();
+    frame.voxelSizeUm = voxel > 0.0 && std::isfinite(voxel) ? voxel : 0.0;
+    out.frame = std::move(frame);
+    return out;
 }
 
 void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)

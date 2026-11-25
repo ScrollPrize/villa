@@ -232,6 +232,7 @@ private:
     QAction* _mirrorCursorAct{nullptr};
     QAction* _hudHistogramAct{nullptr};
     QAction* _hudLineProfileAct{nullptr};
+    QAction* _hudDrawProfileAct{nullptr};
     QAction* _hudGridAct{nullptr};
     QAction* _hudLoupeAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
