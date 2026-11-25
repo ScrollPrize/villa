@@ -147,7 +147,7 @@ public:
     static File open_read(const std::string& path)
     {
         diagnostics::SourceElapsed elapsed(diagnostics::SchedulerMetric::FileOpen);
-        const int fd = platform::open_file(path, O_RDONLY);
+        const int fd = platform::open_file(utf8Path(path), O_RDONLY);
         if (fd < 0 && errno != ENOENT && errno != ENOTDIR)
             throw std::system_error(errno, std::generic_category(), "open " + path);
         return File(fd);
@@ -160,7 +160,7 @@ private:
 inline bool exists(const std::string& path)
 {
     std::error_code error;
-    return std::filesystem::exists(path, error);
+    return std::filesystem::exists(utf8Path(path), error);
 }
 
 // Reads exactly n bytes at offset; throws on a short read.

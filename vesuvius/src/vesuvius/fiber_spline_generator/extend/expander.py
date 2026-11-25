@@ -283,7 +283,7 @@ class Expander:
                     continue
                 _,at=_project(np.asarray(gap['points'])[ [0,-1] ],p,s)
                 begin,end=max(low,float(min(at))),min(high,float(max(at)))
-                if end>begin+1e-6:
+                if end>=begin:
                     gaps.append(dict(gap,points=_at(p,s,[begin,end]).tolist(),lengthVoxels=end-begin))
         for step in self.steps:
             gaps.append(dict(kind='overlap-seam' if step.get('kind')=='overlap' else 'gap',

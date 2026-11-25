@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import numpy as np
-from vc_reader import transforms as A
+from vc_reader import cuda as vc_cuda, transforms as A
 from vc_reader.reader import open_zarr
 
 from vesuvius.neural_tracing.tracers.shared.io import atomic_write
@@ -82,4 +82,7 @@ def normalize_ct(image, record):
 
 def zscore_crops(crops):
     """Per-crop z-score of torch crops (..., D, H, W): the GPU sampler's counterpart of ``normalize_ct``."""
-    return _ZSCORE.batch(crops.reshape(-1, 1, *crops.shape[-3:])).view_as(crops)
+    flat = crops.reshape(-1, 1, *crops.shape[-3:])
+    if flat.device.type == 'mps' or (flat.device.type == 'cuda' and not vc_cuda.is_available()):
+        return _ZSCORE.batch(flat.cpu()).to(crops.device).view_as(crops)
+    return _ZSCORE.batch(flat).view_as(crops)

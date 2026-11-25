@@ -4188,7 +4188,7 @@ def test_3d_fiber_inference_scale_defaults_and_validates_all_axes() -> None:
     # None selects the model's native output stride.
     assert parameters["inference_scaledown_power"].default is None
     assert parameters["ome_chunk"].default == 64
-    assert parameters["ome_compressor"].default == "blosc-zstd"
+    assert parameters["ome_compressor"].default is None
     assert _input_scaledown_from_base((17, 33, 65), (5, 9, 17)) == 4
     with pytest.raises(ValueError, match="isotropic power-of-two"):
         _input_scaledown_from_base((17, 33, 65), (5, 17, 17))

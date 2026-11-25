@@ -32,11 +32,30 @@ endif()
 if(VC_OBJECT_STORE_BUILD_ADAPTERS)
     find_package(OpenCV REQUIRED COMPONENTS core)
 endif()
+set(VC_OBJECT_STORE_DETECTORS_OPENMP OFF)
 if(VC_OBJECT_STORE_BUILD_LINKING)
     if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
         message(FATAL_ERROR "Relationship detectors require adapters")
     endif()
-    find_package(OpenMP REQUIRED)
+    if(APPLE AND VC_OBJECT_STORE_BUILD_PYTHON)
+        # The Python module is imported next to torch, whose macOS wheels load
+        # their own libomp.dylib; linking Homebrew's libomp into it would put a
+        # second OpenMP runtime in the process (OMP Error #15 at import). So the
+        # module links a serial copy of the detectors (TrackCrossings.cpp has a
+        # serial path; see src/CMakeLists.txt), and the native tools and the
+        # server keep OpenMP when it is found. Apple's clang finds it with a
+        # hint such as -DOpenMP_ROOT=$(brew --prefix libomp).
+        find_package(OpenMP QUIET COMPONENTS CXX)
+        if(OpenMP_CXX_FOUND)
+            set(VC_OBJECT_STORE_DETECTORS_OPENMP ON)
+        else()
+            message(STATUS "vc_object_store: OpenMP not found, so vc_object_links and "
+                           "vc_object_server find track crossings on one worker")
+        endif()
+    else()
+        find_package(OpenMP REQUIRED)
+        set(VC_OBJECT_STORE_DETECTORS_OPENMP ON)
+    endif()
 endif()
 add_subdirectory(src)
 if(VC_OBJECT_STORE_BUILD_BENCHMARKS)

@@ -159,6 +159,22 @@ def _load_json(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+def _lasagna_manifest(document: dict[str, Any], *, label: str) -> dict[str, Any]:
+    """The manifest of a sidecar, or the validated one a compact store's .zattrs embeds."""
+    if "lasagna" not in document:
+        return document
+    from lasagna.lasagna_volume import LasagnaVolume
+
+    manifest = document["lasagna"]
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{label} embeds an invalid Lasagna manifest")
+    try:
+        LasagnaVolume.validate_compact(manifest)
+    except ValueError as error:
+        raise ValueError(f"{label} embeds an invalid Lasagna manifest: {error}") from error
+    return manifest
+
+
 def _manifest_channels(manifest: dict[str, Any]) -> set[str]:
     return {
         str(channel)
@@ -232,7 +248,10 @@ def _completed_dependency(
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError("input manifest path is not portable")
     manifest_path = bundle / relative
-    manifest = _load_json(manifest_path, "Lasagna manifest")
+    manifest = _lasagna_manifest(
+        _load_json(manifest_path, "Lasagna manifest"),
+        label=f"input run {record.get('run_name', selector)!r}",
+    )
     _validate_prediction_manifest(
         manifest, expected_kind=expected_kind,
         label=f"input run {record.get('run_name', selector)!r}",
@@ -296,26 +315,35 @@ def _discover_published_manifest(
     if not artifact_s3 or not artifact_url:
         raise ValueError(f"published prediction {record.selector} has no usable S3 origin")
     bucket, prefix, region = parse_catalog_s3_url(artifact_s3)
-    prefix = prefix.rstrip("/") + "/"
+    names: set[str] = set()
+    stores: set[str] = set()
     try:
-        # Anonymous listing names the bucket's region in the location.
-        entries = ObjectStore(f"s3+{region}://{bucket}", auth=None).keys(prefix)
+        # Anonymous listing names the bucket's region in the location. One level
+        # only: the arrays below hold up to millions of chunks.
+        root = ObjectStore(f"s3+{region}://{bucket}/{prefix.strip('/')}", auth=None)
+        token = ""
+        while True:
+            page = root.list_page(continuation_token=token)
+            names.update(item["key"] for item in page["objects"])
+            stores.update(name.rstrip("/") for name in page["children"])
+            token = page["next_continuation_token"]
+            if not token:
+                break
     except Exception as error:
         raise RuntimeError(
             f"could not list published prediction {record.selector} at {artifact_s3}: {error}"
         ) from error
-    keys = []
-    for key in entries:
-        relative = key[len(prefix):] if key.startswith(prefix) else ""
-        if relative and "/" not in relative and relative.endswith(".lasagna.json"):
-            keys.append(key)
-    keys = sorted(set(keys))
-    if len(keys) != 1:
+    sidecars = sorted(name for name in names if name.endswith(".lasagna.json"))
+    compact = sorted(name for name in stores if name.endswith(".zarr"))
+    if not sidecars and len(compact) == 1:
+        return artifact_url.rstrip("/") + "/" + compact[0] + "/.zattrs"
+    if len(sidecars) != 1:
         raise ValueError(
             f"published prediction {record.selector} must contain exactly one root "
-            f".lasagna.json; found {len(keys)} below {artifact_s3}"
+            f".lasagna.json or compact .zarr; found {len(sidecars)} and {len(compact)} "
+            f"below {artifact_s3}"
         )
-    return artifact_url.rstrip("/") + "/" + keys[0][len(prefix):]
+    return artifact_url.rstrip("/") + "/" + sidecars[0]
 
 
 def _safe_cache_component(value: str) -> str:
@@ -390,8 +418,8 @@ def _validate_published_manifest(
     manifest: dict[str, Any], *, cache_values: dict[str, Any], label: str,
 ) -> None:
     _validate_prediction_manifest(manifest, expected_kind="lasagna", label=label)
-    if manifest.get("version") != 2:
-        raise ValueError(f"{label} must use Lasagna manifest version 2")
+    if manifest.get("version") not in (2, 3):
+        raise ValueError(f"{label} must use Lasagna manifest version 2 or 3")
     outer_version = cache_values.get("lasagna_version")
     if outer_version is not None and manifest.get("version") != outer_version:
         raise ValueError(f"{label} disagrees with catalogue creation_info.lasagna_version")
@@ -415,7 +443,19 @@ def _decode_published_manifest(raw: bytes, *, url: str) -> dict[str, Any]:
         raise ValueError(f"published normal manifest is invalid JSON: {url}: {error}") from error
     if not isinstance(manifest, dict):
         raise ValueError(f"published normal manifest must contain an object: {url}")
-    return manifest
+    return _lasagna_manifest(manifest, label=f"published normal manifest {url}")
+
+
+def _safe_manifest_file(value: Any) -> bool:
+    """A root sidecar's name, or ``<store>.zarr/.zattrs`` of a compact bundle."""
+    if not isinstance(value, str):
+        return False
+    name, separator, rest = value.partition("/")
+    return (
+        Path(name).name == name and name not in ("", "..")
+        and (rest == ".zattrs" and name.endswith(".zarr") if separator
+             else name.endswith(".lasagna.json"))
+    )
 
 
 def _validate_remote_group_descriptors(
@@ -423,14 +463,16 @@ def _validate_remote_group_descriptors(
 ) -> None:
     base_shape = manifest["base_shape_zyx"]
     source_to_base = float(manifest["source_to_base"])
+    # Schema v3 packs a resolution's channels into one CZYX array.
+    packed = manifest.get("version") == 3
     seen: set[str] = set()
     for name, group in manifest.get("groups", {}).items():
         if not isinstance(group, dict):
             raise ValueError(f"published normal group {name!r} must be an object")
         channels = group.get("channels")
         if not (
-            isinstance(channels, list) and len(channels) == 1
-            and isinstance(channels[0], str)
+            isinstance(channels, list) and (packed or len(channels) == 1)
+            and channels and all(isinstance(channel, str) for channel in channels)
         ):
             raise ValueError(f"published normal group {name!r} must describe exactly one channel")
         relative = group.get("zarr")
@@ -466,11 +508,19 @@ def _validate_remote_group_descriptors(
         shape = descriptor.get("shape")
         chunks = descriptor.get("chunks")
         if not all(
-            isinstance(values, list) and len(values) == 3
+            isinstance(values, list) and len(values) == (4 if packed else 3)
             and all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in values)
             for values in (shape, chunks)
         ):
-            raise ValueError(f"published normal Zarr descriptor is not a valid 3D array: {descriptor_url}")
+            raise ValueError(
+                f"published normal Zarr descriptor is not a valid {4 if packed else 3}D array: {descriptor_url}"
+            )
+        if packed:
+            if shape[0] != len(channels) or chunks[0] != shape[0]:
+                raise ValueError(
+                    f"published normal Zarr does not store its channels in whole chunks: {descriptor_url}"
+                )
+            shape, chunks = shape[1:], chunks[1:]
         scaledown = group.get("scaledown")
         if (
             not isinstance(scaledown, int) or isinstance(scaledown, bool)
@@ -517,8 +567,7 @@ def _prepare_published_manifest(
             and marker.get("sample_id") == cache_values["sample_id"]
             and marker.get("volume_id") == cache_values["volume_id"]
             and marker.get("model_id") == cache_values["model_id"]
-            and isinstance(filename, str)
-            and Path(filename).name == filename
+            and _safe_manifest_file(filename)
         ):
             raise ValueError(
                 f"VC3D Lasagna remote marker does not match catalogue identity: {marker_path}"
@@ -541,7 +590,8 @@ def _prepare_published_manifest(
                 label="cached published normal manifest",
             )
             _validate_remote_group_descriptors(
-                cached_manifest, directory=directory, artifact_url=artifact_url,
+                cached_manifest, directory=cached_path.parent,
+                artifact_url=cached_url.rpartition("/")[0],
             )
             marker_changed = False
             if marker.get("anonymous") is not True:
@@ -564,18 +614,20 @@ def _prepare_published_manifest(
         raise ValueError(
             f"published normal manifest changed: expected {expected_sha256}, got {digest}"
         )
-    filename = Path(urlparse(manifest_url).path).name
-    if not filename.endswith(".lasagna.json"):
+    parts = Path(urlparse(manifest_url).path).parts
+    filename = "/".join(parts[-2:] if parts and parts[-1] == ".zattrs" else parts[-1:])
+    if not _safe_manifest_file(filename):
         raise ValueError(f"published normal manifest URL has an invalid filename: {manifest_url}")
     downloaded_manifest = _decode_published_manifest(raw, url=manifest_url)
     _validate_published_manifest(
         downloaded_manifest, cache_values=cache_values,
         label="downloaded published normal manifest",
     )
-    _validate_remote_group_descriptors(
-        downloaded_manifest, directory=directory, artifact_url=artifact_url,
-    )
     manifest_path = directory / filename
+    _validate_remote_group_descriptors(
+        downloaded_manifest, directory=manifest_path.parent,
+        artifact_url=manifest_url.rpartition("/")[0],
+    )
     _atomic_bytes(manifest_path, raw)
     marker = {
         "version": 1,
@@ -660,7 +712,7 @@ def _restore_published_dependency(
         config, cache_values=cache_values, manifest_url=manifest_url,
         expected_sha256=expected_sha256,
     )
-    manifest = json.loads(raw)
+    manifest = _decode_published_manifest(raw, url=manifest_url)
     _validate_prediction_manifest(
         manifest, expected_kind="lasagna", label="recorded published normal prediction",
     )
