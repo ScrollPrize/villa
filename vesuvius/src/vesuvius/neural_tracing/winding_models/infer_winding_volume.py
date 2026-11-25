@@ -1311,6 +1311,8 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
         model = WindingModel(model_cfg.get("model"))
         model.load_state_dict(checkpoint["model"])
         model.to(device).eval()
+        from vesuvius.models.utilities.mps_conv3d import speed_up_3d_convs_on_mps
+        speed_up_3d_convs_on_mps(model, device)
         if args.compile:
             model = torch.compile(model)
 
