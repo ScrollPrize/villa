@@ -48,7 +48,7 @@ def _reference_eigh_block(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         ("cuSOLVER error: CUSOLVER_STATUS_INTERNAL_ERROR", True),
         ("hipsolver error: HIPSOLVER_STATUS_EXECUTION_FAILED", True),
         ("rocSOLVER syevd failed on gfx1100", True),
-        ("ROCm linear algebra backend failure", True),
+        ("ROCm linear algebra backend failure", False),
         ("shape mismatch", False),
         ("out of memory", False),
     ],
@@ -102,11 +102,13 @@ def test_eigh_and_sanitize_falls_back_to_numpy_when_cpu_torch_lacks_lapack():
     assert torch.allclose(w, w_ref.float(), atol=1e-5, rtol=1e-5)
 
 
-def test_eigh_and_sanitize_reraises_non_solver_runtime_error():
+@pytest.mark.parametrize("error_msg", ["unrelated failure", "ROCm out of memory"])
+def test_eigh_and_sanitize_reraises_non_solver_runtime_error(error_msg):
     M = torch.eye(3, dtype=torch.float64).unsqueeze(0)
-    with mock.patch("torch.linalg.eigh", side_effect=RuntimeError("unrelated failure")):
-        with pytest.raises(RuntimeError, match="unrelated failure"):
+    with mock.patch("torch.linalg.eigh", side_effect=RuntimeError(error_msg)) as eigh:
+        with pytest.raises(RuntimeError, match=error_msg):
             _eigh_and_sanitize(M)
+    eigh.assert_called_once()
 
 
 def test_compute_eigenvectors_empty_chunk_exact_zero():

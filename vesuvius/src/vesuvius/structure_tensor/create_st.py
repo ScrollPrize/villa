@@ -372,7 +372,7 @@ _EIGH_BATCH_SIZE = 65536
 def _is_gpu_solver_error(err: BaseException) -> bool:
     """Detect NVIDIA cuSOLVER and AMD ROCm hipSOLVER/rocSOLVER runtime failures."""
     msg = str(err).lower()
-    return any(token in msg for token in ("cusolver", "hipsolver", "rocsolver", "rocm"))
+    return any(token in msg for token in ("cusolver", "hipsolver", "rocsolver"))
 
 
 # solve the eigenvalue problem and sanitize the output
