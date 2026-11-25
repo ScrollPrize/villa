@@ -7,7 +7,9 @@
 #include <fstream>
 #include <iostream>
 #include <numeric>
+#if defined(__linux__)  // as cpuTime() below
 #include <sys/resource.h>
+#endif
 
 namespace fs=std::filesystem;
 using Clock=std::chrono::steady_clock;
