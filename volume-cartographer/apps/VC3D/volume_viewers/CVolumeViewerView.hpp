@@ -94,6 +94,9 @@ public:
         std::function<cv::Vec3f(const QPointF&)> toVolume;
         // Set on plane views, where toVolume is affine; the grid needs it.
         std::optional<vc3d::hud::AffineMap> planeMap;
+        // Set on surface views: whether the surface is unbroken along the straight path
+        // between two frame pixels.
+        std::function<bool(const QPointF&, const QPointF&)> joined;
         double voxelSizeUm = 0.0;  // > 0 only when the volume states its voxel size
     };
     struct FrameResult {

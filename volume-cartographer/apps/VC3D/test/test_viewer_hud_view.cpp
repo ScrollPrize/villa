@@ -31,6 +31,7 @@ struct FakeFrame {
     // a hole in the surface reports.
     bool flattened = false;
     int holeColumn = -1;
+    double breakAt = -1.0;  // the flattened surface breaks at this x, between pixels
     bool samples = true;
 
     CVolumeViewerView::FrameResult operator()(const QSize& size) const
@@ -66,6 +67,11 @@ struct FakeFrame {
             }
             return cv::Vec3f(float(p.x()), float(p.y()), 40.0f);
         };
+        if (flattened) {
+            f.joined = [cut = breakAt](const QPointF& a, const QPointF& b) {
+                return !(std::min(a.x(), b.x()) < cut && cut < std::max(a.x(), b.x()));
+            };
+        }
         f.voxelSizeUm = voxelSizeUm;
         f.composite = composite;
         f.samples = samples;
@@ -365,6 +371,18 @@ private slots:
         r = _view->profileReadout();
         QVERIFY(r.start);
         QVERIFY(!r.end);
+    }
+
+    void aHoleBetweenSamplesHasNoLength()
+    {
+        _frame.flattened = true;
+        _frame.breakAt = 24.5;
+        _view->setProfileLine(QLineF(QPointF(10, 50), QPointF(30, 50)));
+        const auto r = _view->profileReadout();
+        QVERIFY(r.start && r.end);
+        QCOMPARE(r.arc[14], 14.0);
+        QVERIFY(std::isnan(r.arc[15]));
+        QVERIFY(!r.length);
     }
 
     void missingSamplesAreCounted()

@@ -244,6 +244,14 @@ private slots:
         QVERIFY(std::isnan(arc[3]));
     }
 
+    void everyCrossedCellIncludesAClippedCorner()
+    {
+        // The first diagonal only clips the corner of cell (18, 18); the second passes it.
+        const auto notCell18 = [](const QPointF& g) { return !(std::floor(g.x()) == 18 && std::floor(g.y()) == 18); };
+        QVERIFY(!everyCrossedCell(QPointF(5.1, 30.96), QPointF(25.1, 10.96), notCell18));
+        QVERIFY(everyCrossedCell(QPointF(5.1, 30.8), QPointF(25.1, 10.8), notCell18));
+    }
+
     void carriedPixelsStayUnmeasuredAcrossEveryCarry()
     {
         // Pixel 0 waits on a read in every frame; pixel 1 is sampled each time.

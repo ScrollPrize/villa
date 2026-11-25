@@ -2023,15 +2023,16 @@ CVolumeViewerView::FrameResult CChunkedVolumeViewer::measurementFrame() const
         // The vertex grid and raster this frame was sampled with, not the live surface:
         // frame pixel (x, y) sits at grid column x0 + x * sx + y * kx, row
         // y0 + x * ky + y * sy, offset zOff along the normal. Holes give NaN.
-        frame.toVolume = [grid = job.gridSurface, raster = job.raster, window = job.gridWindow,
-                          zOff = job.zOff](const QPointF& p) {
+        const auto toGrid = [raster = job.raster, window = job.gridWindow](const QPointF& p) {
+            return QPointF(raster.x0 - window.x + p.x() * raster.sx + p.y() * raster.kx,
+                           raster.y0 - window.y + p.x() * raster.ky + p.y() * raster.sy);
+        };
+        const auto at = [grid = job.gridSurface, zOff = job.zOff](const QPointF& g) {
             const float nan = std::numeric_limits<float>::quiet_NaN();
             if (!grid) {
                 return cv::Vec3f(nan, nan, nan);
             }
-            const float xy[2] = {
-                float(raster.x0 - window.x + p.x() * raster.sx + p.y() * raster.kx),
-                float(raster.y0 - window.y + p.x() * raster.ky + p.y() * raster.sy)};
+            const float xy[2] = {float(g.x()), float(g.y())};
             float xyz[3] = {nan, nan, nan};
             float normal[3] = {0.0f, 0.0f, 0.0f};
             grid->pointsAt(xy, 1, xyz, zOff != 0.0f ? normal : nullptr);
@@ -2039,6 +2040,13 @@ CVolumeViewerView::FrameResult CChunkedVolumeViewer::measurementFrame() const
                 return cv::Vec3f(nan, nan, nan);
             }
             return cv::Vec3f(xyz[0] + zOff * normal[0], xyz[1] + zOff * normal[1], xyz[2] + zOff * normal[2]);
+        };
+        frame.toVolume = [toGrid, at](const QPointF& p) { return at(toGrid(p)); };
+        frame.joined = [toGrid, at](const QPointF& a, const QPointF& b) {
+            return vc3d::hud::everyCrossedCell(toGrid(a), toGrid(b), [&at](const QPointF& g) {
+                const cv::Vec3f v = at(g);
+                return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+            });
         };
     }
     const double voxel = _volume->voxelSize();

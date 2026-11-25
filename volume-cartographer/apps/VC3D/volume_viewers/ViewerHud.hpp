@@ -295,6 +295,28 @@ inline std::vector<double> cumulativeLength(const std::vector<std::array<double,
     return out;
 }
 
+// Whether `inCell` holds at a point inside every unit grid cell the straight segment
+// from a to b (grid coordinates) crosses, including cells it only clips at a corner.
+template <class InCell>
+bool everyCrossedCell(QPointF a, QPointF b, InCell inCell)
+{
+    std::vector<double> t{0.0, 1.0};
+    const auto crossings = [&t](double p0, double p1) {
+        for (double k = std::floor(std::min(p0, p1)) + 1.0; k < std::max(p0, p1); k += 1.0) {
+            t.push_back((k - p0) / (p1 - p0));
+        }
+    };
+    crossings(a.x(), b.x());
+    crossings(a.y(), b.y());
+    std::sort(t.begin(), t.end());
+    for (std::size_t i = 0; i + 1 < t.size(); ++i) {
+        if (t[i] < t[i + 1] && !inCell(a + (b - a) * (0.5 * (t[i] + t[i + 1])))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Volume position as an affine function of frame pixel position: v = origin + dx * x + dy * y.
 struct AffineMap {
     std::array<double, 3> origin{};

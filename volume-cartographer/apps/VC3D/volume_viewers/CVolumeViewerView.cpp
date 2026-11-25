@@ -943,6 +943,13 @@ CVolumeViewerView::ProfileReadout CVolumeViewerView::profileReadout() const
     r.alongSurface = !frame.planeMap;
     r.complete = frame.complete;
     r.arc = vc3d::hud::cumulativeLength(positions);
+    if (frame.joined) {
+        for (int i = 1; i < n && std::isfinite(r.arc[std::size_t(i)]); ++i) {
+            if (!frame.joined(vc3d::hud::samplePoint(a, b, i - 1, n), vc3d::hud::samplePoint(a, b, i, n))) {
+                std::fill(r.arc.begin() + i, r.arc.end(), std::numeric_limits<double>::quiet_NaN());
+            }
+        }
+    }
     if (r.physical) {
         for (double& d : r.arc) {
             d *= frame.voxelSizeUm;
@@ -1060,7 +1067,7 @@ void CVolumeViewerView::drawHistogram(QPainter* p) const
     } else if (_histogramSerial != fr.frame->serial || fr.frame->serial == 0) {
         _histogramSerial = fr.frame->serial;
         _histogram = vc3d::hud::computeHistogram(rasterOf(*fr.frame),
-                                                 QRect(0, 0, viewport()->width(), viewport()->height()), 2,
+                                                 QRect(0, 0, viewport()->width(), viewport()->height()), 1,
                                                  fr.frame->displayed);
     }
 
@@ -1162,7 +1169,9 @@ void CVolumeViewerView::drawLineProfile(QPainter* p) const
         return;
     }
     drawPanelText(p, in, in.top() + 11,
-                  tr("Line profile, 8-bit samples before window: %1 peaks").arg(r.peaks.size()));
+                  r.complete ? tr("Line profile, 8-bit samples before window: %1 peaks").arg(r.peaks.size())
+                             : tr("Line profile (loading), 8-bit samples before window: %1 provisional peaks")
+                                   .arg(r.peaks.size()));
     const QRectF plot(in.left(), in.top() + 18, in.width(), std::max(1.0, in.height() - 52));
     QPainterPath curve;
     bool started = false;
@@ -1204,8 +1213,7 @@ void CVolumeViewerView::drawLineProfile(QPainter* p) const
         }
     }
     if (r.missing > 0) {
-        foot += tr("   %1 of %2 samples missing%3")
-                    .arg(r.missing).arg(n).arg(r.complete ? QString() : tr(", loading"));
+        foot += tr("   %1 of %2 samples missing").arg(r.missing).arg(n);
     }
     drawPanelText(p, in, in.bottom() - 14, foot);
     if (r.start && r.end) {
