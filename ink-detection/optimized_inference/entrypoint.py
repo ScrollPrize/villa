@@ -913,7 +913,7 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
         result_uri = final_output_path
     else:
         # Local file path
-        os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(final_output_path)), exist_ok=True)
         logger.info(f"Copying tiled TIFF to local path: {final_output_path}")
         with scoped_timer(profiler, "local_write_seconds", flag=FLAG_APPROXIMATE):
             shutil.copy2(local_tiff_path, final_output_path)
