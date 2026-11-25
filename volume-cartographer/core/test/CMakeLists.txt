@@ -71,6 +71,10 @@ vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_
 
 vc_add_test(NAME test_omp_thread_point_collection)
 
+# Repeated pool construction/destruction; hung on Windows before the
+# destructor held the pool mutex around request_stop() (#1686).
+vc_add_test(NAME test_thread_pool_lifecycle)
+
 vc_add_test(NAME test_surface_area_units)
 
 
@@ -87,7 +91,8 @@ qt6_wrap_cpp(ink_detection_overlay_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/
 qt6_wrap_cpp(viewer_overlay_base_ink_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/overlays/ViewerOverlayControllerBase.hpp)
 qt6_wrap_cpp(viewer_manager_overlay_test_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/ViewerManager.hpp)
 qt6_wrap_cpp(cstate_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
-             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.hpp)
 qt6_wrap_cpp(vccollection_ink_detection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(surface_catalog_ink_detection_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp)
 vc_add_test(NAME test_ink_detection_overlay
@@ -100,6 +105,7 @@ vc_add_test(NAME test_ink_detection_overlay
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/COutlinedTextItem.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/CVolumeViewerView.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
@@ -176,7 +182,8 @@ vc_add_test(NAME test_lasagna_batch_window
 qt6_wrap_cpp(segmentation_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.hpp)
 qt6_wrap_cpp(collapsible_settings_group_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.hpp)
 qt6_wrap_cpp(cstate_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
-             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.hpp)
 qt6_wrap_cpp(vccollection_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(surface_catalog_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp)
 vc_add_test(NAME test_segmentation_lasagna_panel_ui
@@ -188,6 +195,7 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${segmentation_lasagna_panel_moc}
@@ -216,7 +224,8 @@ vc_add_test(NAME test_spiral_config_profile_editor
 
 qt6_wrap_cpp(line_annotation_vccollection_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
 qt6_wrap_cpp(line_annotation_cstate_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
-             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp)
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
+             ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.hpp)
 vc_add_test(NAME test_line_annotation_link_validation
     SOURCES test_line_annotation_link_validation.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
@@ -245,7 +254,9 @@ vc_add_test(NAME test_line_annotation_generated_views
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/PointCollectionSync.hpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionDrafts.hpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLineGeometry.hpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
@@ -268,6 +279,14 @@ vc_add_test(NAME test_fiber_trace3d
 vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_json LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_trace_winding_bp LIBS doctest::doctest vc_fiber_tracer)
+
+# The native constraint-store regression shares the app's import adapter.
+# Register it after the common test-target helpers are available.
+if(TARGET test_fiber_normal_publication)
+    add_test(NAME test_fiber_normal_publication COMMAND test_fiber_normal_publication)
+    vc_register_test_target(test_fiber_normal_publication)
+    vc_register_ctest(test_fiber_normal_publication test_fiber_normal_publication)
+endif()
 vc_add_test(NAME test_lasagna_normal_alignment LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_prediction_channels LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_benchmark LIBS doctest::doctest vc_fiber_tracer)
@@ -440,6 +459,9 @@ vc_add_test(NAME test_load_json)
 
 vc_add_test(NAME test_lasagna_manifest LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_lasagna_project_volumes LIBS doctest::doctest vc_lasagna)
+# Live S3: a published Lasagna array cached whole as a directory Zarr.
+vc_add_test(NAME test_lasagna_cache_live_s3 LIBS doctest::doctest vc_lasagna)
+set_property(TEST test_lasagna_cache_live_s3 APPEND PROPERTY LABELS network)
 
 vc_add_test(NAME test_open_data_manifest
     SOURCES test_open_data_manifest.cpp
@@ -505,6 +527,7 @@ vc_add_test(NAME test_fiber_side_strip_intersections LIBS doctest::doctest vc_fi
 
 vc_add_test(NAME test_remote_url)
 vc_add_test(NAME test_loopback_http_server)
+vc_add_test(NAME test_http_handle_pool)
 vc_add_test(NAME test_remote_cache_settings)
 
 vc_add_test(NAME test_logging)

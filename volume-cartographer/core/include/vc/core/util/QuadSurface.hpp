@@ -1,6 +1,6 @@
 #pragma once
 
-namespace vc::objects { class TransformedGeometryView; }
+namespace vc::objects { class TransformedGeometryView; class StoreReader; }
 
 #include <array>
 #include <atomic>
@@ -512,7 +512,7 @@ private:
 
 // --- vc_object_store surfaces ------------------------------------------------
 // The store equivalents of load_quad_from_tifxyz and save(). Callers own the
-// transactions and revision pins. Stored vertices whose `valid` channel is 0 load
+// reads, checked requests and pins. Stored vertices whose `valid` channel is 0 load
 // as the (-1,-1,-1) sentinel and `valid` is exposed as the "mask" channel (255/0);
 // record tags appear as meta["tags"] keys;
 // writes touch only vertices that changed, so masked coordinates stay stored.
@@ -523,20 +523,24 @@ std::vector<std::pair<int, int>> surface_components(const nlohmann::json& meta);
 // The tags a tifxyz meta.json records: the keys of its "tags" object.
 std::vector<std::string> tifxyz_tags(const nlohmann::json& meta);
 
-// A surface object's geometry revision (default: its current one). Other
+// A surface object's geometry revision (default: its current one), read
+// through any attachment's reader (ObjectStoreSession::readStore). Other
 // channels are registered empty; set a loader (store_channel_loader) to read them.
 // Without applyValidity, masked vertices keep their coordinates (like SURF_LOAD_IGNORE_MASK).
 // Through `transformed` (a view of that revision), points are in the view's volume voxels.
-std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore&, const vc::objects::Txn&,
+std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader&,
     const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt,
     bool applyValidity = true, const vc::objects::TransformedGeometryView* transformed = nullptr);
+std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader&,
+    const vc::objects::ObjectRevision&, bool applyValidity = true,
+    const vc::objects::TransformedGeometryView* transformed = nullptr);
 // Reads channels of an immutable geometry revision through a session on demand.
 std::function<cv::Mat(const std::string&)> store_channel_loader(
     std::shared_ptr<vc::objects::ObjectStoreSession>, vc::objects::AttachmentIdentity, std::string geometryRevision);
-// Create surface object `uuid` holding `surface` (the caller's transaction
-// expects it absent) through the store's createSurface: bound by
-// `coordinates`, with `provenance`, keeping the surface's other meta.
-void create_quad_in_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& uuid, QuadSurface&,
+// The operations of a checked request creating surface object `uuid` holding
+// `surface` (the request expects it absent; createSurfaceOperations): bound
+// by `coordinates`, with `provenance`, keeping the surface's other meta.
+std::vector<vc::objects::TransactionOperation> create_quad_operations(const std::string& uuid, QuadSurface&,
     const std::string& name, const std::vector<std::string>& tags, const nlohmann::json& coordinates,
     const vc::objects::SurfaceProvenance& provenance);
 // The surface's grid as stored: points (missing vertices as the sentinel) and
@@ -545,18 +549,19 @@ void create_quad_in_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, con
 vc::geometry::Surface quad_surface_grid(QuadSurface&);
 // Geometry for putGeometry: quad_surface_grid and the other channels.
 vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
-// Publish the vertices of `rect` (grid rows/columns) that differ from the stored
-// revision `expected` in one sparse edit: new coordinates also mark the vertex
-// valid; a vertex cleared to the sentinel loses its coordinates. `decide` answers
-// for relationships the edit affects. Returns the new (or unchanged) geometry revision.
-std::string write_quad_rect_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
-    QuadSurface&, const cv::Rect& rect, const std::string& expected,
-    const vc::objects::ObjectStoreSession::KeepRecorded& decide = {},
-    const vc::objects::TransformedGeometryView* transformed = nullptr);
-// Replace the named channels ("mask" is `valid`) with the surface's and remove `remove`.
-std::string write_quad_channels_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
-    QuadSurface&, const std::vector<std::string>& names, const std::vector<std::string>& remove,
-    const std::string& expected, const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits = {});
+// The sparse edit publishing the vertices of `rect` (grid rows/columns) that
+// differ from the revision `view` shows (its stored frame or a transformed
+// one): new coordinates also mark the vertex valid; a vertex cleared to the
+// sentinel loses its coordinates. Relationships the edit affects are kept as
+// recorded. nullopt when nothing changed. `validity` is the grid's validity
+// when an earlier operation of the request replaces it (quad_channels_operation).
+std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::TransformedGeometryView& view,
+    QuadSurface&, const cv::Rect& rect, const std::vector<uint8_t>* validity = nullptr);
+// Replace the named channels ("mask" is `valid`) of a rows x columns surface
+// with the surface's and remove `remove`, keeping affected relationships as
+// recorded.
+vc::objects::SetSurfaceChannelsOp quad_channels_operation(const std::string& objectUuid, QuadSurface&,
+    const std::vector<std::string>& names, const std::vector<std::string>& remove, int rows, int columns);
 
 // Serialize a bbox as [[minX,minY,minZ],[maxX,maxY,maxZ]], the layout
 // QuadSurface::save() writes for its own bbox key.

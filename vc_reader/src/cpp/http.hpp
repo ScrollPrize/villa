@@ -1,6 +1,6 @@
-// HTTP(S) requests over a bounded pool of libcurl handles: anonymous, HTTP basic
-// auth, or signed for S3 (AWS Signature Version 4). sftp:// and ssh:// URLs are
-// read through pooled OpenSSH sessions and answered with the same responses.
+// HTTP(S) requests over libcurl handles shared by the whole process: anonymous,
+// HTTP basic auth, or signed for S3 (AWS Signature Version 4). sftp:// and ssh://
+// URLs are read through pooled OpenSSH sessions and answered with the same responses.
 #pragma once
 
 #include "reader_types.hpp"
@@ -9,7 +9,14 @@
 
 #include <curl/curl.h>
 
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -31,12 +38,14 @@
 namespace vcr {
 
 struct HttpOptions {
-    int connections = 16;          // concurrent requests (and kept-alive connections)
+    int connections = 16;          // concurrent requests of one client
     long connect_timeout_ms = 10000;
     long stall_timeout_s = 10;     // abort an attempt after this long without receiving data
     int retries = 5;
     Auth auth;
     long request_timeout_ms = 0;
+    bool path_as_is = false;
+    bool bypass_proxy = false;
 };
 
 struct HttpResponse {
@@ -44,7 +53,7 @@ struct HttpResponse {
     std::string etag, modified, content_range;
     std::size_t bytes = 0;
     std::optional<std::size_t> content_length;
-    std::string content_encoding;
+    std::string content_encoding, content_type;
 };
 
 // The CA bundle to use instead of libcurl's built-in one: empty when that one exists (or
@@ -65,6 +74,87 @@ inline std::string select_ca_bundle(const std::string& builtin)
     return {};
 }
 
+// The libcurl easy handles of every HttpClient in the process. A handle keeps
+// its open connections between requests, and since libcurl 8 also a wakeup
+// descriptor of its own (an eventfd on Linux, a socket pair elsewhere), so a
+// client with its own handles holds file descriptors for as long as it lives. A process opening many remote arrays (each with a client) used to
+// keep hundreds of idle handles and run out of descriptors. Handles are now made
+// when a request needs one, shared by all clients (a connection to a host serves
+// any client asking that host), and at most kMaxIdle wait idle; the rest are
+// closed when their request ends. curl_easy_reset before every request clears
+// the previous request's options, credentials included.
+class CurlHandles {
+public:
+    static constexpr std::size_t kMaxIdle = 64;
+
+    // This process's pool. A forked child gets a new, empty one: the parent's
+    // handles share the parent's connections, and its lock may have been held
+    // across fork, so the inherited pool is left alone (leaked, never touched).
+    static CurlHandles& instance()
+    {
+        // Never destroyed: requests may still end during static destruction.
+        static std::atomic<CurlHandles*> current{new CurlHandles};
+        CurlHandles* pool = current.load(std::memory_order_acquire);
+        if (pool->owner_ == pid())
+            return *pool;
+        auto* fresh = new CurlHandles;
+        if (current.compare_exchange_strong(pool, fresh, std::memory_order_acq_rel))
+            return *fresh;
+        delete fresh;  // another thread of this process replaced it first
+        return *pool;
+    }
+
+    CURL* acquire()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (!idle_.empty()) {
+                CURL* h = idle_.back();
+                idle_.pop_back();
+                return h;
+            }
+        }
+        CURL* h = curl_easy_init();
+        if (!h)
+            throw std::runtime_error("curl_easy_init failed");
+        return h;
+    }
+
+    void release(CURL* h) noexcept
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (idle_.size() < kMaxIdle) {
+                idle_.push_back(h);  // never allocates: capacity reserved up front
+                return;
+            }
+        }
+        curl_easy_cleanup(h);
+    }
+
+    std::size_t idle() const
+    {
+        std::lock_guard lock(mutex_);
+        return idle_.size();
+    }
+
+private:
+    CurlHandles() : owner_(pid()) { idle_.reserve(kMaxIdle); }
+
+    static long pid()
+    {
+#ifdef _WIN32
+        return static_cast<long>(::_getpid());
+#else
+        return static_cast<long>(::getpid());
+#endif
+    }
+
+    const long owner_;
+    mutable std::mutex mutex_;
+    std::vector<CURL*> idle_;
+};
+
 class HttpClient {
 public:
     explicit HttpClient(HttpOptions options) : options_(options)
@@ -73,14 +163,6 @@ public:
         std::call_once(init, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
         if (options_.connections < 1)
             options_.connections = 1;
-        handles_.reserve(options_.connections);
-        for (int i = 0; i < options_.connections; ++i) {
-            CURL* h = curl_easy_init();
-            if (!h)
-                throw std::runtime_error("curl_easy_init failed");
-            handles_.push_back(h);
-        }
-        free_ = handles_;
         auth_ = std::make_shared<const Auth>(options_.auth);
         if (!auth_->kind.empty() && auth_->kind != "basic" && auth_->kind != "s3")
             throw std::invalid_argument("unknown auth kind '" + auth_->kind + "'");
@@ -94,11 +176,7 @@ public:
         auth_ = std::move(next);
     }
 
-    ~HttpClient()
-    {
-        for (CURL* h : handles_)
-            curl_easy_cleanup(h);
-    }
+    ~HttpClient() = default;
 
     HttpClient(const HttpClient&) = delete;
     HttpClient& operator=(const HttpClient&) = delete;
@@ -171,6 +249,17 @@ public:
         return answer;
     }
 
+    // A request whose answer the caller interprets: the status and whole body of
+    // any final response. Connection errors, stalls, 429 and 5xx are retried
+    // like a read, so only for requests safe to repeat (idempotent, or carrying a
+    // durable request id the server deduplicates).
+    HttpResponse exchange(const char* method, const std::string& url, const void* data, std::size_t size,
+                          const std::vector<std::pair<std::string, std::string>>& headers, std::string& answer)
+    {
+        return perform(method, url, [&] { answer.clear(); }, [&](const char* p, std::size_t n) { answer.append(p, n); },
+                       headers, 200, {}, data, size, true);
+    }
+
     // Whether `url` exists (HEAD): false for 404.
     bool head(const std::string& url)
     {
@@ -187,7 +276,8 @@ private:
     HttpResponse perform(const char* method, const std::string& url, const std::function<void()>& reset,
                          std::function<void(const char*, std::size_t)> write,
                          const std::vector<std::pair<std::string, std::string>>& extra, long body_status,
-                         std::function<void(const HttpResponse&)> begin_body, const void* upload, std::size_t upload_size)
+                         std::function<void(const HttpResponse&)> begin_body, const void* upload, std::size_t upload_size,
+                         bool any_status = false)
     {
         Lease lease(*this);
         CURL* h = lease.handle;
@@ -196,12 +286,16 @@ private:
         float delay = 0.25f;
         std::string last_error;
         const bool get = std::strcmp(method, "GET") == 0, post = std::strcmp(method, "POST") == 0, put = std::strcmp(method, "PUT") == 0 || post;
+        const bool upload_body = put || (any_status && upload_size > 0);
         const std::string payload = put && auth->kind == "s3" ? payload_hash(upload, upload_size) : sigv4_empty_payload();
         for (int attempt = 0; attempt <= options_.retries; ++attempt) {
             reset();
             Transfer transfer{write, body_status, begin_body};
+            transfer.any_status = any_status;
             curl_easy_reset(h);
             curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+            if (options_.bypass_proxy) curl_easy_setopt(h, CURLOPT_PROXY, "");
+            curl_easy_setopt(h, CURLOPT_PATH_AS_IS, options_.path_as_is ? 1L : 0L);
             curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
             curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, get ? 1L : 0L);  // a redirected write is an error
             curl_easy_setopt(h, CURLOPT_USERAGENT, "vc_reader");
@@ -235,9 +329,9 @@ private:
             curl_easy_setopt(h, CURLOPT_HEADERDATA, &transfer);
             Upload body{static_cast<const char*>(upload), upload_size};
             HeaderList headers;
-            if (put) {
+            if (upload_body) {
                 curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
-                if (post) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "POST");
+                if (std::strcmp(method, "PUT") != 0) curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
                 curl_easy_setopt(h, CURLOPT_READFUNCTION, &HttpClient::send);
                 curl_easy_setopt(h, CURLOPT_READDATA, &body);
                 curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(upload_size));
@@ -266,6 +360,8 @@ private:
                 long status = 0;
                 curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
                 transfer.response.status = status;
+                if (any_status && status != 429 && status < 500)
+                    return transfer.response;
                 if (status == body_status || status == 304 || status == 404 || (!get && status / 100 == 2))
                     return transfer.response;
                 if (status != 429 && status < 500) {
@@ -386,21 +482,40 @@ private:
         ~HeaderList() { curl_slist_free_all(list); }
     };
 
+    // One of this client's `connections` request slots, and a handle from the
+    // process-wide pool for its duration.
     struct Lease {
         HttpClient& client;
-        CURL* handle;
+        CurlHandles& pool = CurlHandles::instance();
+        CURL* handle = nullptr;
         explicit Lease(HttpClient& c) : client(c)
         {
-            std::unique_lock lock(client.mutex_);
-            client.cv_.wait(lock, [&] { return !client.free_.empty(); });
-            handle = client.free_.back();
-            client.free_.pop_back();
+            {
+                std::unique_lock lock(client.mutex_);
+                client.cv_.wait(lock, [&] { return client.active_ < client.options_.connections; });
+                ++client.active_;
+            }
+            try {
+                handle = pool.acquire();
+            } catch (...) {
+                free_slot();
+                throw;
+            }
         }
         ~Lease()
         {
+            pool.release(handle);
+            free_slot();
+        }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+
+    private:
+        void free_slot() noexcept
+        {
             {
                 std::lock_guard lock(client.mutex_);
-                client.free_.push_back(handle);
+                --client.active_;
             }
             client.cv_.notify_one();
         }
@@ -413,6 +528,7 @@ private:
         HttpResponse response;
         std::string snippet;
         std::exception_ptr error;
+        bool any_status = false;  // deliver every status's body to the sink
     };
 
     struct Upload {
@@ -437,7 +553,7 @@ private:
         try {
             if (t.body_status == 206 && t.response.status == 200)
                 throw std::runtime_error("server ignored HTTP Range; refusing a whole-shard download");
-            if (t.response.status == t.body_status) {
+            if (t.response.status == t.body_status || (t.any_status && t.response.status != 429 && t.response.status < 500)) {
                 if (!t.response.bytes && t.begin_body) t.begin_body(t.response);
                 t.sink(data, n);
                 t.response.bytes += n;
@@ -466,14 +582,14 @@ private:
                 if (name == "content-range") t.response.content_range = value;
                 if (name == "content-length") t.response.content_length = std::stoull(value);
                 if (name == "content-encoding") t.response.content_encoding = value;
+                if (name == "content-type") t.response.content_type = value;
             }
             return n;
         } catch (...) { t.error = std::current_exception(); return 0; }
     }
 
     HttpOptions options_;
-    std::vector<CURL*> handles_;
-    std::vector<CURL*> free_;
+    int active_ = 0;  // requests in flight; guarded by mutex_
     std::shared_ptr<const Auth> auth_;  // guarded by mutex_
     std::unique_ptr<sftp::Fetcher> sftp_;  // created on the first sftp:// request; guarded by mutex_
     std::mutex mutex_;

@@ -3,6 +3,7 @@
 
 #include <QFutureWatcher>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QPointer>
 #include <QtConcurrent>
 
@@ -26,6 +27,8 @@
 
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/GeometryExport.hpp>
+#include <vc_object_store/objects/StoreReader.hpp>
+#include <vc_object_store/objects/TransactionJson.hpp>
 #include <vc_reader/zarr.hpp>
 
 // Object stores of the open project (importing source files into them,
@@ -81,7 +84,7 @@ struct ExportTarget {
 };
 
 struct ExportResult {
-    std::string objectRevision;
+    vc::objects::ObjectVersion version;
     std::string geometryRevision;
     QString error;
 };
@@ -239,8 +242,8 @@ QJsonObject AgentBridgeServer::handleObjectsExport(const QJsonValue& params)
         if (std::any_of(candidates.begin(), candidates.end(), [&](const auto& c) { return c.attachment == attachment; }))
             return;
         std::optional<std::string> kind;
-        session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
-            const auto head = db.currentObjectRevision(txn, uuid);
+        session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+            const auto head = reader.currentObject(uuid);
             if (head && !head->deleted && !head->record.retired) kind = head->record.kind;
         });
         if (kind) candidates.push_back({store, attachment, *kind});
@@ -317,7 +320,8 @@ QJsonObject AgentBridgeServer::handleObjectsExport(const QJsonValue& params)
                 {"uuid", QString::fromStdString(uuid)},
                 {"kind", QString::fromStdString(target.kind)},
                 {"store", QString::fromStdString(target.store)},
-                {"objectRevision", QString::fromStdString(result.objectRevision)},
+                {"version", QJsonDocument::fromJson(QByteArray::fromStdString(
+                    vc::objects::objectVersionToJson(result.version))).object()},
                 {"geometryRevision", QString::fromStdString(result.geometryRevision)},
             };
         }
@@ -325,15 +329,15 @@ QJsonObject AgentBridgeServer::handleObjectsExport(const QJsonValue& params)
                   success ? QStringLiteral("Exported %1").arg(QString::fromStdString(uuid)) : result.error,
                   success ? path : QString());
     });
-    watcher->setFuture(QtConcurrent::run([session, target, uuid, destination, overwrite, validOnly]() {
+    watcher->setFuture(QtConcurrent::run([session, attachment = target.attachment, uuid, destination, overwrite, validOnly]() {
         ExportResult result;
         try {
-            session->read(target.attachment, [&](const auto& db, const auto& txn, const auto&) {
-                const auto head = db.currentObjectRevision(txn, uuid);
+            session->readStore(attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+                const auto head = reader.selectedObject(uuid);
                 if (!head || head->deleted || head->record.retired)
                     throw std::runtime_error("the object was removed before it could be exported");
-                result.objectRevision = head->uuid;
-                result.geometryRevision = vc::objects::exportGeometry(db, txn, uuid, destination, std::nullopt, overwrite, validOnly);
+                if (head->geometryRevision) result.geometryRevision = *head->geometryRevision;
+                result.version = vc::objects::exportGeometry(reader, uuid, destination, head->reference(), overwrite, validOnly);
             });
         } catch (const std::exception& error) {
             result.error = QString::fromUtf8(error.what());
@@ -681,7 +685,7 @@ QJsonObject AgentBridgeServer::handleUmbilicusRemove(const QJsonValue&)
     if (!umbilici)
         throw AgentBridgeError{-32007, "No store is routed for umbilici", {{"kind", "store"}}};
     QJsonObject result{{"volume", QString::fromStdString(umbilici->volume)}, {"store", storeReferenceJson(state, umbilici->store)}};
-    if (umbilici->pins.empty()) {
+    if (umbilici->uuids.empty()) {
         result["removed"] = QJsonArray();
         return result;
     }

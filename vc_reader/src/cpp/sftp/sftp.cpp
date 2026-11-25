@@ -6,6 +6,20 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <thread>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 namespace vcr::sftp {
 namespace {
@@ -24,6 +38,42 @@ enum AttributeFlags : uint32_t { SizeFlag = 1, OwnerFlag = 2, PermissionsFlag = 
 
 std::mutex authenticatorMutex;
 Authenticator processAuthenticator;
+
+Authenticator currentAuthenticator()
+{
+    std::lock_guard lock(authenticatorMutex);
+    return processAuthenticator;
+}
+
+uint16_t availableLoopbackPort()
+{
+#ifdef _WIN32
+    WSADATA data;
+    if (WSAStartup(MAKEWORD(2, 2), &data)) throw std::runtime_error("Cannot initialize TCP forwarding");
+    struct Cleanup { ~Cleanup() { WSACleanup(); } } cleanup;
+    const auto socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (socket == INVALID_SOCKET) throw std::runtime_error("Cannot allocate a TCP forwarding socket");
+    int length = sizeof(sockaddr_in);
+#else
+    const auto socket = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (socket < 0) throw std::runtime_error("Cannot allocate a TCP forwarding socket");
+    socklen_t length = sizeof(sockaddr_in);
+#endif
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool ok = ::bind(socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+                    ::getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length) == 0;
+#ifdef _WIN32
+    closesocket(socket);
+#else
+    ::close(socket);
+#endif
+    if (!ok) throw std::runtime_error("Cannot allocate a loopback port for SSH forwarding");
+    // ssh must bind this port itself. ExitOnForwardFailure prevents readiness
+    // if another process wins the race after we release the reservation.
+    return ntohs(address.sin_port);
+}
 
 void u32(std::string& b, uint32_t v)
 {
@@ -220,6 +270,58 @@ void setAuthenticator(Authenticator authenticator)
     processAuthenticator = std::move(authenticator);
 }
 
+Url parseForwardUrl(std::string_view endpoint)
+{
+    auto url = parseUrl(endpoint);
+    if (!url.port || url.path != "/")
+        throw std::invalid_argument("Expected ssh://[user@]host:SERVICE_PORT or sftp://[user@]host:SERVICE_PORT (no file path)");
+    return url;
+}
+
+struct Forward::Impl {
+    std::string endpoint;
+    std::unique_ptr<detail::SshProcess> process;
+    std::jthread drain; // joins before process destruction
+};
+
+Forward::Forward(const std::string& endpoint, Options options) : impl_(std::make_unique<Impl>())
+{
+    auto destination = parseForwardUrl(endpoint);
+    const auto servicePort = *destination.port;
+    destination.port.reset(); // SSH login uses ~/.ssh/config, not the service port.
+    const auto localPort = availableLoopbackPort();
+    impl_->endpoint = "http://127.0.0.1:" + std::to_string(localPort);
+    impl_->process = std::make_unique<detail::SshProcess>(destination, options, currentAuthenticator(),
+        "127.0.0.1:" + std::to_string(localPort) + ":127.0.0.1:" + std::to_string(servicePort));
+    std::string output;
+    auto activity = std::chrono::steady_clock::now();
+    while (output.find("VC_SSH_FORWARD_READY\n") == std::string::npos &&
+           output.find("VC_SSH_FORWARD_READY\r\n") == std::string::npos) {
+        if (options.cancelled && options.cancelled()) throw std::runtime_error("SSH forwarding cancelled");
+        const auto now = std::chrono::steady_clock::now();
+        if (impl_->process->prompting()) activity = now;
+        if (now - activity > options.idleTimeout)
+            throw std::runtime_error("SSH forwarding timed out: " + impl_->process->diagnostics());
+        std::byte buffer[256];
+        const auto count = impl_->process->read(buffer, std::chrono::milliseconds(100));
+        output.append(reinterpret_cast<const char*>(buffer), count);
+        if (output.size() > 4096) output.erase(0, output.size() - 4096);
+    }
+    impl_->process->authenticated();
+    // A long-lived forward must drain ssh's diagnostics even between HTTP
+    // requests, or repeated remote connection errors can fill its stderr pipe.
+    impl_->drain = std::jthread([process = impl_->process.get()](std::stop_token stop) {
+        std::byte buffer[256];
+        while (!stop.stop_requested()) {
+            try { process->read(buffer, std::chrono::milliseconds(100)); }
+            catch (const std::exception&) { break; }
+        }
+    });
+}
+
+Forward::~Forward() = default;
+const std::string& Forward::endpoint() const { return impl_->endpoint; }
+
 struct Session::Impl {
     Url url;
     Options options;
@@ -329,12 +431,7 @@ Session::Session(const Url& destination, Options options) : impl_(std::make_uniq
 {
     impl_->url = destination;
     impl_->options = std::move(options);
-    Authenticator authenticator;
-    {
-        std::lock_guard lock(authenticatorMutex);
-        authenticator = processAuthenticator;
-    }
-    impl_->process = std::make_unique<detail::SshProcess>(destination, impl_->options, std::move(authenticator));
+    impl_->process = std::make_unique<detail::SshProcess>(destination, impl_->options, currentAuthenticator());
     std::string init(1, char(Init));
     u32(init, 3);
     impl_->send(init);

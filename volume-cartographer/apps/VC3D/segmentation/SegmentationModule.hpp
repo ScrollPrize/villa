@@ -36,6 +36,7 @@
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
 #include "SegmentationAutosaveState.hpp"
+#include "SurfaceCorrections.hpp"
 
 namespace segmentation { class CorrectionsState; }
 
@@ -122,7 +123,9 @@ public:
     void setStorePinResolver(StorePinResolver resolver) { _storePinResolver = std::move(resolver); }
     // Synchronously publish `surface` to its store object: its changed vertices
     // (with `vertices`) and its loaded `channels` (every channel when empty).
-    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {});
+    // With `geometryRevision`, only over that stored geometry (SurfaceStoreEdit::save).
+    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {},
+                     const std::optional<std::string>& geometryRevision = std::nullopt);
     // The store revisions the surface's edits continue from.
     std::optional<vc::objects::PinnedObject> storePin(QuadSurface* surface);
     void endEditingSession();
@@ -135,7 +138,8 @@ public:
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
     // The active surface's correction point collections in the store.
     void loadCorrections(QuadSurface* surface);
-    void saveCorrections();
+    bool saveCorrections();
+    void saveGrowthAnnotation(const vc3d::corrections::GrowthAnnotation&);
 
     void attachViewer(VolumeViewerBase* viewer);
     void detachViewer(VolumeViewerBase* viewer);
@@ -542,9 +546,14 @@ private:
     // The store edit of the active surface, kept across editing sessions so
     // saves continue from their own revisions.
     std::shared_ptr<SurfaceStoreEdit> _storeEdit;
-    // The edited object's hold (ObjectStoreSession::holdForEditing) while a session lasts.
-    vc::objects::LeaseHold _editLease;
     std::shared_ptr<SurfaceStoreEdit> storeEditFor(QuadSurface* surface);
+    // The frame an edit's points are in (its view, else the stored coordinates).
+    vc::objects::CoordinateJson editCoordinates(const SurfaceStoreEdit& storeEdit) const;
+    // The open surface has unsaved edits recovered from an earlier session:
+    // ask to restore (reapplied on the version on screen and autosaved),
+    // keep for later, or discard them.
+    void offerRecoveredDraft(const QString& objectUuid);
+    bool _offeringRecoveredDraft = false;
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
     std::unordered_map<std::uint64_t, std::size_t> _pendingAutosaveVertexUpdateIndex;
 
@@ -552,6 +561,7 @@ private:
     static constexpr int kCorrectionsSaveDelayMs = 2000;
     QTimer* _correctionsSaveTimer{nullptr};
     std::string _correctionsSurfaceId;
+    std::optional<vc3d::corrections::Snapshot> _correctionsSnapshot;
     void scheduleCorrectionsAutoSave();
     void performCorrectionsAutoSave();
 

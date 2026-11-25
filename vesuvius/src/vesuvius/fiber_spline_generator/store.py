@@ -81,25 +81,28 @@ def write_store(
         temporary = Path(directory) / destination.name
         with ObjectStore.create(str(temporary), author=getpass.getuser()) as store:
             fiber_count = point_count = 0
-            with store.write() as tx:
-                for fiber in fibers:
-                    points = _validated(fiber)
-                    source = dict(fiber.annotation)
-                    controls = np.asarray(source.pop("control_points", [points[0], points[-1]]), dtype="<f8")
-                    if controls.ndim != 2 or controls.shape[1] != 3 or not np.isfinite(controls).all():
-                        raise ValueError(f"Fiber {fiber.name!r} has invalid control points")
-                    source.update(type="vc3d_fiber", version=4)
-                    json.dumps(source, allow_nan=False)
-                    geometry = StoredFiber.from_arrays(np.ascontiguousarray(controls), points)
-                    uid = tx.upsert_object(dict(
-                        uuid=str(uuid.uuid4()), kind="fiber", name=fiber.name, format_version=4,
-                        fiber=dict(family=fiber.family, manual_family=bool(fiber.family), optimization_mode="lasagna",
-                                   control_point_count=len(controls), line_point_count=len(points), length=geometry.length()),
-                        meta={**extra, "coordinates": dict(coordinates), "source": source},
-                    ))
-                    tx.put_geometry(uid, geometry)
-                    fiber_count += 1
-                    point_count += len(points)
+            prepared = []
+            for fiber in fibers:
+                points = _validated(fiber)
+                source = dict(fiber.annotation)
+                controls = np.asarray(source.pop("control_points", [points[0], points[-1]]), dtype="<f8")
+                if controls.ndim != 2 or controls.shape[1] != 3 or not np.isfinite(controls).all():
+                    raise ValueError(f"Fiber {fiber.name!r} has invalid control points")
+                source.update(type="vc3d_fiber", version=4)
+                json.dumps(source, allow_nan=False)
+                geometry = StoredFiber.from_arrays(np.ascontiguousarray(controls), points)
+                prepared.append((dict(
+                    uuid=str(uuid.uuid4()), kind="fiber", name=fiber.name, format_version=4,
+                    fiber=dict(family=fiber.family, manual_family=bool(fiber.family), optimization_mode="lasagna",
+                               control_point_count=len(controls), line_point_count=len(points), length=geometry.length()),
+                    meta={**extra, "coordinates": dict(coordinates), "source": source},
+                ), geometry))
+                fiber_count += 1
+                point_count += len(points)
+            # One checked transaction that creates every fiber (each expected absent).
+            with store.write(expected_versions={record["uuid"]: None for record, _ in prepared}) as tx:
+                for record, geometry in prepared:
+                    tx.put_geometry(tx.upsert_object(record), geometry)
             store_uuid = store.uuid
             store.checkpoint()
         with open(temporary, "rb") as stream:

@@ -2052,8 +2052,8 @@ SpiralBrushController::PreparedPatch SpiralBrushController::makePatch(Gesture& g
     patch->id = gesture.id.toStdString();
     // Painted boundaries already encode the user's exact selection. Unlike
     // hand-authored input patches, they must not receive the fitter's generic
-    // invalid-edge erosion when incorporated now or after dataset commit.
-    patch->meta["spiral_patch_erode_cells"] = 0;
+    // invalid-edge erosion: the object store's meta.source says so.
+    patch->meta["source"] = {{"spiral_patch_erode_cells", 0}};
     result.id = gesture.id;
     result.color = gesture.color;
     result.surface = std::move(patch);
@@ -2142,6 +2142,7 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
         result.targetCollectionId = line.pclEdit->collectionId;
         result.sourceIdentity = line.pclEdit->sourceIdentity;
         result.document = line.pclEdit->replacementDocument();
+        result.draft = *line.pclEdit;
         line.id = result.id;
         line.state = GestureState::Finalizing;
         results.push_back(std::move(result));
@@ -2167,11 +2168,13 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
                 || (line.kind == PolylineGesture::Kind::PointCollection
                     && line.pclEdit && !line.pclEdit->collectionId.isEmpty())) continue;
             QJsonObject collection;
+            std::optional<vc3d::spiral::EditablePclDraft> edited;
             if (line.kind == PolylineGesture::Kind::PointCollection && line.pclEdit) {
                 auto draft = *line.pclEdit;
                 draft.collectionId = QStringLiteral("0");
                 collection = draft.replacementDocument().object()
                     .value(QStringLiteral("collections")).toObject().value(draft.collectionId).toObject();
+                edited = std::move(draft);
             } else {
                 QJsonObject points;
                 for (int index = 0; index < static_cast<int>(line.volumePoints.size()); ++index) {
@@ -2194,6 +2197,7 @@ SpiralBrushController::preparePointCollections(QStringList& warnings)
             result.document = QJsonDocument(QJsonObject{
                 {QStringLiteral("vc_pointcollections_json_version"), QStringLiteral("1")},
                 {QStringLiteral("collections"), QJsonObject{{QStringLiteral("0"), collection}}}});
+            result.draft = std::move(edited);
             line.state = GestureState::Finalizing;
             results.push_back(std::move(result));
         }
@@ -2331,6 +2335,15 @@ QJsonArray SpiralBrushController::patchDrafts() const
         });
     }
     return rows;
+}
+
+bool SpiralBrushController::savedUnchanged(const QString& id) const
+{
+    for (const auto& gesture : _gestures)
+        if (gesture.id == id) return gesture.state == GestureState::Finalized && !gesture.uploadInFlight;
+    for (const auto& line : _polylines)
+        if (line.id == id) return line.state == GestureState::Finalized;
+    return false;
 }
 
 bool SpiralBrushController::removePatchDraft(const QString& id)

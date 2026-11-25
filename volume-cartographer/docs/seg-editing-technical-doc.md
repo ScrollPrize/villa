@@ -47,6 +47,19 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
    re-pins the surface from the commit's receipt. The store's revision history
    replaces backups. A session ends by clearing overlay state and cached
    snapshots.
+6. **Crash recovery** – the open surface is a draft of the store session
+   (CState, then the edit manager as edits land). `SessionDrafts` checkpoints
+   changed drafts every `object_store/draft_checkpoint_seconds` (default 30;
+   0 turns recovery off) to `object_store/draft_directory` (default: `drafts`
+   in the application data directory), independently of autosave. Saves are
+   durable (`submitDurably`): the request is written before it is sent, the
+   draft stays open and is marked saved, and a save whose hosted store did not
+   answer stays pending until the next save (or a later reattachment) resolves
+   it. After a crash, opening a surface with recovered edits asks to restore
+   them (reapplied on the version on screen, then autosaved; a newer version
+   is named first), keep them for later, or discard them. Only vertex
+   positions are recovered, not mask/channel edits; a second VC3D instance
+   runs without recovery (the directory serves one session).
 
 
 ## Component Overview
@@ -65,8 +78,8 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 1. **Begin** – `SegmentationModule::beginEditingSession` primes the edit manager
    with the base surface, updates overlay parameters, and republishes that same
    surface through the shared collection so viewers refresh immediately. The
-   surface's `SurfaceStoreEdit` holds the object for editing (a lease in a
-   hosted store); a read-only store or a stale pin refuses the session.
+   surface's `SurfaceStoreEdit` pins the version being edited
+   (`requireCurrent`); a read-only store or a stale pin refuses the session.
 2. **Edit** – All vertex mutations occur directly on the base surface while the
    module keeps `_originalPoints` as the reset snapshot. The module
    continuously mirrors dirty state back to the widget so the UI can flag

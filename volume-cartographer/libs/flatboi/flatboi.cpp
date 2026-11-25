@@ -38,6 +38,9 @@
 #include <vc_object_store/Uuid.hpp>
 
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -901,7 +904,10 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
 {
   cv::Mat_<cv::Vec3f> full = surface.rawPoints().clone();
 
-  // Initial UVs are grid positions scaled by 1/scale, as vc_tifxyz2obj writes them.
+  // Initial UVs are positions in the full grid scaled by 1/scale. A decimated
+  // cell (r, c) sits at (r, c) * stride in the full grid: without the stride the
+  // starting map is stride times too small, and SLIM, which has no term keeping
+  // disconnected pieces apart, grows them onto each other.
   const cv::Vec2f scale = surface.scale();
   const float uv_fac_x = (std::isfinite(scale[0]) && scale[0] > 0.f) ? 1.0f / scale[0] : 1.0f;
   const float uv_fac_y = (std::isfinite(scale[1]) && scale[1] > 0.f) ? 1.0f / scale[1] : 1.0f;
@@ -926,7 +932,8 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
   for (std::size_t i = 0; i < coarse_mesh.positions.size(); ++i) {
     const auto& p = coarse_mesh.positions[i];
     V.row(i) << p[0], p[1], p[2];
-    TC.row(i) << float(coarse_mesh.cells[i][1]) * uv_fac_x, float(coarse_mesh.cells[i][0]) * uv_fac_y;
+    TC.row(i) << float(coarse_mesh.cells[i][1] * stride) * uv_fac_x,
+        float(coarse_mesh.cells[i][0] * stride) * uv_fac_y;
   }
   Eigen::MatrixXi F(coarse_mesh.faces.size(), 3);
   for (std::size_t f = 0; f < coarse_mesh.faces.size(); ++f)
@@ -971,12 +978,24 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
   for (const auto& f : fine_mesh.faces)
     if (uv_valid[f[0]] && uv_valid[f[1]] && uv_valid[f[2]])
       faces.push_back({{f[0], f[1], f[2]}, {f[0], f[1], f[2]}});
+  // The rasterizer keeps the first face to claim a pixel, and a continued
+  // border can overlap the interior in UV space.
+  if (decimating)
+    std::stable_partition(faces.begin(), faces.end(), [&](const vc::meshing::UvFace& f) {
+      const cv::Vec2i sum = fine_mesh.cells[f.v[0]] + fine_mesh.cells[f.v[1]] + fine_mesh.cells[f.v[2]];
+      return loc_valid(coarse, cv::Vec2d(sum) / (3.0 * stride));
+    });
   if (faces.size() != fine_mesh.faces.size())
     std::cerr << "warning: " << (fine_mesh.faces.size() - faces.size()) << " triangle(s) had no flattened UVs\n";
 
   // Rasterized at the source's sampling density, as vc_obj2tifxyz --tifxyz-source does.
   vc::meshing::UvGridRasterizer rasterizer;
   if (scale[0] > 0.f && scale[1] > 0.f) rasterizer.setSrcScale(scale);
+  // Border UVs continued past the decimated quads must not move the interior's samples.
+  if (decimating) {
+    const Eigen::RowVector2d lo = uv_out.colwise().minCoeff(), hi = uv_out.colwise().maxCoeff();
+    rasterizer.setGridBounds(cv::Vec2f(float(lo[0]), float(lo[1])), cv::Vec2f(float(hi[0]), float(hi[1])));
+  }
   rasterizer.setMesh(fine_mesh.positions, std::move(uvs), std::move(faces));
   rasterizer.determineGridDimensions(1.0f);
   std::unique_ptr<QuadSurface> flat(rasterizer.createQuadSurface(1.0f));
@@ -990,7 +1009,8 @@ static nlohmann::json parameters(const Options& opt)
           {"keep_percent", opt.keep_percent}, {"inpaint", opt.inpaint}};
 }
 
-// A stored surface into a new surface object; reports go to its artifact directory.
+// A stored surface into a new surface object; its reports are published as the
+// new surface's artifacts (flatboi/<file name>), kept on disk if that fails.
 static int run_store(const StoreToolOptions& output, const std::string& source, const Options& opt)
 {
   StoreSurfaces store(output.store, "flatboi");
@@ -1004,13 +1024,19 @@ static int run_store(const StoreToolOptions& output, const std::string& source, 
   const std::string name = output.name.value_or(
       (surface->meta.contains("name") ? surface->meta["name"].get<std::string>() : surface->id) + "_flatboi");
   const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.volume);
-  const auto artifacts = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid);
-  for (const auto& entry : fs::directory_iterator(report_dir)) {
-    std::error_code ignored;
-    fs::copy_file(entry.path(), artifacts / entry.path().filename(), fs::copy_options::overwrite_existing, ignored);
+  std::vector<std::pair<std::string, fs::path>> reports;
+  for (const auto& entry : fs::directory_iterator(report_dir))
+    if (entry.is_regular_file()) reports.emplace_back("flatboi/" + entry.path().filename().string(), entry.path());
+  std::sort(reports.begin(), reports.end());
+  bool keep = false;
+  try {
+    if (!reports.empty()) store.objects().publishArtifacts(uuid, reports);
+  } catch (const std::exception& failure) {
+    keep = true;
+    std::cerr << "keeping flatboi reports at " << report_dir << ": " << failure.what() << std::endl;
   }
   std::error_code ignored;
-  fs::remove_all(report_dir, ignored);
+  if (!keep) fs::remove_all(report_dir, ignored);
   store.objects().finish();
   std::cout << "surface_uuid: " << uuid << std::endl;
   return 0;
@@ -1036,6 +1062,27 @@ static int run_tifxyz(const fs::path& input, const fs::path& output, const Optio
 // main
 // ------------------------------
 int main(int argc, char** argv) {
+  bool blas_omp_single = false;
+#if defined(__APPLE__)
+  // macOS: PaStiX's worker threads call into Homebrew's OpenBLAS, an OpenMP
+  // build, and each call opens its own OpenMP team. OpenBLAS before 0.3.34
+  // races there (its 0.3.34 notes: "Fixed potential race conditions between
+  // concurrent calls to level3 BLAS"); on real segments PaStiX prints
+  // "Negative diagonal term" and flatboi crashes inside libopenblas. One
+  // OpenMP thread per BLAS call avoids it, and PaStiX keeps all its threads.
+  // setenv("OMP_NUM_THREADS") here would be too late, because the OpenMP
+  // runtime OpenBLAS loads has already read it, so change the runtime's
+  // default instead. flatboi has no OpenMP of its own on Clang, so the call is
+  // looked up at run time. An OMP_NUM_THREADS set by the user still wins and
+  // skips this; the threading line in the log warns when it is not 1.
+  if (!std::getenv("OMP_NUM_THREADS")) {
+    using SetDefaults = void (*)(const char*);
+    if (auto set_defaults = reinterpret_cast<SetDefaults>(dlsym(RTLD_DEFAULT, "kmp_set_defaults"))) {
+      set_defaults("OMP_NUM_THREADS=1");
+      blas_omp_single = true;
+    }
+  }
+#endif
   std::string input_path;
   int iters = 50;
   igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
@@ -1128,9 +1175,19 @@ int main(int argc, char** argv) {
     const char* on = std::getenv("OMP_NUM_THREADS");
     std::cout << "Threading env: PASTIX_NUM_THREADS="
               << (pn ? pn : "<unset, PaStiX auto via hwloc>")
-              << ", OMP_NUM_THREADS=" << (on ? on : "<unset>")
+              << ", OMP_NUM_THREADS="
+              << (on ? on : blas_omp_single ? "<unset, 1 per BLAS call on macOS>" : "<unset>")
               << ", hardware_concurrency=" << std::thread::hardware_concurrency()
               << std::endl;
+#if defined(__APPLE__)
+    // A user's OMP_NUM_THREADS bypasses the workaround at the top of main, so
+    // say so where the thread settings are logged when it is not 1.
+    if (on && std::atoi(on) != 1) {
+      std::cerr << "warning: OMP_NUM_THREADS=" << on << " is set, so flatboi's macOS OpenBLAS "
+                   "workaround is off; with OpenBLAS before 0.3.34, any value other than 1 can "
+                   "crash the solve (\"Negative diagonal term\"); unset it or set it to 1\n";
+    }
+#endif
   }
 
   std::ios::sync_with_stdio(false);

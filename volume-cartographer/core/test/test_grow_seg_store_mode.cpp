@@ -1,13 +1,16 @@
 // vc_grow_seg_from_seed in store mode: grow a surface into an object store, then
 // resume from the stored surface into a new object. With a fixed seed and one
-// thread the stored surface equals the tifxyz output of the same run. A
+// thread the stored surface equals the tifxyz output of the same run after
+// applying that format's negative-coordinate validity rule. A
 // neighbor copy projects and refines in one run, creating one surface.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <doctest/doctest.h>
 
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/zarr_write.hpp>
+#include <vc_reader/tifxyz.hpp>
 #include "vc/core/types/Volume.hpp"
 #include <nlohmann/json.hpp>
 #include <filesystem>
@@ -82,12 +85,15 @@ TEST_CASE("vc_grow_seg_from_seed grows into and resumes from an object store")
         const auto meta = nlohmann::json::parse(object->meta);
         CHECK(meta.at("coordinates").at("volume_uuid") == "test-volume");
         CHECK(meta.at("provenance").at("tool") == "vc_grow_seg_from_seed");
-        CHECK(load_quad_from_store(store, txn, uuid)->countValidPoints() > 4);
+        CHECK(load_quad_from_store(vc::objects::LocalStoreReader(store, txn), uuid)->countValidPoints() > 4);
     }
-    const auto stored = load_quad_from_store(store, txn, grown);
+    const auto stored = load_quad_from_store(vc::objects::LocalStoreReader(store, txn), grown);
     const auto files = load_quad_from_tifxyz(dir / "files");
     REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
-    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
+    auto inFileFormat = stored->rawPointsPtr()->clone();
+    for (auto& point : inFileFormat)
+        if (!vcr::tifxyz::vertexValid(point.val)) point = {-1.f, -1.f, -1.f};
+    CHECK(cv::norm(inFileFormat, *files->rawPointsPtr(), cv::NORM_INF) == 0);
     CHECK(nlohmann::json::parse(store.objectByUuid(txn, resumed)->meta).at("provenance").at("sources") ==
           nlohmann::json::array({grown}));
     std::error_code ignored;
@@ -121,7 +127,7 @@ TEST_CASE("A neighbor copy projects and refines in one run and creates one surfa
     CHECK(meta.at("provenance").at("sources") == nlohmann::json::array({grown}));
     CHECK(meta.at("vc_gsfs_mode") == "resume");  // the projection was refined in the same run
     // The source's vertices outside this small volume are invalid, which leaves one quad to copy.
-    CHECK(load_quad_from_store(store, txn, copied)->countValidPoints() >= 4);
+    CHECK(load_quad_from_store(vc::objects::LocalStoreReader(store, txn), copied)->countValidPoints() >= 4);
     std::error_code ignored;
     fs::remove_all(dir, ignored);
 }

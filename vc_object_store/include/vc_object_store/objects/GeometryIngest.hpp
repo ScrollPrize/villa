@@ -27,6 +27,14 @@ struct SourceIngestOptions {
     // identities; surfaces keep the pre-rename kind "patch" here. Canonical source
     // UUIDs are kept.
     std::optional<std::string> uuidNamespace;
+    // Drop fiber branch declarations whose target file is absent, recording each in
+    // the declaring fiber's meta.source.dropped_branches. Otherwise the import fails.
+    bool dropDanglingBranches = false;
+    // Renumber every PCL collection that shares a point ID with another collection
+    // of its document, above the document's largest ID and in point-ID order. Each
+    // renumbered point keeps its file ID as the point attribute "source_point_id".
+    // Documents with point links are refused. Otherwise the import fails.
+    bool renumberCollidingPointIds = false;
     // Without a namespace, a fiber file without a UUID (including a branch's peer
     // file) is a problem rather than named from its file name.
     bool requireSourceUuids = false;
@@ -62,9 +70,21 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind,
 int64_t ingestGeometryBatch(ObjectStore&, WriteTxn&, std::vector<GeometrySource>,
     const std::string& coordinateContext = "{}");
 
+class StoreReader;
+// Adds an IngestGeometryOp of `batch` to `request` with its expectations,
+// read through `reader`: every new object expected absent (an existing one at
+// its current version, so importing it again fails as a re-import), every
+// existing fiber a source branch links to at its current version. Links
+// resolved by source identity (point and winding links) must stay within
+// the batch.
+void addIngestOperation(TransactionRequest&, const StoreReader&, std::vector<GeometrySource> batch,
+    const std::string& coordinateContext = "{}");
+
 struct GeometryIngestReport {
     int64_t ingested = 0, edgesImported = 0;
     std::vector<std::string> problems;
+    // Repairs applied by SourceIngestOptions; informational, not failures.
+    std::vector<std::string> notices;
     // The objects created, in commit order.
     std::vector<std::string> uuids;
     // Identities rejected because the store already has them (including retired
@@ -82,9 +102,11 @@ struct GeometryIngestReport {
 // never had geometry are eligible. Existing/retired imports are errors, even if
 // unchanged. Source data must be stable during ingestion; edit imported objects
 // through the store APIs. There is no file refresh or reconciliation.
+// coordinateContext is applied as for ingestGeometrySource.
 GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
     const std::optional<std::filesystem::path>& datasetRoot = std::nullopt,
-    const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {});
+    const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {},
+    const std::string& coordinateContext = "{}");
 
 // Create new objects and ingest one source: a tifxyz surface directory or a
 // folder of them, vc3d_fiber JSON, collection or directory, vc_pointcollections
@@ -103,11 +125,12 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
     const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {},
     const SourceIngestOptions& options = {});
-// The same into a writable session attachment (ObjectStoreSession::writeJob),
-// on the caller's thread. Detaching, or setting `cancel`, stops it before the
-// next surface or track, and before a fiber or collection batch commits.
-// A failure to enter or leave the job is thrown, or with stopOnInfrastructureError
-// reported as fatalError alongside whatever was committed.
+// Every commit is a checked request (addIngestOperation). The same into any
+// writable session attachment, local or hosted, on the caller's thread.
+// Detaching, or setting `cancel`, stops it before the next surface or track,
+// and before a fiber or collection batch commits.
+// An attachment that is not writable is thrown, or with stopOnInfrastructureError
+// reported as fatalError.
 GeometryIngestReport ingestGeometrySource(ObjectStoreSession&, const AttachmentIdentity&, const std::string& kind,
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
     const std::string& coordinateContext = "{}", const std::vector<std::string>& tags = {},

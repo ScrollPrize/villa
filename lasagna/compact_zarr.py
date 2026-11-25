@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from vc_reader.reader import ZarrWriter, create_group, open_zarr
 
-from lasagna.lasagna_volume import ChannelGroup, LasagnaVolume
+from lasagna.lasagna_volume import VALIDITY_BY_CHUNKS, ChannelGroup, LasagnaVolume
 
 
 def resolve_output(path, output_format="compact"):
@@ -152,8 +152,8 @@ class CompactOutputAdapter:
             if len(enabled) != 1:
                 raise ValueError(f"sd{level}: compact groups cannot mix native-only and pyramid products; use legacy output")
         names = [c.name for p in products for c in p.channels]
-        if len(set(names)) != len(names) or validity_channel not in names:
-            raise ValueError("packed channels must be unique and include validity_channel")
+        if len(set(names)) != len(names) or not (validity_channel == VALIDITY_BY_CHUNKS or validity_channel in names):
+            raise ValueError("packed channels must be unique and validity_channel must name one of them or 'chunks'")
 
     def product_by_name(self, name):
         return next(p for p in self.products if p.name == name)

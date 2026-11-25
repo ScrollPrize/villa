@@ -6,6 +6,7 @@
 
 #include "vc/core/types/Volume.hpp"
 
+#include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/VolumeUmbilicus.hpp>
 
 namespace vc3d {
@@ -54,8 +55,8 @@ UmbilicusImportPlan planUmbilicusImport(const CState& state, const std::filesyst
     plan.binding = vc::objects::umbilicusBinding(plan.umbilicus, grid(*volume), named);
     plan.store = *attachment;
     plan.target = *state.annotationVolume();
-    state.objectStoreSession()->read(plan.store, [&](const auto& db, const auto& txn, const auto&) {
-        plan.replaces = !vc::objects::volumeUmbilicusRevisions(db, txn, plan.target.volume).empty();
+    state.objectStoreSession()->readStore(plan.store, [&](const vc::objects::StoreReader& reader, const auto&) {
+        plan.replaces = !vc::objects::volumeUmbilici(reader, plan.target.volume).empty();
     });
     return plan;
 }
@@ -77,20 +78,19 @@ std::optional<AnnotationUmbilici> annotationUmbilici(const CState& state)
     const auto attachment = state.storeFor("umbilicus");
     if (!attachment || !state.annotationVolume()) return std::nullopt;
     AnnotationUmbilici result{*attachment, state.annotationVolume()->volume, {}};
-    state.objectStoreSession()->read(result.store, [&](const auto& db, const auto& txn, const auto&) {
-        result.pins = vc::objects::volumeUmbilicusRevisions(db, txn, result.volume);
+    state.objectStoreSession()->readStore(result.store, [&](const vc::objects::StoreReader& reader, const auto&) {
+        for (const auto& record : vc::objects::volumeUmbilici(reader, result.volume)) result.uuids.push_back(record.uuid);
     });
     return result;
 }
 
 std::vector<std::string> retireUmbilici(const CState& state, const AnnotationUmbilici& umbilici)
 {
-    std::vector<std::string> removed;
-    state.objectStoreSession()->act(umbilici.store, umbilici.pins, [&](auto& db, auto& txn) {
-        for (const auto& [id, revision] : umbilici.pins) db.retireObject(txn, id);
-    });
-    for (const auto& [id, revision] : umbilici.pins) removed.push_back(id);
-    return removed;
+    (void)state.objectStoreSession()->editCurrent(umbilici.store, umbilici.uuids,
+        [](const vc::objects::StoreReader&, const std::string& uuid) {
+            return std::vector<vc::objects::TransactionOperation>{vc::objects::RetireObjectOp{uuid}};
+        });
+    return umbilici.uuids;
 }
 
 }  // namespace vc3d

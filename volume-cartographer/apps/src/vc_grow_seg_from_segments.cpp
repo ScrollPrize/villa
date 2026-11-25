@@ -39,6 +39,7 @@
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
 
 
 using shape = std::vector<size_t>;
@@ -1142,7 +1143,8 @@ int main(int argc, char *argv[])
         store.emplace(store_path, "vc_grow_seg_from_segments");
         tgt_dir = std::filesystem::temp_directory_path() / ("vc-grow-segments-" + vc::objects::util::newUuid());
         std::vector<std::string> uuids;
-        store->objects().session()->read(store->objects().attachment(), [&](const auto& db, const auto& txn, const auto&) {
+        store->objects().session()->readStore(store->objects().attachment(),
+                                              [&](const vc::objects::StoreReader& reader, const auto&) {
             vc::objects::ObjectSelection selection;
             selection.kind = "surface";
             if (!source_tag.empty()) selection.tag = source_tag;
@@ -1150,7 +1152,7 @@ int main(int argc, char *argv[])
                 selection.volume = volume_voxels->volume;
                 selection.targetScale = volume_voxels->scale;
             }
-            for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
+            for (const auto& object : reader.selectObjects(selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
         });
         if (!src_surface.empty() && std::find(uuids.begin(), uuids.end(), vc::objects::util::canonicalUuid(src_surface)) == uuids.end())
             uuids.push_back(src_surface);
@@ -1167,20 +1169,26 @@ int main(int argc, char *argv[])
         published.push_back(uuid);
         std::cout << "surface_uuid: " << uuid << std::endl;
     };
-    // The debug output moves into the first published surface's artifacts;
-    // across filesystems it is copied. It is kept where it is if neither works.
+    // The debug output is published as artifacts of the first published
+    // surface (grow_debug/<relative path>), then removed. It is kept where it
+    // is when publishing fails.
     auto finish_store = [&] {
         std::error_code error;
+        bool keep = false;
         if (!published.empty() && std::filesystem::exists(tgt_dir) && !std::filesystem::is_empty(tgt_dir, error)) {
-            const auto debug = store->objects().session()->artifactDirectory(store->objects().attachment(), published.front()) / "grow_debug";
-            std::filesystem::rename(tgt_dir, debug, error);
-            if (error) {
-                error.clear();
-                std::filesystem::copy(tgt_dir, debug, std::filesystem::copy_options::recursive, error);
+            std::vector<std::pair<std::string, std::filesystem::path>> files;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(tgt_dir))
+                if (entry.is_regular_file())
+                    files.emplace_back("grow_debug/" + entry.path().lexically_relative(tgt_dir).generic_string(), entry.path());
+            std::sort(files.begin(), files.end());
+            try {
+                if (!files.empty()) store->objects().publishArtifacts(published.front(), files);
+            } catch (const std::exception& failure) {
+                keep = true;
+                std::cerr << "keeping grow debug output at " << tgt_dir << ": " << failure.what() << std::endl;
             }
-            if (error) std::cerr << "keeping grow debug output at " << tgt_dir << ": " << error.message() << std::endl;
         }
-        if (!error) std::filesystem::remove_all(tgt_dir, error);
+        if (!keep) std::filesystem::remove_all(tgt_dir, error);
         store->objects().finish();
     };
     params["tgt_dir"] = tgt_dir.string();

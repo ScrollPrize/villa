@@ -40,7 +40,7 @@
 				"station_n": 10.0,
 				"station_t": 10.0
 			}
-		}
+		},
 		{
 			"name": "snap",
 			"steps": 1000,

@@ -85,12 +85,32 @@ void seededByOlderVersion(const fs::path& root)
     check(cache.max_bytes()==32,"a chosen limit on an older index stays");
 }
 
+// Hosted object records and blocks are not numeric Zarr chunks. Their ownership
+// must survive reconciliation, or restarting would silently escape the limit.
+void ownedFiles(const fs::path& root)
+{
+    const auto path = root / "objects" / "immutable-payload";
+    const std::vector<uint8_t> bytes(32, 7);
+    {
+        vcr::DiskCache cache(root.string(), 64);
+        cache.write(path.string(), bytes.data(), bytes.size(), true);
+        check(cache.total_bytes() == 32, "owned payload is accounted");
+    }
+    {
+        vcr::DiskCache cache(root.string(), -1);
+        check(cache.total_bytes() == 32 && fs::exists(path), "owned payload survives index reconciliation");
+        cache.set_max_bytes(0);
+        check(!fs::exists(path) && cache.total_bytes() == 0, "reopened budget evicts owned payload");
+    }
+}
+
 int main() try {
     const auto root=fs::temp_directory_path()/("vcr-adopt-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup {fs::path p;~Cleanup(){fs::remove_all(p);}} cleanup{root};
     const fs::path other=root.string()+"-unbounded";
     struct CleanupOther {fs::path p;~CleanupOther(){fs::remove_all(p);}} cleanupOther{other};
     unbounded(other);
+    ownedFiles(root / "owned");
     const fs::path fresh=root.string()+"-default";
     struct CleanupFresh {fs::path p;~CleanupFresh(){fs::remove_all(p);}} cleanupFresh{fresh};
     defaultBudget(fresh);

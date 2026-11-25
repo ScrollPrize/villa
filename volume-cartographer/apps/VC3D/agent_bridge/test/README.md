@@ -17,8 +17,10 @@ After changing a method descriptor, regenerate the checked-in description with
 the same command plus `--update-description-snapshot`.
 
 `object_store_smoke.py` runs the bridge's fiber and surface workflows against
-real stores on a disposable database it builds itself. It needs the
-vc_object_store Python extension on `PYTHONPATH`:
+real stores on a disposable database it builds itself, then has two VC3D
+clients share a copy through `vc_object_server` (found beside `--vc3d`, or
+`--object-server PATH`). It needs the vc_object_store Python extension on
+`PYTHONPATH`:
 
 ```sh
 QT_QPA_PLATFORM=offscreen python3 apps/VC3D/agent_bridge/test/object_store_smoke.py \

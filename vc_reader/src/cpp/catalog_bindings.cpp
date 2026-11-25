@@ -11,6 +11,7 @@
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/registrations.hpp"
 #include "vc_reader/sources.hpp"
+#include "vc_reader/sftp.hpp"
 #include "catalog_io.hpp"
 namespace nb = nanobind;
 using namespace vcr::catalog;
@@ -259,6 +260,9 @@ Catalog catalogFrom(nb::handle data, nb::handle source)
 } // namespace
 
 NB_MODULE(_catalog, m) {
+    nb::class_<vcr::sftp::Forward>(m, "SshForward")
+        .def(nb::init<const std::string&>(), nb::arg("endpoint"), nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("endpoint", &vcr::sftp::Forward::endpoint);
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
             std::rethrow_exception(p);

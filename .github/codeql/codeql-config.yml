@@ -1,4 +1,0 @@
-name: VC CodeQL config
-
-paths-ignore:
-  - 'volume-cartographer/core/test/sanitizer_canary.cpp'

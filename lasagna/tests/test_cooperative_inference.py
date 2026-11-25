@@ -248,7 +248,6 @@ def test_slow_flush_keeps_coordinator_polling_and_clears_in_workers(tmp_path, ha
     volume = np.full((24,4,4), 127, np.uint8)
     output = SpawnFileOutputAdapter(str(tmp_path / "output"), delay_s=1.5, hard_exit=hard_exit)
     with mock.patch.object(tiled._CircularZBand, "clear", side_effect=AssertionError("coordinator cleared data")), \
-         mock.patch.object(tiled, "_input_has_chunks", return_value=True), \
          (pytest.raises(RuntimeError, match="flush worker .* exited unexpectedly with code 24")
           if hard_exit else contextlib.nullcontext()):
         tiled.run_tiled_inference_3d(None, volume, crop_slices=(0,24,0,4,0,4),
@@ -338,8 +337,7 @@ def test_real_tile_pipeline_survives_pause_resize_without_reloading_input(tmp_pa
         return Cycling()
     volume = np.full((128, 4, 4), 127, dtype=np.uint8)
     output = Output()
-    with mock.patch("lasagna.tiled_predict3d._input_has_chunks", return_value=True), \
-         mock.patch("lasagna.tiled_predict3d._read_tile_zarr", wraps=_read_tile_zarr) as reads:
+    with mock.patch("lasagna.tiled_predict3d._read_tile_zarr", wraps=_read_tile_zarr) as reads:
         run_tiled_inference_3d(None, volume, crop_slices=(0, 128, 0, 4, 0, 4),
             device=torch.device(backend), devices=tuple(torch.device(f"cuda:{i}" if backend == "cuda" else "cpu") for i in range(device_count)),
             model_adapter=SpawnIdentityAdapter(product), output_adapter=output, products=(product,),

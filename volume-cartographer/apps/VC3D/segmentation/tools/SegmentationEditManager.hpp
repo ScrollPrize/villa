@@ -81,6 +81,11 @@ public:
         std::shared_ptr<vc::objects::ObjectStoreSession> session;
         vc::objects::CoordinateJson coordinates;
         vc::objects::AttachmentIdentity attachment;
+        // The committed version the surface was read at, and whether the
+        // surface still holds it (no unsaved edits): then the draft needs no
+        // crash-recovery checkpoint until it is edited.
+        std::optional<vc::objects::ObjectVersion> base;
+        bool saved = false;
     };
     // Edits keep the draft current (the open surface's, kept by CState).
     bool beginSession(std::shared_ptr<QuadSurface> baseSurface, DraftTarget draft);

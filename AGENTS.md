@@ -232,6 +232,10 @@ If you add:
 - new benchmark harnesses
 document how to use them and how they’re validated.
 
+Keep committed documentation focused on current usage, supported formats, contracts and design intentions. Do not commit task trackers, implementation plans, review/audit reports, finding inventories, agent adjudications or one-off validation logs. Keep those working artifacts under ignored `local/` storage; promote only their durable conclusions into the relevant documentation. Do not link permanent docs to local or historical review artifacts.
+
+For changes involving vcobj stores or their consumers, read the [store API contract](vc_object_store/docs/store-api-contract.md), [reading guide](vc_object_store/docs/reading.md), and [versioned-reference contract](vc_object_store/docs/versioned-reference-contract.md).
+
 ---
 
 ## 5) What to include in your final response (agent output format)

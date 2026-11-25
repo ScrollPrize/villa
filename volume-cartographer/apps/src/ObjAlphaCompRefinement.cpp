@@ -401,7 +401,7 @@ int process_stored(StoreSurfaces& store, const StoreToolOptions& options, const 
         auto refined = refine_surface(*surf, reader, cfg);
         if (!refined) return EXIT_FAILURE;
         if (!options.name) {
-            std::cout << "geometry_revision: " << store.update(surf->id, *refined) << std::endl;
+            std::cout << "version: " << store.update(surf->id, *refined) << std::endl;
         } else {
             const auto created = store.create(*refined, *options.name, parameters, {surf->id}, options.tags);
             std::cout << "surface_uuid: " << created << std::endl;

@@ -68,7 +68,7 @@ public:
 
     void setVolumePath(const QString& path);
     // Tools read and write surfaces in this object store (the attached store's
-    // file; a hosted replica's local file, which tools sync themselves), in the
+    // file), in the
     // voxels of their volume at `voxelScale` of its own (--voxel-scale).
     void setStore(const QString& storePath, double voxelScale);
     // The stored surface a render or OBJ export reads.
@@ -217,6 +217,7 @@ private:
 
     QString _refineName;  // the refined surface's name; empty: refined in place
     QStringList _createdSurfaces;
-    QString _exportedObj;
+    QString _exportedObj; // the OBJ artifact's name, reported by vc_tifxyz2obj
+    QString exportedObjCopy() const;
 
 };

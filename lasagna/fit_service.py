@@ -659,28 +659,20 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
         raise
 
 
-def _is_surface_ref(ref: Any) -> bool:
-    """A stored surface: {"type": "surface", "uuid": ..., "revision": optional geometry revision}."""
-    return isinstance(ref, dict) and ref.get("type") == "surface"
-
-
 def _require_store() -> stored_surfaces.StoreSession:
     if _store is None:
         raise ValueError("stored surface references need a service started with --store")
     return _store
 
 
-def _stored_surface_path(ref: dict[str, Any]) -> str:
-    """The fit's reference to a stored surface (read from the service store)."""
-    _require_store()
-    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), ref.get("revision") or None)
-
-
-def _stored_model_path(ref: dict[str, Any]) -> Path:
-    """The model checkpoint a fit left in a stored surface's artifact directory."""
-    path = _require_store().artifact_directory(str(ref.get("uuid") or ""), create=False) / "model.pt"
-    if not path.is_file():
-        raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
+def _stored_model_path(ref: dict[str, Any] | str) -> Path:
+    """The model checkpoint a fit published with a stored surface (its ``model.pt`` artifact), as a local copy in
+    the service's object cache."""
+    store = _require_store()
+    reference = store.decode_reference(ref)
+    path = store.artifact_file(reference, "model.pt", _object_store_root() / "artifacts")
+    if path is None:
+        raise ValueError(f"surface {reference['object']} has no Lasagna model")
     return path
 
 
@@ -692,11 +684,12 @@ def _stored_corr_points(uuids: list[Any], volume: str | None, target_scale: floa
         raise ValueError("corr_point_collections needs a store request (store_uuid and volume_uuid)")
     from vc_object_store.documents import point_collections
     collections: dict[str, Any] = {}
-    for index, stored in enumerate(point_collections(_require_store().path, [str(u) for u in uuids], volume,
+    for index, stored in enumerate(point_collections(_require_store().location, [str(u) for u in uuids], volume,
                                                                 target_scale), start=1):
         collection = dict(stored["source"])
         collection["uuid"] = stored["uuid"]
         collection["name"] = stored["name"]
+        collection["reference"] = stored["reference"]
         collection["points"] = {
             str(point_id): {**(annotation if isinstance(annotation, dict) else {}), "p": list(point)}
             for point_id, point, annotation in zip(stored["ids"], stored["points"], stored["annotations"])}
@@ -748,7 +741,7 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
     base = resolved.get("base")
     if not isinstance(base, dict) or not isinstance(base.get("ref"), dict):
         raise ValueError("atlas JSON requires base.ref")
-    base["path"] = (_stored_surface_path(base["ref"]) if _is_surface_ref(base["ref"])
+    base["path"] = (_require_store().decode_reference(base["ref"]) if stored_surfaces.is_surface_ref(base["ref"])
                     else str(_resolve_object_ref(base["ref"])))
 
     objects = resolved.get("objects")
@@ -946,7 +939,7 @@ def _set_snap_surf_map_debug_obj_dir(cfg: dict[str, Any], out_dir: str) -> None:
                     map_args["debug_obj_dir"] = out_dir
 
 
-def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str:
+def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str | dict:
     external_surfaces = cfg.get("external_surfaces")
     if not isinstance(external_surfaces, list) or len(external_surfaces) != 1:
         count = len(external_surfaces) if isinstance(external_surfaces, list) else 0
@@ -954,7 +947,7 @@ def _single_external_surface_path(cfg: dict[str, Any], *, consumer: str) -> str:
     surface = external_surfaces[0]
     if not isinstance(surface, dict) or not surface.get("path"):
         raise ValueError(f"{consumer} external_surfaces[0] requires path")
-    return str(surface["path"])
+    return surface["path"]
 
 
 def _wire_external_surface_for_request(
@@ -1031,6 +1024,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("job_spec.config must be an object")
     resolved = dict(body)
     resolved_cfg = dict(cfg)
+    input_references = []
     external_surfaces_raw = resolved_cfg.get("external_surfaces")
     if external_surfaces_raw is not None:
         if not isinstance(external_surfaces_raw, list):
@@ -1040,8 +1034,9 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(surface_raw, dict):
                 raise ValueError(f"job_spec.config.external_surfaces[{i}] must be an object")
             surface = dict(surface_raw)
-            if _is_surface_ref(surface):
-                surface["path"] = _stored_surface_path(surface)
+            if stored_surfaces.is_surface_ref(surface):
+                surface["path"] = _require_store().decode_reference(surface)
+                input_references.append(surface["path"])
             elif all(k in surface for k in ("type", "name", "hash")):
                 surface["path"] = str(_resolve_object_ref(surface))
             external_surfaces.append(surface)
@@ -1053,12 +1048,16 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("job_spec.config.corr_point_collections must be a list of UUIDs")
         resolved_cfg["corr_points"] = _stored_corr_points(
             collection_uuids, _request_store_volume(body), _request_voxel_scale(body))
+        input_references.extend(collection["reference"] for collection in resolved_cfg["corr_points"]["collections"].values())
 
     model_ref = spec.get("model")
     model_object_refs: dict[str, Any] | None = None
     if model_ref not in (None, {}, ""):
+        if stored_surfaces.is_surface_ref(model_ref):
+            model_ref = _require_store().decode_reference(model_ref)
+            input_references.append(model_ref)
         resolved_model_path = str(
-            _stored_model_path(model_ref) if _is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
+            _stored_model_path(model_ref) if stored_surfaces.is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
         resolved["model_input"] = resolved_model_path
         model_object_refs = _checkpoint_object_refs(resolved_model_path)
 
@@ -1075,6 +1074,7 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
         atlas_ref = model_atlas_ref
 
     effective_job_spec = {
+        "input_references": input_references,
         "model": spec.get("model"),
         "atlas": atlas_ref,
         "linked_surfaces": spec.get("linked_surfaces", []),
@@ -1087,6 +1087,8 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
 
     if atlas_ref not in (None, {}, ""):
         resolved_cfg["atlas"] = _resolve_lasagna_atlas_ref(atlas_ref)
+        if stored_surfaces.is_surface_ref(resolved_cfg["atlas"]["base"]["path"]):
+            input_references.append(resolved_cfg["atlas"]["base"]["path"])
 
     linked_refs = spec.get("linked_surfaces", [])
     if linked_refs is None:
@@ -1876,8 +1878,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         store_volume = _request_store_volume(body)
         store_voxel_scale = _request_voxel_scale(body)
         if store_volume is not None:
-            job.set_running("loading", 0, 0, 0.0, stage_name="Syncing the object store")
-            _require_store().sync()
+            _require_store()
         body = _body_with_resolved_job_spec(body)
     except Exception as exc:
         job.set_error(str(exc))
@@ -1984,7 +1985,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
         if store_volume is not None:
-            args_section["store"] = _require_store().path
+            args_section["store"] = _require_store().location
             args_section["volume-uuid"] = store_volume
             args_section["voxel-scale"] = store_voxel_scale
         if not omit_model_output:
@@ -2087,7 +2088,7 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             import fit2tifxyz
             export_argv = ["--input", str(model_output)]
             if store_volume is not None:
-                export_argv.extend(["--store", _require_store().path, "--volume-uuid", store_volume,
+                export_argv.extend(["--store", _require_store().location, "--volume-uuid", store_volume,
                                     "--voxel-scale", repr(store_voxel_scale)])
             else:
                 export_argv.extend(["--output", str(output_dir)])
@@ -2132,7 +2133,6 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 "finalizing", 0, 0, 0.0,
                 stage_name="Finalizing Lasagna preview export")
             if store_volume is not None:
-                _require_store().sync()
                 print(f"[fit-service] results stored: surfaces {output_surfaces} "
                       f"in {time.perf_counter() - save_t0:.3f}s", flush=True)
             else:
@@ -2484,7 +2484,7 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             tmp_dir = tempfile.mkdtemp(prefix="fit_vis_")
 
-            if _is_surface_ref(body.get("model")):
+            if stored_surfaces.is_surface_ref(body.get("model")):
                 model_input = str(_stored_model_path(body["model"]))
             elif model_data:
                 model_bytes = base64.b64decode(model_data)
@@ -2587,9 +2587,10 @@ def main() -> None:
     p.add_argument("--capture-dir", default=None,
                    help="Directory for captured queued jobs (default: ./job_captures)")
     p.add_argument("--store", default=None,
-                   help="VC object store (a hub replica or local store) VC3D jobs read surfaces from and write to")
+                   help="VC object store VC3D jobs read surfaces from and write to: a store file, or the "
+                        "endpoint of the vc_object_server VC3D attached (http://...)")
     p.add_argument("--shared-store", action="store_true", default=False,
-                   help="--store is the store file of the VC3D that started this service; its session syncs it")
+                   help="--store is the store file of the VC3D that started this service")
     args = p.parse_args()
     if args.store:
         _store = stored_surfaces.StoreSession(args.store, shared=args.shared_store)

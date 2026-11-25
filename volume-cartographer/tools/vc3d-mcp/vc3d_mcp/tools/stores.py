@@ -124,7 +124,7 @@ async def vc3d_export_object(
     per voxel of that volume; divide stored XYZ by scale_factor for that
     volume's voxels; unknown values stay null). Re-importing the files keeps
     the UUID and coordinates. The job's result is {path, uuid, kind, store,
-    objectRevision, geometryRevision}. Export is not cancellable.
+    version, geometryRevision}, with version the complete selected object reference. Export is not cancellable.
     """
     result = await _call(
         "objects.export",
