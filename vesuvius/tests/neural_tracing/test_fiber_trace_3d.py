@@ -956,6 +956,251 @@ def test_fiber_inference_cli_omits_config_for_current_checkpoint(monkeypatch: py
     assert captured["config_path"] is None
 
 
+class _ConstantPresenceFiberModel(torch.nn.Module):
+    def forward(self, volume: torch.Tensor, **kwargs: object) -> torch.Tensor:
+        out = torch.full((volume.shape[0], 7, *volume.shape[2:]), 0.5)
+        out[:, 6] = 1.0
+        return out
+
+
+@pytest.mark.parametrize(("args", "expected_overlap"), [
+    ((), 32),
+    (("--tile-size", "32", "--border", "8"), 16),
+])
+def test_fiber_inference_cli_defaults_predict_every_voxel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: tuple[str, ...], expected_overlap: int,
+) -> None:
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    output = tmp_path / "fiber.lasagna.json"
+
+    assert run(output, *args) == 0
+
+    attrs = json.loads((tmp_path / "fiber_presence.ome.zarr" / ".zattrs").read_text())
+    assert attrs["fiber_inference_tiling"]["overlap"] == expected_overlap
+    presence = _presence(output)
+    assert presence.shape == (96, 96, 96)
+    assert int((presence == 0).sum()) == 0
+
+
+def test_fiber_inference_rejects_overlap_below_both_tile_borders(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="overlap=16 must be >= 2 \\* border=16"):
+        run_fiber_trace_3d_inference(
+            input_path=str(tmp_path / "input.zarr"),
+            output_path=tmp_path / "fiber.lasagna.json",
+            checkpoint=None,
+            overlap=16,
+            border=16,
+        )
+
+
+@pytest.mark.parametrize(("border", "overlap"), [(16, None), (8, 32), (8, 40)])
+def test_fiber_inference_rejects_overlap_at_or_above_tile_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, border: int, overlap: int | None,
+) -> None:
+    monkeypatch.setattr(
+        fiber_infer_module, "_checkpoint_config_for_inference",
+        lambda *_: ({"patch_shape_zyx": [32, 32, 32]}, "checkpoint"),
+    )
+    with pytest.raises(ValueError, match=r"overlap=\d+ must be < tile_size=32"):
+        run_fiber_trace_3d_inference(
+            input_path=str(tmp_path / "input.zarr"),
+            output_path=tmp_path / "fiber.zarr",
+            checkpoint=None,
+            overlap=overlap,
+            border=border,
+        )
+
+
+def _constant_fiber_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Direct Fiber CLI on a 96^3 volume (8 output chunks) with a presence-1 stand-in model."""
+    input_path = tmp_path / "input.zarr"
+    create_v2_array(input_path, shape=(96, 96, 96), chunks=(32, 32, 32), dtype=np.uint8)[:] = 100
+    checkpoint = tmp_path / "model.pt"
+    torch.save({"config": {
+        "patch_shape_zyx": [64, 64, 64],
+        "image_normalization": "none",
+        "model_3d": {"output_stride": 1},
+        "training": {"mixed_precision": "off"},
+    }}, checkpoint)
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.fiber_trace_3d.inference_adapter.build_fiber_trace_3d_model",
+        lambda config: _ConstantPresenceFiberModel(),
+    )
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.fiber_trace_3d.train._load_snapshot",
+        lambda *args, **kwargs: None,
+    )
+
+    def run(output: Path, *extra: str) -> int:
+        return fiber_infer_module.main([
+            "--input", str(input_path), "--output", str(output),
+            "--output-format", "legacy" if output.name.endswith(".lasagna.json") else "compact",
+            "--checkpoint", str(checkpoint), "--base-ref", str(input_path), "--base-scale", "0",
+            "--device", "cpu", "--levels", "1", "--flush-workers", "0", "--accumulator-workers", "0",
+            *extra,
+        ])
+    return run
+
+
+def _presence(output: Path) -> np.ndarray:
+    if output.name.endswith(".lasagna.json"):
+        return np.asarray(open_zarr(output.parent / "fiber_presence.ome.zarr" / "0")[:])
+    group = next(g for g in json.loads((output / ".zattrs").read_text())["lasagna"]["groups"].values()
+                 if "presence" in g["channels"])
+    return np.asarray(open_zarr(output / group["zarr"])[:])[group["channels"].index("presence")]
+
+
+def _finest_chunks(output: Path) -> dict[str, tuple[int, int]]:
+    root = output.parent / "fiber_presence.ome.zarr" / "0" if output.name.endswith(".lasagna.json") else output / "sd0" / "0"
+    return {p.relative_to(root).as_posix(): (p.stat().st_ino, p.stat().st_mtime_ns)
+            for p in sorted(root.rglob("*")) if p.is_file() and not p.name.startswith(".")}
+
+
+def _files(directory: Path) -> dict[str, bytes]:
+    return {p.relative_to(directory).as_posix(): p.read_bytes()
+            for p in sorted(directory.rglob("*")) if p.is_file()}
+
+
+def _drop_tiling_records(directory: Path) -> None:
+    """Make stores look like ones written before tilings were recorded."""
+    for attrs in directory.rglob(".zattrs"):
+        values = json.loads(attrs.read_text())
+        if values.pop("fiber_inference_tiling", None) is not None:
+            attrs.write_text(json.dumps(values))
+
+
+def test_fiber_inference_refuses_resume_of_store_without_tiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    output = tmp_path / "out" / "fiber.zarr"
+    assert run(output, "--overlap", "16", "--border", "8") == 0
+    _drop_tiling_records(output.parent)
+    removed = output / "sd0" / "0" / "0" / "1" / "1" / "1"
+    removed.unlink()
+    before = _files(output.parent)
+
+    with pytest.raises(ValueError, match="holds prediction chunks but records no tiling"):
+        run(output)
+
+    assert _files(output.parent) == before
+    assert json.loads((output.parent / "inference.json").read_text())["inference"]["overlap"] == 16
+
+
+@pytest.mark.parametrize("name", ["fiber.zarr", "fiber.lasagna.json"])
+def test_fiber_inference_adopts_store_without_tiling_on_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str,
+) -> None:
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    output = tmp_path / "out" / name
+    assert run(output, "--crop", "0", "0", "0", "32", "32", "32") == 0
+    _drop_tiling_records(output.parent)
+    crop_chunks = _finest_chunks(output)
+    assert len(crop_chunks) == 1
+
+    assert run(output, "--adopt-unrecorded-tiling") == 0
+
+    after = _finest_chunks(output)
+    assert len(after) == 8 and crop_chunks.items() <= after.items()
+    assert int((_presence(output) == 0).sum()) == 0
+    assert run(output) == 0
+
+
+@pytest.mark.parametrize("keep_manifest", [True, False])
+def test_fiber_inference_refuses_legacy_resume_with_other_tiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, keep_manifest: bool,
+) -> None:
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    output = tmp_path / "out" / "fiber.lasagna.json"
+    assert run(output) == 0
+    if not keep_manifest:
+        output.unlink()
+    before = _files(output.parent)
+
+    with pytest.raises(ValueError, match="from tiling .*overlap=32.* uses .*overlap=48"):
+        run(output, "--overlap", "48")
+
+    assert _files(output.parent) == before
+
+
+def test_fiber_inference_same_tiling_retry_rebuilds_only_missing_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    output = tmp_path / "out" / "fiber.zarr"
+    assert run(output, "--overlap", "48") == 0
+    chunks = _finest_chunks(output)
+    assert len(chunks) == 8
+    (output / "sd0" / "0" / "0" / "1" / "1" / "1").unlink()
+
+    assert run(output, "--overlap", "48") == 0
+
+    after = _finest_chunks(output)
+    assert set(after) == set(chunks)
+    assert [key for key in chunks if after[key] != chunks[key]] == ["0/1/1/1"]
+    assert int((_presence(output) == 0).sum()) == 0
+
+
+def test_fiber_inference_extends_crop_after_other_output_in_same_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    a, b = tmp_path / "out" / "a.zarr", tmp_path / "out" / "b.zarr"
+    assert run(a, "--crop", "0", "0", "0", "32", "32", "32") == 0
+    crop_chunks = _finest_chunks(a)
+    assert list(crop_chunks) == ["0/0/0/0"]
+    assert run(b, "--overlap", "48") == 0
+
+    assert run(a) == 0
+
+    after = _finest_chunks(a)
+    assert len(after) == 8 and after["0/0/0/0"] == crop_chunks["0/0/0/0"]
+    assert int((_presence(a) == 0).sum()) == 0
+    before = _files(tmp_path / "out")
+    with pytest.raises(ValueError, match="from tiling .*overlap=32.* uses .*overlap=48"):
+        run(a, "--overlap", "48")
+    assert _files(tmp_path / "out") == before
+
+
+class _Interrupted(Exception):
+    pass
+
+
+@pytest.mark.parametrize("record_written", [True, False])
+@pytest.mark.parametrize("name", ["fiber.zarr", "fiber.lasagna.json"])
+def test_fiber_inference_retries_after_interrupted_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, record_written: bool,
+) -> None:
+    run = _constant_fiber_cli(tmp_path, monkeypatch)
+    output = tmp_path / "out" / name
+    armed = [True]
+    for module_name in ("inference_provenance", "lasagna.inference_provenance"):
+        try:
+            module = __import__(module_name, fromlist=["atomic_write"])
+        except ImportError:
+            continue
+
+        def interrupt(path, value, *args, _write=module.atomic_write, **kwargs):
+            if armed[0] and Path(path).name == "inference.json":
+                armed[0] = False
+                raise _Interrupted
+            return _write(path, value, *args, **kwargs)
+        monkeypatch.setattr(module, "atomic_write", interrupt)
+
+    with pytest.raises(_Interrupted):
+        run(output)
+    assert not (output.parent / "inference.json").exists()
+    assert not _finest_chunks(output)
+    if not record_written:
+        _drop_tiling_records(output.parent)
+
+    assert run(output) == 0
+
+    assert len(_finest_chunks(output)) == 8
+    assert int((_presence(output) == 0).sum()) == 0
+    assert json.loads((output.parent / "inference.json").read_text())["status"] == "completed"
+
+
 def test_checkpoint_config_is_authoritative_with_legacy_fallback(tmp_path: Path) -> None:
     checkpoint = tmp_path / "model.pt"
     legacy = tmp_path / "legacy.json"
