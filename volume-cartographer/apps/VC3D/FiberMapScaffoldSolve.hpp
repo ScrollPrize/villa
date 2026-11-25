@@ -105,10 +105,25 @@ struct ScaffoldRunView {
     std::vector<vc::fiber_graph::ScaffoldStoredResidual> flips;
     // Sign suspects: per violated sign constraint and fiber, the stretch from
     // that crossing to other crossings of the fiber (ScaffoldConstraints.hpp).
-    std::vector<vc::fiber_graph::ScaffoldStoredResidual> signSuspects;
+    std::vector<vc::fiber_graph::ScaffoldStoredResidual> stretches;
+    // The run's perpendicular crossings, for the approval window.
+    std::vector<vc::fiber_graph::ScaffoldStoredCrossing> crossings;
     std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding> windings;
     // The accused stretches, highest score first (rankScaffoldPieces).
     std::vector<ScaffoldRankedPiece> pieces;
+};
+
+// One crossing of a fiber as the approval window offers it.
+struct ScaffoldFiberCrossing {
+    double arc = 0, otherArc = 0;
+    std::string otherUuid;
+    // The separation the measurement rounds to, in half windings (1: a direct
+    // neighbour, 3: one sheet over); 0 without a measurement.
+    std::int64_t estimateHalves = 0;
+    // The normals state which of the two fibers lies outside.
+    bool signKnown = false;
+    // What a reviewer stated: 0 undefined, 1 direct neighbour, 2 distant.
+    int state = 0;
 };
 
 // Runs the solve, saves it, and holds the selected run for the docks. Owns no
@@ -192,9 +207,12 @@ public:
     // its edge record's review state and is not touched here.
     void reloadConstraintApprovals();
     [[nodiscard]] bool constraintApproved(const vc::fiber_graph::ScaffoldStoredResidual&) const;
-    // Writes the approval or its revocation; the returned message is empty
-    // when the store took it.
-    QString setConstraintApproval(const vc::fiber_graph::ScaffoldStoredResidual&, bool approved);
+    // The crossings of one fiber in the selected solve, along the fiber,
+    // with the state a reviewer gave each.
+    [[nodiscard]] std::vector<ScaffoldFiberCrossing> crossingsOf(const std::string& fiberUuid) const;
+    // Stores a crossing's neighbour state (0 takes it back); the returned
+    // message is empty when the store took it.
+    QString setCrossingApproval(const std::string& fiberUuid, const ScaffoldFiberCrossing&, int state);
 
     // Re-read the store's run rows (after a solve, or when the store changed).
     void reloadRuns();
@@ -379,20 +397,21 @@ signals:
 
 private:
     enum Column {
-        kKindColumn = 0,
-        kFiberColumn,
+        // Check marks: the stretch is approved for geometry, for normals.
+        kGeometryColumn = 0,
+        kNormalsColumn,
+        // "X/Y": crossings of the stretch with a neighbour state, of all.
+        kReviewedColumn,
+        // "X of Y": violated constraints anchored on the stretch, of all.
+        kViolatedColumn,
+        // "X of Y": violated sign constraints on the stretch, of its crossings
+        // whose normals state a side.
+        kSignColumn,
         kWhereColumn,
-        kOffColumn,
-        kStateColumn,
         kCostColumn,
-        // Cost per 1000 voxels of fiber: what the default order ranks by.
         kDensityColumn,
-        kJointColumn,
-        // The numbered cycle (scaffoldCycleNumbers) and its constraint count.
-        kCycleNumberColumn,
-        kCycleColumn,
         kLengthColumn,
-        kCountColumn,
+        kFiberColumn,
         kColumnCount,
     };
     // One table row. A constraint row carries the two covering pieces as its
@@ -413,6 +432,10 @@ private:
         // which is a covering piece of a constraint.
         double arcFrom = std::numeric_limits<double>::quiet_NaN();
         double arcTo = std::numeric_limits<double>::quiet_NaN();
+        // Sort keys of the crossings and violated columns.
+        double reviewedShare = 0, violated = 0, signViolated = 0;
+        // Share of the stretch approved for geometry and for normals.
+        std::array<double, 2> approvedShare{0., 0.};
         ScaffoldApprovalRow keys;
     };
     void rebuild();
@@ -430,7 +453,6 @@ private:
         const vc::fiber_graph::ScaffoldStoredResidual&) const;
 
     ScaffoldSolveController* _controller = nullptr;
-    QPushButton* _approveButton = nullptr;
     QComboBox* _fadeCombo = nullptr;
     QComboBox* _orderCombo = nullptr;
     QComboBox* _componentCombo = nullptr;

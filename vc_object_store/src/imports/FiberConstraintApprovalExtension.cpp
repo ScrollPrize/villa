@@ -81,6 +81,8 @@ void validateApproval(const FiberConstraintApproval& row)
 {
     if (row.state != FiberConstraintApprovalState::Approved && row.state != FiberConstraintApprovalState::Revoked)
         throw std::invalid_argument("fiber constraint approval: invalid state");
+    if (row.distance != FiberConstraintDistance::Direct && row.distance != FiberConstraintDistance::Distant)
+        throw std::invalid_argument("fiber constraint approval: invalid distance");
     const auto kind = row.identity.kind;
     if (kind != FiberConstraintKind::Perpendicular && kind != FiberConstraintKind::Parallel &&
         kind != FiberConstraintKind::Enclosure)
@@ -104,7 +106,9 @@ void validateApproval(const FiberConstraintApproval& row)
         throw std::invalid_argument("fiber constraint approval: row supersedes itself");
 }
 
-FiberSpanFingerprint spanFingerprint(const FiberPieceContent& content, size_t span)
+} // namespace
+
+FiberSpanFingerprint fiberSpanFingerprint(const FiberPieceContent& content, size_t span)
 {
     if (content.controlPoints.size() < 2 || span + 1 >= content.controlPoints.size())
         throw std::invalid_argument("fiber constraint approval: span index outside the fiber");
@@ -115,7 +119,6 @@ FiberSpanFingerprint spanFingerprint(const FiberPieceContent& content, size_t sp
     fingerprint.hash = fiberSpanHash(content, span);
     return fingerprint;
 }
-} // namespace
 
 FiberConstraintIdentity fiberConstraintIdentity(const std::string& fiberA, double arcA, const std::string& fiberB,
                                                 double arcB, FiberConstraintKind kind, double quantum)
@@ -143,14 +146,14 @@ ExtensionTable fiberConstraintApprovalTable()
     table.formatVersion = kFiberConstraintApprovalFormat;
     table.provisioning = R"({"fingerprint":"fnv1a64-v1","arc_quantum_base_voxels":64.0,)"
                          R"("kinds":{"perpendicular":1,"parallel":2,"enclosure":3},)"
-                         R"("states":{"approved":1,"revoked":2}})";
+                         R"("states":{"approved":1,"revoked":2},"distances":{"direct":1,"distant":2}})";
     table.keySpace = "objects";
     table.versioned = false;
     table.columns = {required("fiber_a", Type::Blob),     required("fiber_b", Type::Blob),
                      required("kind", Type::Integer),     required("arc_a", Type::Integer),
                      required("arc_b", Type::Integer),    required("row_uuid", Type::Blob),
                      required("approval_uuid", Type::Blob), required("state", Type::Integer),
-                     optional("supersedes", Type::Blob),  required("fiber_version_a", Type::Integer),
+                     required("distance", Type::Integer), optional("supersedes", Type::Blob),  required("fiber_version_a", Type::Integer),
                      required("fiber_version_b", Type::Integer), optional("span_a_id_low", Type::Integer),
                      optional("span_a_id_high", Type::Integer), optional("span_a_hash", Type::Integer),
                      optional("span_b_id_low", Type::Integer), optional("span_b_id_high", Type::Integer),
@@ -173,6 +176,7 @@ ExtensionRow fiberConstraintApprovalRow(const FiberConstraintApproval& row)
             extensionUuid(row.rowUuid),
             extensionUuid(row.approvalUuid),
             int64_t(row.state),
+            int64_t(row.distance),
             optionalUuid(row.supersedes),
             row.fiberVersionA,
             row.fiberVersionB,
@@ -202,16 +206,17 @@ FiberConstraintApproval decodeFiberConstraintApprovalRow(const ExtensionRow& val
     row.rowUuid = blobText(values[5], "row uuid");
     row.approvalUuid = blobText(values[6], "approval uuid");
     row.state = FiberConstraintApprovalState(integer(values[7], "state"));
-    row.supersedes = optionalBlobText(values[8], "supersedes");
-    row.fiberVersionA = integer(values[9], "fiber version a");
-    row.fiberVersionB = integer(values[10], "fiber version b");
-    row.spanA = fingerprintOf(values, 11, "span a fingerprint");
-    row.spanB = fingerprintOf(values, 14, "span b fingerprint");
-    row.author = text(values[17], "author");
-    row.approvedAt = text(values[18], "approved_at");
-    row.host = text(values[19], "host");
-    row.changedBy = optionalText(values[20], "changed_by");
-    row.changedAt = optionalText(values[21], "changed_at");
+    row.distance = FiberConstraintDistance(integer(values[8], "distance"));
+    row.supersedes = optionalBlobText(values[9], "supersedes");
+    row.fiberVersionA = integer(values[10], "fiber version a");
+    row.fiberVersionB = integer(values[11], "fiber version b");
+    row.spanA = fingerprintOf(values, 12, "span a fingerprint");
+    row.spanB = fingerprintOf(values, 15, "span b fingerprint");
+    row.author = text(values[18], "author");
+    row.approvedAt = text(values[19], "approved_at");
+    row.host = text(values[20], "host");
+    row.changedBy = optionalText(values[21], "changed_by");
+    row.changedAt = optionalText(values[22], "changed_at");
     validateApproval(row);
     return row;
 }
@@ -219,17 +224,28 @@ FiberConstraintApproval decodeFiberConstraintApprovalRow(const ExtensionRow& val
 std::optional<size_t> fiberSpanCoveringLineIndex(const FiberPieceContent& content, int64_t lineIndex)
 {
     if (content.controlLineIndex.size() < 2 || lineIndex < 0) return std::nullopt;
+    // A line point past the first or last control point (a tail) belongs to
+    // the nearest span: the tail is drawn from it.
+    std::optional<size_t> nearest;
+    int64_t nearestDistance = 0;
     for (size_t span = 0; span + 1 < content.controlLineIndex.size(); ++span) {
         const auto from = content.controlLineIndex[span], to = content.controlLineIndex[span + 1];
         if (from < 0 || to < 0) continue;
-        if (lineIndex >= std::min(from, to) && lineIndex <= std::max(from, to)) return span;
+        const auto low = std::min(from, to), high = std::max(from, to);
+        if (lineIndex >= low && lineIndex <= high) return span;
+        const auto distance = lineIndex < low ? low - lineIndex : lineIndex - high;
+        if (!nearest || distance < nearestDistance) {
+            nearest = span;
+            nearestDistance = distance;
+        }
     }
-    return std::nullopt;
+    return nearest;
 }
 
 FiberConstraintApproval approveFiberConstraint(const FiberConstraintIdentity& identity, const FiberPieceContent& a,
                                                size_t spanA, int64_t fiberVersionA, const FiberPieceContent& b,
-                                               size_t spanB, int64_t fiberVersionB, const std::string& author,
+                                               size_t spanB, int64_t fiberVersionB,
+                                               FiberConstraintDistance distance, const std::string& author,
                                                const std::string& approvedAt, const std::string& host)
 {
     FiberConstraintApproval row;
@@ -237,10 +253,11 @@ FiberConstraintApproval approveFiberConstraint(const FiberConstraintIdentity& id
     row.rowUuid = util::newUuid();
     row.approvalUuid = row.rowUuid;
     row.state = FiberConstraintApprovalState::Approved;
+    row.distance = distance;
     row.fiberVersionA = fiberVersionA;
     row.fiberVersionB = fiberVersionB;
-    row.spanA = spanFingerprint(a, spanA);
-    row.spanB = spanFingerprint(b, spanB);
+    row.spanA = fiberSpanFingerprint(a, spanA);
+    row.spanB = fiberSpanFingerprint(b, spanB);
     row.author = author;
     row.approvedAt = approvedAt;
     row.host = host;
@@ -281,7 +298,7 @@ bool fiberConstraintApprovalCurrent(const FiberConstraintApproval& row, const Fi
 {
     if (!row.spanA || !row.spanB) return false;
     if (spanA + 1 >= a.controlPoints.size() || spanB + 1 >= b.controlPoints.size()) return false;
-    return spanFingerprint(a, spanA) == *row.spanA && spanFingerprint(b, spanB) == *row.spanB;
+    return fiberSpanFingerprint(a, spanA) == *row.spanA && fiberSpanFingerprint(b, spanB) == *row.spanB;
 }
 
 std::vector<FiberConstraintApproval> readFiberConstraintApprovals(const StoreReader& reader)

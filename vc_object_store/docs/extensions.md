@@ -345,8 +345,8 @@ A link between two fibers carries its approval state on its edge record. A
 *measured* constraint - a crossing an extraction found rather than an
 annotation - has no record to carry one, so its approval is a row of
 `ext_fiber_constraint_approval` (extension `fiber-constraint-approval`, format
-1, `keySpace="objects"`, immutable). Revoking appends a superseding row; live rows of one constraint never
-overlap.
+2, `keySpace="objects"`, immutable). Revoking appends a superseding row, and so does changing the stated
+distance (an approved row that supersedes the previous one); live rows of one constraint never overlap.
 
 | Column | Type | Value |
 | --- | --- | --- |
@@ -356,6 +356,7 @@ overlap.
 | `row_uuid` | BLOB, 16 bytes | This row; the five columns above plus it are the primary key |
 | `approval_uuid` | BLOB, 16 bytes | The approval event, shared by the rows derived from it |
 | `state` | INTEGER | approved=1, revoked=2 |
+| `distance` | INTEGER | What the approval states: direct=1 (the two fibers lie on neighbouring sheets), distant=2 (farther apart than that). Neither says which fiber lies outside |
 | `supersedes` | BLOB, 16 bytes, NULL | The row this one replaces; required on a revocation |
 | `fiber_version_a`, `fiber_version_b` | INTEGER | Object versions the approval was taken at |
 | `span_a_id_low`, `span_a_id_high`, `span_a_hash` | INTEGER, NULL | Fingerprint of the span of fiber a covering its anchor |
@@ -375,9 +376,9 @@ editing either covering span invalidates the approval, and
 `fiberConstraintApprovalCurrent` is what states that. An approval row carries
 both fingerprints; a revocation carries neither.
 
-These rows record a reviewer's decision about one measured relation. They do
-not change a solve: a solver reads them to decide which constraints it may
-hold rigid.
+These rows record a reviewer's decision about one measured relation. A solver
+reads them to decide which separation a crossing states and which constraints
+it may hold rigid.
 
 Python has the same definitions and constructors:
 `fiber_constraint_approval_table()`, `fiber_constraint_identity(fiber_a,

@@ -78,6 +78,10 @@ struct ScaffoldFiber {
     // axis on the stretches approved for normals and at the normal points,
     // zero elsewhere. Empty when there is none.
     std::vector<geometry::Point> approvedLineNormals;
+    // Per control span, its fingerprint over the fiber as the store holds it
+    // (its own frame, tails included): what a constraint approval records.
+    // Empty for a scaffold not read from a store.
+    std::vector<objects::FiberSpanFingerprint> spanFingerprints;
 };
 
 // One annotation link between two fibers. Both anchors are the annotated

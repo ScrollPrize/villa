@@ -1,6 +1,7 @@
 #include "vc/fiber_graph/ScaffoldGraph.hpp"
 
 #include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/FiberConstraintApprovalExtension.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/VolumeUmbilicus.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
@@ -216,6 +217,11 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
                     if (annotations[k].is_object()) fiber.content.annotations[k] = annotations[k];
         }
         fiber.content.resolveLineIndices();
+        {
+            const auto stored = objects::fiberPieceContent(reader, revision);
+            for (std::size_t span = 0; span + 1 < stored.controlPoints.size(); ++span)
+                fiber.spanFingerprints.push_back(objects::fiberSpanFingerprint(stored, span));
+        }
         mappingOf.insert_or_assign(fiber.uuid, view.mapping());
         if (options.readApprovals) {
             if (const auto layer = objects::readFiberApproval(reader, fiber.uuid); layer && !layer->empty()) {

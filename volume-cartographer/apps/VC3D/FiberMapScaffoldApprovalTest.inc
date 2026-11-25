@@ -108,11 +108,20 @@
         require(controls.size() == 8, "the fiber's controls are untouched");
     }
 
-    // Approval is refused while the pieces are not approved, and nothing is
-    // written: the dock's button rule and the store write agree.
-    const auto refusal = solves.setConstraintApproval(residual, true);
-    require(!refusal.isEmpty(), "a crossing over unapproved geometry is refused");
-    require(!solves.constraintApproved(residual), "the refusal stored no approval");
+    // A crossing's neighbour state is stored whatever the geometry's state,
+    // changed by a superseding row and taken back by a revocation.
+    vc3d::fiber_map::ScaffoldFiberCrossing crossing;
+    crossing.arc = residual.arcA;
+    crossing.otherUuid = residual.fiberB;
+    crossing.otherArc = residual.arcB;
+    require(solves.setCrossingApproval(residual.fiberA, crossing, 1).isEmpty(), "a direct neighbour is stored");
+    require(solves.constraintApproved(residual), "the state is read back");
+    require(solves.setCrossingApproval(residual.fiberA, crossing, 2).isEmpty(), "the state changes to distant");
+    require(solves.constraintApproved(residual), "the changed state is live");
+    require(solves.setCrossingApproval(residual.fiberA, crossing, 0).isEmpty(), "the state is taken back");
+    require(!solves.constraintApproved(residual), "nothing is stated any more");
+    require(!solves.setCrossingApproval(residual.fiberA, crossing, 0).isEmpty(),
+            "taking back a state that is not there is refused");
 
     // The geometry between controls 3 and 4 of both fibers gets a state in
     // their approval layer, as the approval window writes it.
@@ -151,10 +160,6 @@
     require(solves.anchorSpan(residual.fiberA, residual.arcA).geometryApproved &&
                 solves.anchorSpan(residual.fiberB, residual.arcB).geometryApproved,
             "both covering pieces are approved now");
-
-    const auto approved = solves.setConstraintApproval(residual, true);
-    require(approved.isEmpty(), "the crossing is approved once its pieces are");
-    require(solves.constraintApproved(residual), "the approval is read back");
 
     // Back to undefined: the next generation of the layer decides.
     writeLayer(horizontal, vc::objects::FiberStretchState::Undefined);

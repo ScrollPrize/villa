@@ -378,7 +378,7 @@ public:
     // approval layer. The stretch to start on is a range of stored line
     // points, or of control points when that is -1; all -1 selects the
     // annotated line.
-    void openFiberApproval(uint64_t fiberId, const std::string& runUuid, int lineFrom, int lineTo, int controlFrom,
+    void openFiberApproval(uint64_t fiberId, const std::string& runUuid, double lineFrom, double lineTo, int controlFrom,
                            int controlTo);
     // Whether the fiber has a current approval layer (stretch states or
     // normal points) that editing it would invalidate.
@@ -402,10 +402,28 @@ public:
     };
     void setSolverLineNormals(uint64_t fiberId, std::shared_ptr<const SolverLineNormals> normals);
     // The stretches the fiber map's approval list holds for a fiber, as ranges
-    // of its stored line points: what "select nearest stretch" in the
+    // of its stored line points: what "Open this stretch" in the
     // approval window chooses from.
     using ApprovalStretchProvider = std::function<std::vector<std::pair<double, double>>(uint64_t fiberId)>;
     void setApprovalStretchProvider(ApprovalStretchProvider provider);
+    // The crossings of a fiber with other fibers in the selected solve, for
+    // the approval window's neighbour dropdowns, and the store write of one's
+    // state (0 undefined, 1 direct neighbour, 2 distant); the write returns
+    // an empty text when the store took it.
+    struct ApprovalCrossing {
+        double linePosition = 0;  // on the fiber's stored line points
+        double arc = 0, otherArc = 0;
+        std::string otherUuid;
+        QString otherLabel;
+        int estimateHalves = 0;  // 1: 0.5 windings, 3: 1.5, ...; 0: not measured
+        bool signKnown = false;
+        int state = 0;
+        // Where the other fiber crosses (volume); NaN when it cannot be read.
+        cv::Vec3f otherPoint{std::numeric_limits<float>::quiet_NaN(), 0.f, 0.f};
+    };
+    using ApprovalCrossingProvider = std::function<std::vector<ApprovalCrossing>(uint64_t fiberId)>;
+    using ApprovalCrossingWriter = std::function<QString(uint64_t fiberId, const ApprovalCrossing&, int state)>;
+    void setApprovalCrossingAccess(ApprovalCrossingProvider provider, ApprovalCrossingWriter writer);
     // The stored fiber's control points as (index, stable id); empty when
     // the fiber is not stored.
     struct StoredControlSummary { size_t index = 0; int64_t storeId = -1; };
@@ -418,6 +436,13 @@ public:
     // when the fiber or its line is missing, or the arc lies past the last
     // control point - never clamped onto one.
     [[nodiscard]] std::optional<int> storedLineIndexAtArc(uint64_t fiberId, double arc, double frameLength = 0.0) const;
+    // The same as an exact position: the line point index before the arc and
+    // the fraction of the way to the next one.
+    [[nodiscard]] std::optional<double> storedLinePositionAtArc(uint64_t fiberId, double arc,
+                                                                double frameLength = 0.0) const;
+    // The stored line point there (same arguments).
+    [[nodiscard]] std::optional<cv::Vec3f> storedLinePointAtArc(uint64_t fiberId, double arc,
+                                                               double frameLength = 0.0) const;
     // Stored fibers open read-only unless the user's Open fibers editable
     // setting is on. Enables editing in the most recent pane of this fiber
     // (as its Enable editing button does); false when it cannot.
@@ -627,7 +652,10 @@ private:
     struct LineAnnotationSession;
     struct ApprovalOpen {
         std::string runUuid;
-        int lineFrom = -1, lineTo = -1, controlFrom = -1, controlTo = -1;
+        // The stretch as positions on the stored line points (a point index
+        // and a fraction: a stretch's ends are not rounded to line points).
+        double lineFrom = -1, lineTo = -1;
+        int controlFrom = -1, controlTo = -1;
     };
     struct FiberMetricsTaskResult;
     struct ControlSpanRecord {
@@ -799,6 +827,7 @@ private:
     void approvalDeleteNormalPoint(const std::string& surfaceName, double linePosition);
     void approvalSetSelectionBound(const std::string& surfaceName, int bound, double linePosition);
     void approvalSetState(const std::string& surfaceName, int aspect, int state);
+    void approvalSetCrossingState(const std::string& surfaceName, int index, int state);
     bool saveApprovalLayer(LineAnnotationSession& session);
     bool refreshApprovalViews(LineAnnotationSession& session);
     void pushApprovalDisplay(LineAnnotationSession& session);
@@ -1285,6 +1314,8 @@ private:
     // NaN entries mark invalid samples.
     std::map<uint64_t, std::shared_ptr<const SolverLineNormals>> _solverLineNormals;
     ApprovalStretchProvider _approvalStretchProvider;
+    ApprovalCrossingProvider _approvalCrossingProvider;
+    ApprovalCrossingWriter _approvalCrossingWriter;
     [[nodiscard]] std::vector<cv::Vec3f> orientedLineNormalsForSession(
         const LineAnnotationSession& session);
     [[nodiscard]] vc::fiber_tracer::FiberDisplayField displayFieldForSession(

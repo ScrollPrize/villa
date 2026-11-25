@@ -242,12 +242,26 @@ public:
     [[nodiscard]] bool approvalMode() const { return _approvalMode; }
     // Move the views to a position on the line (the cut there, the strips centred on it).
     void showLinePosition(double linePosition);
+    // Show a range of the line: the strips zoomed onto it and centred, the cut at its middle.
+    void showLineRange(double from, double to);
     struct ApprovalDisplay {
         std::optional<std::pair<double, double>> selection;  // line positions
         std::vector<std::pair<double, double>> approvedGeometry, approvedNormals, broken, stale;
         // State of the selection per aspect: 0 undefined, 1 approved, 2 broken, -1 mixed.
         int geometryState = 0, normalsState = 0;
         int normalPoints = 0;
+        // The fiber's crossings with other fibers, in line order: a dropdown
+        // each between the two strips, at the crossing's position.
+        struct Crossing {
+            double linePosition = 0;
+            QString other;
+            int estimateHalves = 0;  // 1: 0.5 windings, 3: 1.5, ...; 0: not measured
+            bool signKnown = false;
+            int state = 0;  // 0 undefined, 1 direct neighbour, 2 distant neighbour
+            // Where the other fiber crosses (volume); NaN when unknown.
+            cv::Vec3f otherPoint{std::numeric_limits<float>::quiet_NaN(), 0.f, 0.f};
+        };
+        std::vector<Crossing> crossings;
     };
     void setApprovalDisplay(const ApprovalDisplay& display);
     // Called by the receiver of an edit commit (crossSectionDragFinished,
@@ -363,6 +377,9 @@ signals:
     void approvalSelectionBoundRequested(int bound, double linePosition);
     // aspect: 0 geometry, 1 normals; state: 0 undefined, 1 approved, 2 broken.
     void approvalStateRequested(int aspect, int state);
+    // A crossing's neighbour state (ApprovalDisplay::Crossing::state), by its
+    // index in the display's crossings.
+    void approvalCrossingStateRequested(int index, int state);
     void closeFinalizationRequested(QCloseEvent* event);
     void reoptimizationModeChanged(LineAnnotationDialog::ReoptimizationMode mode);
     void fiberOptimizationModeChanged(
@@ -710,6 +727,18 @@ private:
     QComboBox* _approvalGeometryCombo = nullptr;
     QComboBox* _approvalNormalsCombo = nullptr;
     ApprovalDisplay _approvalDisplay;
+    // The neighbour dropdowns: one per crossing along the top or bottom edge
+    // of the side strip (the side the other fiber crosses on), moved with the
+    // strips' camera; a small button where two dropdowns would overlap. The
+    // bar draws a line from each to the other fiber's crossing point.
+    QPointer<QWidget> _approvalCrossingBar;
+    struct ApprovalCrossingBox {
+        QPointer<QWidget> full;
+        QPointer<QWidget> compact;
+    };
+    std::vector<ApprovalCrossingBox> _approvalCrossingBoxes;
+    void rebuildApprovalCrossingBar();
+    void layoutApprovalCrossingBar();
     QPointer<QLabel> _optimizationStatusLabel;
     bool _optimizationStatusOptimized = false;
     QWidget* _fiberTraceStatus = nullptr;

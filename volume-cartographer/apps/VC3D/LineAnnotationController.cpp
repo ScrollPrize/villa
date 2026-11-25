@@ -176,6 +176,8 @@ struct LineAnnotationController::LineAnnotationSession {
     std::vector<vc::objects::FiberStretch> approvalStretches;
     std::vector<char> approvalStretchCurrent;
     std::optional<std::pair<double, double>> approvalSelection;
+    // The crossings last shown, in the order the window numbers them.
+    std::vector<LineAnnotationController::ApprovalCrossing> approvalCrossings;
     std::shared_ptr<vc::lasagna::LasagnaDataset> fiberInferenceDataset;
     std::shared_ptr<vc::fiber_tracer::FiberPredictionField> fiberPredictionField;
     std::string traceNormalDatasetLocation;
@@ -9979,8 +9981,26 @@ std::vector<LineAnnotationController::StoredControlSummary> LineAnnotationContro
     return result;
 }
 
+std::optional<cv::Vec3f> LineAnnotationController::storedLinePointAtArc(uint64_t fiberId, double arc,
+                                                                        double frameLength) const
+{
+    const auto index = storedLineIndexAtArc(fiberId, arc, frameLength);
+    if (!index) return std::nullopt;
+    const auto stored = readStoredFiber(fiberId, true);
+    if (!stored || *index < 0 || size_t(*index) >= stored->linePoints.size()) return std::nullopt;
+    return stored->linePoints[size_t(*index)];
+}
+
 std::optional<int> LineAnnotationController::storedLineIndexAtArc(uint64_t fiberId, double arc,
                                                                  double frameLength) const
+{
+    const auto position = storedLinePositionAtArc(fiberId, arc, frameLength);
+    if (!position) return std::nullopt;
+    return int(std::lround(*position));
+}
+
+std::optional<double> LineAnnotationController::storedLinePositionAtArc(uint64_t fiberId, double arc,
+                                                                        double frameLength) const
 {
     if (!std::isfinite(arc) || arc < 0.0) return std::nullopt;
     const auto stored = readStoredFiber(fiberId, true);
@@ -10002,13 +10022,13 @@ std::optional<int> LineAnnotationController::storedLineIndexAtArc(uint64_t fiber
     for (size_t i = range.begin + 1; i < range.end; ++i) {
         const double step = cv::norm(stored->linePoints[i] - stored->linePoints[i - 1]);
         if (walked + step >= arc) {
-            // The nearer of the two line points bounding the arc.
-            return int(arc - walked <= walked + step - arc ? i - 1 : i);
+            // Between the two line points bounding the arc, exactly.
+            return double(i - 1) + (step > 0.0 ? (arc - walked) / step : 0.0);
         }
         walked += step;
     }
     // Past the last control point (beyond rounding): refused, never clamped.
-    if (arc <= walked + 1e-6 * std::max(1.0, walked)) return int(range.end - 1);
+    if (arc <= walked + 1e-6 * std::max(1.0, walked)) return double(range.end - 1);
     return std::nullopt;
 }
 
@@ -18383,8 +18403,8 @@ void LineAnnotationController::readSavedFiberHeads(const FiberCommitJob& job, vc
 // (vc_object_store FiberApprovalExtension.hpp), written whole on every change
 // together with the normals the views show. The fiber is never saved.
 // ---------------------------------------------------------------------------
-void LineAnnotationController::openFiberApproval(uint64_t fiberId, const std::string& runUuid, int lineFrom,
-                                                 int lineTo, int controlFrom, int controlTo)
+void LineAnnotationController::openFiberApproval(uint64_t fiberId, const std::string& runUuid, double lineFrom,
+                                                 double lineTo, int controlFrom, int controlTo)
 {
     if (!_solverLineNormals.contains(fiberId)) {
         showError(tr("The fiber was not opened for approval: no scaffold solve's normals were handed over for it. "
@@ -18398,7 +18418,7 @@ void LineAnnotationController::openFiberApproval(uint64_t fiberId, const std::st
     open.controlFrom = controlFrom;
     open.controlTo = controlTo;
     std::optional<int> lineIndex;
-    if (lineFrom >= 0) lineIndex = lineFrom;
+    if (lineFrom >= 0) lineIndex = int(std::lround(lineFrom));
     std::optional<int> controlIndex;
     if (!lineIndex && controlFrom >= 0) controlIndex = controlFrom;
     openFiberWithControlPoint(fiberId, controlIndex, lineIndex, std::nullopt, false, &open);
@@ -18533,8 +18553,8 @@ bool LineAnnotationController::loadApprovalLayer(LineAnnotationSession& session,
         break;
     }
     if (open.lineFrom >= 0 && open.lineTo > open.lineFrom) {
-        from = double(open.lineFrom);
-        to = double(open.lineTo);
+        from = open.lineFrom;
+        to = open.lineTo;
     } else if (open.controlFrom >= 0 && open.controlTo > open.controlFrom) {
         std::vector<double> stored;
         for (const auto& control : session.controlPoints)
@@ -18613,6 +18633,8 @@ void LineAnnotationController::connectApprovalEditing(LineAnnotationDialog* dial
             });
     connect(dialog, &LineAnnotationDialog::approvalStateRequested, this,
             [this, surfaceName](int aspect, int state) { approvalSetState(surfaceName, aspect, state); });
+    connect(dialog, &LineAnnotationDialog::approvalCrossingStateRequested, this,
+            [this, surfaceName](int index, int state) { approvalSetCrossingState(surfaceName, index, state); });
 }
 
 // The views of an approval session after a change of its normal points. A
@@ -18772,6 +18794,31 @@ void LineAnnotationController::setApprovalStretchProvider(ApprovalStretchProvide
     _approvalStretchProvider = std::move(provider);
 }
 
+void LineAnnotationController::setApprovalCrossingAccess(ApprovalCrossingProvider provider,
+                                                         ApprovalCrossingWriter writer)
+{
+    _approvalCrossingProvider = std::move(provider);
+    _approvalCrossingWriter = std::move(writer);
+}
+
+void LineAnnotationController::approvalSetCrossingState(const std::string& surfaceName, int index, int state)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session || !pane->session->approvalMode) return;
+    auto& session = *pane->session;
+    QString error;
+    if (index < 0 || size_t(index) >= session.approvalCrossings.size())
+        error = tr("this crossing is no longer listed");
+    else if (!_approvalCrossingWriter)
+        error = tr("no solve is attached to this window");
+    else
+        error = _approvalCrossingWriter(session.fiberId, session.approvalCrossings[size_t(index)], state);
+    if (error.isEmpty()) session.approvalChanged = true;
+    else showError(tr("The neighbour state was NOT changed: %1").arg(error), session.suppressErrorDialogs);
+    // Also after a refusal: the dropdown goes back to what is stored.
+    pushApprovalDisplay(session);
+}
+
 void LineAnnotationController::approvalSetSelectionBound(const std::string& surfaceName, int bound,
                                                          double linePosition)
 {
@@ -18788,8 +18835,8 @@ void LineAnnotationController::approvalSetSelectionBound(const std::string& surf
         for (auto it = session.controlPoints.rbegin(); it != session.controlPoints.rend(); ++it)
             if (!la::isNormalPoint(*it)) { to = it->linePosition; break; }
     } else if (bound == 3) {
-        // The stretch of the fiber map's approval list nearest the position;
-        // the views move to its start.
+        // The stretch of the fiber map's approval list at the position (the
+        // nearest one where none holds it).
         const auto listed = _approvalStretchProvider && session.fiberId
             ? _approvalStretchProvider(session.fiberId) : std::vector<std::pair<double, double>>{};
         if (listed.empty()) {
@@ -18812,7 +18859,8 @@ void LineAnnotationController::approvalSetSelectionBound(const std::string& surf
                 to = std::min(last, second);
             }
         }
-        if (pane->dialog) pane->dialog->showLinePosition(from);
+        // Shown as the list's double-click shows it: the strips on the stretch.
+        if (pane->dialog && to > from) pane->dialog->showLineRange(from, to);
     } else {
         if (session.approvalSelection) std::tie(from, to) = *session.approvalSelection;
         linePosition = std::clamp(linePosition, 0.0, last);
@@ -19001,6 +19049,11 @@ void LineAnnotationController::pushApprovalDisplay(LineAnnotationSession& sessio
     }
     for (const auto& control : session.controlPoints)
         if (la::isNormalPoint(control)) ++display.normalPoints;
+    session.approvalCrossings = _approvalCrossingProvider && session.fiberId
+        ? _approvalCrossingProvider(session.fiberId) : std::vector<ApprovalCrossing>{};
+    for (const auto& crossing : session.approvalCrossings)
+        display.crossings.push_back({crossing.linePosition, crossing.otherLabel, crossing.estimateHalves,
+                                     crossing.signKnown, crossing.state, crossing.otherPoint});
     for (auto& pane : _panes)
         if (pane.session.get() == &session && pane.dialog) pane.dialog->setApprovalDisplay(display);
 }

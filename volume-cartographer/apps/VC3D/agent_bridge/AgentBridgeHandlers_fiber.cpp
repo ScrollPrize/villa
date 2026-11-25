@@ -448,8 +448,8 @@ QJsonObject AgentBridgeServer::handleFiberOpenApproval(const QJsonValue& params)
     // Opens the fiber in the approval window on the solve whose normals the
     // fiber map handed over; a stretch is given as stored line indices.
     const QString err = captureFiberError(ctrl, [&] {
-        ctrl->openFiberApproval(fiberId, p.value("run").toString().toStdString(), p.value("lineFrom").toInt(-1),
-                                p.value("lineTo").toInt(-1), -1, -1);
+        ctrl->openFiberApproval(fiberId, p.value("run").toString().toStdString(), p.value("lineFrom").toDouble(-1),
+                                p.value("lineTo").toDouble(-1), -1, -1);
     });
     if (!err.isEmpty()) {
         QJsonObject data;

@@ -1377,7 +1377,7 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
     // A changed approval layer (the approval window closed with changes)
     // solves again; while a solve runs, once more when it has finished.
     if (_controller) {
-        // The approval window chooses its "nearest stretch" from this list.
+        // The approval window "Open this stretch" chooses from this list.
         _controller->setApprovalStretchProvider([this](uint64_t fiberId) {
             std::vector<std::pair<double, double>> out;
             if (!_approvalPanel || !_solveController) return out;
@@ -1389,15 +1389,76 @@ FiberMapWorkspace::FiberMapWorkspace(CState* state, LineAnnotationController* co
             const auto spans = _solveController->approvals().find(uuid);
             if (spans != _solveController->approvals().end() && !spans->second.controlArcs.empty())
                 runLength = spans->second.controlArcs.back();
-            for (const auto& [arcFrom, arcTo] : _approvalPanel->stretchArcs(uuid)) {
-                const auto first = _controller->storedLineIndexAtArc(fiberId, arcFrom, runLength);
-                const auto last = _controller->storedLineIndexAtArc(fiberId, arcTo, runLength);
-                if (first && last && *last > *first) out.emplace_back(double(*first), double(*last));
+            for (auto [arcFrom, arcTo] : _approvalPanel->stretchArcs(uuid)) {
+                // A stretch ends on the fiber's own ends at most.
+                arcFrom = std::max(arcFrom, 0.0);
+                if (runLength > 0.0) arcTo = std::min(arcTo, runLength);
+                const auto first = _controller->storedLinePositionAtArc(fiberId, arcFrom, runLength);
+                const auto last = _controller->storedLinePositionAtArc(fiberId, arcTo, runLength);
+                if (first && last && *last > *first) out.emplace_back(*first, *last);
             }
             return out;
         });
+        // The approval window's neighbour dropdowns: the fiber's crossings
+        // in the selected solve, and the store write of one's state.
+        const auto uuidOfFiber = [this](uint64_t fiberId) {
+            for (const auto& [candidate, id] : _fiberIdByUuid)
+                if (id == fiberId) return candidate;
+            return std::string();
+        };
+        _controller->setApprovalCrossingAccess(
+            [this, uuidOfFiber](uint64_t fiberId) {
+                std::vector<LineAnnotationController::ApprovalCrossing> out;
+                if (!_solveController) return out;
+                const auto uuid = uuidOfFiber(fiberId);
+                if (uuid.empty()) return out;
+                double runLength = 0.0;
+                const auto spans = _solveController->approvals().find(uuid);
+                if (spans != _solveController->approvals().end() && !spans->second.controlArcs.empty())
+                    runLength = spans->second.controlArcs.back();
+                for (const auto& crossing : _solveController->crossingsOf(uuid)) {
+                    const auto index = _controller->storedLinePositionAtArc(fiberId, crossing.arc, runLength);
+                    if (!index) continue;
+                    LineAnnotationController::ApprovalCrossing entry;
+                    entry.linePosition = *index;
+                    entry.arc = crossing.arc;
+                    entry.otherArc = crossing.otherArc;
+                    entry.otherUuid = crossing.otherUuid;
+                    entry.otherLabel = QString::fromStdString(crossing.otherUuid).left(8);
+                    entry.estimateHalves = int(crossing.estimateHalves);
+                    entry.signKnown = crossing.signKnown;
+                    entry.state = crossing.state;
+                    // Where the other fiber crosses, for the line to it.
+                    const auto other = _fiberIdByUuid.find(crossing.otherUuid);
+                    if (other != _fiberIdByUuid.end()) {
+                        double otherLength = 0.0;
+                        const auto otherSpans = _solveController->approvals().find(crossing.otherUuid);
+                        if (otherSpans != _solveController->approvals().end() &&
+                            !otherSpans->second.controlArcs.empty())
+                            otherLength = otherSpans->second.controlArcs.back();
+                        if (const auto point =
+                                _controller->storedLinePointAtArc(other->second, crossing.otherArc, otherLength))
+                            entry.otherPoint = *point;
+                    }
+                    out.push_back(std::move(entry));
+                }
+                return out;
+            },
+            [this, uuidOfFiber](uint64_t fiberId, const LineAnnotationController::ApprovalCrossing& crossing,
+                                int state) {
+                if (!_solveController) return tr("no solve is selected");
+                const auto uuid = uuidOfFiber(fiberId);
+                if (uuid.empty()) return tr("the fiber is not on the map");
+                vc3d::fiber_map::ScaffoldFiberCrossing stored;
+                stored.arc = crossing.arc;
+                stored.otherArc = crossing.otherArc;
+                stored.otherUuid = crossing.otherUuid;
+                return _solveController->setCrossingApproval(uuid, stored, state);
+            });
         connect(_controller, &LineAnnotationController::fiberApprovalChanged, this, [this](const QString&) {
             if (!_solveController || !_solverPanel) return;
+            // The list shows the new approvals at once, before the solve.
+            _solveController->loadApprovals();
             if (_solveController->busy()) {
                 _solveAgainWhenIdle = true;
                 setOperationStatus(tr("Approval changed - solving again when the running solve has finished"));
@@ -4573,7 +4634,7 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
     const auto fiberId = found->second;
     // The stretch as a range of the fiber's stored line points; without the
     // stretch's own ends, the control points that bracket it.
-    int lineFrom = -1, lineTo = -1;
+    double lineFrom = -1, lineTo = -1;
     if (std::isfinite(arcFrom) && std::isfinite(arcTo) && arcTo > arcFrom) {
         // The solve's arcs are in its own frame: the fiber's annotated length
         // there (its last control's arc) brings them into the open volume's.
@@ -4584,8 +4645,11 @@ void FiberMapWorkspace::openScaffoldPiece(const std::string& fiberUuid, std::int
             if (spans != _solveController->approvals().end() && !spans->second.controlArcs.empty())
                 runLength = spans->second.controlArcs.back();
         }
-        const auto first = _controller->storedLineIndexAtArc(fiberId, arcFrom, runLength);
-        const auto last = _controller->storedLineIndexAtArc(fiberId, arcTo, runLength);
+        // A stretch ends on the fiber's own ends at most.
+        arcFrom = std::max(arcFrom, 0.0);
+        if (runLength > 0.0) arcTo = std::min(arcTo, runLength);
+        const auto first = _controller->storedLinePositionAtArc(fiberId, arcFrom, runLength);
+        const auto last = _controller->storedLinePositionAtArc(fiberId, arcTo, runLength);
         if (!first || !last) {
             refuse(tr("the stretch (arc %1 to %2 of the solve) reaches past the fiber's control points; the fiber "
                       "was edited since the solve").arg(arcFrom).arg(arcTo),

@@ -315,7 +315,8 @@ void ScaffoldSolveController::selectRun(const std::string& runUuid)
         session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
             view.residuals = readScaffoldResiduals(reader, runUuid);
             view.flips = readScaffoldNormalFlips(reader, runUuid);
-            view.signSuspects = readScaffoldSignSuspects(reader, runUuid);
+            view.stretches = readScaffoldStretches(reader, runUuid);
+            view.crossings = readScaffoldCrossings(reader, runUuid);
             view.windings = readScaffoldWindings(reader, runUuid);
         });
     } catch (const std::exception& problem) {
@@ -671,6 +672,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                 ScaffoldMeasuredReport measuredReport;
                 ScaffoldSignResult signs;
                 ScaffoldApprovalReport approvals;
+                std::vector<ScaffoldCrossing> crossings;
                 ScaffoldRunStages stages;
                 if (job->request.measureCrossings) {
                     normalOptions.cache = &cache;
@@ -711,10 +713,11 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     normals.emplace(graph, geometry, normalOptions, job->axes);
                     events = scaffoldEvents(graph, geometry, *normals, eventOptions, distances, eventReport);
                     signs = scaffoldNormalSigns(graph, *normals, events, signOptions);
-                    measured =
-                        scaffoldMeasuredConstraints(graph, geometry, events, signs.sign, measuredOptions, measuredReport);
-                    applyScaffoldConstraintApprovals(graph, geometry, measured,
-                                                     vc::objects::readFiberConstraintApprovals(reader), approvals);
+                    const auto stated = scaffoldCrossingApprovals(
+                        graph, geometry, events, vc::objects::readFiberConstraintApprovals(reader), approvals);
+                    measured = scaffoldMeasuredConstraints(graph, geometry, events, signs.sign, measuredOptions,
+                                                           measuredReport, stated, &crossings);
+                    stages.crossings = &crossings;
                     stages.normalOptions = &normalOptions;
                     stages.normals = &normals->report();
                     stages.normalRows = normals->cacheRows();
@@ -737,10 +740,10 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     stages.flipReport = &flipReport;
                 }
                 // The stretches to look at for the violated sign constraints.
-                ScaffoldSignSuspectReport signSuspectReport;
-                const auto signSuspects = scaffoldSignSuspects(graph, geometry, result, {}, signSuspectReport);
-                stages.signSuspects = &signSuspects;
-                stages.signSuspectReport = &signSuspectReport;
+                ScaffoldStretchReport stretchReport;
+                const auto stretches = scaffoldStretches(graph, geometry, result, {}, stretchReport);
+                stages.stretches = &stretches;
+                stages.stretchReport = &stretchReport;
                 record.input = {graph.source.storeUuid, graph.source.generation, graph.source.commitSequence};
                 job->rows = scaffoldSolveRunRows(graph, result, options, record, stages);
                 job->runUuid = record.runUuid;
@@ -916,18 +919,52 @@ bool ScaffoldSolveController::constraintApproved(const ScaffoldStoredResidual& r
     return identity && _constraintApprovals.count(*identity) != 0;
 }
 
-QString ScaffoldSolveController::setConstraintApproval(const ScaffoldStoredResidual& residual, bool approved)
+std::vector<ScaffoldFiberCrossing> ScaffoldSolveController::crossingsOf(const std::string& fiberUuid) const
+{
+    std::vector<ScaffoldFiberCrossing> out;
+    if (!_selected) return out;
+    for (const auto& crossing : _selected->crossings) {
+        const bool first = crossing.fiberA == fiberUuid;
+        if (!first && crossing.fiberB != fiberUuid) continue;
+        ScaffoldFiberCrossing entry;
+        entry.arc = first ? crossing.arcA : crossing.arcB;
+        entry.otherUuid = first ? crossing.fiberB : crossing.fiberA;
+        entry.otherArc = first ? crossing.arcB : crossing.arcA;
+        entry.estimateHalves = crossing.estimateHalves;
+        entry.signKnown = crossing.signKnown;
+        try {
+            const auto found = _constraintApprovals.find(vc::objects::fiberConstraintIdentity(
+                crossing.fiberA, crossing.arcA, crossing.fiberB, crossing.arcB,
+                vc::objects::FiberConstraintKind::Perpendicular));
+            if (found != _constraintApprovals.end())
+                entry.state = found->second.distance == vc::objects::FiberConstraintDistance::Distant ? 2 : 1;
+        } catch (const std::exception&) {
+            continue; // not a crossing an approval can name
+        }
+        out.push_back(std::move(entry));
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.arc < b.arc; });
+    return out;
+}
+
+QString ScaffoldSolveController::setCrossingApproval(const std::string& fiberUuid, const ScaffoldFiberCrossing& crossing,
+                                                     int state)
 {
     using namespace vc::objects;
-    const auto identity = storedConstraintIdentity(residual);
-    if (!identity)
-        return tr("A link's approval is its review state; only a measured crossing is approved here.");
+    if (state < 0 || state > 2) return tr("Unknown neighbour state.");
     const auto store = attachment();
     const auto session = _state ? _state->objectStoreSession() : nullptr;
     if (!store || !session) return tr("No fiber store is attached.");
-    const auto existing = _constraintApprovals.find(*identity);
-    if (!approved && existing == _constraintApprovals.end())
-        return tr("This constraint carries no approval to revoke.");
+    FiberConstraintIdentity identity;
+    try {
+        identity = fiberConstraintIdentity(fiberUuid, crossing.arc, crossing.otherUuid, crossing.otherArc,
+                                           FiberConstraintKind::Perpendicular);
+    } catch (const std::exception& problem) {
+        return tr("This crossing cannot be named: %1").arg(QString::fromUtf8(problem.what()));
+    }
+    const auto existing = _constraintApprovals.find(identity);
+    if (state == 0 && existing == _constraintApprovals.end()) return tr("This crossing carries no state to take back.");
+    if (!_approvalsLoaded) loadApprovals();
 
     auto request = session->newRequest(*store);
     const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
@@ -937,9 +974,9 @@ QString ScaffoldSolveController::setConstraintApproval(const ScaffoldStoredResid
     QString error;
     try {
         session->readStore(*store, [&](const StoreReader& reader, const auto&) {
-            if (!approved) {
-                values.push_back(fiberConstraintApprovalRow(
-                    revokeFiberConstraintApproval(existing->second, request.author, now)));
+            if (state == 0) {
+                values.push_back(
+                    fiberConstraintApprovalRow(revokeFiberConstraintApproval(existing->second, request.author, now)));
                 return;
             }
             // Both fibers as the store holds them now: the approval records
@@ -947,36 +984,42 @@ QString ScaffoldSolveController::setConstraintApproval(const ScaffoldStoredResid
             std::array<FiberPieceContent, 2> contents;
             std::array<std::int64_t, 2> versions{0, 0};
             std::array<std::size_t, 2> spans{0, 0};
-            const std::array<std::string, 2> uuids{identity->fiberA, identity->fiberB};
-            const std::array<double, 2> arcs{identity->fiberA == residual.fiberA ? residual.arcA : residual.arcB,
-                                             identity->fiberA == residual.fiberA ? residual.arcB : residual.arcA};
+            const std::array<std::string, 2> uuids{identity.fiberA, identity.fiberB};
+            const bool ordered = identity.fiberA == fiberUuid;
+            const std::array<double, 2> arcs{ordered ? crossing.arc : crossing.otherArc,
+                                             ordered ? crossing.otherArc : crossing.arc};
             for (std::size_t side = 0; side < 2; ++side) {
                 const auto record = reader.currentObject(uuids[side]);
-                if (!record) { error = tr("A fiber of this constraint is no longer in the store."); return; }
+                if (!record) { error = tr("A fiber of this crossing is no longer in the store."); return; }
                 const auto found = reader.objectsAtVersions({record->reference()});
                 if (found.empty() || !found.front() || found.front()->deleted) {
-                    error = tr("A fiber of this constraint cannot be read.");
+                    error = tr("A fiber of this crossing cannot be read.");
                     return;
                 }
                 revisions.push_back(*found.front());
                 contents[side] = fiberPieceContent(reader, *found.front());
                 versions[side] = found.front()->version;
-                const auto span = vc::fiber_graph::scaffoldSpanCoveringArc(contents[side], arcs[side]);
-                if (!span) { error = tr("A fiber of this constraint has no span covering its anchor."); return; }
-                spans[side] = *span;
-                // A constraint is a statement about two pieces of geometry.
-                // Approving it before those pieces are approved would pin a
-                // solve to geometry nobody has reviewed.
-                const auto covered =
-                    approvedSpans(approvedRangesOfLayer(reader, uuids[side], contents[side]), contents[side])[0];
-                if (spans[side] >= covered.size() || covered[spans[side]] == 0) {
-                    error = tr("Approve the geometry of both pieces this crossing lies on first.");
+                // The span the anchor lies on, as the solve places it among
+                // the fiber's control points (arcs are the solve's own).
+                const auto span = anchorSpan(uuids[side], arcs[side]);
+                if (!span.known || std::size_t(span.span) + 1 >= contents[side].controlPoints.size()) {
+                    error = tr("Fiber %1 of this crossing has changed since the solve: solve again.")
+                                .arg(QString::fromStdString(uuids[side]).left(8));
                     return;
                 }
+                spans[side] = std::size_t(span.span);
             }
-            values.push_back(fiberConstraintApprovalRow(
-                approveFiberConstraint(*identity, contents[0], spans[0], versions[0], contents[1], spans[1],
-                                       versions[1], request.author, now, host)));
+            auto row = approveFiberConstraint(identity, contents[0], spans[0], versions[0], contents[1], spans[1],
+                                              versions[1],
+                                              state == 2 ? FiberConstraintDistance::Distant
+                                                         : FiberConstraintDistance::Direct,
+                                              request.author, now, host);
+            // A changed state replaces the live row of this crossing.
+            if (existing != _constraintApprovals.end()) {
+                row.supersedes = existing->second.rowUuid;
+                row.approvalUuid = existing->second.approvalUuid;
+            }
+            values.push_back(fiberConstraintApprovalRow(row));
         });
     } catch (const std::exception& problem) {
         return tr("The store could not be read: %1").arg(QString::fromUtf8(problem.what()));
@@ -989,7 +1032,7 @@ QString ScaffoldSolveController::setConstraintApproval(const ScaffoldStoredResid
     try {
         session->submitDurably(*store, request);
     } catch (const std::exception& problem) {
-        return tr("The approval could not be stored: %1").arg(QString::fromUtf8(problem.what()));
+        return tr("The neighbour state could not be stored: %1").arg(QString::fromUtf8(problem.what()));
     }
     reloadConstraintApprovals();
     return {};
@@ -1371,17 +1414,10 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
     orderLayout->addWidget(new QLabel(tr("Order by"), orderRow));
     _orderCombo = new QComboBox(orderRow);
     _orderCombo->setObjectName(QStringLiteral("fiberMapApprovalOrder"));
-    _orderCombo->addItem(tr("cost per voxel"), int(ScaffoldApprovalOrder::Density));
-    _orderCombo->addItem(tr("smallest cycle"), int(ScaffoldApprovalOrder::Cycle));
     _orderCombo->addItem(tr("highest cost"), int(ScaffoldApprovalOrder::Cost));
-    _orderCombo->addItem(tr("cost per hop"), int(ScaffoldApprovalOrder::Joint));
-    _orderCombo->setToolTip(tr("cost per voxel: where a look at a short piece of fiber settles the most.\n"
-                               "smallest cycle: the shortest loop a violation lies on first, ties by\n"
-                               "the shorter stretch - the most specific suspects.\n"
-                               "highest cost: the most expensive violation first, ties by the shorter\n"
-                               "cycle and stretch.\n"
-                               "cost per hop: cost divided by the cycle's constraints, which favours an\n"
-                               "expensive violation on a short loop."));
+    _orderCombo->addItem(tr("cost per voxel"), int(ScaffoldApprovalOrder::Density));
+    _orderCombo->setToolTip(tr("highest cost: the stretch with the most violated cost on it first.\n"
+                               "cost per voxel: that cost over the stretch's length."));
     orderLayout->addWidget(_orderCombo, 1);
     layout->addWidget(orderRow);
 
@@ -1400,30 +1436,20 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
     _tree = new QTreeWidget(this);
     _tree->setObjectName(QStringLiteral("fiberMapApprovalTree"));
     _tree->setColumnCount(kColumnCount);
-    _tree->setHeaderLabels({tr("what"), tr("fiber"), tr("where"), tr("off"), tr("state"), tr("cost"), tr("cost/kvx"),
-                            tr("joint"),
-                            tr("loop"), tr("cycle"), tr("length"), tr("paths")});
-    _tree->headerItem()->setToolTip(kOffColumn, tr("Turns of winding the solve could not satisfy on this constraint."));
-    _tree->headerItem()->setToolTip(kStateColumn,
-                                    tr("A constraint: approved, approvable (both pieces approved), blocked (they are\n"
-                                       "not) or link (its approval is its review state). A piece: whether its\n"
-                                       "geometry is approved, +n when its normals are too."));
-    _tree->headerItem()->setToolTip(kCostColumn, tr("Weight times residual, in weighted turns."));
-    _tree->headerItem()->setToolTip(kDensityColumn,
-                                    tr("Cost per 1000 voxels of fiber. A segment: the densest accusation it\n"
-                                       "was built from. A constraint: its cost over its cycle's length."));
-    _tree->headerItem()->setToolTip(kJointColumn, tr("Cost per constraint of the shortest cycle (weighted turns)."));
-    _tree->headerItem()->setToolTip(kCycleNumberColumn,
-                                    tr("Which cycle this row is about, numbered from 1 in rank order. Rows\n"
-                                       "sharing a number are about the same loop; a stretch lists every loop\n"
-                                       "that runs along it."));
-    _tree->headerItem()->setToolTip(kCycleColumn, tr("Constraints on the shortest cycle the violation lies on."));
-    _tree->headerItem()->setToolTip(kLengthColumn,
-                                    tr("The stretch's length, or the cycle's total stretch length (voxels)."));
-    _tree->headerItem()->setToolTip(kCountColumn,
-                                    tr("A constraint: edge-disjoint alternative paths found (redundancy). A\n"
-                                       "geometry stretch: how many violated constraints accuse it. A normals\n"
-                                       "stretch: the fiber's crossings on it."));
+    _tree->setHeaderLabels({tr("geo"), tr("nrm"), tr("crossings"), tr("violated"), tr("sign"), tr("where"), tr("cost"),
+                            tr("cost/kvx"), tr("length"), tr("fiber")});
+    _tree->headerItem()->setToolTip(kGeometryColumn, tr("A check: the stretch is approved for geometry."));
+    _tree->headerItem()->setToolTip(kNormalsColumn, tr("A check: the stretch is approved for normals."));
+    _tree->headerItem()->setToolTip(kReviewedColumn,
+                                    tr("Crossings on the stretch with a neighbour state (direct or distant), of all."));
+    _tree->headerItem()->setToolTip(kViolatedColumn,
+                                    tr("Violated constraints anchored on the stretch, of all constraints on it."));
+    _tree->headerItem()->setToolTip(kSignColumn,
+                                    tr("Violated sign constraints on the stretch (which fiber lies outside), of its\n"
+                                       "crossings whose normals state a side. They are counted in \"violated\" too."));
+    _tree->headerItem()->setToolTip(kCostColumn, tr("Summed cost of the violated constraints on the stretch, in weighted turns."));
+    _tree->headerItem()->setToolTip(kDensityColumn, tr("Cost per 1000 voxels of the stretch."));
+    _tree->headerItem()->setToolTip(kLengthColumn, tr("The stretch's length (voxels)."));
     _tree->setUniformRowHeights(true);
     _tree->setRootIsDecorated(true);
     _tree->setExpandsOnDoubleClick(false);
@@ -1442,15 +1468,6 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
                          "in the fiber approval window."));
     layout->addWidget(_tree, 1);
 
-    _approveButton = new QPushButton(tr("Approve constraint"), this);
-    _approveButton->setObjectName(QStringLiteral("fiberMapApproveConstraint"));
-    _approveButton->setEnabled(false);
-    _approveButton->setToolTip(tr("Record that this measured crossing is right. An approved constraint is\n"
-                                  "held rigid by the next solve, and the record is invalidated if either\n"
-                                  "fiber's covering span is edited. A link is not approved here: its\n"
-                                  "approval is its review state in the annotation."));
-    layout->addWidget(_approveButton);
-
     _summaryLabel = new QLabel(this);
     _summaryLabel->setObjectName(QStringLiteral("fiberMapApprovalSummary"));
     _summaryLabel->setWordWrap(true);
@@ -1463,15 +1480,6 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
     _errorLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(_errorLabel);
 
-    connect(_approveButton, &QPushButton::clicked, this, [this]() {
-        const auto* residual = residualOf(_tree->currentItem());
-        if (!residual || !_controller) return;
-        const bool approved = _controller->constraintApproved(*residual);
-        const auto error = _controller->setConstraintApproval(*residual, !approved);
-        _errorLabel->setText(error);
-        if (!error.isEmpty()) return;
-        rebuild();
-    });
     for (auto* combo : {_orderCombo, _componentCombo})
         connect(combo, &QComboBox::currentIndexChanged, this, [this]() {
             if (_rebuilding) return;
@@ -1586,75 +1594,7 @@ void ScaffoldApprovalPanel::rebuild()
         if (span.geometryApproved) return span.normalsApproved ? tr("approved +n") : tr("approved");
         return tr("unapproved");
     };
-    const auto cycleNumbers = scaffoldCycleNumbers(view->residuals);
-    const auto cycleText = [](std::int64_t number) { return number > 0 ? QString::number(number) : QString(); };
     std::vector<Entry> entries;
-    for (std::size_t index = 0; index < view->residuals.size(); ++index) {
-        const auto& residual = view->residuals[index];
-        Entry entry;
-        entry.row.kind = Row::Kind::Constraint;
-        entry.row.residual = std::int64_t(index);
-        entry.row.keys.cost = residual.weight * residual.residual;
-        entry.row.keys.cycle = residual.cycleHops.value_or(-1);
-        entry.row.keys.length = residual.cyclePieceLength;
-        entry.row.keys.density = residual.cyclePieceLength > 0 ? entry.row.keys.cost / residual.cyclePieceLength : 0.;
-        entry.row.fiberUuid = residual.fiberA;
-        entry.row.otherUuid = residual.fiberB;
-        const auto measured = residual.edgeUuid.empty();
-        const auto spans = coveringSpans(residual);
-        // Where: the two pieces the crossing lies on, which is where it can
-        // be looked at; a link states its anchors the same way.
-        const auto where = tr("%1 / %2").arg(spanText(spans[0], residual.arcA), spanText(spans[1], residual.arcB));
-        const auto approvedConstraint = measured && _controller && _controller->constraintApproved(residual);
-        const bool signConstraint = residual.kind == std::int64_t(ScaffoldConstraintKind::SignAtLeast) ||
-                           residual.kind == std::int64_t(ScaffoldConstraintKind::SignAtMost);
-        // A bound is evidence, not a relation: there is nothing to approve.
-        const auto state = !measured
-            ? tr("link")
-            : signConstraint ? tr("sign")
-            : (approvedConstraint ? tr("approved")
-                                  : (spans[0].geometryApproved && spans[1].geometryApproved ? tr("approvable")
-                                                                                            : tr("blocked")));
-        entry.text << (residual.edgeUuid.empty() ? kindName(residual.kind) : tr("link"))
-                   << tr("%1 - %2").arg(label(residual.fiberA), label(residual.fiberB)) << where
-                   << tr("%1 turns").arg(residual.residual, 0, 'f', 2) << state
-                   << QString::number(entry.row.keys.cost, 'f', 3)
-                   << (entry.row.keys.density > 0 ? QString::number(1000. * entry.row.keys.density, 'f', 3) : QString())
-                   << (entry.row.keys.cycle > 0
-                           ? QString::number(entry.row.keys.cost / double(entry.row.keys.cycle), 'f', 3)
-                           : QString())
-                   << cycleText(cycleNumbers[index])
-                   << (entry.row.keys.cycle > 0 ? QString::number(entry.row.keys.cycle) : tr("none"))
-                   << QString::number(entry.row.keys.length, 'f', 0)
-                   << (residual.redundancy ? QString::number(*residual.redundancy) : QString());
-        // The two covering pieces as children: each is openable, and its
-        // state says what still blocks the constraint.
-        const std::array<std::string, 2> uuids{residual.fiberA, residual.fiberB};
-        for (std::size_t side = 0; side < 2; ++side) {
-            if (!spans[side].known) continue;
-            Row child;
-            child.kind = Row::Kind::Piece;
-            child.fiberUuid = uuids[side];
-            child.controlFrom = spans[side].controlFrom;
-            child.controlTo = spans[side].controlTo;
-            QStringList text;
-            text << tr("piece") << label(uuids[side]) << spanText(spans[side], 0.) << QString()
-                 << stateText(spans[side]) << QString() << QString() << QString() << QString() << QString()
-                 << QString() << QString();
-            entry.children.emplace_back(child, text);
-        }
-        entries.push_back(std::move(entry));
-    }
-    // The geometry stretches: per fiber, the stretches the cycles of the
-    // violated constraints run along, from constraint to constraint, without
-    // what is already approved (scaffoldApprovalSegments). Recomputed here,
-    // so an approval moves the cost onto what is left.
-    static const std::map<std::string, ScaffoldApprovalSpans> noApprovals;
-    // The approvals of the fibers this run solved.
-    std::map<std::string, ScaffoldApprovalSpans> runFibers;
-    for (const auto& [uuid, spans] : _controller ? _controller->approvals() : noApprovals)
-        if (view->windings.contains(uuid)) runFibers.emplace(uuid, spans);
-    const auto segments = scaffoldApprovalSegments(view->residuals, runFibers);
     // A control position as text: a whole number on a control point, two
     // decimals between two of them - never a range the segment does not have.
     const auto positionText = [](double position) {
@@ -1694,53 +1634,70 @@ void ScaffoldApprovalPanel::rebuild()
                                 : tr("cp %1").arg(positionText(positionFrom));
         return entry;
     };
-    for (const auto& segment : segments) {
-        QString where;
-        auto entry = stretchEntry(segment.fiberUuid, segment.arcFrom, segment.arcTo, where);
-        entry.row.keys.cost = segment.cost;
-        entry.row.keys.cycle = segment.cycleHops;
-        entry.row.keys.density = segment.density;
-        QStringList loops;
-        for (const auto number : segment.cycles) loops << QString::number(number);
-        entry.text << tr("geometry") << label(segment.fiberUuid) << where << QString() << tr("unapproved")
-                   << QString::number(segment.cost, 'f', 3) << QString::number(1000. * segment.density, 'f', 3)
-                   << (segment.cycleHops > 0 ? QString::number(segment.cost / double(segment.cycleHops), 'f', 3)
-                                             : QString())
-                   << loops.join(QStringLiteral(", "))
-                   << (segment.cycleHops > 0 ? QString::number(segment.cycleHops) : tr("none"))
-                   << QString::number(segment.length(), 'f', 0) << QString::number(segment.constraints);
-        entries.push_back(std::move(entry));
-    }
-    // The normals stretches: for every violated sign constraint, the stretch
-    // of each of its fibers from that crossing to at least one other crossing.
-    // Approving the normals there ties the crossings to one facing. A stretch
-    // already approved for normals from end to end is not offered again.
-    std::int64_t turnRows = 0;
-    for (const auto& turn : view->signSuspects) {
-        if (turn.pieces.empty()) continue;
-        const auto& piece = turn.pieces.front();
+    // The stretches of the run: each ties the violated constraints on it to
+    // the fiber's other crossings there, and its cost is theirs summed.
+    std::map<std::string, std::vector<ScaffoldFiberCrossing>> crossingsOfFiber;
+    const QString check = QStringLiteral("\u2713");
+    for (const auto& stretch : view->stretches) {
+        if (stretch.pieces.empty()) continue;
+        const auto& piece = stretch.pieces.front();
+        // Per aspect: how much of the stretch is approved, 0 to 1.
+        std::array<double, 2> approved{0., 0.};
+        std::int64_t crossings = 0, reviewed = 0, signed_ = 0, signViolated = 0;
+        for (const auto& residual : view->residuals) {
+            if (residual.kind != std::int64_t(ScaffoldConstraintKind::SignAtLeast) &&
+                residual.kind != std::int64_t(ScaffoldConstraintKind::SignAtMost))
+                continue;
+            const auto on = [&](const std::string& fiber, double arc) {
+                return fiber == stretch.fiberA && arc >= piece.arcFrom && arc <= piece.arcTo;
+            };
+            if (on(residual.fiberA, residual.arcA) || on(residual.fiberB, residual.arcB)) ++signViolated;
+        }
         if (_controller) {
-            const auto found = _controller->approvals().find(turn.fiberA);
+            const auto found = _controller->approvals().find(stretch.fiberA);
             if (found != _controller->approvals().end()) {
-                bool approved = false;
-                for (const auto& [first, last] : found->second.approvedArcs[1])
-                    if (piece.arcFrom >= first - 1e-6 && piece.arcTo <= last + 1e-6) approved = true;
-                if (approved) continue;
+                for (std::size_t aspect = 0; aspect < 2; ++aspect) {
+                    double covered = 0;
+                    for (const auto& [first, last] : found->second.approvedArcs[aspect])
+                        covered += std::max(0., std::min(piece.arcTo, last) - std::max(piece.arcFrom, first));
+                    approved[aspect] = std::min(1., covered / std::max(piece.arcTo - piece.arcFrom, 1.));
+                }
+            }
+            auto list = crossingsOfFiber.find(stretch.fiberA);
+            if (list == crossingsOfFiber.end())
+                list = crossingsOfFiber.emplace(stretch.fiberA, _controller->crossingsOf(stretch.fiberA)).first;
+            for (const auto& crossing : list->second) {
+                if (crossing.arc < piece.arcFrom || crossing.arc > piece.arcTo) continue;
+                ++crossings;
+                if (crossing.state != 0) ++reviewed;
+                if (crossing.signKnown) ++signed_;
             }
         }
         QString where;
-        auto entry = stretchEntry(turn.fiberA, piece.arcFrom, piece.arcTo, where);
+        auto entry = stretchEntry(stretch.fiberA, piece.arcFrom, piece.arcTo, where);
         const double length = piece.arcTo - piece.arcFrom;
-        entry.row.keys.cost = turn.residual;
-        entry.row.keys.density = turn.residual / std::max(length, 1.);
-        entry.row.otherUuid = turn.fiberB;
-        entry.text << tr("normals") << tr("%1 vs %2").arg(label(turn.fiberA), label(turn.fiberB)) << where
-                   << QString() << tr("%1 sign violated").arg(turn.target)
-                   << QString::number(turn.residual, 'f', 3) << QString::number(1000. * entry.row.keys.density, 'f', 3)
-                   << QString() << QString() << QString() << QString::number(length, 'f', 0)
-                   << QString::number(qlonglong(turn.weight));
+        entry.row.keys.cost = stretch.residual;
+        entry.row.keys.density = stretch.residual / std::max(length, 1.);
+        entry.row.otherUuid = stretch.fiberB;
+        entry.row.reviewedShare = crossings > 0 ? double(reviewed) / double(crossings) : 0.;
+        entry.row.violated = double(stretch.target);
+        entry.row.signViolated = double(signViolated);
+        // A check for a stretch approved as a whole. A new
+        // stretch only reaches a margin into an approved neighbour, which
+        // is not an approval of it.
+        const auto approvalText = [&](double share) {
+            const double length = piece.arcTo - piece.arcFrom;
+            return share * length >= length - 0.5 ? check : QString();
+        };
+        entry.row.approvedShare = approved;
+        entry.text << approvalText(approved[0]) << approvalText(approved[1])
+                   << tr("%1/%2").arg(reviewed).arg(crossings)
+                   << tr("%1 of %2").arg(stretch.target).arg(qlonglong(stretch.weight))
+                   << tr("%1 of %2").arg(signViolated).arg(std::max(signed_, signViolated)) << where
+                   << QString::number(stretch.residual, 'f', 3)
+                   << QString::number(1000. * entry.row.keys.density, 'f', 3) << QString::number(length, 'f', 0)
+                   << label(stretch.fiberA);
         entries.push_back(std::move(entry));
-        ++turnRows;
     }
     // Offer every component the rows actually name, keeping the chosen one
     // when the run still has it.
@@ -1770,51 +1727,12 @@ void ScaffoldApprovalPanel::rebuild()
     std::stable_sort(entries.begin(), entries.end(), [&](const Entry& x, const Entry& y) {
         return scaffoldApprovalRowBefore(x.row.keys, y.row.keys, order);
     });
-    // The normal flip suspects come first: a stretch on which a fiber's
-    // normal turns over makes every crossing beyond it state the wrong order,
-    // so it is looked at before the residuals it causes.
-    {
-        std::vector<Entry> flipEntries;
-        for (const auto& flip : view->flips) {
-            if (filter >= 0 && componentOf(flip.fiberA) != filter) continue;
-            Entry entry;
-            entry.row.kind = Row::Kind::Piece;
-            entry.row.fiberUuid = flip.fiberA;
-            entry.row.otherUuid = flip.fiberB;
-            QString where = tr("%1 vx").arg(flip.arcA, 0, 'f', 0);
-            double length = 0;
-            if (!flip.pieces.empty()) {
-                const auto& piece = flip.pieces.front();
-                entry.row.arcFrom = piece.arcFrom;
-                entry.row.arcTo = piece.arcTo;
-                entry.row.controlFrom = piece.controlFrom.value_or(-1);
-                entry.row.controlTo = piece.controlTo.value_or(-1);
-                length = piece.arcTo - piece.arcFrom;
-                if (piece.controlFrom && piece.controlTo)
-                    where = tr("cp %1-%2").arg(*piece.controlFrom).arg(*piece.controlTo);
-            }
-            entry.row.keys.length = length;
-            // Agreeing links bracket the flip; without one only the anchor's
-            // own span is known.
-            const bool bracketed = flip.weight > 0;
-            entry.text << tr("normal flip") << tr("%1 vs %2").arg(label(flip.fiberA), label(flip.fiberB)) << where
-                       << QString()
-                       << tr("%1 of %2 links disagree")
-                              .arg(qlonglong(flip.residual))
-                              .arg(qlonglong(flip.residual + flip.weight))
-                       << QString() << QString() << QString() << QString() << QString()
-                       << (bracketed ? QString::number(length, 'f', 0) : QString()) << QString();
-            flipEntries.push_back(std::move(entry));
-        }
-        entries.insert(entries.begin(), std::make_move_iterator(flipEntries.begin()),
-                       std::make_move_iterator(flipEntries.end()));
-    }
     // The rows are kept beside the items: an item carries only its index, so
     // every column is free to show what it means rather than a payload.
     const auto append = [this](QTreeWidgetItem* parent, const Row& row, const QStringList& text) {
         auto* item = new RankingItem(text);
         if (parent) parent->addChild(item); else _tree->addTopLevelItem(item);
-        item->setData(kKindColumn, Qt::UserRole, qlonglong(_rows.size()));
+        item->setData(kGeometryColumn, Qt::UserRole, qlonglong(_rows.size()));
         // Numeric sort keys for the columns a header click orders by; the
         // text of those columns is formatted for reading.
         const auto number = [&](int column, double value) {
@@ -1822,37 +1740,23 @@ void ScaffoldApprovalPanel::rebuild()
         };
         number(kCostColumn, row.keys.cost);
         number(kDensityColumn, row.keys.density);
-        number(kJointColumn, row.keys.cycle > 0 ? row.keys.cost / double(row.keys.cycle) : 0.);
-        number(kCycleColumn, row.keys.cycle > 0 ? double(row.keys.cycle) : 1e18);
         number(kLengthColumn, row.keys.length);
+        number(kGeometryColumn, row.approvedShare[0]);
+        number(kNormalsColumn, row.approvedShare[1]);
+        number(kReviewedColumn, row.reviewedShare);
+        number(kViolatedColumn, row.violated);
+        number(kSignColumn, row.signViolated);
         _rows.push_back(row);
         return item;
     };
-    std::int64_t constraintRows = 0, pieceRows = 0, blocked = 0, approvedRows = 0;
-    for (const auto& entry : entries) {
-        if (entry.row.kind == Row::Kind::Piece) ++pieceRows; else ++constraintRows;
-        auto* item = append(nullptr, entry.row, entry.text);
-        if (entry.text.value(kStateColumn) == tr("blocked")) ++blocked;
-        if (entry.text.value(kStateColumn) == tr("approved")) ++approvedRows;
-        for (const auto& [row, text] : entry.children) append(item, row, text);
-    }
+    for (const auto& entry : entries) append(nullptr, entry.row, entry.text);
     _tree->setSortingEnabled(true);
     for (int column = 0; column < kColumnCount - 1; ++column) _tree->resizeColumnToContents(column);
-    const auto counts = filter >= 0
-        ? tr("%1 violated constraints and %2 accused stretches of component %3, of %4 and %5 in the whole solve")
-              .arg(constraintRows)
-              .arg(pieceRows)
-              .arg(filter)
-              .arg(view->residuals.size())
-              .arg(segments.size())
-        : tr("%1 normal flip suspects, %2 violated constraints, %3 geometry and %4 normals stretches to look at")
-              .arg(view->flips.size())
-              .arg(view->residuals.size())
-              .arg(segments.size())
-              .arg(turnRows);
-    _summaryLabel->setText(counts + tr("; %1 approved, %2 blocked by unapproved geometry")
-                                        .arg(approvedRows)
-                                        .arg(blocked));
+    _summaryLabel->setText(filter >= 0
+        ? tr("%1 stretches to approve in component %2; the solve left %3 constraints violated")
+              .arg(entries.size()).arg(filter).arg(view->residuals.size())
+        : tr("%1 stretches to approve; the solve left %2 constraints violated")
+              .arg(entries.size()).arg(view->residuals.size()));
     _rebuilding = false;
     applySelection();
 }
@@ -1860,7 +1764,7 @@ void ScaffoldApprovalPanel::rebuild()
 const ScaffoldApprovalPanel::Row* ScaffoldApprovalPanel::rowOf(const QTreeWidgetItem* item) const
 {
     if (!item) return nullptr;
-    const auto index = item->data(kKindColumn, Qt::UserRole).toLongLong();
+    const auto index = item->data(kGeometryColumn, Qt::UserRole).toLongLong();
     if (index < 0 || std::size_t(index) >= _rows.size()) return nullptr;
     return &_rows[std::size_t(index)];
 }
@@ -1877,27 +1781,6 @@ void ScaffoldApprovalPanel::applySelection()
 {
     if (_rebuilding) return;
     const auto items = _tree->selectedItems();
-    // The approve button follows the selection: a measured crossing can be
-    // approved or revoked, and only while both pieces it lies on are
-    // approved geometry. A link and a stretch cannot be approved here.
-    const auto* residual = items.isEmpty() ? nullptr : residualOf(items.front());
-    const bool measured = residual && residual->edgeUuid.empty();
-    const bool approved = measured && _controller && _controller->constraintApproved(*residual);
-    bool pieces = false;
-    if (measured) {
-        const auto spans = coveringSpans(*residual);
-        pieces = spans[0].geometryApproved && spans[1].geometryApproved;
-    }
-    _approveButton->setEnabled(measured && (approved || pieces));
-    _approveButton->setText(approved ? tr("Revoke approval") : tr("Approve constraint"));
-    if (measured && !approved && !pieces)
-        _approveButton->setToolTip(tr("Both pieces this crossing lies on have to be approved for geometry\n"
-                                      "first: they are the rows under it, and a double-click opens one."));
-    else
-        _approveButton->setToolTip(tr("Record that this measured crossing is right. An approved constraint is\n"
-                                      "held rigid by the next solve, and the record is invalidated if either\n"
-                                      "fiber's covering span is edited or its approval revoked. A link is not\n"
-                                      "approved here: its approval is its review state in the annotation."));
     if (items.isEmpty()) {
         emit highlightRequested({});
         return;

@@ -254,11 +254,10 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("links_with_crossing", result.linkReport.linksWithCrossing, "links");
     count("crossings_replaced_by_links", result.linkReport.deduplicatedCrossings, "crossings");
     metric("link_refinement_max_shift", result.linkReport.maxRefinementShift, "voxels");
-    if (stages.signSuspectReport) {
-        count("sign_violations", stages.signSuspectReport->violations, "constraints");
-        count("sign_suspects", stages.signSuspectReport->suspects, "stretches");
-        count("sign_suspects_without_crossing", stages.signSuspectReport->withoutCrossing, "fiber sides");
-        count("sign_suspects_approved", stages.signSuspectReport->approved, "fiber sides");
+    if (stages.stretchReport) {
+        count("stretch_violations", stages.stretchReport->violations, "constraints");
+        count("stretches", stages.stretchReport->suspects, "stretches");
+        count("stretches_without_crossing", stages.stretchReport->withoutCrossing, "fiber sides");
     }
     if (stages.flipReport) {
         count("normal_order_links_checked", stages.flipReport->checked, "links");
@@ -325,6 +324,12 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         count("enclosure_one_sided", stages.measured->enclosureOneSided, "fiber_pairs");
         count("enclosure_contradictory", stages.measured->enclosureContradictory, "fiber_pairs");
         count("enclosure_nonunique", stages.measured->enclosureNonunique, "fiber_pairs");
+        count("crossings_stated_direct", stages.measured->statedDirect, "crossings");
+        count("crossings_stated_distant_kept", stages.measured->statedDistantKept, "crossings");
+        count("crossings_stated_distant_dropped", stages.measured->statedDistantDropped, "crossings");
+        count("crossings_stated_without_sign", stages.measured->statedWithoutSign, "crossings");
+        count("crossings_stated_rigid", stages.measured->statedRigid, "constraints");
+        count("crossings_stated_without_pieces", stages.measured->statedWithoutPieces, "constraints");
     }
     if (stages.signs) {
         count("sign_events", stages.signs->events, "events");
@@ -347,7 +352,6 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         count("constraint_approval_rows", stages.approvals->live, "rows");
         count("constraint_approvals_applied", stages.approvals->approved, "constraints");
         count("constraint_approvals_stale", stages.approvals->stale, "rows");
-        count("constraint_approvals_without_pieces", stages.approvals->withoutPieces, "rows");
     }
     add(FiberGraphTable::Metrics, std::move(metrics));
 
@@ -432,20 +436,20 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
                  {"score", nullValue()}}).values);
         }
     }
-    if (stages.signSuspects) {
+    if (stages.stretches) {
         const auto first = std::int64_t(result.residuals.size() + (stages.flips ? stages.flips->size() : 0));
-        for (std::size_t at = 0; at < stages.signSuspects->size(); ++at) {
-            const auto& suspect = (*stages.signSuspects)[at];
+        for (std::size_t at = 0; at < stages.stretches->size(); ++at) {
+            const auto& suspect = (*stages.stretches)[at];
             const auto rank = first + std::int64_t(at);
             const auto fiber = uuidValue(graph.fibers[std::size_t(suspect.fiber)].uuid);
             residuals.push_back(objects::fiberGraphSolveRow(FiberGraphTable::Residuals,
                 {{"run_uuid", uuidValue(record.runUuid)},
                  {"residual_index", rank},
-                 {"kind", kScaffoldSignSuspectRowKind},
+                 {"kind", kScaffoldStretchRowKind},
                  {"fiber_a", fiber},
                  {"fiber_b", uuidValue(graph.fibers[std::size_t(suspect.other)].uuid)},
                  {"target", suspect.violations},
-                 {"weight", double(suspect.crossings)},
+                 {"weight", double(suspect.constraints)},
                  {"residual", suspect.cost},
                  {"edge_uuid", nullValue()},
                  {"arc_a", suspect.arc},
@@ -463,6 +467,28 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
                  {"control_from", suspect.piece.controlFrom >= 0 ? ExtensionValue{suspect.piece.controlFrom} : nullValue()},
                  {"control_to", suspect.piece.controlTo >= 0 ? ExtensionValue{suspect.piece.controlTo} : nullValue()},
                  {"score", nullValue()}}).values);
+        }
+    }
+    if (stages.crossings) {
+        const auto first = std::int64_t(result.residuals.size() + (stages.flips ? stages.flips->size() : 0) +
+                                        (stages.stretches ? stages.stretches->size() : 0));
+        for (std::size_t at = 0; at < stages.crossings->size(); ++at) {
+            const auto& crossing = (*stages.crossings)[at];
+            residuals.push_back(objects::fiberGraphSolveRow(FiberGraphTable::Residuals,
+                {{"run_uuid", uuidValue(record.runUuid)},
+                 {"residual_index", first + std::int64_t(at)},
+                 {"kind", kScaffoldCrossingRowKind},
+                 {"fiber_a", uuidValue(graph.fibers[std::size_t(crossing.a)].uuid)},
+                 {"fiber_b", uuidValue(graph.fibers[std::size_t(crossing.b)].uuid)},
+                 {"target", crossing.estimateHalves},
+                 {"weight", crossing.signKnown ? 1. : 0.},
+                 {"residual", std::isfinite(crossing.distance) ? crossing.distance : -1.},
+                 {"edge_uuid", nullValue()},
+                 {"arc_a", crossing.arcA},
+                 {"arc_b", crossing.arcB},
+                 {"cycle_hops", nullValue()},
+                 {"cycle_piece_length", nullValue()},
+                 {"redundancy", nullValue()}}).values);
         }
     }
     add(FiberGraphTable::Residuals, std::move(residuals));
@@ -524,7 +550,9 @@ std::vector<ScaffoldStoredRun> readScaffoldRuns(const objects::StoreReader& read
         const Columns residuals(FiberGraphTable::Residuals);
         scanRun(reader, FiberGraphTable::Residuals, entry.runUuid, [&](const ExtensionRow& row) {
             const auto kind = residuals.integer(row, "kind");
-            if (kind != kScaffoldNormalFlipRowKind && kind != kScaffoldSignSuspectRowKind) ++entry.residuals;
+            if (kind != kScaffoldNormalFlipRowKind && kind != kScaffoldStretchRowKind &&
+                kind != kScaffoldCrossingRowKind)
+                ++entry.residuals;
         });
     }
     return out;
@@ -548,10 +576,28 @@ std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::Store
     return readResidualRows(reader, runUuid, kScaffoldNormalFlipRowKind);
 }
 
-std::vector<ScaffoldStoredResidual> readScaffoldSignSuspects(const objects::StoreReader& reader,
+std::vector<ScaffoldStoredResidual> readScaffoldStretches(const objects::StoreReader& reader,
                                                             const std::string& runUuid)
 {
-    return readResidualRows(reader, runUuid, kScaffoldSignSuspectRowKind);
+    return readResidualRows(reader, runUuid, kScaffoldStretchRowKind);
+}
+
+std::vector<ScaffoldStoredCrossing> readScaffoldCrossings(const objects::StoreReader& reader,
+                                                          const std::string& runUuid)
+{
+    std::vector<ScaffoldStoredCrossing> out;
+    for (const auto& row : readResidualRows(reader, runUuid, kScaffoldCrossingRowKind)) {
+        ScaffoldStoredCrossing crossing;
+        crossing.fiberA = row.fiberA;
+        crossing.fiberB = row.fiberB;
+        crossing.arcA = row.arcA;
+        crossing.arcB = row.arcB;
+        crossing.estimateHalves = row.target;
+        crossing.signKnown = row.weight > 0;
+        crossing.distance = row.residual < 0 ? std::numeric_limits<double>::quiet_NaN() : row.residual;
+        out.push_back(std::move(crossing));
+    }
+    return out;
 }
 
 namespace {
@@ -566,7 +612,8 @@ std::vector<ScaffoldStoredResidual> readResidualRows(const objects::StoreReader&
         ScaffoldStoredResidual entry;
         entry.index = columns.integer(row, "residual_index");
         entry.kind = columns.integer(row, "kind");
-        const bool suspect = entry.kind == kScaffoldNormalFlipRowKind || entry.kind == kScaffoldSignSuspectRowKind;
+        const bool suspect = entry.kind == kScaffoldNormalFlipRowKind || entry.kind == kScaffoldStretchRowKind ||
+                             entry.kind == kScaffoldCrossingRowKind;
         if (suspects == 0 ? suspect : entry.kind != suspects) return;
         entry.target = columns.integer(row, "target");
         entry.fiberA = columns.uuid(row, "fiber_a");

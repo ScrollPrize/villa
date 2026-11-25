@@ -569,20 +569,33 @@ contradict each other stop the run instead of being averaged).
 Nothing is held rigid over geometry nobody reviewed. Whatever states the
 approval, a constraint only counts as approved when the two pieces its anchors
 lie on are *currently* approved for geometry
-(`scaffoldConstraintPiecesApproved`). That covers both kinds: a link whose
-record says approved but whose pieces are not counts as an ordinary link and
-is reported as `link_approved_without_pieces`, and a measured crossing with a
-live approval row whose pieces have since been revoked is reported as
-`constraint_approvals_without_pieces`. A link's approval is otherwise its
-record's review state. A measured crossing has no record, so
-its approval is a row of `ext_fiber_constraint_approval`, keyed by the two
-fibers, the kind and the two anchors quantized to 64 base voxels, and carrying
-the span fingerprints (`fiberSpanHash`) of the two covering spans. `applyScaffoldConstraintApprovals`
-marks the constraints a live row covers, and skips a row whose spans have been
-edited since: the annotation moved under it, so the decision is no longer
-about what is there now. Re-running the extraction does not lose an approval -
-the crossing lands in the same quantum - but editing either fiber's covering
-span does.
+(`scaffoldConstraintPiecesApproved`). A link whose record says approved but
+whose pieces are not counts as an ordinary link and is reported as
+`link_approved_without_pieces`. A link's approval is otherwise its record's
+review state.
+
+A measured crossing has no record, so what a reviewer states about it is a row
+of `ext_fiber_constraint_approval`, keyed by the two fibers, the kind and the
+two anchors quantized to 64 base voxels, and carrying the span fingerprints
+(`fiberSpanHash`) of the two covering spans. The row states a distance only -
+direct neighbour or distant - never which fiber lies outside.
+`scaffoldCrossingApprovals` reads what the live rows state per crossing and
+skips a row whose spans have been edited since. `scaffoldMeasuredConstraints`
+applies it:
+
+- direct: the separation is the perpendicular offset, whatever was measured
+  (with no known side nothing can be stated, `crossings_stated_without_sign`);
+- distant, measurement not direct either: the measurement is kept;
+- distant, measurement direct or missing: the separation is dropped;
+- distant, always: the sign bound moves one winding out.
+
+A reviewed separation takes the full perpendicular weight and is held rigid
+where both pieces are approved geometry (`crossings_stated_rigid`, otherwise
+`crossings_stated_without_pieces`). Re-running the extraction does not lose a
+row - the crossing lands in the same quantum - but editing either fiber's
+covering span does. The run stores its perpendicular crossings (residual row
+kind 18: the measured separation and whether the side is known), which is
+what the approval window lists.
 
 ## In the fiber map
 
@@ -667,7 +680,7 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   fiber nothing accuses has no row.
 
   **Normals** rows come from the violated sign constraints
-  (`scaffoldSignSuspects`). A sign constraint the solve had to break says a
+  (`scaffoldStretches`). A sign constraint the solve had to break says a
   normal is wrong at that crossing, on one of its two fibers. An annotation
   states a normal without a facing, so the row always reaches from that
   crossing to at least one other crossing of the same fiber (the nearest,
@@ -678,7 +691,7 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   *state* their number and *paths* the fiber's crossings on it. A row whose
   stretch is approved for normals from end to end is not offered, which
   leaves the other fiber. A fiber with no other crossing has no row; the run
-  counts those (`sign_suspects_without_crossing`).
+  counts those (`stretches_without_crossing`).
 
   What a run accuses outside a fiber's present control points stays a row
   without a control range, and selecting it is an error that says the run is
@@ -712,20 +725,14 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   look at, and how many of that fiber's links disagree with its normal.
   Activating one opens the stretch, as for any other stretch.
 
-  The *state* column reads `approved`, `approvable` (both pieces approved),
-  `blocked` (they are not) or `link`, and **Approve constraint** is enabled
-  only for an approvable or an approved crossing - a constraint is a statement
-  about two pieces of geometry, and pinning a solve to geometry nobody
-  reviewed is what the workflow is meant to prevent. The write refuses the
-  same case regardless of the button, and the refusal appears on its own line
-  below the counts. A link is never approved here: a link's approval is its
-  review state in the annotation.
+  The *state* column reads `reviewed` (the crossing's neighbour state was set
+  in the approval window), `sign` or `link`. A link is never approved here: a
+  link's approval is its review state in the annotation.
 
 A run records what its approvals actually fixed:
 `constraint_approval_rows` (live rows), `constraint_approvals_applied`,
 `constraint_approvals_stale` (the covering spans were edited),
-`constraint_approvals_without_pieces` (the pieces are no longer approved) and
-`link_approved_without_pieces`.
+the `crossings_stated_*` counts above and `link_approved_without_pieces`.
 
 Halos are reserved for the selection - the fiber list's and the approval
 dock's - so what the map says about a fiber's own geometry stays what it always

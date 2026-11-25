@@ -62,9 +62,11 @@ struct ScaffoldRunStages {
     const std::vector<ScaffoldNormalFlip>* flips = nullptr;
     const ScaffoldNormalFlipReport* flipReport = nullptr;
     // The stretches to look at for the violated sign constraints
-    // (scaffoldSignSuspects).
-    const std::vector<ScaffoldSignSuspect>* signSuspects = nullptr;
-    const ScaffoldSignSuspectReport* signSuspectReport = nullptr;
+    // (scaffoldStretches).
+    const std::vector<ScaffoldStretch>* stretches = nullptr;
+    const ScaffoldStretchReport* stretchReport = nullptr;
+    // The perpendicular crossings the run assembled (scaffoldMeasuredConstraints).
+    const std::vector<ScaffoldCrossing>* crossings = nullptr;
 };
 
 // A normal flip suspect is stored beside the residuals, as a row of this kind
@@ -73,13 +75,20 @@ struct ScaffoldRunStages {
 // `residual` and `weight` the suspected fiber's disagreeing and agreeing
 // links, and one piece row for the stretch to look at.
 inline constexpr std::int64_t kScaffoldNormalFlipRowKind = 16;
-// A sign suspect, stored the same way after the flips: fiber_a the suspected
-// fiber and arc_a its crossing of the (worst) violated sign constraint,
-// fiber_b / arc_b that constraint's other fiber, `residual` the summed cost of
-// the violated sign constraints on the stretch, `weight` the fiber's crossings
-// on it, `target` the number of those violations, and one piece row for the
-// stretch to look at.
-inline constexpr std::int64_t kScaffoldSignSuspectRowKind = 17;
+// A stretch to approve (scaffoldStretches), stored the same way after the
+// flips: fiber_a the stretch's fiber and arc_a its anchor of the worst
+// violated constraint, fiber_b / arc_b that constraint's other fiber,
+// `residual` the summed cost of the violated constraints on the stretch,
+// `target` their number, `weight` the number of all constraints anchored on
+// it, and one piece row for the stretch itself.
+inline constexpr std::int64_t kScaffoldStretchRowKind = 17;
+// A perpendicular crossing of the run, stored after the suspects: the two
+// fibers and anchors, `target` the separation the measurement rounds to in
+// half windings (0 for none), `residual` the measured separation in turns
+// (-1 for none), and `weight` 1 when the normals state which fiber lies
+// outside. It is what the approval window lists; the state a reviewer gave it
+// is the constraint approval row, not this.
+inline constexpr std::int64_t kScaffoldCrossingRowKind = 18;
 
 // The rows of one solve. `method` names the backend the result came from.
 ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph&, const ScaffoldSolveResult&, const ScaffoldSolveOptions&,
@@ -124,8 +133,18 @@ struct ScaffoldStoredResidual {
 std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreReader&, const std::string& runUuid);
 // The run's normal flip suspects (kScaffoldNormalFlipRowKind), in stored order.
 std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::StoreReader&, const std::string& runUuid);
-// The run's sign suspects (kScaffoldSignSuspectRowKind), highest cost first.
-std::vector<ScaffoldStoredResidual> readScaffoldSignSuspects(const objects::StoreReader&, const std::string& runUuid);
+// The run's sign suspects (kScaffoldStretchRowKind), highest cost first.
+std::vector<ScaffoldStoredResidual> readScaffoldStretches(const objects::StoreReader&, const std::string& runUuid);
+
+// The run's perpendicular crossings (kScaffoldCrossingRowKind).
+struct ScaffoldStoredCrossing {
+    std::string fiberA, fiberB;
+    double arcA = 0, arcB = 0;
+    double distance = 0; // turns; NaN when none was measured
+    std::int64_t estimateHalves = 0;
+    bool signKnown = false;
+};
+std::vector<ScaffoldStoredCrossing> readScaffoldCrossings(const objects::StoreReader&, const std::string& runUuid);
 
 // The strip normals a run used for one fiber (XYZ per annotated line point),
 // by the run's own reference to its normals row - never a search among a

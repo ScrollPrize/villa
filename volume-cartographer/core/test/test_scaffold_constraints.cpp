@@ -990,7 +990,7 @@ TEST_CASE("a scaffold's measured relations are the ones the bulk assembly builds
     CHECK(measuredReport.used == std::int64_t(columns.used));
 }
 
-TEST_CASE("an approval row marks the measured constraint it names")
+TEST_CASE("a reviewed crossing states its distance, never its side")
 {
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
@@ -999,65 +999,112 @@ TEST_CASE("an approval row marks the measured constraint it names")
     scaffold.faceOutward(vertical);
     const ScaffoldGeometry geometry(scaffold.graph);
     const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
-    ScaffoldEventReport report;
-    const auto events = scaffoldEvents(scaffold.graph, geometry, normals, {}, constantDistance(1.), report);
-    ScaffoldMeasuredReport measuredReport;
-    auto measured = scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kOutwardSigns, unitWeights(), measuredReport);
-    REQUIRE_FALSE(measured.empty());
-    for (const auto& constraint : measured) CHECK_FALSE(constraint.approved);
+    auto options = unitWeights();
+    options.signWeight = 100.;
+    options.separations = ScaffoldSeparationMode::Rounded;
+    struct Stated {
+        std::optional<ScaffoldConstraint> separation, sign;
+        ScaffoldMeasuredReport report;
+        std::vector<ScaffoldCrossing> crossings;
+    };
+    const auto state = [&](double distance, ScaffoldNeighbour review) {
+        ScaffoldEventReport report;
+        const auto events = scaffoldEvents(scaffold.graph, geometry, normals, {}, constantDistance(distance), report);
+        REQUIRE_FALSE(events.empty());
+        const std::vector<ScaffoldNeighbour> stated(events.size(), review);
+        Stated out;
+        for (const auto& constraint : scaffoldMeasuredConstraints(scaffold.graph, geometry, events, kOutwardSigns,
+                                                                  options, out.report, stated, &out.crossings)) {
+            if (constraint.event != 0) continue;
+            (scaffoldConstraintSide(constraint.kind) != 0 ? out.sign : out.separation) = constraint;
+        }
+        return out;
+    };
+    // Measured one sheet over (1.6 turns rounds to 1.5).
+    const auto measured = state(1.6, ScaffoldNeighbour::Undecided);
+    REQUIRE(measured.separation);
+    REQUIRE(measured.sign);
+    REQUIRE_FALSE(measured.crossings.empty());
+    CHECK(measured.crossings.front().estimateHalves == 3);
+    CHECK(measured.crossings.front().signKnown);
+    CHECK_FALSE(measured.separation->approved);
+    const auto side = scaffoldConstraintSide(measured.sign->kind);
 
-    const auto row = approveScaffoldConstraint(scaffold.graph, geometry, measured.front(), "alice",
-                                               "2026-11-17T10:00:00Z", "host-a");
-    const auto identity = scaffoldConstraintIdentity(scaffold.graph, measured.front());
-    CHECK(row.identity == identity);
-    CHECK(row.identity.fiberA < row.identity.fiberB);
+    // Direct: the separation sits on the sign bound, whatever was measured.
+    const auto direct = state(1.6, ScaffoldNeighbour::Direct);
+    REQUIRE(direct.separation);
+    REQUIRE(direct.sign);
+    CHECK(direct.separation->target == direct.sign->target);
+    CHECK(direct.sign->target == measured.sign->target);
+    CHECK(direct.sign->kind == measured.sign->kind);
+    CHECK(direct.report.statedDirect >= 1);
+    // Used, but not held rigid over geometry nobody approved.
+    CHECK_FALSE(direct.separation->approved);
+    CHECK(direct.report.statedWithoutPieces >= 1);
 
-    ScaffoldApprovalReport approvals;
-    // The row alone approves nothing while the pieces it lies on are not
-    // approved geometry.
-    applyScaffoldConstraintApprovals(scaffold.graph, geometry, measured, {&row, 1}, approvals);
-    CHECK(approvals.live == 1);
-    CHECK(approvals.approved == 0);
-    CHECK(approvals.withoutPieces >= 1);
-    CHECK_FALSE(measured.front().approved);
+    // Distant, and the measurement says so too: the measurement is kept and
+    // the bound moves one winding out.
+    const auto distant = state(1.6, ScaffoldNeighbour::Distant);
+    REQUIRE(distant.separation);
+    REQUIRE(distant.sign);
+    CHECK(distant.separation->target == measured.separation->target);
+    CHECK(distant.sign->target == measured.sign->target + side);
+    CHECK(distant.report.statedDistantKept >= 1);
 
-    // With the geometry approved at both anchors it applies.
-    const auto approveAll = [&](std::int64_t fiber) {
+    // Distant against a measurement of a direct neighbour: how far is not
+    // known, so only the moved bound is left.
+    const auto near = state(0.5, ScaffoldNeighbour::Undecided);
+    REQUIRE(near.sign);
+    CHECK(near.crossings.front().estimateHalves == 1);
+    const auto dropped = state(0.5, ScaffoldNeighbour::Distant);
+    CHECK_FALSE(dropped.separation);
+    REQUIRE(dropped.sign);
+    CHECK(dropped.sign->target == near.sign->target + side);
+    CHECK(dropped.report.statedDistantDropped >= 1);
+    CHECK_FALSE(dropped.crossings.front().separation);
+
+    // With the geometry approved at both anchors the reviewed separation is held.
+    for (const auto fiber : {measured.separation->a, measured.separation->b}) {
         auto& entry = scaffold.graph.fibers[std::size_t(fiber)];
         entry.approval.approvedGeometry = {{0., double(entry.pointCount - 1)}};
-    };
-    approveAll(measured.front().a);
-    approveAll(measured.front().b);
-    applyScaffoldConstraintApprovals(scaffold.graph, geometry, measured, {&row, 1}, approvals);
-    CHECK(approvals.live == 1);
-    CHECK(approvals.approved >= 1);
-    CHECK(approvals.unmatched == 0);
-    CHECK(measured.front().approved);
+    }
+    CHECK(state(1.6, ScaffoldNeighbour::Direct).separation->approved);
 
-    // A revoked row approves nothing, and the one it revoked is not live.
+    // The store row: what it states per event, a revocation, and an edit of
+    // a covering span.
+    ScaffoldEventReport report;
+    const auto events = scaffoldEvents(scaffold.graph, geometry, normals, {}, constantDistance(1.6), report);
+    const auto row = approveScaffoldConstraint(scaffold.graph, geometry, *measured.separation,
+                                               vc::objects::FiberConstraintDistance::Distant, "alice",
+                                               "2026-11-17T10:00:00Z", "host-a");
+    CHECK(row.identity == scaffoldConstraintIdentity(scaffold.graph, *measured.separation));
+    CHECK(row.identity.fiberA < row.identity.fiberB);
+    ScaffoldApprovalReport approvals;
+    auto stated = scaffoldCrossingApprovals(scaffold.graph, geometry, events, {&row, 1}, approvals);
+    CHECK(approvals.live == 1);
+    CHECK(approvals.approved == 1);
+    CHECK(approvals.unmatched == 0);
+    CHECK(stated.at(0) == ScaffoldNeighbour::Distant);
+
     const auto revoked = vc::objects::revokeFiberConstraintApproval(row, "bob", "2026-11-17T11:00:00Z");
     const std::vector<vc::objects::FiberConstraintApproval> both{row, revoked};
-    for (auto& constraint : measured) constraint.approved = false;
-    applyScaffoldConstraintApprovals(scaffold.graph, geometry, measured, both, approvals);
+    stated = scaffoldCrossingApprovals(scaffold.graph, geometry, events, both, approvals);
     CHECK(approvals.rows == 2);
     CHECK(approvals.live == 0);
-    CHECK(approvals.approved == 0);
-    CHECK_FALSE(measured.front().approved);
+    CHECK(stated.at(0) == ScaffoldNeighbour::Undecided);
 
-    // Moving a line point of the covering span invalidates the approval.
     Scaffold moved = scaffold;
-    const auto spans = scaffoldConstraintSpans(scaffold.graph, geometry, measured.front());
+    const auto spans = scaffoldConstraintSpans(scaffold.graph, geometry, *measured.separation);
     REQUIRE(spans);
-    const auto& fiber = moved.graph.fibers[std::size_t(measured.front().a)];
+    const auto& fiber = moved.graph.fibers[std::size_t(measured.separation->a)];
     const auto line = std::size_t(fiber.content.controlLineIndex.at(spans->spanA));
     moved.graph.linePoints[3 * (std::size_t(fiber.pointFirst) + line) + 2] += 0.5;
     const ScaffoldGeometry movedGeometry(moved.graph);
-    for (auto& constraint : measured) constraint.approved = false;
-    applyScaffoldConstraintApprovals(moved.graph, movedGeometry, measured, {&row, 1}, approvals);
+    stated = scaffoldCrossingApprovals(moved.graph, movedGeometry, events, {&row, 1}, approvals);
     CHECK(approvals.live == 1);
     CHECK(approvals.approved == 0);
     CHECK(approvals.stale == 1);
-    CHECK_FALSE(measured.front().approved);
+    CHECK(stated.at(0) == ScaffoldNeighbour::Undecided);
 }
 
 TEST_CASE("a prediction's sheet axis pulls the strip normals")
@@ -1143,7 +1190,7 @@ TEST_CASE("the neighbour normals face a fiber whose normals are approved, and an
     }
 }
 
-TEST_CASE("a violated sign constraint is tied to at least one other crossing of each fiber")
+TEST_CASE("a stretch ties a violated constraint to other crossings of its fiber")
 {
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 110., 0., 90));
@@ -1173,10 +1220,12 @@ TEST_CASE("a violated sign constraint is tied to at least one other crossing of 
     residual.cost = 50.;
     result.residuals.push_back(residual);
 
-    ScaffoldSignSuspectOptions narrow;
+    ScaffoldStretchOptions narrow;
     narrow.joinVx = 0.;
-    ScaffoldSignSuspectReport report;
-    auto suspects = scaffoldSignSuspects(scaffold.graph, geometry, result, narrow, report);
+    narrow.minStretchVx = 0.;
+    narrow.marginVx = 0.;
+    ScaffoldStretchReport report;
+    auto suspects = scaffoldStretches(scaffold.graph, geometry, result, narrow, report);
     CHECK(report.violations == 1);
     // The V fiber has no other crossing: nothing ties its normal there.
     CHECK(report.withoutCrossing == 1);
@@ -1192,19 +1241,76 @@ TEST_CASE("a violated sign constraint is tied to at least one other crossing of 
     CHECK(suspects[0].piece.controlTo > suspects[0].piece.controlFrom);
 
     // Close crossings join the stretch.
-    ScaffoldSignSuspectOptions wide;
+    ScaffoldStretchOptions wide;
     wide.joinVx = 1000.;
+    wide.marginVx = 0.;
+    wide.minStretchVx = 0.;
     wide.maxStretchVx = 5000.;
-    suspects = scaffoldSignSuspects(scaffold.graph, geometry, result, wide, report);
+    suspects = scaffoldStretches(scaffold.graph, geometry, result, wide, report);
     REQUIRE(suspects.size() == 1);
     CHECK(suspects[0].piece.arcFrom == doctest::Approx(arcs[0]));
     CHECK(suspects[0].crossings == 3);
 
-    // Normals approved over the whole stretch: this fiber is settled there.
-    const double from = double(geometry.lineIndexAt(horizontal, arcs[1])) - 1.;
-    const double to = double(geometry.lineIndexAt(horizontal, arcs[2])) + 1.;
-    scaffold.graph.fibers[horizontal].approval.approvedNormals = {{from, to}};
-    suspects = scaffoldSignSuspects(scaffold.graph, geometry, result, narrow, report);
-    CHECK(suspects.empty());
-    CHECK(report.approved == 1);
+    // The minimum length takes further crossings in, whatever their distance.
+    ScaffoldStretchOptions longer = narrow;
+    longer.minStretchVx = arcs[2] - arcs[1] + 1.;
+    longer.maxStretchVx = 5000.;
+    suspects = scaffoldStretches(scaffold.graph, geometry, result, longer, report);
+    REQUIRE(suspects.size() == 1);
+    CHECK(suspects[0].piece.arcFrom == doctest::Approx(arcs[0]));
+    CHECK(suspects[0].crossings == 3);
+
+    // A stretch reaches past its outer crossings, within the fiber.
+    ScaffoldStretchOptions padded = narrow;
+    padded.marginVx = 10.;
+    suspects = scaffoldStretches(scaffold.graph, geometry, result, padded, report);
+    REQUIRE(suspects.size() == 1);
+    CHECK(suspects[0].piece.arcFrom == doctest::Approx(arcs[1] - 10.));
+    CHECK(suspects[0].piece.arcTo == doctest::Approx(arcs[2] + 10.));
+    padded.marginVx = 1e6;
+    suspects = scaffoldStretches(scaffold.graph, geometry, result, padded, report);
+    REQUIRE(suspects.size() == 1);
+    CHECK(suspects[0].piece.arcFrom == doctest::Approx(0.));
+
+    // A violated separation on the stretch adds its cost.
+    ScaffoldResidual separation;
+    separation.constraint = 1;
+    separation.residual = 1;
+    separation.cost = 7.;
+    result.residuals.push_back(separation);
+    suspects = scaffoldStretches(scaffold.graph, geometry, result, wide, report);
+    REQUIRE(suspects.size() == 1);
+    CHECK(suspects[0].cost == doctest::Approx(57.));
+    CHECK(suspects[0].violations == 2);
+    result.residuals.pop_back();
+
+    // An approved stretch is fixed: the violated constraint on it lists it
+    // exactly as approved, whatever the lengths asked for.
+    {
+        Scaffold approved = scaffold;
+        const double lineFrom = double(geometry.lineIndexAt(horizontal, arcs[1])) + 2.;
+        const double lineTo = double(geometry.lineIndexAt(horizontal, arcs[2])) + 2.;
+        approved.graph.fibers[horizontal].approval.approvedNormals = {{lineFrom, lineTo}};
+        const ScaffoldGeometry approvedGeometry(approved.graph);
+        const auto fixed = scaffoldStretches(approved.graph, approvedGeometry, result, wide, report);
+        REQUIRE(fixed.size() == 1);
+        CHECK(fixed[0].piece.arcFrom == doctest::Approx(approvedGeometry.arcAtLineIndex(horizontal, lineFrom)));
+        CHECK(fixed[0].piece.arcTo == doctest::Approx(approvedGeometry.arcAtLineIndex(horizontal, lineTo)));
+        CHECK(fixed[0].cost == doctest::Approx(50.));
+        // Approved beside the violated crossing instead: the new stretch
+        // stays outside it but for the margin.
+        const double besideTo = double(geometry.lineIndexAt(horizontal, arcs[1])) + 2.;
+        approved.graph.fibers[horizontal].approval.approvedNormals = {{0., besideTo}};
+        ScaffoldStretchOptions margin = wide;
+        margin.marginVx = 5.;
+        const auto beside = scaffoldStretches(approved.graph, approvedGeometry, result, margin, report);
+        REQUIRE(beside.size() == 1);
+        CHECK(beside[0].piece.arcFrom >= approvedGeometry.arcAtLineIndex(horizontal, besideTo) - 5. - 1e-6);
+        CHECK(beside[0].piece.arcTo > arcs[2]);
+    }
+
+    // All three constraints of the fiber lie on the wide stretch.
+    suspects = scaffoldStretches(scaffold.graph, geometry, result, wide, report);
+    REQUIRE(suspects.size() == 1);
+    CHECK(suspects[0].constraints == 3);
 }

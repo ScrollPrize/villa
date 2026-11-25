@@ -58,7 +58,7 @@ void rowsAndValidation()
 {
     const auto a = fixture(), b = fixture(5.);
     const auto identity = fiberConstraintIdentity(fiberLow, 35., fiberHigh, 35., Kind::Perpendicular);
-    const auto row = approveFiberConstraint(identity, a, 3, 7, b, 3, 2, "alice", "2026-11-17T10:00:00Z", "host-a");
+    const auto row = approveFiberConstraint(identity, a, 3, 7, b, 3, 2, FiberConstraintDistance::Direct, "alice", "2026-11-17T10:00:00Z", "host-a");
     require(row.state == State::Approved && !row.supersedes, "a fresh approval supersedes nothing");
     require(row.approvalUuid == row.rowUuid, "the first row of an approval names the event");
     require(row.spanA && row.spanB, "an approval fingerprints both covering spans");
@@ -97,14 +97,14 @@ void rowsAndValidation()
     broken = revoked;
     broken.supersedes.reset();
     mustFail([&] { fiberConstraintApprovalRow(broken); });
-    mustFail([&] { approveFiberConstraint(identity, a, 99, 7, b, 3, 2, "alice", "2026-11-17T10:00:00Z", "host-a"); });
+    mustFail([&] { approveFiberConstraint(identity, a, 99, 7, b, 3, 2, FiberConstraintDistance::Direct, "alice", "2026-11-17T10:00:00Z", "host-a"); });
 }
 
 void currencyFollowsTheCoveringSpans()
 {
     const auto a = fixture(), b = fixture(5.);
     const auto identity = fiberConstraintIdentity(fiberLow, 35., fiberHigh, 35., Kind::Perpendicular);
-    const auto row = approveFiberConstraint(identity, a, 3, 7, b, 3, 2, "alice", "2026-11-17T10:00:00Z", "host-a");
+    const auto row = approveFiberConstraint(identity, a, 3, 7, b, 3, 2, FiberConstraintDistance::Direct, "alice", "2026-11-17T10:00:00Z", "host-a");
     require(fiberConstraintApprovalCurrent(row, a, 3, b, 3), "an untouched pair stays approved");
     auto edited = a;
     edited.linePoints[35] = {35.0, 0.5, 0.0};
@@ -119,7 +119,8 @@ void currencyFollowsTheCoveringSpans()
     require(fiberSpanCoveringLineIndex(a, 35) == size_t{3}, "a line index inside the fourth span resolves to it");
     require(fiberSpanCoveringLineIndex(a, 0) == size_t{0}, "the first line point belongs to the first span");
     require(fiberSpanCoveringLineIndex(a, 70) == size_t{6}, "the last line point belongs to the last span");
-    require(!fiberSpanCoveringLineIndex(a, 71).has_value(), "a line index past the fiber covers no span");
+    require(fiberSpanCoveringLineIndex(a, 71) == size_t{6}, "a line point on a tail belongs to the nearest span");
+    require(!fiberSpanCoveringLineIndex(a, -1).has_value(), "a negative line index covers no span");
 }
 
 void storeRoundTrip()
@@ -128,7 +129,7 @@ void storeRoundTrip()
     const auto path = (directory.path / "constraints.vcobj").string();
     const auto a = fixture(), b = fixture(5.);
     const auto identity = fiberConstraintIdentity(fiberLow, 35., fiberHigh, 35., Kind::Perpendicular);
-    const auto row = approveFiberConstraint(identity, a, 3, 7, b, 3, 2, "alice", "2026-11-17T10:00:00Z", "host-a");
+    const auto row = approveFiberConstraint(identity, a, 3, 7, b, 3, 2, FiberConstraintDistance::Direct, "alice", "2026-11-17T10:00:00Z", "host-a");
     const auto revoked = revokeFiberConstraintApproval(row, "bob", "2026-11-17T11:00:00Z");
     {
         OpenOptions options;

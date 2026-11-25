@@ -27,7 +27,7 @@ class StoreReader;
 
 inline constexpr const char* kFiberConstraintApprovalTable = "ext_fiber_constraint_approval";
 inline constexpr const char* kFiberConstraintApprovalExtension = "fiber-constraint-approval";
-inline constexpr int64_t kFiberConstraintApprovalFormat = 1;
+inline constexpr int64_t kFiberConstraintApprovalFormat = 2;
 // The arc step an anchor is quantized to, in base voxels: the extraction's
 // own event spacing, so one crossing keeps one identity.
 inline constexpr double kFiberConstraintArcQuantum = 64.0;
@@ -36,6 +36,11 @@ inline constexpr double kFiberConstraintArcQuantum = 64.0;
 // them. A manual link is not one of these: its approval is its edge state.
 enum class FiberConstraintKind : int64_t { Perpendicular = 1, Parallel = 2, Enclosure = 3 };
 enum class FiberConstraintApprovalState : int64_t { Approved = 1, Revoked = 2 };
+// What an approval of a crossing states about its two fibers: they lie on
+// neighbouring sheets (half a winding apart, the smallest separation an H and
+// a V fiber can have), or farther apart than that. It says nothing about
+// which of the two lies outside: that is the normals' statement.
+enum class FiberConstraintDistance : int64_t { Direct = 1, Distant = 2 };
 
 // The identity of one measured constraint. `fiberA` sorts before `fiberB`,
 // and the arcs follow that order.
@@ -59,6 +64,7 @@ struct FiberConstraintApproval {
     // derived from it; `rowUuid` is unique per row.
     std::string rowUuid, approvalUuid;
     FiberConstraintApprovalState state = FiberConstraintApprovalState::Approved;
+    FiberConstraintDistance distance = FiberConstraintDistance::Direct;
     std::optional<std::string> supersedes;
     int64_t fiberVersionA = 0, fiberVersionB = 0;
     // The span of each fiber covering its anchor; a revocation carries none.
@@ -72,16 +78,23 @@ ExtensionTable fiberConstraintApprovalTable();
 ExtensionRow fiberConstraintApprovalRow(const FiberConstraintApproval&);
 FiberConstraintApproval decodeFiberConstraintApprovalRow(const ExtensionRow&);
 
-// The span of a fiber that covers an arc position: the span between the two
-// control points around it, by the line index of each control.
+// The span of a fiber that covers a line point: the span between the two
+// control points around it, by the line index of each control. A line point
+// on a tail (past the first or last control point) belongs to the nearest
+// span. Nullopt only for a fiber without two placed control points.
 std::optional<size_t> fiberSpanCoveringLineIndex(const FiberPieceContent&, int64_t lineIndex);
+
+// The fingerprint of one span of a fiber as the store holds it. Throws
+// std::invalid_argument when the span index is outside the fiber.
+FiberSpanFingerprint fiberSpanFingerprint(const FiberPieceContent&, size_t span);
 
 // A fresh approval row for one constraint, fingerprinted over both fibers.
 // Throws std::invalid_argument when a span index is outside its fiber.
 FiberConstraintApproval approveFiberConstraint(const FiberConstraintIdentity&, const FiberPieceContent& a,
                                                size_t spanA, int64_t fiberVersionA, const FiberPieceContent& b,
-                                               size_t spanB, int64_t fiberVersionB, const std::string& author,
-                                               const std::string& approvedAt, const std::string& host);
+                                               size_t spanB, int64_t fiberVersionB, FiberConstraintDistance,
+                                               const std::string& author, const std::string& approvedAt,
+                                               const std::string& host);
 FiberConstraintApproval revokeFiberConstraintApproval(const FiberConstraintApproval& live,
                                                       const std::string& changedBy, const std::string& now);
 

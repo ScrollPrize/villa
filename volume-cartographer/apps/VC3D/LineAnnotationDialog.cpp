@@ -2335,6 +2335,8 @@ void LineAnnotationDialog::setApprovalMode(bool approval)
     _tagRowWidget->hide();
     _fiberWidthSpin->setEnabled(true);
     _fiberWidthSpin->setToolTip(tr("Shown width in this window only; it is not saved to the fiber."));
+    // The side strip pans up and down here (see where the strips are built).
+    if (_stripViewers.size() > 1 && _stripViewers[1]) _stripViewers[1]->setPinnedSurfaceY(std::nullopt);
 }
 
 void LineAnnotationDialog::showLinePosition(double linePosition)
@@ -2342,6 +2344,24 @@ void LineAnnotationDialog::showLinePosition(double linePosition)
     if (!_hasGeneratedViews) return;
     setCurrentLinePosition(linePosition);
     centerStripsOnLinePosition(linePosition, true);
+}
+
+void LineAnnotationDialog::showLineRange(double from, double to)
+{
+    if (!_hasGeneratedViews || !(to > from)) return;
+    const double middle = 0.5 * (from + to);
+    setCurrentLinePosition(middle);
+    // The strips share position and zoom: the range fills them, centred.
+    for (const auto& stripViewer : _stripViewers) {
+        if (!stripViewer) continue;
+        auto camera = stripViewer->cameraState();
+        if (const auto scale = generatedStripScaleForLinePositionRange(
+                stripViewer, std::optional<std::pair<double, double>>(std::pair{from, to}),
+                &_generatedViews.stripPositionMap))
+            camera.scale = *scale;
+        stripViewer->applyCameraState(camera);
+    }
+    centerStripsOnLinePosition(middle, true);
 }
 
 void LineAnnotationDialog::setApprovalDisplay(const ApprovalDisplay& display)
@@ -2372,6 +2392,197 @@ void LineAnnotationDialog::setApprovalDisplay(const ApprovalDisplay& display)
         if (display.selection->second < last) ranges.dimmed.emplace_back(display.selection->second, last);
     }
     setLineRangeDisplay(ranges);
+    rebuildApprovalCrossingBar();
+}
+
+namespace {
+// Draws the lines from the neighbour dropdowns to the crossing points; mouse
+// events pass through to the strip.
+class ApprovalCrossingLines : public QWidget
+{
+public:
+    explicit ApprovalCrossingLines(QWidget* parent) : QWidget(parent)
+    {
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_NoSystemBackground);
+    }
+    std::vector<std::pair<QPoint, QPoint>> lines;
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QPen(QColor(255, 214, 64, 220), 1.5));
+        painter.setBrush(Qt::NoBrush);
+        for (const auto& [from, to] : lines) {
+            painter.drawLine(from, to);
+            painter.drawEllipse(to, 4, 4);
+        }
+    }
+};
+} // namespace
+
+// One box per crossing (the unsigned separation estimate, a mark when the
+// normals do not say which fiber lies outside, and the state) and a small
+// button with the same choices for where boxes would overlap.
+void LineAnnotationDialog::rebuildApprovalCrossingBar()
+{
+    for (auto& box : _approvalCrossingBoxes) {
+        if (box.full) box.full->deleteLater();
+        if (box.compact) box.compact->deleteLater();
+    }
+    _approvalCrossingBoxes.clear();
+    auto* viewer = _stripViewers.size() > 1 ? _stripViewers[1].data() : nullptr;
+    if (!_approvalMode || !viewer) return;
+    if (!_approvalCrossingBar || _approvalCrossingBar->parentWidget() != viewer) {
+        if (_approvalCrossingBar) _approvalCrossingBar->deleteLater();
+        _approvalCrossingBar = new ApprovalCrossingLines(viewer);
+        _approvalCrossingBar->setObjectName(QStringLiteral("lineAnnotationApprovalCrossingBar"));
+        viewer->installEventFilter(this);
+        _approvalCrossingBar->show();
+    }
+    const QStringList states{tr("undefined"), tr("direct"), tr("distant")};
+    for (size_t i = 0; i < _approvalDisplay.crossings.size(); ++i) {
+        const auto& crossing = _approvalDisplay.crossings[i];
+        const int state = std::clamp(crossing.state, 0, 2);
+        const QString estimate = crossing.estimateHalves > 0
+            ? QStringLiteral("±%1").arg(crossing.estimateHalves / 2.0, 0, 'f', 1)
+            : QStringLiteral("±?");
+        QString tip = tr("Crossing with fiber %1.\n").arg(crossing.other);
+        tip += crossing.estimateHalves > 0
+            ? tr("Measured separation: %1 windings (0.5 is a direct neighbour, 1.5 one sheet over; "
+                 "it does not say which fiber lies outside).\n").arg(estimate)
+            : tr("No separation was measured here.\n");
+        if (!crossing.signKnown)
+            tip += tr("The normals do not say which of the two fibers lies outside: a direct neighbour "
+                      "states nothing in the solve until they do.\n");
+        tip += tr("State: %1.\n").arg(states[state]);
+        tip += tr("direct: the two fibers lie on neighbouring sheets.\n"
+                  "distant: farther apart. The estimate is kept if it says so too; otherwise the "
+                  "distance is dropped and only the side stays, moved one sheet out.");
+        const auto request = [this, index = int(i)](int chosen) {
+            emit approvalCrossingStateRequested(index, chosen);
+        };
+
+        auto* full = new QWidget(viewer);
+        full->setAutoFillBackground(true);
+        full->setCursor(Qt::ArrowCursor);
+        auto* layout = new QHBoxLayout(full);
+        layout->setContentsMargins(3, 1, 3, 1);
+        layout->setSpacing(3);
+        auto* label = new QLabel(crossing.signKnown ? estimate : tr("%1 sign ?").arg(estimate), full);
+        if (!crossing.signKnown) label->setStyleSheet(QStringLiteral("color: #d99a2b;"));
+        layout->addWidget(label);
+        auto* combo = new QComboBox(full);
+        combo->addItems(states);
+        combo->setCurrentIndex(state);
+        combo->setFocusPolicy(Qt::NoFocus);
+        layout->addWidget(combo);
+        full->setToolTip(tip);
+        connect(combo, &QComboBox::activated, this, request);
+        full->adjustSize();
+        full->hide();
+
+        // The same choices behind a small button: "?" undefined, "d" direct, "D" distant.
+        auto* compact = new QToolButton(viewer);
+        compact->setText(state == 0 ? QStringLiteral("?") : state == 1 ? QStringLiteral("d") : QStringLiteral("D"));
+        compact->setPopupMode(QToolButton::InstantPopup);
+        compact->setCursor(Qt::ArrowCursor);
+        compact->setFocusPolicy(Qt::NoFocus);
+        compact->setToolTip(tip);
+        auto* menu = new QMenu(compact);
+        // The measured estimate as a heading, then the state to choose.
+        auto* heading = menu->addAction(crossing.signKnown ? tr("estimate %1").arg(estimate)
+                                                           : tr("estimate %1, sign ?").arg(estimate));
+        heading->setEnabled(false);
+        menu->addSeparator();
+        for (int choice = 0; choice < states.size(); ++choice) {
+            auto* action = menu->addAction(states[choice]);
+            action->setCheckable(true);
+            action->setChecked(choice == state);
+            connect(action, &QAction::triggered, this, [request, choice]() { request(choice); });
+        }
+        compact->setMenu(menu);
+        compact->adjustSize();
+        compact->hide();
+        _approvalCrossingBoxes.push_back({full, compact});
+    }
+    layoutApprovalCrossingBar();
+}
+
+void LineAnnotationDialog::layoutApprovalCrossingBar()
+{
+    auto* bar = static_cast<ApprovalCrossingLines*>(_approvalCrossingBar.data());
+    if (!bar) {
+        // The strips were rebuilt and took the boxes with them.
+        if (_approvalMode && !_approvalDisplay.crossings.empty() && _stripViewers.size() > 1 && _stripViewers[1])
+            rebuildApprovalCrossingBar();
+        return;
+    }
+    if (!bar->parentWidget()) return;
+    auto* parent = bar->parentWidget();
+    bar->setGeometry(parent->rect());
+    bar->lines.clear();
+    auto* viewer = _stripViewers.size() > 1 ? _stripViewers[1].data() : nullptr;
+    auto* view = viewer ? viewer->graphicsView() : nullptr;
+    auto* quad = viewer ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
+    const bool ready = view && quad && _hasGeneratedViews && viewer == parent;
+    const auto toParent = [&](const QPointF& scene) {
+        return parent->mapFromGlobal(view->viewport()->mapToGlobal(view->mapFromScene(scene)));
+    };
+    const QRect area = ready ? QRect(parent->mapFromGlobal(view->viewport()->mapToGlobal(QPoint(0, 0))),
+                                     view->viewport()->size())
+                             : QRect();
+    // Per edge (0 top, 1 bottom) and row: the right end of what is placed.
+    std::array<std::vector<int>, 2> rowEnd;
+    for (size_t i = 0; i < _approvalCrossingBoxes.size() && i < _approvalDisplay.crossings.size(); ++i) {
+        auto* full = _approvalCrossingBoxes[i].full.data();
+        auto* compact = _approvalCrossingBoxes[i].compact.data();
+        if (!full || !compact) continue;
+        full->hide();
+        compact->hide();
+        if (!ready) continue;
+        const auto& crossing = _approvalDisplay.crossings[i];
+        const QPoint onLine = toParent(vc3d::line_annotation::generatedStripLinePositionToScene(
+            viewer, quad, crossing.linePosition, &_generatedViews.stripPositionMap));
+        if (onLine.x() < area.left() || onLine.x() > area.right()) continue;
+        // The other fiber's crossing point in this strip decides the edge.
+        QPoint target = onLine;
+        if (std::isfinite(crossing.otherPoint[0])) {
+            const QPointF scene = viewer->volumeToScene(crossing.otherPoint);
+            if (std::isfinite(scene.x()) && std::isfinite(scene.y())) target = toParent(scene);
+        }
+        const int edge = target.y() > onLine.y() ? 1 : 0;
+        // The dropdown where it fits beside what is placed on its edge, the
+        // small button otherwise; the button moves to a further row if needed.
+        const auto place = [&](QWidget* widget, bool anyRow) {
+            const QSize size = widget->sizeHint();
+            const int left = std::clamp(onLine.x() - size.width() / 2, area.left(),
+                                        std::max(area.left(), area.right() - size.width()));
+            auto& rows = rowEnd[size_t(edge)];
+            for (size_t row = 0; row < (anyRow ? rows.size() + 1 : std::max<size_t>(rows.size(), 1)); ++row) {
+                if (row < rows.size() && left < rows[row] + 2) {
+                    if (!anyRow) return false;
+                    continue;
+                }
+                if (row > 0 && !anyRow) return false;
+                if (row >= rows.size()) rows.resize(row + 1, area.left() - 10);
+                const int step = int(row) * (size.height() + 2);
+                const int top = edge == 0 ? area.top() + 2 + step : area.bottom() - 2 - size.height() - step;
+                widget->setGeometry(left, top, size.width(), size.height());
+                widget->show();
+                widget->raise();
+                rows[row] = left + size.width();
+                bar->lines.emplace_back(QPoint(left + size.width() / 2, edge == 0 ? top + size.height() : top),
+                                        target);
+                return true;
+            }
+            return false;
+        };
+        if (!place(full, false)) place(compact, true);
+    }
+    bar->update();
 }
 
 void LineAnnotationDialog::setWorkspaceEmbedded(bool embedded)
@@ -2678,7 +2889,8 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
     // The new strips' centre row is where each camera stays pinned (the row
     // layout is normally unchanged, so this is a no-op most of the time).
     for (size_t i = 0; i < newQuads.size(); ++i) {
-        if (_stripViewers[i] && newQuads[i]) {
+        // (The approval window's side strip pans freely and is never pinned.)
+        if (_stripViewers[i] && newQuads[i] && !(_approvalMode && i == 1)) {
             _stripViewers[i]->setPinnedSurfaceY(generatedStripCenterlineSurfaceY(newQuads[i]));
         }
     }
@@ -3299,8 +3511,13 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         }
         // The fiber line stays on the strip's vertical centre: pans move the
         // strip along the line only and zooms are anchored on the centre row.
-        viewer->setPinnedSurfaceY(generatedStripCenterlineSurfaceY(
-            dynamic_cast<QuadSurface*>(viewer->currentSurface())));
+        // Except the side strip of the approval window: the fibers crossing
+        // above and below the line have to be reachable, so it pans freely.
+        if (_approvalMode && stripIndex == 1)
+            viewer->setPinnedSurfaceY(std::nullopt);
+        else
+            viewer->setPinnedSurfaceY(generatedStripCenterlineSurfaceY(
+                dynamic_cast<QuadSurface*>(viewer->currentSurface())));
         viewer->applyCameraState(stripCamera);
         bindPaneInteractions(surfaceName, viewer, false);
         connect(viewer,
@@ -3375,6 +3592,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
         _generatedOverlayRefreshConnections.push_back(
             viewer->connectOverlaysUpdated(this, [this, viewer]() {
                 syncLinkedStripCamera(viewer);
+                layoutApprovalCrossingBar();
                 // The hover glow is NOT re-resolved here: the markers it sits
                 // on move only with the coalesced static rebuild (16 ms) or
                 // the pan tick's translation, and both refresh it themselves,
@@ -3561,7 +3779,7 @@ LineAnnotationDialog::showGeneratedControlPointContextMenu(
     options.newLinkedToCandidateLabel = newLinkedToCandidateState.label;
     if (_approvalMode) {
         // The stretch of the fiber map's approval list nearest the click.
-        options.windowActions.emplace_back(tr("Select nearest stretch of the approval list"), [this, linePosition]() {
+        options.windowActions.emplace_back(tr("Open this stretch"), [this, linePosition]() {
             emit approvalSelectionBoundRequested(3, linePosition);
         });
     }
@@ -6873,6 +7091,10 @@ bool LineAnnotationDialog::eventFilter(QObject* watched, QEvent* event)
     if (handleCrossSectionDragEvent(watched, event)) return true;
     if (watched == _fiberNameLabel && event->type() == QEvent::Resize) {
         updateFiberNameLabel();
+    }
+    if (_approvalCrossingBar && watched == _approvalCrossingBar->parentWidget() &&
+        event->type() == QEvent::Resize) {
+        layoutApprovalCrossingBar();
     }
     if (_pauseIndicator && watched == _pauseIndicator->parentWidget() &&
         event->type() == QEvent::Resize) {

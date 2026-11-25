@@ -327,6 +327,7 @@ int run(const std::string& configPath)
     ScaffoldMeasuredReport measuredReport;
     ScaffoldSignResult signs;
     ScaffoldApprovalReport approvalReport;
+    std::vector<ScaffoldCrossing> crossings;
     std::vector<ScaffoldConstraint> measured;
     double normalSeconds = 0, eventSeconds = 0, signSeconds = 0, measuredSeconds = 0;
     std::unique_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
@@ -451,8 +452,9 @@ int run(const std::string& configPath)
         signs = scaffoldNormalSigns(graph, *normals, events, *signOptions);
         signSeconds = seconds(started);
         started = Clock::now();
-        measured = scaffoldMeasuredConstraints(graph, geometry, events, signs.sign, *measuredOptions, measuredReport);
-        applyScaffoldConstraintApprovals(graph, geometry, measured, constraintApprovals, approvalReport);
+        const auto stated = scaffoldCrossingApprovals(graph, geometry, events, constraintApprovals, approvalReport);
+        measured = scaffoldMeasuredConstraints(graph, geometry, events, signs.sign, *measuredOptions, measuredReport,
+                                               stated, &crossings);
         measuredSeconds = seconds(started);
     }
     const auto result = solveScaffoldWinding(graph, geometry, options, measured);
@@ -568,8 +570,8 @@ int run(const std::string& configPath)
     ScaffoldNormalFlipReport flipReport;
     if (normals) flips = scaffoldLinkNormalFlips(graph, geometry, *normals, signs.sign, result.constraints, flipReport);
     // The stretches to look at for the violated sign constraints.
-    ScaffoldSignSuspectReport signSuspectReport;
-    const auto signSuspects = scaffoldSignSuspects(graph, geometry, result, {}, signSuspectReport);
+    ScaffoldStretchReport stretchReport;
+    const auto stretches = scaffoldStretches(graph, geometry, result, {}, stretchReport);
 
     Json summary{
         {"store", cfg.at("store")},
@@ -731,7 +733,13 @@ int run(const std::string& configPath)
                                                {"live", approvalReport.live},
                                                {"approved", approvalReport.approved},
                                                {"unmatched", approvalReport.unmatched},
-                                               {"stale", approvalReport.stale}};
+                                               {"stale", approvalReport.stale},
+                                               {"direct", measuredReport.statedDirect},
+                                               {"distant_kept", measuredReport.statedDistantKept},
+                                               {"distant_dropped", measuredReport.statedDistantDropped},
+                                               {"without_sign", measuredReport.statedWithoutSign},
+                                               {"rigid", measuredReport.statedRigid},
+                                               {"without_pieces", measuredReport.statedWithoutPieces}};
     }
 
     if (persist) {
@@ -751,10 +759,11 @@ int run(const std::string& configPath)
             stages.signOptions = &*signOptions;
             stages.signs = &signs;
             stages.approvals = &approvalReport;
+            stages.crossings = &crossings;
             stages.flips = &flips;
             stages.flipReport = &flipReport;
-            stages.signSuspects = &signSuspects;
-            stages.signSuspectReport = &signSuspectReport;
+            stages.stretches = &stretches;
+            stages.stretchReport = &stretchReport;
         }
         const auto rows = scaffoldSolveRunRows(graph, result, options, record, stages);
         auto txn = store.write();
@@ -818,7 +827,7 @@ int run(const std::string& configPath)
                             {"control_to", flip.piece.controlTo}});
         }
         Json suspectRows = Json::array();
-        for (const auto& suspect : signSuspects)
+        for (const auto& suspect : stretches)
             suspectRows.push_back({{"fiber", graph.fibers[std::size_t(suspect.fiber)].uuid},
                                    {"other", graph.fibers[std::size_t(suspect.other)].uuid},
                                    {"arc", suspect.arc},
@@ -829,9 +838,8 @@ int run(const std::string& configPath)
                                    {"arc_to", suspect.piece.arcTo},
                                    {"control_from", suspect.piece.controlFrom},
                                    {"control_to", suspect.piece.controlTo}});
-        summary["sign_suspects"] = Json{{"violations", signSuspectReport.violations},
-                                        {"without_crossing", signSuspectReport.withoutCrossing},
-                                        {"approved", signSuspectReport.approved},
+        summary["stretches"] = Json{{"violations", stretchReport.violations},
+                                        {"without_crossing", stretchReport.withoutCrossing},
                                         {"suspects", std::move(suspectRows)}};
         summary["normal_flips"] = Json{{"links_checked", flipReport.checked},
                                        {"agreed", flipReport.agreed},

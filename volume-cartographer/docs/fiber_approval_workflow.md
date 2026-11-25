@@ -26,6 +26,18 @@ Store format: `vc_object_store/docs/fiber-approval.md`. Solver: [fiber_map_scaff
   bar underlines approved geometry green and broken stretches amber and dims everything outside the selection.
 - Every change is stored at once as a new generation of the layer, together with the normals shown.
 
+## Neighbour state of a crossing
+
+- Every crossing of the open fiber with another fiber of the selected solve has a dropdown on the bar between
+  the two strips, at the crossing's position: undefined, direct (the two fibers lie on neighbouring sheets) or
+  distant (farther apart).
+- Beside it the measured separation, unsigned, in windings: 0.5 is a direct neighbour, 1.5 one sheet over,
+  2.5 two. This is a display convention; it does not say which fiber lies outside.
+- The state is about the distance only. Which fiber lies outside is never part of it: that comes from the
+  normals. "sign ?" marks a crossing whose normals do not say it.
+- A change is stored at once (`ext_fiber_constraint_approval`), whatever the geometry's state.
+- Where two dropdowns would overlap, the earlier one is shown; zooming in separates them.
+
 ## Solver
 
 - Approved normals: the stretch is used with the normals that were shown, as axes; which way they face is solved.
@@ -35,6 +47,12 @@ Store format: `vc_object_store/docs/fiber-approval.md`. Solver: [fiber_map_scaff
   hold the longest part.
 - Stale stretches and normal points are not used; the run counts them.
 - Manual normals on the fiber's own control points are held as axes outside approved stretches.
+- A crossing stated direct: its separation is that of a direct neighbour, whatever was measured. Without a
+  known side it states nothing.
+- A crossing stated distant: a measurement that also says "not direct" is kept. Otherwise the separation is
+  dropped (how far is not known). In both cases the side's bound moves one sheet out.
+- A reviewed separation counts with full weight, and is held rigid where both pieces it lies on are approved
+  geometry.
 
 ## Dock
 

@@ -911,7 +911,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
     connect(_fiberMapWorkspace, &FiberMapWorkspace::dockLayoutChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberMapWorkspace, &FiberMapWorkspace::openFiberApprovalRequested,
-            this, [this](uint64_t fiberId, QString runUuid, int lineFrom, int lineTo, int controlFrom, int controlTo) {
+            this, [this](uint64_t fiberId, QString runUuid, double lineFrom, double lineTo, int controlFrom, int controlTo) {
                 if (_fiberWidget) _fiberWidget->selectFiber(fiberId);
                 if (_lineAnnotationController)
                     _lineAnnotationController->openFiberApproval(fiberId, runUuid.toStdString(), lineFrom, lineTo,

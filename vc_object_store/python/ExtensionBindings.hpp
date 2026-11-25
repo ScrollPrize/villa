@@ -360,6 +360,7 @@ inline nb::dict fiberConstraintApprovalToPy(const vo::FiberConstraintApproval& r
     d["arc_a"] = row.identity.arcA; d["arc_b"] = row.identity.arcB;
     d["row_uuid"] = row.rowUuid; d["approval_uuid"] = row.approvalUuid;
     d["state"] = row.state == vo::FiberConstraintApprovalState::Revoked ? "revoked" : "approved";
+    d["distance"] = row.distance == vo::FiberConstraintDistance::Distant ? "distant" : "direct";
     d["supersedes"] = row.supersedes ? nb::cast(*row.supersedes) : nb::none();
     d["fiber_version_a"] = row.fiberVersionA; d["fiber_version_b"] = row.fiberVersionB;
     d["span_a"] = fiberSpanFingerprintToPy(row.spanA); d["span_b"] = fiberSpanFingerprintToPy(row.spanB);
@@ -386,6 +387,10 @@ inline vo::FiberConstraintApproval fiberConstraintApprovalFromPy(const nb::dict&
     if (state == "approved") row.state = vo::FiberConstraintApprovalState::Approved;
     else if (state == "revoked") row.state = vo::FiberConstraintApprovalState::Revoked;
     else throw std::invalid_argument("fiber constraint approval: state must be approved or revoked");
+    const auto distance = nb::cast<std::string>(d["distance"]);
+    if (distance == "direct") row.distance = vo::FiberConstraintDistance::Direct;
+    else if (distance == "distant") row.distance = vo::FiberConstraintDistance::Distant;
+    else throw std::invalid_argument("fiber constraint approval: distance must be direct or distant");
     row.supersedes = optionalText("supersedes");
     row.fiberVersionA = nb::cast<int64_t>(d["fiber_version_a"]);
     row.fiberVersionB = nb::cast<int64_t>(d["fiber_version_b"]);

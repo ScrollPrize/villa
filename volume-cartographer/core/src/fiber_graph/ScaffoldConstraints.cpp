@@ -576,13 +576,27 @@ void appendEventConstraints(std::vector<ScaffoldConstraint>& constraints, const 
 }
 } // namespace
 
+std::int64_t scaffoldCrossingEstimateHalves(double distance, const ScaffoldMeasuredOptions& options)
+{
+    if (!std::isfinite(distance)) return 0;
+    // The half-winding minimum plus whole windings, as the rounded
+    // perpendicular constraint states it.
+    const double whole = std::round(distance * options.windingScale - options.perpendicularOffset);
+    return 2 * std::int64_t(std::max(0., whole)) + 1;
+}
+
 std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph& graph,
                                                            const ScaffoldGeometry& geometry,
                                                            std::span<const ScaffoldEvent> events,
                                                            std::span<const std::int64_t> normalSign,
                                                            const ScaffoldMeasuredOptions& options,
-                                                           ScaffoldMeasuredReport& report)
+                                                           ScaffoldMeasuredReport& report,
+                                                           std::span<const ScaffoldNeighbour> stated,
+                                                           std::vector<ScaffoldCrossing>* crossings)
 {
+    if (!stated.empty() && stated.size() != events.size())
+        throw std::invalid_argument("scaffold constraints: the reviewed crossings cover a different event set");
+    if (crossings) crossings->clear();
     for (const auto weight :
          {options.perpendicularWeight, options.parallelWeight, options.enclosureWeight, options.signWeight})
         if (!std::isfinite(weight) || weight < 0)
@@ -609,14 +623,62 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
 
     const auto shared = sharedConstraintOptions(options);
     for (std::size_t index = 0; index < events.size(); ++index) {
-        const auto& event = events[index];
+        auto event = events[index];
         if (!eventStatesRelation(graph, event, &report)) continue;
-        const auto built = eventConstraints(graph, geometry, event, normalSign[std::size_t(event.a)],
-                                            normalSign[std::size_t(event.b)], fallingSign, shared);
+        const auto review = stated.empty() || event.parallel ? ScaffoldNeighbour::Undecided : stated[index];
+        const auto estimate = scaffoldCrossingEstimateHalves(event.distance, options);
+        // A direct neighbour is a separation of the perpendicular offset,
+        // whatever was measured.
+        if (review == ScaffoldNeighbour::Direct && options.windingScale > 0)
+            event.distance = options.perpendicularOffset / options.windingScale;
+        auto built = eventConstraints(graph, geometry, event, normalSign[std::size_t(event.a)],
+                                      normalSign[std::size_t(event.b)], fallingSign, shared);
         if (built.filtered) { ++report.crossingFiltered; continue; }
+        if (review == ScaffoldNeighbour::Distant) {
+            // Farther than a direct neighbour: the bound moves one winding
+            // out, and a measurement that says "direct" (or none) states no
+            // separation, since how far is not known.
+            if (built.hasSign) built.sign.target += built.sign.side;
+            if (built.relation.hasEnclosure) built.relation.enclosure.bound += built.relation.enclosure.sign;
+            if (estimate <= 1) {
+                built.relation.usable = false;
+                ++report.statedDistantDropped;
+            } else {
+                ++report.statedDistantKept;
+            }
+        } else if (review == ScaffoldNeighbour::Direct) {
+            ++report.statedDirect;
+            if (built.relation.sign == 0) ++report.statedWithoutSign;
+        }
         if (built.relation.hasEnclosure && shared.enclosures)
             bounds.push_back({built.relation.enclosure, std::int64_t(index), built.relation.transport});
+        const auto first = constraints.size();
         appendEventConstraints(constraints, built, event, std::int64_t(index), options, &report);
+        if (review != ScaffoldNeighbour::Undecided) {
+            // A reviewed separation counts in full, and is held rigid where
+            // both pieces it lies on are approved geometry.
+            for (auto at = first; at < constraints.size(); ++at) {
+                auto& constraint = constraints[at];
+                if (scaffoldConstraintSide(constraint.kind) != 0) continue;
+                constraint.weight = options.perpendicularWeight;
+                constraint.approved = scaffoldConstraintPiecesApproved(graph, geometry, constraint);
+                ++(constraint.approved ? report.statedRigid : report.statedWithoutPieces);
+            }
+        }
+        if (crossings && !event.parallel) {
+            ScaffoldCrossing crossing;
+            crossing.event = std::int64_t(index);
+            crossing.a = event.a;
+            crossing.b = event.b;
+            crossing.arcA = event.arcA;
+            crossing.arcB = event.arcB;
+            crossing.distance = events[index].distance;
+            crossing.estimateHalves = estimate;
+            crossing.signKnown = built.relation.sign != 0;
+            crossing.stated = review;
+            crossing.separation = built.relation.usable;
+            crossings->push_back(crossing);
+        }
     }
 
     const auto append = [&](const geometry::winding_graph_detail::Arc& arc, const ScaffoldEvent& event,
@@ -681,28 +743,10 @@ objects::FiberConstraintIdentity scaffoldConstraintIdentity(const ScaffoldGraph&
                                             scaffoldConstraintStoreKind(constraint.kind));
 }
 
-std::optional<std::size_t> scaffoldSpanCoveringArc(const objects::FiberPieceContent& content, double arc)
-{
-    if (content.linePoints.size() < 2 || !std::isfinite(arc)) return std::nullopt;
-    double walked = 0, bestDistance = std::abs(arc);
-    std::size_t best = 0;
-    for (std::size_t i = 1; i < content.linePoints.size(); ++i) {
-        const auto& previous = content.linePoints[i - 1];
-        const auto& current = content.linePoints[i];
-        const double dx = current[0] - previous[0], dy = current[1] - previous[1], dz = current[2] - previous[2];
-        walked += std::sqrt((dx * dx + dy * dy) + dz * dz);
-        const double distance = std::abs(arc - walked);
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            best = i;
-        }
-    }
-    return objects::fiberSpanCoveringLineIndex(content, std::int64_t(best));
-}
-
 objects::FiberConstraintApproval approveScaffoldConstraint(const ScaffoldGraph& graph,
                                                            const ScaffoldGeometry& geometry,
                                                            const ScaffoldConstraint& constraint,
+                                                           objects::FiberConstraintDistance distance,
                                                            const std::string& author, const std::string& approvedAt,
                                                            const std::string& host)
 {
@@ -723,8 +767,8 @@ objects::FiberConstraintApproval approveScaffoldConstraint(const ScaffoldGraph& 
     if (!versionA || !versionB)
         throw std::invalid_argument("scaffold constraints: an approval records both fibers' versions");
     return objects::approveFiberConstraint(identity, contentA, ordered ? spans->spanA : spans->spanB, *versionA,
-                                           contentB, ordered ? spans->spanB : spans->spanA, *versionB, author,
-                                           approvedAt, host);
+                                           contentB, ordered ? spans->spanB : spans->spanA, *versionB, distance,
+                                           author, approvedAt, host);
 }
 
 bool scaffoldConstraintPiecesApproved(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
@@ -741,73 +785,132 @@ bool scaffoldConstraintPiecesApproved(const ScaffoldGraph& graph, const Scaffold
     return approved(constraint.a, constraint.arcA) && approved(constraint.b, constraint.arcB);
 }
 
-void applyScaffoldConstraintApprovals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
-                                      std::span<ScaffoldConstraint> measured,
-                                      std::span<const objects::FiberConstraintApproval> rows,
-                                      ScaffoldApprovalReport& report)
+std::vector<ScaffoldNeighbour> scaffoldCrossingApprovals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                                         std::span<const ScaffoldEvent> events,
+                                                         std::span<const objects::FiberConstraintApproval> rows,
+                                                         ScaffoldApprovalReport& report)
 {
     report = ScaffoldApprovalReport{};
     report.rows = std::int64_t(rows.size());
+    std::vector<ScaffoldNeighbour> stated(events.size(), ScaffoldNeighbour::Undecided);
     const auto live = objects::liveFiberConstraintApprovals(rows);
     report.live = std::int64_t(live.size());
-    if (live.empty()) return;
+    if (live.empty()) return stated;
     std::map<objects::FiberConstraintIdentity, std::size_t> index;
     for (std::size_t i = 0; i < live.size(); ++i) index.emplace(live[i].identity, i);
-    std::vector<char> matched(live.size(), 0);
-    // One content per fiber, materialized only for the fibers an approval
-    // names: the fingerprints are taken over their line points.
-    std::map<std::size_t, objects::FiberPieceContent> contents;
-    const auto contentOf = [&](std::size_t fiber) -> const objects::FiberPieceContent& {
-        const auto found = contents.find(fiber);
-        if (found != contents.end()) return found->second;
-        return contents.emplace(fiber, scaffoldFiberContent(graph, fiber)).first->second;
+    std::vector<char> matched(live.size(), 0), current(live.size(), 0);
+    // The span fingerprints of a fiber as the store holds it; a scaffold that
+    // was not read from a store states them over its own line points.
+    std::map<std::size_t, std::vector<objects::FiberSpanFingerprint>> computed;
+    const auto fingerprintsOf = [&](std::size_t fiber) -> const std::vector<objects::FiberSpanFingerprint>& {
+        if (!graph.fibers[fiber].spanFingerprints.empty()) return graph.fibers[fiber].spanFingerprints;
+        const auto found = computed.find(fiber);
+        if (found != computed.end()) return found->second;
+        const auto content = scaffoldFiberContent(graph, fiber);
+        std::vector<objects::FiberSpanFingerprint> list;
+        for (std::size_t span = 0; span + 1 < content.controlPoints.size(); ++span)
+            list.push_back(objects::fiberSpanFingerprint(content, span));
+        return computed.emplace(fiber, std::move(list)).first->second;
     };
-    for (auto& constraint : measured) {
-        if (constraint.link >= 0) continue; // a map link's approval is its edge record's state
-        if (scaffoldConstraintSide(constraint.kind) != 0) continue; // a bound is never approved
+    // The recorded span is the covering one or a neighbour of it: an anchor
+    // beside a control point may be placed on either side of it.
+    const auto spanCurrent = [&](std::size_t fiber, std::size_t span,
+                                 const std::optional<objects::FiberSpanFingerprint>& recorded) {
+        if (!recorded) return false;
+        const auto& list = fingerprintsOf(fiber);
+        for (std::size_t at = span > 0 ? span - 1 : 0; at <= span + 1 && at < list.size(); ++at)
+            if (list[at] == *recorded) return true;
+        return false;
+    };
+    for (std::size_t at = 0; at < events.size(); ++at) {
+        const auto& event = events[at];
+        if (event.parallel || event.a == event.b || !event.validA || !event.validB) continue;
+        ScaffoldConstraint constraint;
+        constraint.kind = ScaffoldConstraintKind::Perpendicular;
+        constraint.a = event.a;
+        constraint.b = event.b;
+        constraint.arcA = event.arcA;
+        constraint.arcB = event.arcB;
         const auto found = index.find(scaffoldConstraintIdentity(graph, constraint));
         if (found == index.end()) continue;
         matched[found->second] = 1;
         const auto spans = scaffoldConstraintSpans(graph, geometry, constraint);
         if (!spans) continue;
-        const auto& fiberA = graph.fibers.at(std::size_t(constraint.a));
-        const auto& fiberB = graph.fibers.at(std::size_t(constraint.b));
-        const bool ordered = fiberA.uuid < fiberB.uuid;
-        const auto& contentA = contentOf(std::size_t(ordered ? constraint.a : constraint.b));
-        const auto& contentB = contentOf(std::size_t(ordered ? constraint.b : constraint.a));
-        if (!objects::fiberConstraintApprovalCurrent(live[found->second], contentA,
-                                                     ordered ? spans->spanA : spans->spanB, contentB,
-                                                     ordered ? spans->spanB : spans->spanA))
+        const bool ordered = graph.fibers.at(std::size_t(constraint.a)).uuid <
+                             graph.fibers.at(std::size_t(constraint.b)).uuid;
+        const auto& row = live[found->second];
+        if (!spanCurrent(std::size_t(constraint.a), spans->spanA, ordered ? row.spanA : row.spanB) ||
+            !spanCurrent(std::size_t(constraint.b), spans->spanB, ordered ? row.spanB : row.spanA))
             continue;
-        // The geometry approvals can be revoked after the constraint was
-        // approved; the constraint then asserts nothing rigid either.
-        if (!scaffoldConstraintPiecesApproved(graph, geometry, constraint)) {
-            ++report.withoutPieces;
-            continue;
-        }
-        constraint.approved = true;
-        ++report.approved;
+        current[found->second] = 1;
+        stated[at] = row.distance == objects::FiberConstraintDistance::Distant ? ScaffoldNeighbour::Distant
+                                                                              : ScaffoldNeighbour::Direct;
     }
-    for (std::size_t i = 0; i < live.size(); ++i)
+    for (std::size_t i = 0; i < live.size(); ++i) {
         if (!matched[i]) ++report.unmatched;
-    report.stale = report.live - report.unmatched - report.approved;
+        else if (current[i]) ++report.approved;
+        else ++report.stale;
+    }
+    return stated;
 }
 
-std::vector<ScaffoldSignSuspect> scaffoldSignSuspects(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+std::vector<ScaffoldStretch> scaffoldStretches(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
                                                       const ScaffoldSolveResult& result,
-                                                      const ScaffoldSignSuspectOptions& options,
-                                                      ScaffoldSignSuspectReport& report)
+                                                      const ScaffoldStretchOptions& options,
+                                                      ScaffoldStretchReport& report)
 {
     const auto fibers = graph.fibers.size();
-    if (!(options.joinVx >= 0) || !(options.maxStretchVx > 0))
-        throw std::invalid_argument("scaffold sign suspects: invalid stretch lengths");
-    report = ScaffoldSignSuspectReport{};
-    // A fiber with broken geometry is its parts: a stretch stays in one.
-    std::vector<std::vector<double>> cuts(fibers);
-    for (std::size_t i = 0; i < fibers; ++i) cuts[i] = geometry.splitArcs(i);
+    if (!(options.joinVx >= 0) || !(options.marginVx >= 0) || !(options.minStretchVx >= 0) || !(options.maxStretchVx >= options.minStretchVx) ||
+        !(options.maxStretchVx > 0))
+        throw std::invalid_argument("scaffold stretches: invalid stretch lengths");
+    report = ScaffoldStretchReport{};
+    // A fiber is a row of zones, and a stretch stays in one: its parts
+    // between broken geometry, and within a part every stretch that is
+    // already approved (for geometry or normals) as it stands. An approved
+    // stretch is never cut up or offset: it is offered whole, and new
+    // stretches lie in the fiber between the approved ones.
+    struct Zone {
+        double from = 0, to = 0;
+        bool fixed = false;
+    };
+    std::vector<std::vector<Zone>> zones(fibers);
+    for (std::size_t i = 0; i < fibers; ++i) {
+        const double length = geometry.arcAtLineIndex(i, double(graph.fibers[i].pointCount - 1));
+        std::vector<std::pair<double, double>> approved;
+        for (const auto* ranges : {&graph.fibers[i].approval.approvedGeometry, &graph.fibers[i].approval.approvedNormals})
+            for (const auto& [from, to] : *ranges)
+                approved.emplace_back(geometry.arcAtLineIndex(i, from), geometry.arcAtLineIndex(i, to));
+        std::sort(approved.begin(), approved.end());
+        // Ranges that overlap are one stretch; ranges that only touch stay two.
+        std::vector<std::pair<double, double>> fixed;
+        for (const auto& range : approved) {
+            if (!(range.second > range.first)) continue;
+            if (!fixed.empty() && range.first < fixed.back().second - 1.)
+                fixed.back().second = std::max(fixed.back().second, range.second);
+            else
+                fixed.push_back(range);
+        }
+        auto bounds = geometry.splitArcs(i);
+        bounds.insert(bounds.begin(), 0.);
+        bounds.push_back(length);
+        for (std::size_t part = 0; part + 1 < bounds.size(); ++part) {
+            double at = bounds[part];
+            for (const auto& range : fixed) {
+                const double from = std::max(range.first, bounds[part]), to = std::min(range.second, bounds[part + 1]);
+                if (!(to > from)) continue;
+                if (from > at) zones[i].push_back({at, from, false});
+                zones[i].push_back({from, to, true});
+                at = to;
+            }
+            if (bounds[part + 1] > at || zones[i].empty()) zones[i].push_back({at, bounds[part + 1], false});
+        }
+    }
     const auto partAt = [&](std::int64_t fiber, double arc) {
-        const auto& list = cuts[std::size_t(fiber)];
-        return std::int64_t(std::upper_bound(list.begin(), list.end(), arc) - list.begin());
+        const auto& list = zones[std::size_t(fiber)];
+        // The last zone starting at or before the arc.
+        std::int64_t at = 0;
+        while (at + 1 < std::int64_t(list.size()) && list[std::size_t(at) + 1].from <= arc) ++at;
+        return at;
     };
     // Every crossing of every fiber part: the anchors of the solve's constraints.
     std::map<std::pair<std::int64_t, std::int64_t>, std::vector<double>> crossings;
@@ -815,6 +918,8 @@ std::vector<ScaffoldSignSuspect> scaffoldSignSuspects(const ScaffoldGraph& graph
         crossings[{constraint.a, partAt(constraint.a, constraint.arcA)}].push_back(constraint.arcA);
         crossings[{constraint.b, partAt(constraint.b, constraint.arcB)}].push_back(constraint.arcB);
     }
+    // Every constraint's anchor, before they are reduced to places.
+    const auto anchors = crossings;
     // One crossing states several constraints at one arc; crossings less than
     // a voxel apart are one place of the fiber.
     for (auto& [key, arcs] : crossings) {
@@ -829,20 +934,46 @@ std::vector<ScaffoldSignSuspect> scaffoldSignSuspects(const ScaffoldGraph& graph
         double cost = 0, arc = 0, otherArc = 0;
         std::int64_t other = 0, violations = 0;
     };
+    // Per fiber part: every violated constraint anchored on it.
+    struct Violation {
+        double arc = 0, cost = 0, otherArc = 0;
+        std::int64_t other = 0;
+    };
+    std::map<std::pair<std::int64_t, std::int64_t>, std::vector<Violation>> violated;
     std::map<std::pair<std::int64_t, std::int64_t>, std::vector<Stretch>> stretches;
     for (const auto& residual : result.residuals) {
         const auto& constraint = result.constraints.at(std::size_t(residual.constraint));
-        if (scaffoldConstraintSide(constraint.kind) == 0) continue;
         ++report.violations;
         for (int side = 0; side < 2; ++side) {
             const auto fiber = side == 0 ? constraint.a : constraint.b;
             const double arc = side == 0 ? constraint.arcA : constraint.arcB;
             const std::pair<std::int64_t, std::int64_t> key{fiber, partAt(fiber, arc)};
             const auto& arcs = crossings[key];
-            if (arcs.size() < 2) { ++report.withoutCrossing; continue; }
-            // The crossing's own place among the part's crossings.
+            violated[key].push_back({arc, residual.cost, side == 0 ? constraint.arcB : constraint.arcA,
+                                     side == 0 ? constraint.b : constraint.a});
+            const auto& zoneList = zones[std::size_t(fiber)];
+            const auto zone = std::size_t(key.second);
+            if (arcs.empty()) { ++report.withoutCrossing; continue; }
+            if (zoneList[zone].fixed) {
+                // An approved stretch is the stretch, whole.
+                Stretch whole;
+                whole.to = arcs.size() - 1;
+                stretches[key].push_back(whole);
+                continue;
+            }
+            // The crossing's own place among the zone's crossings.
             auto at = std::size_t(std::lower_bound(arcs.begin(), arcs.end(), arc) - arcs.begin());
             if (at >= arcs.size() || (at > 0 && arc - arcs[at - 1] < arcs[at] - arc)) --at;
+            if (arcs.size() < 2) {
+                // Alone between approved stretches, it is tied by them.
+                const bool beside = (zone > 0 && zoneList[zone - 1].fixed) ||
+                                    (zone + 1 < zoneList.size() && zoneList[zone + 1].fixed);
+                if (!beside) { ++report.withoutCrossing; continue; }
+                Stretch single;
+                single.from = single.to = at;
+                stretches[key].push_back(single);
+                continue;
+            }
             // Another crossing is mandatory: the nearer neighbour, whatever
             // its distance. Further ones join while they are close.
             std::size_t from = at, to = at;
@@ -850,6 +981,16 @@ std::vector<ScaffoldSignSuspect> scaffoldSignSuspects(const ScaffoldGraph& graph
             else if (at + 1 == arcs.size()) from = at - 1;
             else if (arcs[at] - arcs[at - 1] <= arcs[at + 1] - arcs[at]) from = at - 1;
             else to = at + 1;
+            // Up to the minimum length: the nearer next crossing on either
+            // side, whatever its distance (the minimum outranks the maximum).
+            while (arcs[to] - arcs[from] < options.minStretchVx) {
+                const double before = from > 0 ? arcs[from] - arcs[from - 1] : -1.;
+                const double after = to + 1 < arcs.size() ? arcs[to + 1] - arcs[to] : -1.;
+                const bool takeBefore = before >= 0 && (after < 0 || before <= after);
+                const double added = takeBefore ? before : after;
+                if (added < 0) break;
+                if (takeBefore) --from; else ++to;
+            }
             for (bool grown = true; grown;) {
                 grown = false;
                 if (from > 0 && arcs[from] - arcs[from - 1] <= options.joinVx &&
@@ -868,49 +1009,90 @@ std::vector<ScaffoldSignSuspect> scaffoldSignSuspects(const ScaffoldGraph& graph
             stretches[key].push_back(stretch);
         }
     }
-    std::vector<ScaffoldSignSuspect> out;
+    std::vector<ScaffoldStretch> out;
     for (auto& [key, list] : stretches) {
         const auto fiber = std::size_t(key.first);
         const auto& arcs = crossings[key];
-        std::vector<std::pair<double, double>> approved;
-        for (const auto& [from, to] : graph.fibers[fiber].approval.approvedNormals)
-            approved.emplace_back(geometry.arcAtLineIndex(fiber, from), geometry.arcAtLineIndex(fiber, to));
         // Overlapping stretches are one; the first (worst) names the row.
-        std::stable_sort(list.begin(), list.end(), [](const Stretch& x, const Stretch& y) { return x.from < y.from; });
+        std::stable_sort(list.begin(), list.end(), [](const Stretch& x, const Stretch& y) {
+            return x.from != y.from ? x.from < y.from : x.to > y.to;
+        });
         std::vector<Stretch> merged;
         for (const auto& stretch : list) {
-            if (!merged.empty() && stretch.from <= merged.back().to) {
+            // ... while the result stays within the maximum length.
+            // A stretch inside the last one is that one.
+            if (!merged.empty() && stretch.from <= merged.back().to &&
+                (stretch.to <= merged.back().to ||
+                 arcs[stretch.to] - arcs[merged.back().from] <= options.maxStretchVx)) {
                 auto& last = merged.back();
                 last.to = std::max(last.to, stretch.to);
-                if (stretch.cost > last.cost) { last.arc = stretch.arc; last.other = stretch.other; last.otherArc = stretch.otherArc; }
-                last.cost += stretch.cost;
-                last.violations += stretch.violations;
             } else {
                 merged.push_back(stretch);
             }
         }
-        for (const auto& stretch : merged) {
-            if (ScaffoldApproval::covers(approved, arcs[stretch.from], arcs[stretch.to])) {
-                report.approved += stretch.violations;
-                continue;
+        for (auto& stretch : merged) {
+            // The cost: every violated constraint anchored on the stretch,
+            // each once; the worst of them names the row.
+            stretch.cost = 0;
+            stretch.violations = 0;
+            double worst = -1;
+            for (const auto& violation : violated[key]) {
+                if (violation.arc < arcs[stretch.from] - 1. || violation.arc > arcs[stretch.to] + 1.) continue;
+                stretch.cost += violation.cost;
+                ++stretch.violations;
+                if (violation.cost > worst) {
+                    worst = violation.cost;
+                    stretch.arc = violation.arc;
+                    stretch.other = violation.other;
+                    stretch.otherArc = violation.otherArc;
+                }
             }
-            ScaffoldSignSuspect suspect;
+            // The stretch itself: past its outer crossings by the margin and
+            // at least the minimum length, within its zone - reaching the
+            // margin into an approved neighbour, never farther.
+            const auto& zoneList = zones[fiber];
+            const auto zone = std::size_t(key.second);
+            const double partFrom = zoneList[zone].from -
+                                    (zone > 0 && zoneList[zone - 1].fixed ? options.marginVx : 0.);
+            const double partTo = zoneList[zone].to +
+                                  (zone + 1 < zoneList.size() && zoneList[zone + 1].fixed ? options.marginVx : 0.);
+            double arcFrom = arcs[stretch.from] - options.marginVx, arcTo = arcs[stretch.to] + options.marginVx;
+            if (arcTo - arcFrom < options.minStretchVx) {
+                const double pad = (options.minStretchVx - (arcTo - arcFrom)) / 2.;
+                arcFrom -= pad;
+                arcTo += pad;
+            }
+            // What one end cannot take, the other does.
+            if (arcFrom < partFrom) { arcTo += partFrom - arcFrom; arcFrom = partFrom; }
+            if (arcTo > partTo) { arcFrom -= arcTo - partTo; arcTo = partTo; }
+            arcFrom = std::max(arcFrom, partFrom);
+            // An approved stretch stands exactly as it was approved.
+            if (zoneList[zone].fixed) {
+                arcFrom = zoneList[zone].from;
+                arcTo = zoneList[zone].to;
+            }
+            // Every constraint anchored on it, violated or not.
+            std::int64_t anchored = 0;
+            for (const double arc : anchors.at(key))
+                if (arc >= arcs[stretch.from] - 1. && arc <= arcs[stretch.to] + 1.) ++anchored;
+            ScaffoldStretch suspect;
             suspect.fiber = key.first;
             suspect.violations = stretch.violations;
+            suspect.constraints = anchored;
             suspect.cost = stretch.cost;
             suspect.arc = stretch.arc;
             suspect.other = stretch.other;
             suspect.otherArc = stretch.otherArc;
             suspect.crossings = std::int64_t(stretch.to - stretch.from + 1);
             suspect.piece.fiber = key.first;
-            suspect.piece.arcFrom = arcs[stretch.from];
-            suspect.piece.arcTo = arcs[stretch.to];
+            suspect.piece.arcFrom = arcFrom;
+            suspect.piece.arcTo = arcTo;
             scaffoldPieceControls(graph, geometry, suspect.piece);
             out.push_back(suspect);
         }
     }
     std::stable_sort(out.begin(), out.end(),
-                     [](const ScaffoldSignSuspect& x, const ScaffoldSignSuspect& y) { return x.cost > y.cost; });
+                     [](const ScaffoldStretch& x, const ScaffoldStretch& y) { return x.cost > y.cost; });
     report.suspects = std::int64_t(out.size());
     return out;
 }

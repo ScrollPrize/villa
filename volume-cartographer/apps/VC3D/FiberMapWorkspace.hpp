@@ -145,7 +145,7 @@ signals:
     // Open a fiber in the approval window on the selected solve `runUuid`.
     // The stretch to start on is a range of stored line points, or of
     // control points when the line range is -1; all -1 is the whole fiber.
-    void openFiberApprovalRequested(uint64_t fiberId, QString runUuid, int lineFrom, int lineTo, int controlFrom,
+    void openFiberApprovalRequested(uint64_t fiberId, QString runUuid, double lineFrom, double lineTo, int controlFrom,
                                     int controlTo);
     // A dock of this workspace was moved, floated or closed, so the window
     // state is worth saving again (CWindow owns the settings).
