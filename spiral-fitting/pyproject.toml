@@ -61,9 +61,12 @@ cuda = [
     "cucim-cu12>=26.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "cupy-cuda12x>=14.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+# Apple-silicon GPU backend (`--backend metal`), from PyPI. Installed by a plain `uv sync`
+# (see default-groups); `--no-group metal` skips it.
+metal = ["teasar>=0.1.1; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [tool.uv]
-default-groups = ["dev", "cuda"]
+default-groups = ["dev", "cuda", "metal"]
 
 [tool.uv.sources]
 vc-reader = { path = "../vc_reader", editable = true }

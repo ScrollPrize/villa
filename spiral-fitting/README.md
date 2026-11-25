@@ -1604,8 +1604,9 @@ Three backends write the same keys in the same format:
   (`nvidia-smi` indices, PCI bus order); UUID and MIG entries are not accepted,
   so pass `--gpus` instead. With `--gpus`, `--backend auto` does not fall back
   to Kimimaro when the GPU backend cannot run.
-- `metal`: teasar on Apple GPUs, when it is installed in the
-  same environment. Slabs teasar declines run on Kimimaro.
+- `metal`: teasar (`teasar` on PyPI) on Apple-silicon GPUs. `uv sync` installs
+  it on Apple-silicon Macs as the default `metal` dependency group
+  (`--no-group metal` skips it). Slabs teasar declines run on Kimimaro.
 - `cpu`: Kimimaro, with slabs in parallel worker processes (see
   [CPU surface-track extraction](#cpu-surface-track-extraction)). `uv sync` installs it on every platform
   except Linux x86-64, where it is the optional `cpu` extra

@@ -2036,6 +2036,9 @@ cuda = [
 dev = [
     { name = "pytest" },
 ]
+metal = [
+    { name = "teasar", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -2085,6 +2088,7 @@ cuda = [
     { name = "cupy-cuda12x", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=14.2.0" },
 ]
 dev = [{ name = "pytest", specifier = ">=9.1.1" }]
+metal = [{ name = "teasar", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.1.1" }]
 
 [[package]]
 name = "sympy"
@@ -2096,6 +2100,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/83/d3/803453b36afefb7c2bb238361cd4ae6125a569b4db67cd9e79846ba2d68c/sympy-1.14.0.tar.gz", hash = "sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517", size = 7793921, upload-time = "2025-04-27T18:05:01.611Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a2/09/77d55d46fd61b4a135c444fc97158ef34a095e5681d0a6c10b75bf356191/sympy-1.14.0-py3-none-any.whl", hash = "sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5", size = 6299353, upload-time = "2025-04-27T18:04:59.103Z" },
+]
+
+[[package]]
+name = "teasar"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d7/bb/ea3164526120008249d652f23cbc52312d9e6fd2119967332dd3436f980c/teasar-0.1.1.tar.gz", hash = "sha256:559d0f96094ef7a8e22b9dbdfac3e5afbee72d1f01f161cf2523396e793b51c2", size = 142224, upload-time = "2026-11-25T01:47:21.295Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/47/82/e4169fc740850cdb9e091127c1c014ce7d8a539f13c9019ea3b98d1435d0/teasar-0.1.1-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:9fdee4c44fe80a24c1674c3c90d146d8917fe00ef0a29d26f453f86837c63573", size = 659594, upload-time = "2026-11-25T01:47:17.25Z" },
 ]
 
 [[package]]
