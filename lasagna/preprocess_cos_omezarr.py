@@ -38,7 +38,7 @@ except ImportError:
 	_HAS_NUMBA = False
 import torch
 import vc_reader
-from vc_reader.reader import ZarrGroup, ZarrWriter, open_group, open_node, open_zarr
+from vc_reader.reader import ZarrWriter, open_zarr
 
 try:
 	from input_level import (
@@ -78,6 +78,7 @@ try:
 		_predict3d_overall_eta,
 		_read_tile_zarr,
 		_remove_path_quiet,
+		_resolve_base_shape,
 		build_product_omezarr_pyramids,
 		create_product_omezarr_groups,
 		resolve_inference_devices,
@@ -107,6 +108,7 @@ except ImportError:
 		_predict3d_overall_eta,
 		_read_tile_zarr,
 		_remove_path_quiet,
+		_resolve_base_shape,
 		build_product_omezarr_pyramids,
 		create_product_omezarr_groups,
 		resolve_inference_devices,
@@ -150,6 +152,11 @@ def _crop_xyzwhd_bounds(*, shape_zyx: tuple[int, int, int], crop_xyzwhd: tuple[i
 def _ds_size(v: int, f: int) -> int:
 	# Match interpolate(scale_factor=1/f) floor behavior.
 	return max(1, int(v) // int(f))
+
+
+def _ds_end(v: int, f: int) -> int:
+	"""Exclusive output bound of an input bound: stored pyramid levels are ceil-sized."""
+	return (max(0, int(v)) + int(f) - 1) // int(f)
 
 
 def _ds_index(v: int, f: int) -> int:
@@ -1287,55 +1294,6 @@ def _calibrate_instance_norm(
 	print("[calibrate_norm] done")
 
 
-def _resolve_base_shape(
-	input_path: str,
-	base_ref: str | None,
-	base_scale: int | None,
-) -> tuple[int, int, int] | None:
-	"""Resolve base_shape_zyx from --base-ref/--base-scale or auto-detect.
-
-	Three modes (checked in order):
-	1. base_ref + base_scale: read zarr shape, multiply by 2^base_scale
-	2. base_ref alone: zarr IS 1× base, use shape directly
-	3. Neither: try to open the input as a zarr group and read level 0
-	"""
-	if base_ref is not None:
-		ref = open_node(base_ref)
-		if isinstance(ref, ZarrGroup):
-			raise ValueError(f"--base-ref must point to a zarr array, got group: {base_ref}")
-		sh = tuple(int(v) for v in ref.shape)
-		# Strip leading channel dim if present
-		if len(sh) == 4:
-			sh = sh[1:]
-		if len(sh) != 3:
-			raise ValueError(f"--base-ref array must be 3D or 4D (CZYX), got shape={sh}")
-		scale = base_scale if base_scale is not None else 0
-		f = 2 ** scale
-		return (sh[0] * f, sh[1] * f, sh[2] * f)
-
-	# Auto-detect: find the zarr group root and read actual level 0 shape.
-	try:
-		inp = Path(str(input_path).rstrip("/"))
-		group = open_group(inp.parent if inp.name.isdigit() else inp)
-		level_keys = sorted(int(k) for k in group.keys() if k.isdigit())
-		if level_keys:
-			finest_lv = level_keys[0]
-			sh = tuple(int(v) for v in group[str(finest_lv)].shape)
-			if len(sh) == 3 and finest_lv == 0:
-				print(f"[predict3d] base shape from level 0: {sh}", flush=True)
-				return sh
-			# Fall back to finest available level × 2^level (approximate!)
-			if len(sh) == 3:
-				f = 2 ** finest_lv
-				base = (sh[0] * f, sh[1] * f, sh[2] * f)
-				print(f"[predict3d] WARNING: base shape estimated from level {finest_lv} "
-					  f"shape={sh} × {f} → {base} (may be off by a few voxels)", flush=True)
-				return base
-	except Exception:
-		pass
-	return None
-
-
 def run_preprocess_3d(
 	*,
 	input_path: str,
@@ -1490,13 +1448,13 @@ def run_preprocess_3d(
 	cos_sd = max(1, int(cos_scaledown))
 	other_sd = max(1, int(scaledown))
 
-	full_cos_z = _ds_size(sh[0], cos_sd)
-	full_cos_y = _ds_size(sh[1], cos_sd)
-	full_cos_x = _ds_size(sh[2], cos_sd)
+	full_cos_z = _ds_end(sh[0], cos_sd)
+	full_cos_y = _ds_end(sh[1], cos_sd)
+	full_cos_x = _ds_end(sh[2], cos_sd)
 
-	full_other_z = _ds_size(sh[0], other_sd)
-	full_other_y = _ds_size(sh[1], other_sd)
-	full_other_x = _ds_size(sh[2], other_sd)
+	full_other_z = _ds_end(sh[0], other_sd)
+	full_other_y = _ds_end(sh[1], other_sd)
+	full_other_x = _ds_end(sh[2], other_sd)
 
 	# OME-Zarr output chunk size (needed for crop rounding)
 	oc = max(1, int(ome_chunk))
@@ -1506,16 +1464,16 @@ def run_preprocess_3d(
 	cos_oz0 = (_ds_index(z0, cos_sd) // oc) * oc
 	cos_oy0 = (_ds_index(y0, cos_sd) // oc) * oc
 	cos_ox0 = (_ds_index(x0, cos_sd) // oc) * oc
-	cos_oz1 = min(full_cos_z, ((_ds_index(z0, cos_sd) + _ds_size(nz, cos_sd) + oc - 1) // oc) * oc)
-	cos_oy1 = min(full_cos_y, ((_ds_index(y0, cos_sd) + _ds_size(ny, cos_sd) + oc - 1) // oc) * oc)
-	cos_ox1 = min(full_cos_x, ((_ds_index(x0, cos_sd) + _ds_size(nx_dim, cos_sd) + oc - 1) // oc) * oc)
+	cos_oz1 = min(full_cos_z, ((_ds_end(z1, cos_sd) + oc - 1) // oc) * oc)
+	cos_oy1 = min(full_cos_y, ((_ds_end(y1, cos_sd) + oc - 1) // oc) * oc)
+	cos_ox1 = min(full_cos_x, ((_ds_end(x1, cos_sd) + oc - 1) // oc) * oc)
 
 	other_oz0 = (_ds_index(z0, other_sd) // oc) * oc
 	other_oy0 = (_ds_index(y0, other_sd) // oc) * oc
 	other_ox0 = (_ds_index(x0, other_sd) // oc) * oc
-	other_oz1 = min(full_other_z, ((_ds_index(z0, other_sd) + _ds_size(nz, other_sd) + oc - 1) // oc) * oc)
-	other_oy1 = min(full_other_y, ((_ds_index(y0, other_sd) + _ds_size(ny, other_sd) + oc - 1) // oc) * oc)
-	other_ox1 = min(full_other_x, ((_ds_index(x0, other_sd) + _ds_size(nx_dim, other_sd) + oc - 1) // oc) * oc)
+	other_oz1 = min(full_other_z, ((_ds_end(z1, other_sd) + oc - 1) // oc) * oc)
+	other_oy1 = min(full_other_y, ((_ds_end(y1, other_sd) + oc - 1) // oc) * oc)
+	other_ox1 = min(full_other_x, ((_ds_end(x1, other_sd) + oc - 1) // oc) * oc)
 
 	# Expand input crop to cover the rounded output chunk boundaries.
 	# The accumulator must produce data for every output chunk.
@@ -1532,15 +1490,15 @@ def run_preprocess_3d(
 	cos_oz0 = (_ds_index(z0, cos_sd) // oc) * oc
 	cos_oy0 = (_ds_index(y0, cos_sd) // oc) * oc
 	cos_ox0 = (_ds_index(x0, cos_sd) // oc) * oc
-	cos_oz1 = min(full_cos_z, ((_ds_index(z0, cos_sd) + _ds_size(nz, cos_sd) + oc - 1) // oc) * oc)
-	cos_oy1 = min(full_cos_y, ((_ds_index(y0, cos_sd) + _ds_size(ny, cos_sd) + oc - 1) // oc) * oc)
-	cos_ox1 = min(full_cos_x, ((_ds_index(x0, cos_sd) + _ds_size(nx_dim, cos_sd) + oc - 1) // oc) * oc)
+	cos_oz1 = min(full_cos_z, ((_ds_end(z1, cos_sd) + oc - 1) // oc) * oc)
+	cos_oy1 = min(full_cos_y, ((_ds_end(y1, cos_sd) + oc - 1) // oc) * oc)
+	cos_ox1 = min(full_cos_x, ((_ds_end(x1, cos_sd) + oc - 1) // oc) * oc)
 	other_oz0 = (_ds_index(z0, other_sd) // oc) * oc
 	other_oy0 = (_ds_index(y0, other_sd) // oc) * oc
 	other_ox0 = (_ds_index(x0, other_sd) // oc) * oc
-	other_oz1 = min(full_other_z, ((_ds_index(z0, other_sd) + _ds_size(nz, other_sd) + oc - 1) // oc) * oc)
-	other_oy1 = min(full_other_y, ((_ds_index(y0, other_sd) + _ds_size(ny, other_sd) + oc - 1) // oc) * oc)
-	other_ox1 = min(full_other_x, ((_ds_index(x0, other_sd) + _ds_size(nx_dim, other_sd) + oc - 1) // oc) * oc)
+	other_oz1 = min(full_other_z, ((_ds_end(z1, other_sd) + oc - 1) // oc) * oc)
+	other_oy1 = min(full_other_y, ((_ds_end(y1, other_sd) + oc - 1) // oc) * oc)
+	other_ox1 = min(full_other_x, ((_ds_end(x1, other_sd) + oc - 1) // oc) * oc)
 
 	# Recompute output region sizes with expanded crop
 	cos_wz = cos_oz1 - cos_oz0
@@ -1755,7 +1713,7 @@ def run_preprocess_3d(
 			output_omezarr_path=dt_omezarr_path,
 			output_level_key=str(cos_level),
 			pred_z0=base_z0 // pred_sd,
-			pred_z1=base_z1 // pred_sd,
+			pred_z1=min(base_z1 // pred_sd, int(pred_dt_zarr.shape[0])),
 			pred_y0=pdt_y0,
 			pred_y1=pdt_y1,
 			pred_x0=pdt_x0,
