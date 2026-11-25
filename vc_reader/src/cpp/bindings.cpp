@@ -180,6 +180,12 @@ NB_MODULE(_reader, m)
             nb::object cls = nb::module_::import_("vc_reader.errors").attr("LowDiskSpaceError");
             PyErr_SetString(cls.ptr(), e.what());
         } catch (const std::filesystem::filesystem_error& e) {
+#ifdef _WIN32
+            if (e.code().category() == std::system_category()) {
+                PyErr_SetExcFromWindowsErrWithFilename(PyExc_OSError, e.code().value(), e.path1().string().c_str());
+                return;
+            }
+#endif
             errno = e.code().value();
             PyErr_SetFromErrnoWithFilename(PyExc_OSError, e.path1().string().c_str());
         }
