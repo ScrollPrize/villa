@@ -198,8 +198,8 @@ class ZarrWriter:
     ) -> ZarrWriter:
         """Create an array. ``compressor``: None, blosc, zstd, zlib, gzip, lz4, vc-delta3d or volcomp;
         ``cname`` and ``shuffle`` (0 none, 1 byte, 2 bit) configure blosc. ``level`` <= 0 is the codec's
-        default. ``overwrite`` replaces whatever is at the path. ``skip_empty`` does not store chunks that
-        come out entirely ``fill_value``. ``shards`` is a v3 array's outer shape in elements. ``packbits``
+        default. vc-delta3d stores 3-D and channel-first 4-D (CZYX) uint8 or uint16 chunks. ``overwrite``
+        replaces whatever is at the path. ``skip_empty`` does not store chunks that come out entirely ``fill_value``. ``shards`` is a v3 array's outer shape in elements. ``packbits``
         stores a bool array's elements as bits, in front of the compressor.
         """
         path = os.fspath(path)

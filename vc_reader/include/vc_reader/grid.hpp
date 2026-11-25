@@ -64,6 +64,12 @@ struct SurfaceOptions {
     // Negate the patch normals (a grid whose rows and columns are mirrored against the
     // convention). Vertex normals given in `Vertices` keep their sign.
     bool flipNormals = false;
+    // Vertex rows [core[0], core[1]) and columns [core[2], core[3]) the surface is used for, when it was
+    // given more vertices around them as context (all zero: none). Bicubic patches then take the sign
+    // of their normal from the surface made of the core vertices alone, so a render never changes which
+    // side of the mesh a signed offset samples with the context around the core, while positions and the
+    // size of the normal still come from the whole surface. Ignored with vertex normals and in linear mode.
+    std::array<int, 4> core{0, 0, 0, 0};
 };
 
 // A raster laid over the grid: pixel (i, j) sits at grid column x0 + i * sx + j * kx,

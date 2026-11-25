@@ -1,9 +1,14 @@
 # Lasagna volume schema v3: embedded manifest and resolution groups
 
-Status: schema implemented by the shared prediction writer and the local
-accelerated tracing reader. Existing volumes and running jobs are unchanged.
-Other consumers, particularly remote catalogue/publication integrations,
-still need schema-v3 support before compact output is used with them.
+Status: schema implemented by the shared prediction writer, the local
+accelerated tracing reader, VC3D (local, remote and open-data catalogue
+attachment), the manager's Fiberlet inputs and Atlas ingestion. Existing volumes
+and running jobs are unchanged. The Lasagna fit service still lists only
+`.lasagna.json` datasets.
+
+A published v3 artifact directory holds one `<name>.zarr` and its
+`inference.json`. Local catalogue copies keep `lasagna-remote.json` beside the
+store, with `manifest_file` set to `<name>.zarr/.zattrs`.
 
 This replaces the external `.lasagna.json` manifest and separate per-channel
 Zarr stores with one Zarr store containing resolution-based channel groups.

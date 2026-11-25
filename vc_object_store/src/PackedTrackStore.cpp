@@ -3,8 +3,10 @@
 #include <array>
 #include <algorithm>
 #include <bit>
+#include <cstdint>
 #include <cstring>
 #include <chrono>
+#include <optional>
 #include <set>
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -23,6 +25,51 @@ std::span<const T> mapArray(objects::memmap::MappedFileRO& map, const std::files
     if (count == 0) return {};
     map.open(path);
     return {static_cast<const T*>(map.data()), static_cast<size_t>(count)};
+}
+
+// Same rule as spiral-fitting's _db_signatures_match. Name and size match
+// exactly. mtime matches exactly, except when either side is a whole second
+// (divisible by 1e9, the part HTTP Last-Modified keeps) and the seconds match.
+// Two different nanosecond stamps in one second stay stale. JSON integers
+// only: floats and other non-integers are malformed and therefore stale.
+// Bad metadata is stale rather than a JSON type error. Stamps are after
+// 1970 and the Python writer stores integers, so toward-zero division by
+// 1000000000 matches that writer's floor division.
+constexpr std::int64_t kSignatureSecondNs = 1000000000;
+
+std::optional<std::int64_t> signatureInteger(const nlohmann::json& value)
+{
+    try {
+        if (!value.is_number_integer()) return std::nullopt;
+        return value.get<std::int64_t>();
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
+}
+
+bool samePackedDbSignature(const nlohmann::json& stored, const nlohmann::json& expected)
+{
+    if (!stored.is_array() || stored.size() != expected.size()) return false;
+    try {
+        for (std::size_t i = 0; i < stored.size(); ++i) {
+            const auto& item = stored.at(i);
+            const auto& want = expected.at(i);
+            if (!item.is_array() || item.size() != 3) return false;
+            if (item.at(0) != want.at(0)) return false;
+            const auto haveSize = signatureInteger(item.at(1));
+            const auto needSize = signatureInteger(want.at(1));
+            if (!haveSize || !needSize || *haveSize != *needSize) return false;
+            const auto have = signatureInteger(item.at(2));
+            const auto need = signatureInteger(want.at(2));
+            if (!have || !need) return false;
+            if (*have == *need) continue;
+            const bool truncated = *have % kSignatureSecondNs == 0 || *need % kSignatureSecondNs == 0;
+            if (!truncated || *have / kSignatureSecondNs != *need / kSignatureSecondNs) return false;
+        }
+    } catch (const nlohmann::json::exception&) {
+        return false;
+    }
+    return true;
 }
 }
 std::filesystem::path resolvePackedTrackStore(const std::filesystem::path& input)
@@ -50,7 +97,7 @@ std::filesystem::path resolvePackedTrackStore(const std::filesystem::path& input
     std::sort(actual.begin(), actual.end());
     if (actual.empty()) throw std::runtime_error("DBM backing files missing: " + logical.string());
     if (metadata.value("version", 0) != 1 || !metadata.contains("source_db_signature")
-        || metadata.at("source_db_signature") != actual)
+        || !samePackedDbSignature(metadata.at("source_db_signature"), actual))
         throw std::runtime_error("packed tracks are stale for " + logical.string()
             + "; rebuild with Spiral's convert_track_store.py --force");
     return fs::canonical(packed);

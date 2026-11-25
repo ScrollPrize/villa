@@ -1,3 +1,4 @@
+import json
 import multiprocessing as mp
 import pickle
 
@@ -8,7 +9,7 @@ import zarr
 from build_support import load_build
 load_build()
 
-from vc_reader.reader import (ZarrReader, ZarrWriter, create_group, create_pyramid_levels, ome_multiscales, open_node, open_zarr,
+from vc_reader.reader import (ZarrReader, ZarrWriter, compress_bytes, create_group, create_pyramid_levels, ome_multiscales, open_node, open_zarr,
                               write_pyramid, write_pyramid_level)
 
 
@@ -93,6 +94,49 @@ def test_create_like_keeps_layout_and_codec(tmp_path):
     changed = ZarrWriter.create_like(tmp_path / "c", source, shape=(2, 2), chunks=(1, 1), dtype="u1", fill_value=0, separator=".")
     assert changed.shape == (2, 2) and changed.dtype == np.uint8 and changed.fill_value == 0
     assert ZarrReader.open(changed.path).meta.separator == "."
+
+
+@pytest.mark.parametrize("version", [2, 3])
+@pytest.mark.parametrize("dtype,side", [("u1", 32), ("u1", 64), ("u1", 20), ("u2", 32)])
+def test_delta3d_stores_channel_first_4d_chunks(tmp_path, version, dtype, side):
+    shape, chunks = (6, side + 5, side, 2 * side), (6, side, side, side)
+    data = np.random.default_rng(0).integers(0, 200, shape).astype(dtype)
+    data[:, :, :, side:] = 0
+    w = ZarrWriter.create(tmp_path / "a", shape=shape, chunks=chunks, dtype=dtype, compressor="vc-delta3d",
+                          version=version, separator="/", skip_empty=True)
+    w[:] = data
+    assert not w.chunk_exists((0, 0, 0, 1))
+    np.testing.assert_array_equal(open_zarr(tmp_path / "a")[:], data)
+    np.testing.assert_array_equal(open_zarr(tmp_path / "a")[2:3, 1:7], data[2:3, 1:7])
+    if version == 2:
+        assert json.loads((tmp_path / "a/.zarray").read_text())["compressor"] == {
+            "id": "vc-delta3d", "quant": 1, "channel_axis": "first"}
+    like = ZarrWriter.create_like(tmp_path / "b", w)
+    like[:] = data
+    np.testing.assert_array_equal(open_zarr(tmp_path / "b")[:], data)
+
+
+@pytest.mark.parametrize("axis", ["first", "last"])
+def test_delta3d_4d_chunks_match_numcodecs(tmp_path, axis):
+    codec = pytest.importorskip("vc_delta3d").Delta3D(channel_axis=axis)
+    shape = (3, 32, 32, 32) if axis == "first" else (32, 32, 32, 3)
+    data = np.random.default_rng(1).integers(0, 50, shape).astype(np.uint8)
+    array = zarr.create_array(tmp_path / "a", shape=shape, chunks=shape, dtype="u1", zarr_format=2, compressors=codec)
+    array[:] = data
+    np.testing.assert_array_equal(open_zarr(tmp_path / "a")[:], data)
+    stored = next(p for p in (tmp_path / "a").rglob("0*") if p.is_file()).read_bytes()
+    assert compress_bytes(data, codec.get_config(), shape=shape) == stored
+    w = ZarrWriter.open(tmp_path / "a")
+    w[:] = data[::-1]
+    np.testing.assert_array_equal(zarr.open_array(tmp_path / "a", mode="r")[:], data[::-1])
+    ZarrWriter.create_like(tmp_path / "b", w)
+    assert open_zarr(tmp_path / "b").compressor["channel_axis"] == axis
+
+
+@pytest.mark.parametrize("chunks,dtype", [((8, 8), "u1"), ((2, 2, 8, 8, 8), "u1"), ((2, 8, 8, 8), "f4"), ((2, 8, 8, 8), "i1")])
+def test_delta3d_rejects_unsupported_arrays(tmp_path, chunks, dtype):
+    with pytest.raises(ValueError, match="vc-delta3d"):
+        ZarrWriter.create(tmp_path / "a", shape=chunks, chunks=chunks, dtype=dtype, compressor="vc-delta3d")
 
 
 @pytest.mark.parametrize(("reduction", "expected"), [("mean", 6), ("nearest", 7), ("mode", 5)])

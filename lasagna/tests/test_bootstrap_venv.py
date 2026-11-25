@@ -44,9 +44,10 @@ class BootstrapVenvTests(unittest.TestCase):
         native = [["-e", str(villa / name)] for name in ("vc_reader", "volume-cartographer", "vc_object_store")]
         for sibling in native:
             self.assertIn(sibling, [command[-2:] for command in commands])
-        # The object store is installed before Lasagna, which requires it.
+        # These siblings are installed before Lasagna, which requires them.
         installs = [command[-1] for command in commands if command[-2] == "-e"]
         self.assertLess(installs.index(str(villa / "vc_object_store")), installs.index(str(villa / "lasagna")))
+        self.assertLess(installs.index(str(villa / "gpu_manager")), installs.index(str(villa / "lasagna")))
         native_calls = [
             call for call in mocked_run.call_args_list
             if call.args[0][-2:] in native

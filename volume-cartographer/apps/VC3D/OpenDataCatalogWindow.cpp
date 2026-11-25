@@ -375,10 +375,16 @@ QString catalogTabStyle(const QPalette& palette)
 } // namespace
 
 OpenDataCatalogWindow::OpenDataCatalogWindow(QWidget* parent)
-    : QDialog(parent)
+    : OpenDataCatalogWindow(std::string(vcr::catalog::kDefaultManifestUrl), parent)
+{
+}
+
+OpenDataCatalogWindow::OpenDataCatalogWindow(std::string manifestUrl, QWidget* parent)
+    : QDialog(parent), _manifestUrl(std::move(manifestUrl))
 {
     buildUi();
-    loadCachedManifestIfAvailable();
+    if (const auto cached = vcr::catalog::cachedManifest(_cacheFile))
+        applyManifest(*cached, QString::fromUtf8(_cacheFile.u8string().c_str()), true);
     reloadManifest();
 }
 
@@ -427,7 +433,7 @@ void OpenDataCatalogWindow::setRefreshSampleHandler(RefreshSampleHandler handler
 
 void OpenDataCatalogWindow::createSelectedProject()
 {
-    if (_manifestRefreshPending || !selectedSample() || !_createProjectHandler) return;
+    if (!projectActionsReady() || !selectedSample() || !_createProjectHandler) return;
     // Snapshot indices and metadata while the modal dialog is open.
     const auto sample = *selectedSample();
     const auto remoteRoot = vc3d::remoteCachePathFs();
@@ -587,6 +593,7 @@ void OpenDataCatalogWindow::buildUi()
     _segmentsOnlyCheck = new QCheckBox(tr("Segments"), this);
     _inkOnlyCheck = new QCheckBox(tr("Ink"), this);
     _refreshButton = new QPushButton(tr("Refresh"), this);
+    _refreshButton->setObjectName("refreshCatalog");
     _refreshButton->setToolTip(tr("Refresh the open-data catalog manifest from the remote source."));
     _refreshButton->setStatusTip(tr("Refreshes the open-data catalog listing, including samples, scans, volumes, representations, and segments."));
     topRow->addWidget(_searchEdit, 1);
@@ -597,6 +604,7 @@ void OpenDataCatalogWindow::buildUi()
 
     auto* splitter = new QSplitter(Qt::Horizontal, this);
     _sampleTable = new QTableWidget(splitter);
+    _sampleTable->setObjectName("catalogSamples");
     _sampleTable->setColumnCount(5);
     _sampleTable->setHorizontalHeaderLabels({
         tr("Sample ID"),
@@ -773,6 +781,7 @@ void OpenDataCatalogWindow::buildUi()
     _refreshSampleButton->setToolTip(tr("Re-read the published catalog into this sample's surface store: new and "
                                         "republished surfaces. Locally edited surfaces are preserved."));
     _openSampleButton = new QPushButton(tr("Open Sample"), this);
+    _openSampleButton->setObjectName("openCatalogSample");
     _createProjectButton = new QPushButton(tr("Create Project..."), this);
     _createProjectButton->setToolTip(tr("Choose resources for a new project"));
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -823,7 +832,7 @@ void OpenDataCatalogWindow::buildUi()
     connect(_attachRepresentationButton, &QPushButton::clicked, this, [this]() {
         const auto* sample = selectedSample();
         const auto ref = selectedRepresentation();
-        if (_manifestRefreshPending || !sample || !ref || !_attachRepresentationHandler ||
+        if (!projectActionsReady() || !sample || !ref || !_attachRepresentationHandler ||
             !canAttachRepresentation(*sample, *ref))
             return;
         // The full sample gives the attach its catalog context (source volumes,
@@ -872,14 +881,13 @@ void OpenDataCatalogWindow::reloadManifest()
     connect(_fetchWatcher, &QFutureWatcher<ManifestLoadResult>::finished,
             this, &OpenDataCatalogWindow::onFetchFinished);
 
-    const auto manifestUrl = std::string(vcr::catalog::kDefaultManifestUrl);
-    _fetchWatcher->setFuture(QtConcurrent::run([manifestUrl]() {
+    _fetchWatcher->setFuture(QtConcurrent::run([manifestUrl = _manifestUrl, cacheFile = _cacheFile]() {
         ManifestLoadResult result;
         result.sourceLabel = QString::fromStdString(manifestUrl);
         try {
-            auto loaded = vcr::catalog::loadCatalog(manifestUrl,
-                {vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)), true});
+            auto loaded = vcr::catalog::loadCatalog(manifestUrl, {cacheFile, true});
             result.manifest = std::move(loaded.manifest);
+            result.browseOnly = !loaded.onDisk;
             if (loaded.fromCache) result.sourceLabel += QStringLiteral(" (cached)");
             if (!loaded.warning.empty()) result.sourceLabel += QStringLiteral(": ") + QString::fromStdString(loaded.warning);
         } catch (const std::exception& e) {
@@ -895,42 +903,52 @@ void OpenDataCatalogWindow::onFetchFinished()
 {
     QFutureWatcher<ManifestLoadResult>* watcher = _fetchWatcher;
     _fetchWatcher = nullptr;
-    const ManifestLoadResult result = watcher->result();
+    ManifestLoadResult result = watcher->result();
     watcher->deleteLater();
+    if (result.error.isEmpty() && !result.browseOnly) {
+        applyManifest(std::move(result.manifest), result.sourceLabel, false);
+    } else {
+        // Project actions resolve through the current cache file. It may have
+        // changed or disappeared since the dialog last loaded it.
+        const auto cached = vcr::catalog::cachedManifest(_cacheFile);
+        if (cached) {
+            applyManifest(*cached, QString::fromUtf8(_cacheFile.u8string().c_str()), true);
+            setStatus(result.error.isEmpty()
+                ? tr("Using cached catalog. Live catalog from %1").arg(result.sourceLabel)
+                : tr("Using cached catalog. Live refresh failed: %1").arg(result.error));
+        } else if (result.error.isEmpty()) {
+            applyManifest(std::move(result.manifest), result.sourceLabel, false, true);
+        } else {
+            _browseOnly = _manifest.has_value();
+            auto status = tr("Live catalog refresh failed: %1").arg(result.error);
+            if (_browseOnly)
+                status += tr(". Showing previously loaded data in browse-only mode.");
+            setStatus(status);
+        }
+    }
     _manifestRefreshPending = false;
     setLoading(false);
-    if (!result.error.isEmpty()) {
-        if (_manifest) {
-            setStatus(tr("Using cached catalog. Live refresh failed: %1").arg(result.error));
-        } else {
-            setStatus(tr("Live catalog refresh failed: %1").arg(result.error));
-        }
-        return;
-    }
-
-    applyManifest(result.manifest, result.sourceLabel, false);
 }
 
-void OpenDataCatalogWindow::loadCachedManifestIfAvailable()
-{
-    const auto path = vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl));
-    if (!std::filesystem::is_regular_file(path)) {
-        return;
-    }
-    if (const auto manifest = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl))))
-        applyManifest(*manifest, qstr(path.string()), true);
-    else
-        setStatus(tr("Could not parse cached open-data manifest %1").arg(qstr(path.string())));
-}
-
-void OpenDataCatalogWindow::applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache)
+void OpenDataCatalogWindow::applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache,
+                                          bool browseOnly)
 {
     _manifest = std::move(manifest);
+    _browseOnly = browseOnly;
     populateSamples();
-    setStatus(tr("%1 catalog: %2 samples. Source: %3")
-                  .arg(fromCache ? tr("Cached") : tr("Live"))
-                  .arg(_manifest->samples.size())
-                  .arg(sourceLabel));
+    auto status = tr("%1 catalog: %2 samples. Source: %3")
+                      .arg(fromCache ? tr("Cached") : tr("Live"))
+                      .arg(_manifest->samples.size())
+                      .arg(sourceLabel);
+    if (_browseOnly)
+        status += tr(". Browse only: projects cannot be opened or changed until the catalog can be cached.");
+    setStatus(status);
+    updateActionButtons();
+}
+
+bool OpenDataCatalogWindow::projectActionsReady() const
+{
+    return !_manifestRefreshPending && !_browseOnly;
 }
 
 void OpenDataCatalogWindow::setStatus(const QString& text)
@@ -1337,12 +1355,13 @@ QString OpenDataCatalogWindow::selectedSegmentUrl() const
 void OpenDataCatalogWindow::updateActionButtons()
 {
     const bool manifestReady = !_manifestRefreshPending;
+    const bool projectReady = projectActionsReady();
     const bool hasVolumeUrl = !selectedVolumeUrl().isEmpty();
     const bool hasRepresentationUrl = !selectedRepresentationUrl().isEmpty();
     if (_attachRepresentationButton) {
         const auto* sample = selectedSample();
         const auto representation = selectedRepresentation();
-        _attachRepresentationButton->setEnabled(manifestReady && sample && representation &&
+        _attachRepresentationButton->setEnabled(projectReady && sample && representation &&
                                                 bool(_attachRepresentationHandler) &&
                                                 canAttachRepresentation(*sample, *representation));
     }
@@ -1352,14 +1371,14 @@ void OpenDataCatalogWindow::updateActionButtons()
     const auto remoteRoot = vc3d::remoteCachePathFs();
     const bool canOpenSample = sample != nullptr &&
                                static_cast<bool>(_openSampleHandler) &&
-                               manifestReady;
+                               projectReady;
     if (_openSampleButton) {
         _openSampleButton->setEnabled(canOpenSample);
     }
     if (_createProjectButton)
-        _createProjectButton->setEnabled(manifestReady && sample && bool(_createProjectHandler));
+        _createProjectButton->setEnabled(projectReady && sample && bool(_createProjectHandler));
     if (_refreshSampleButton)
-        _refreshSampleButton->setEnabled(manifestReady && sample && sample->surfaceSegmentCount() > 0 &&
+        _refreshSampleButton->setEnabled(projectReady && sample && sample->surfaceSegmentCount() > 0 &&
                                          bool(_refreshSampleHandler));
     if (_downloadNormalGridsButton) {
         const auto* volume = selectedVolume();
@@ -1380,7 +1399,7 @@ void OpenDataCatalogWindow::updateActionButtons()
         _copyVolumeUrlButton->setEnabled(hasVolumeUrl);
     }
     if (_attachVolumeButton) {
-        _attachVolumeButton->setEnabled(manifestReady && hasVolumeUrl);
+        _attachVolumeButton->setEnabled(projectReady && hasVolumeUrl);
     }
     if (_openVolumeUrlButton) {
         _openVolumeUrlButton->setEnabled(hasVolumeUrl);
@@ -1404,7 +1423,7 @@ void OpenDataCatalogWindow::updateActionButtons()
 void OpenDataCatalogWindow::openSelectedSample()
 {
     const auto* sample = selectedSample();
-    if (_manifestRefreshPending || !sample || !_openSampleHandler) {
+    if (!projectActionsReady() || !sample || !_openSampleHandler) {
         return;
     }
     if (_openSampleHandler(*sample)) {
@@ -1582,7 +1601,7 @@ void OpenDataCatalogWindow::openSelectedSegmentUrl()
 void OpenDataCatalogWindow::refreshSelectedSample()
 {
     const auto* sample = selectedSample();
-    if (!sample || !_refreshSampleHandler) return;
+    if (!projectActionsReady() || !sample || !_refreshSampleHandler) return;
     setStatus(tr("Refreshing %1 from Open Data...").arg(qstr(sample->id)));
     setStatus(_refreshSampleHandler(*sample));
 }

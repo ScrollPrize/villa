@@ -55,6 +55,8 @@ class BoundedPatchWriter:
 
     def __exit__(self, exc_type, exc, tb):
         self._executor.__exit__(exc_type, exc, tb)
+        if exc_type is None:
+            self._raise_if_failed()
         return False
 
     def submit(self, write_index, patch_data):

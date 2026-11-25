@@ -7,6 +7,9 @@
 #include <mutex>
 #include <set>
 namespace vcr::reader_cuda {
+struct BrickCacheBudgetError : std::invalid_argument {
+    using std::invalid_argument::invalid_argument;
+};
 // valid: optional uint8 mask, 1 where every neighbour read lies in the volume
 // (and, for source="resident", in a cached brick).
 struct Result { device::Storage storage; std::size_t count; bool floating; device::Storage valid; };
@@ -422,7 +425,7 @@ public:
         std::set<std::int64_t> needed;
         const std::int64_t total=source_.grid[0]*source_.grid[1]*source_.grid[2];
         for (auto key:keys) if (key>=0 && key<total) needed.insert(key);
-        if (needed.size()>capacity()) throw std::invalid_argument("request exceeds CUDA brick-cache budget; increase cache_bytes");
+        if (needed.size()>capacity()) throw BrickCacheBudgetError("request exceeds CUDA brick-cache budget; increase cache_bytes");
         // Before locking, read the bricks this reader lacks and stage them on the device:
         // with_resident promises a frame the bricks already here, so the lock is held
         // only to assign slots and enqueue their scatter, never across a read or a sync.

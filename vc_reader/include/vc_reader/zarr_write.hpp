@@ -73,7 +73,8 @@ void createObjectArray(const std::filesystem::path& path, const Index& shape, co
 // ---- codecs on plain bytes -------------------------------------------------------------
 
 // `data` encoded by a numcodecs compressor config ({"id": "blosc", "cname": ...}; null copies),
-// as a chunk of `itemsize`-byte elements. `shape` is only read by vc-delta3d and volcomp.
+// as a chunk of `itemsize`-byte elements. `shape` is only read by vc-delta3d and volcomp. vc-delta3d
+// stores 3-D shapes, and 4-D ones when the config has a "channel_axis" of "first" or "last".
 std::vector<std::uint8_t> compressBytes(const Json& compressor, std::span<const std::uint8_t> data, std::size_t itemsize = 1,
                                         const Index& shape = {});
 // The reverse, into exactly `out.size()` bytes; throws on any other decoded size.
@@ -93,6 +94,7 @@ struct CreateOptions {
     int level = -1;
     std::string cname = "lz4";  // blosc inner codec: lz4, zstd, zlib, ...
     int shuffle = 1;            // blosc: 0 none, 1 byte, 2 bit
+    std::string channelAxis;    // vc-delta3d, 4-D chunks: "first" (CZYX, also if empty) or "last" (ZYXC)
     bool overwrite = false;     // replace whatever is at the path, stored chunks included
     std::string separator = ".";
     Json fillValue = 0;

@@ -6,17 +6,58 @@
 
 #include <QApplication>
 #include <QDialogButtonBox>
+#include <QFile>
 #include <QPushButton>
+#include <QScopeGuard>
 #include <QTemporaryDir>
 #include <QDir>
 #include <QSettings>
 #include <QLineEdit>
 #include <QTableWidget>
+#include <QTcpServer>
+#include <QTcpSocket>
 #include <QTreeWidget>
 #include <QTimer>
 #include <QtTest>
 
-using namespace vc3d::opendata;
+#include <filesystem>
+
+namespace vc3d::opendata {
+
+namespace {
+
+class CatalogServer : public QTcpServer
+{
+public:
+    CatalogServer()
+    {
+        connect(this, &QTcpServer::newConnection, this, [this] {
+            while (auto* socket = nextPendingConnection()) {
+                connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+                connect(socket, &QTcpSocket::readyRead, socket, [this, socket] {
+                    if (!socket->peek(socket->bytesAvailable()).contains("\r\n\r\n"))
+                        return;
+                    socket->readAll();
+                    const QByteArray body = sample.isEmpty() ? QByteArray{} :
+                        "{\"samples\":{\"" + sample + "\":{\"sample\":{\"id\":\"" + sample + "\"}}}}";
+                    socket->write((sample.isEmpty() ? "HTTP/1.1 404 Not Found" : "HTTP/1.1 200 OK") +
+                                  QByteArray("\r\nConnection: close\r\nContent-Length: ") +
+                                  QByteArray::number(body.size()) + "\r\n\r\n" + body);
+                    socket->disconnectFromHost();
+                });
+            }
+        });
+    }
+
+    std::string url() const
+    {
+        return "http://127.0.0.1:" + std::to_string(serverPort()) + "/catalog.json";
+    }
+
+    QByteArray sample{"Initial"};
+};
+
+} // namespace
 
 class CatalogProjectDialogTest : public QObject
 {
@@ -30,6 +71,75 @@ private slots:
         QVERIFY(_config.isValid());
         qputenv("VC3D_CONFIG_DIR", _config.path().toUtf8());
         qputenv("XDG_DATA_HOME", _config.filePath("data").toUtf8());
+        qputenv("NO_PROXY", "127.0.0.1");
+    }
+
+    void inaccessibleCacheStillLoadsLiveCatalog()
+    {
+        const auto cacheDir = _config.filePath("inaccessible-cache");
+        QVERIFY(QDir().mkpath(cacheDir));
+        const auto permissions = QFile::permissions(cacheDir);
+        QVERIFY(QFile::setPermissions(cacheDir, QFileDevice::Permissions{}));
+        const auto restore = qScopeGuard([&] { QFile::setPermissions(cacheDir, permissions); });
+        qputenv("VC_READER_CACHE_DIR", cacheDir.toUtf8());
+
+        CatalogServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        std::error_code error;
+        QVERIFY(!std::filesystem::is_regular_file(vcr::catalog::catalogCacheFile(server.url()), error));
+        if (error != std::errc::permission_denied)
+            QSKIP("This user or filesystem can traverse the cache directory.");
+
+        OpenDataCatalogWindow catalog(server.url());
+        catalog.setOpenSampleHandler([](const auto&) { return false; });
+        auto* samples = catalog.findChild<QTableWidget*>("catalogSamples");
+        auto* open = catalog.findChild<QPushButton*>("openCatalogSample");
+        QVERIFY(samples && open);
+        QTRY_COMPARE(samples->rowCount(), 1);
+        QCOMPARE(samples->item(0, 0)->text(), QStringLiteral("Initial"));
+        samples->setCurrentCell(0, 0);
+        QVERIFY(!open->isEnabled());
+    }
+
+    void removedCacheDisablesProjectActions_data()
+    {
+        QTest::addColumn<bool>("liveRefreshSucceeds");
+        QTest::newRow("live-download") << true;
+        QTest::newRow("fetch-failure") << false;
+    }
+
+    void removedCacheDisablesProjectActions()
+    {
+        QFETCH(bool, liveRefreshSucceeds);
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        const auto cacheDir = temp.filePath("cache");
+        qputenv("VC_READER_CACHE_DIR", cacheDir.toUtf8());
+
+        CatalogServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        OpenDataCatalogWindow catalog(server.url());
+        catalog.setOpenSampleHandler([](const auto&) { return false; });
+        auto* samples = catalog.findChild<QTableWidget*>("catalogSamples");
+        auto* refresh = catalog.findChild<QPushButton*>("refreshCatalog");
+        auto* open = catalog.findChild<QPushButton*>("openCatalogSample");
+        QVERIFY(samples && refresh && open);
+        QTRY_COMPARE(samples->rowCount(), 1);
+        QCOMPARE(samples->item(0, 0)->text(), QStringLiteral("Initial"));
+        samples->setCurrentCell(0, 0);
+        QVERIFY(open->isEnabled());
+
+        QVERIFY(QDir(cacheDir).removeRecursively());
+        QFile blockedCache(cacheDir);
+        QVERIFY(blockedCache.open(QIODevice::WriteOnly));
+        blockedCache.close();
+        server.sample = liveRefreshSucceeds ? QByteArray("Live") : QByteArray{};
+        refresh->click();
+        QTRY_VERIFY(refresh->isEnabled());
+        QCOMPARE(samples->rowCount(), 1);
+        QCOMPARE(samples->item(0, 0)->text(), liveRefreshSucceeds ? QStringLiteral("Live") : QStringLiteral("Initial"));
+        samples->setCurrentCell(0, 0);
+        QVERIFY(!open->isEnabled());
     }
 
     void attachRepresentations()
@@ -224,5 +334,7 @@ private slots:
     }
 };
 
-QTEST_MAIN(CatalogProjectDialogTest)
+} // namespace vc3d::opendata
+
+QTEST_MAIN(vc3d::opendata::CatalogProjectDialogTest)
 #include "test_catalog_project_dialog.moc"

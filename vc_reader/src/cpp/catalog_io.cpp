@@ -2,6 +2,7 @@
 #include "vc_reader/catalog.hpp"
 #include "http.hpp"
 #include "atomic_file.hpp"
+#include "utf8_path.hpp"
 #include <zlib.h>
 #include <cstdlib>
 #include <fstream>
@@ -54,35 +55,43 @@ std::pair<std::string,HttpResponse> request(const std::string& url,const std::st
 }
 std::string readCatalogFile(const std::filesystem::path& path) {
     std::ifstream in(path,std::ios::binary);
-    if(!in)throw std::runtime_error("cannot open catalog: "+path.string());
+    if(!in)throw std::runtime_error("cannot open catalog: "+utf8String(path));
     std::string body;std::array<char,65536> block;
     while(in){in.read(block.data(),block.size());body.append(block.data(),in.gcount());if(body.size()>maxBytes)throw std::runtime_error("catalog exceeds size limit");}
-    if(!in.eof())throw std::runtime_error("cannot read catalog: "+path.string());
+    if(!in.eof())throw std::runtime_error("cannot read catalog: "+utf8String(path));
     return decode(std::move(body));
 }
 CatalogLoadResult loadCatalog(const std::string& source,const CatalogLoadOptions& options) {
-    if(!source.starts_with("https://")&&!source.starts_with("http://"))return {loadOpenDataManifestFile(source),false,{}};
+    if(!source.starts_with("https://")&&!source.starts_with("http://"))return {loadOpenDataManifestFile(utf8Path(source)),false,false,{}};
     static std::mutex cacheMutex;
     std::lock_guard lock(cacheMutex);
     std::optional<OpenDataManifest> cached;
     nlohmann::json info=nlohmann::json::object();
     const auto now=std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
-    const auto infoPath=options.cacheFile.string()+".info.json";
+    const auto infoPath=utf8String(options.cacheFile)+".info.json";
     if(!options.cacheFile.empty())try {
-        info=nlohmann::json::parse(readCatalogFile(infoPath));
+        info=nlohmann::json::parse(readCatalogFile(utf8Path(infoPath)));
         if(info.value("source",std::string{})==source)cached=loadOpenDataManifestFile(options.cacheFile,source);
     }catch(const std::exception&){}
-    if(cached&&!options.refresh&&now-info.value("checked_at",0.)<options.maxAgeSeconds)return {*cached,true,{}};
+    if(cached&&!options.refresh&&now-info.value("checked_at",0.)<options.maxAgeSeconds)return {*cached,true,true,{}};
     try {
         auto [body,response]=request(source,cached?info.value("etag",std::string{}):std::string{},options.timeoutSeconds);
         if(response.status==304&&!cached)throw std::runtime_error("catalog returned 304 without cached content");
         auto manifest=response.status==304?*cached:parseOpenDataManifest(body,source);
-        if(!options.cacheFile.empty()) {
-            if(response.status!=304)atomic_write(options.cacheFile.string(), reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+        std::string warning;
+        // A 304 confirms the body already in the cache file.
+        bool onDisk=response.status==304;
+        // A cache folder that cannot be written does not make the downloaded catalog unusable,
+        // but readers of the cache file do not see it: onDisk stays false.
+        if(!options.cacheFile.empty())try {
+            if(response.status!=304) {
+                atomic_write(utf8String(options.cacheFile), reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
+                onDisk=true;
+            }
             const auto infoText = nlohmann::json{{"source",source},{"checked_at",now},{"etag",response.etag.empty()?info.value("etag",std::string{}):response.etag}}.dump();
             atomic_write(infoPath, reinterpret_cast<const std::uint8_t*>(infoText.data()), infoText.size());
-        }
-        return {std::move(manifest),response.status==304,{}};
-    }catch(const std::exception& e){if(cached)return {*cached,true,e.what()};throw;}
+        }catch(const std::exception& e){if(cached&&!onDisk)throw;warning=std::string("catalog not cached: ")+e.what();}
+        return {std::move(manifest),response.status==304,onDisk,std::move(warning)};
+    }catch(const std::exception& e){if(cached)return {*cached,true,true,e.what()};throw;}
 }
 }
