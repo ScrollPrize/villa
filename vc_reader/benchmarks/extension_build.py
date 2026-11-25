@@ -1,11 +1,17 @@
 """Select compiled extensions from an existing build for benchmarks and tests."""
 import importlib.util
 from pathlib import Path
+import runpy
 import sys
 
 
 def load_extensions(directory, names=("_catalog", "_reader", "_transforms")):
     import importlib.machinery
+
+    # These extensions are loaded directly, before the package initializer.
+    rocm_init = directory / "_rocm_init.py"
+    if rocm_init.is_file():
+        runpy.run_path(str(rocm_init))["initialize"]()
 
     for name in names:
         candidates = [directory / (name + suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES]
