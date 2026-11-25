@@ -87,6 +87,7 @@ struct Surface::Impl {
     std::vector<std::uint8_t> valid;    // per vertex (bool-sized)
     std::vector<int> piece;             // per column; empty: one piece
     std::vector<float> du, dv, duv;     // per vertex, bicubic mode
+    std::vector<VertexDerivatives> coreDerivatives;
     std::vector<float> packed, packedNormals;  // without row padding, when stride != cols * 3
 
     const float* xyz() const { return packed.empty() ? v.xyz : packed.data(); }
@@ -105,6 +106,11 @@ struct Surface::Impl {
             g.du = du.data();
             g.dv = dv.data();
             g.duv = duv.data();
+            if (!coreDerivatives.empty()) {
+                g.coreDerivatives = coreDerivatives.data();
+                for (int k = 0; k < 4; ++k)
+                    g.core[k] = options.core[std::size_t(k)];
+            }
         }
         return g;
     }
@@ -131,6 +137,36 @@ struct Surface::Impl {
         Derivatives d{view(), v.rows, v.cols};
         for(std::size_t i=0;i<n;++i)d.firstAt(int(i),du.data(),dv.data());
         for(std::size_t i=0;i<n;++i)d.mixedAt(int(i),duv.data());
+        buildCoreDerivatives();
+    }
+
+    // Only perimeter vertices change when the grid is restricted to the core.
+    void buildCoreDerivatives()
+    {
+        const auto& c = options.core;
+        if (c == std::array<int, 4>{})
+            return;
+        if (c[0] < 0 || c[2] < 0 || c[1] <= c[0] || c[3] <= c[2] || c[1] > v.rows || c[3] > v.cols)
+            throw std::invalid_argument("surface core outside the vertices");
+        const int height = c[1] - c[0], width = c[3] - c[2];
+        if (height < 2 || width < 2 || (height == v.rows && width == v.cols) || normals())
+            return;
+
+        coreDerivatives.resize(2 * (std::size_t(height) + width - 2));
+        const Derivatives d{view(), v.rows, v.cols, c[0], c[1], c[2], c[3]};
+        const auto store = [&](int row, int col) {
+            if (d.ok(row, col))
+                coreDerivatives[perimeterIndex(c.data(), row, col)] =
+                    {d.first(row, col, true), d.first(row, col, false), d.mixed<false>(row, col)};
+        };
+        for (int col = c[2]; col < c[3]; ++col) {
+            store(c[0], col);
+            store(c[1] - 1, col);
+        }
+        for (int row = c[0] + 1; row < c[1] - 1; ++row) {
+            store(row, c[2]);
+            store(row, c[3] - 1);
+        }
     }
 
     // Positions and normals of the raster pixels i0 <= i < i0 + w, j0 <= j < j0 + h, into
@@ -817,6 +853,7 @@ device::Storage upload(const void* data, std::size_t bytes, int deviceId)
 // stay there: uploading a whole grid per frame or tile costs far more than sampling it.
 struct DeviceGrid {
     device::Storage xyz, valid, piece, normals, du, dv, duv;
+    device::Storage coreDerivatives;
 };
 struct KeptGrid {
     std::uint64_t serial;
@@ -854,6 +891,7 @@ std::shared_ptr<const DeviceGrid> deviceGrid(const Surface::Impl& impl, int id)
     grid->du = upload(host.du, bicubic ? vertices * 12 : 0, id);
     grid->dv = upload(host.dv, bicubic ? vertices * 12 : 0, id);
     grid->duv = upload(host.duv, bicubic ? vertices * 12 : 0, id);
+    grid->coreDerivatives = upload(host.coreDerivatives, impl.coreDerivatives.size() * sizeof(VertexDerivatives), id);
     device::complete();  // other threads' streams may read it as soon as it is listed
     kept.push_front({impl.serial, id, grid});
     return grid;
@@ -1011,6 +1049,11 @@ Result sample(const Surface& surface, const Raster& raster, const Request& reque
         base.grid.du = static_cast<const float*>(grid->du->ptr);
         base.grid.dv = static_cast<const float*>(grid->dv->ptr);
         base.grid.duv = static_cast<const float*>(grid->duv->ptr);
+        if (host.coreDerivatives) {
+            base.grid.coreDerivatives = static_cast<const VertexDerivatives*>(grid->coreDerivatives->ptr);
+            for (int k = 0; k < 4; ++k)
+                base.grid.core[k] = host.core[k];
+        }
     }
     const auto centre = centreOf(surface, raster);
     return sampleDevice(raster.width, raster.height, request, readers, base, centre.data());

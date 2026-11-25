@@ -227,6 +227,76 @@ void testResample()
 
 }  // namespace
 
+// The sign of a bicubic normal does not depend on the vertices around the core: on a mesh that folds, the
+// surface with context takes the sign of the core's own derivatives, and positions are the context surface's.
+void testCoreSign()
+{
+    const int R = 9, C = 12;
+    std::vector<float> xyz(R * C * 3);
+    for (int r = 0; r < R; ++r)
+        for (int c = 0; c < C; ++c) {
+            float* p = &xyz[std::size_t((r * C + c) * 3)];
+            p[0] = float(c) + 0.9f * std::sin(2.1f * float(c));
+            p[1] = float(r) + 0.4f * std::sin(1.3f * float(c) + float(r));
+            p[2] = 0.3f * std::sin(1.1f * float(r) + float(c));
+        }
+    const int r0 = 2, r1 = 7, c0 = 2, c1 = 9;
+    std::vector<float> core((r1 - r0) * (c1 - c0) * 3);
+    for (int r = r0; r < r1; ++r)
+        for (int c = c0; c < c1; ++c)
+            for (int k = 0; k < 3; ++k) core[std::size_t(((r - r0) * (c1 - c0) + (c - c0)) * 3 + k)] = xyz[std::size_t((r * C + c) * 3 + k)];
+    vcr::grid::SurfaceOptions plain;
+    plain.interpolation = vcr::grid::Interpolation::Bicubic;
+    auto anchored = plain;
+    anchored.core = {r0, r1, c0, c1};
+    const vcr::grid::Surface full({xyz.data(), R, C, std::size_t(C) * 3}, plain);
+    const vcr::grid::Surface withCore({xyz.data(), R, C, std::size_t(C) * 3}, anchored);
+    const vcr::grid::Surface alone({core.data(), r1 - r0, c1 - c0, std::size_t(c1 - c0) * 3}, plain);
+    const int W = 120, H = 80;
+    const double sx = double(c1 - 1 - c0) / W, sy = double(r1 - 1 - r0) / H;
+    std::vector<float> pf(W * H * 3), pa(W * H * 3), po(W * H * 3), nf(W * H * 3), na(W * H * 3), no(W * H * 3);
+    full.resample({double(c0), double(r0), sx, sy, W, H}, pf.data(), nf.data());
+    withCore.resample({double(c0), double(r0), sx, sy, W, H}, pa.data(), na.data());
+    alone.resample({0, 0, sx, sy, W, H}, po.data(), no.data());
+    const auto dot = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    long contextFlips = 0, anchoredFlips = 0;
+    bool samePositions = true;
+    for (std::size_t i = 0; i < std::size_t(W) * H; ++i) {
+        if (!std::isfinite(nf[i * 3] + na[i * 3] + no[i * 3])) continue;
+        if (dot(&nf[i * 3], &no[i * 3]) < 0) ++contextFlips;
+        if (dot(&na[i * 3], &no[i * 3]) < 0) ++anchoredFlips;
+        for (int k = 0; k < 3; ++k) samePositions = samePositions && pf[i * 3 + k] == pa[i * 3 + k];
+    }
+    require(contextFlips > 0, "the context changes the sign of a normal on a folded mesh");
+    require(anchoredFlips == 0, "with the core given, no normal has the other sign than the core alone");
+    require(samePositions, "the core does not move the positions");
+    bool rejected = false;
+    try {
+        auto bad = plain;
+        bad.core = {0, 5, 2, 20};
+        const vcr::grid::Surface refused({xyz.data(), R, C, std::size_t(C) * 3}, bad);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "a core outside the vertices is refused");
+    // A fold where the context's centred tangents at vertex (2, 2) are parallel: the core's own normal is kept.
+    std::vector<float> fold(7 * 7 * 3, 0.f);
+    for (int r = 0; r < 7; ++r)
+        for (int c = 0; c < 7; ++c) {
+            fold[std::size_t((r * 7 + c) * 3)] = float(c);
+            fold[std::size_t((r * 7 + c) * 3 + 1)] = float(r);
+        }
+    fold[std::size_t((2 * 7 + 1) * 3 + 1)] = 1;  // (2, 1) to (1, 1, 0)
+    fold[std::size_t((1 * 7 + 2) * 3)] = 0;      // (1, 2) to (0, 2, 0)
+    fold[std::size_t((1 * 7 + 2) * 3 + 1)] = 2;
+    auto folded = plain;
+    folded.core = {2, 4, 2, 4};
+    float p[3], n[3];
+    vcr::grid::Surface({fold.data(), 7, 7, 21}, folded).resample({2, 2, 1, 1, 1, 1}, p, n);
+    require(p[0] == 2 && p[1] == 2 && std::fabs(n[0]) < 1e-6f && std::fabs(n[1]) < 1e-6f && std::fabs(n[2] - 1) < 1e-6f,
+            "a fold that leaves the context no normal keeps the core's");
+}
+
 int main()
 {
     namespace fs = std::filesystem;
@@ -234,6 +304,7 @@ int main()
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     struct Cleanup { fs::path path; ~Cleanup() { std::error_code ec; fs::remove_all(path, ec); } } cleanup{path};
     try {
+        testCoreSign();
         testDefaultInterpolation();
         testResample();
 
