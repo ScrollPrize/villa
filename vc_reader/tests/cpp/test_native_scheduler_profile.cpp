@@ -1,4 +1,5 @@
 #include <vc_reader/native/thread_pool.hpp>
+#include "portable_env.hpp"
 #include <filesystem>
 #include <fstream>
 #include <iostream>

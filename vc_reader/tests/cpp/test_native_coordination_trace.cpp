@@ -1,5 +1,6 @@
 #include <vc_reader/native/thread_pool.hpp>
 #include <vc_reader/native/single_flight.hpp>
+#include "portable_env.hpp"
 #include <filesystem>
 #include <fstream>
 #include <future>
