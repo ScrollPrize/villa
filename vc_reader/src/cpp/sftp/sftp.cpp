@@ -2,6 +2,7 @@
 #include "ssh_process.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <deque>
 #include <map>
@@ -281,7 +282,15 @@ Url parseForwardUrl(std::string_view endpoint)
 struct Forward::Impl {
     std::string endpoint;
     std::unique_ptr<detail::SshProcess> process;
-    std::jthread drain; // joins before process destruction
+    std::atomic<bool> stopDrain{false};
+    std::thread drain;
+
+    ~Impl()
+    {
+        // Stop and join the drain thread before process is destroyed.
+        stopDrain.store(true, std::memory_order_relaxed);
+        if (drain.joinable()) drain.join();
+    }
 };
 
 Forward::Forward(const std::string& endpoint, Options options) : impl_(std::make_unique<Impl>())
@@ -310,9 +319,9 @@ Forward::Forward(const std::string& endpoint, Options options) : impl_(std::make
     impl_->process->authenticated();
     // A long-lived forward must drain ssh's diagnostics even between HTTP
     // requests, or repeated remote connection errors can fill its stderr pipe.
-    impl_->drain = std::jthread([process = impl_->process.get()](std::stop_token stop) {
+    impl_->drain = std::thread([process = impl_->process.get(), stop = &impl_->stopDrain] {
         std::byte buffer[256];
-        while (!stop.stop_requested()) {
+        while (!stop->load(std::memory_order_relaxed)) {
             try { process->read(buffer, std::chrono::milliseconds(100)); }
             catch (const std::exception&) { break; }
         }
