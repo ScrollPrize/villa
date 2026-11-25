@@ -514,7 +514,7 @@ def accumulate_registration(archive, plan, blocks, patch_grid, num_patches,
         ], dim=1)
         stats.index_add_(0, inverse, columns)
         key_chunks.append(unique.cpu().numpy())
-        stat_chunks.append(stats.double().cpu().numpy())
+        stat_chunks.append(stats.cpu().double().numpy())
         if position % 25 == 0:
             elapsed = time.time() - started
             _log(f"registration block {position + 1}/{len(blocks)}"
