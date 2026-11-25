@@ -1749,7 +1749,9 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		init_shell_dir = _require_init_shell_dir(
 			prep_params, override=data_cfg.init_shell_dir)
 		corr_point_roi_shell_index = InitShellIndex.from_directory(init_shell_dir)
-		if device.type == "cuda":
+		# the ROI needs normals at a few points only, so the GPUs stream chunks instead of dense-loading whole
+		# volumes, as the main fit does; the CPU keeps its dense load
+		if device.type in ("cuda", "mps"):
 			corr_point_roi_normal_data = fit_data.load_3d_streaming(
 				path=str(data_cfg.input),
 				device=device,
