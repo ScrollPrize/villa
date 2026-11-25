@@ -514,17 +514,26 @@ nlohmann::json VolumePkg::viewJson() const
 }
 std::string VolumePkg::annotationNormalSource() const
 {
-    return lasagnaNormalChoices_.contains(selectedFiberInferenceDataset()) ? "lasagna" : "fiber";
+    const auto fiber = selectedFiberInferenceDataset();
+    if (fiber.empty() || lasagnaNormalChoices_.contains(fiber)) return "lasagna";
+    // A dataset not attached to the project is checked by its manifest when used.
+    const auto location = portableResource(fiber, directory());
+    const bool attached = std::any_of(lasagnaDatasets_.begin(), lasagnaDatasets_.end(),
+                                      [&](const auto& entry) { return entry.location == location; });
+    return !attached || hasPredictedFiberNormals(fiber) ? "fiber" : "lasagna";
 }
 
 void VolumePkg::setAnnotationNormalSource(std::string source)
 {
     if (source != "fiber" && source != "lasagna")
         throw std::invalid_argument("Annotation normal source must be fiber or lasagna");
+    const auto fiber = selectedFiberInferenceDataset();
     if (source == "lasagna")
-        lasagnaNormalChoices_.insert(selectedFiberInferenceDataset());
+        lasagnaNormalChoices_.insert(fiber);
     else
-        lasagnaNormalChoices_.erase(selectedFiberInferenceDataset());
+        lasagnaNormalChoices_.erase(fiber);
+    if (source == "fiber" && annotationNormalSource() != "fiber")
+        throw std::invalid_argument("The selected fiber dataset has no predicted normals");
     writeView();
 }
 

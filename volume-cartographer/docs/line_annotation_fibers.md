@@ -96,14 +96,16 @@ window's menu, **Tracing / annotation normals** selects:
 - **Lasagna normals** — explicitly uses the external Lasagna dataset even when
   the fiber volume supplies normals.
 
-**Predicted fiber normals** are always the default, whatever datasets are
-attached and in whatever order. Lasagna normals are used only after choosing
-**Lasagna normals** in this menu; attaching or selecting a Lasagna dataset does
-not do it. The choice is stored for the selected fiber dataset, in the project
-view field `lasagna_normal_choices`, and does not carry over to another fiber
-dataset. Choosing **Predicted fiber normals** removes it. Choices written by
-versions that set `annotation_normal_source` on attachment are ignored. Tracing
-never silently switches sources.
+When the selected fiber dataset has predicted normals, they are the default,
+whatever datasets are attached and in whatever order. Lasagna normals replace
+them only after choosing **Lasagna normals** in this menu; attaching or
+selecting a Lasagna dataset does not do it. The choice is stored for that fiber
+dataset, in the project view field `lasagna_normal_choices`, and does not carry
+over to another fiber dataset. Choosing **Predicted fiber normals** removes it.
+Without a fiber dataset that has predicted normals, Lasagna normals are used.
+Choices written by versions that set `annotation_normal_source` on attachment
+are ignored. Tracing never falls back to Lasagna instead of available predicted
+normals.
 
 Without a selected fiber dataset, the first attached one with predicted normals
 is used, else the first attached one.

@@ -8463,9 +8463,6 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
                     ? fiberLocation : vc::project::resolveLocalPath(
                         fiberLocation, vpkg->path().parent_path()).string();
                 const auto opened = vc::lasagna::LasagnaDataset::openLocation(location, options);
-                // Displaying a fiber needs no normals; using them does.
-                if (!required && !vc3d::line_annotation::hasPredictedFiberNormals(opened.manifest()))
-                    return true;
                 if (vc3d::line_annotation::usePredictedFiberNormals(opened.manifest(), normalPreference)) {
                     auto manifest = vc::lasagna::fiberNormalManifest(opened.manifest());
                     // Annotation points are in the displayed volume's grid. A
@@ -8498,8 +8495,7 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
             }
         } else if (normalPreference == "fiber") {
             if (required)
-                showError(tr("Select a fiber dataset with predicted normals in the Fiber dataset menu, or choose "
-                             "Lasagna normals explicitly in the Tracing / annotation normals menu."), headless);
+                showError(tr("Select a fiber dataset with predicted normals in the Fiber dataset menu."), headless);
             return !required;
         }
     }

@@ -157,9 +157,9 @@ public:
     void clearSelectedFiberInferenceDataset();
     [[nodiscard]] bool hasPredictedFiberNormals(const std::string& fiberDataset) const;
 
-    // "fiber" unless the user explicitly chose Lasagna normals for the selected
-    // fiber dataset. The choice is stored per fiber dataset; attaching or
-    // selecting datasets never makes it.
+    // "fiber" when the selected fiber dataset has predicted normals, unless the
+    // user explicitly chose Lasagna normals for it; "lasagna" otherwise. The
+    // choice is stored per fiber dataset; attaching or selecting never makes it.
     [[nodiscard]] std::string annotationNormalSource() const;
     void setAnnotationNormalSource(std::string source);
 
