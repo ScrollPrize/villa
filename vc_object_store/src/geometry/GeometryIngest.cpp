@@ -561,6 +561,8 @@ BulkOverlayReport ingestTracksBulkOverlay(const fs::path& source, const fs::path
             const auto members = root.members();
             for (std::size_t i = 1; i < members.size(); ++i) have.insert(key(members[i]));
             if (members.size() < 2 || have != expected) throw std::runtime_error("it does not depend on the sealed tracks recorded for this command (" + out.tracksPath.string() + ")");
+            auto writableRoot = ObjectCollection::open(overlayPath, rootOptions);
+            (void)writableRoot;
         } catch (const std::exception& error) { throw overlayError(error); }
         out.overlayAlreadyComplete = true; out.reusedSealedTracks = true; out.ingest.ingested = int64_t(rows);
         return out;
