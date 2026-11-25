@@ -479,7 +479,7 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
     // The recovered grid must address this surface's grid in the frame it is open in.
     QString mismatch;
     if (!points || !SessionDrafts::canRestoreSurface(*surface, contents->surface))
-        mismatch = tr("its grid size differs and its saved channels are incomplete");
+        mismatch = tr("its grid size differs from the surface as opened");
     else if (vc::objects::geometryCoordinates(contents->coordinates) != vc::objects::geometryCoordinates(editCoordinates(*storeEdit)))
         mismatch = tr("it was made in another volume or scale; open the surface in that volume to restore it");
 

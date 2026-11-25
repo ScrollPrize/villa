@@ -1289,8 +1289,9 @@ void QuadSurface::rotate(float angleDeg)
     std::map<std::pair<int, int>, cv::Vec3f> exclusions;
     for (int r = 0; r < sourceSize.height; ++r)
         for (int c = 0; c < sourceSize.width; ++c)
-            if ((!sourceMarker.empty() && sourceMarker(r, c)) ||
-                (!sourceMask.empty() && !sourceMask(r, c) && vc::geometry::validSurfacePoint(storedPoints(r, c))))
+            if ((sourceMask.empty() || !sourceMask(r, c)) &&
+                ((!sourceMarker.empty() && sourceMarker(r, c)) ||
+                 (!sourceMask.empty() && vc::geometry::validSurfacePoint(storedPoints(r, c)))))
                 exclusions[{r, c}] = storedPoints(r, c);
     for (const auto& vertex : maskedVertices)
         if (cv::Rect(cv::Point{}, sourceSize).contains(vertex.cell) &&

@@ -531,6 +531,19 @@ TEST_CASE("oblique rotation keeps colliding exclusions distinct without sampling
     CHECK(absent == 1);
 }
 
+TEST_CASE("rotation keeps a vertex the mask reactivated despite a stale exclusion marker")
+{
+    auto points = makePlanarGrid(3, 5);
+    QuadSurface surface(points, {1,1});
+    cv::Mat_<uint8_t> marker(points.size(), uint8_t{0});
+    marker(1, 2) = 255;
+    surface.setChannel("mask", cv::Mat_<uint8_t>(points.size(), uint8_t{255}));
+    surface.setChannel("growth_exclusions", marker);
+    surface.rotate(90);
+    CHECK((*surface.rawPointsPtr())(2, 1) == points(1, 2));
+    CHECK(cv::countNonZero(surface.channel("mask", SURF_CHANNEL_NORESIZE)) == 15);
+}
+
 TEST_CASE("flips move retained XYZ and marker-only exclusions with lazy channels")
 {
     auto points = makePlanarGrid(4,7);

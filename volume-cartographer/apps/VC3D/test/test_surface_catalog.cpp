@@ -1009,6 +1009,9 @@ void checkResizedTransformCheckpoint(const fs::path& directory)
         legacy.channels.clear();
         require(!SessionDrafts::canRestoreSurface(*base.surface, legacy),
                 "legacy resized drafts retain the incomplete-state guard");
+        base.surface->meta["components"] = nlohmann::json::array({nlohmann::json::array({0, 2}), nlohmann::json::array({2, 5})});
+        require(!SessionDrafts::canRestoreSurface(*base.surface, expected),
+                "resized drafts cannot carry component ranges that Apply refuses to transform");
         session->setDraft(record.uuid, expected, volumeCoordinates("vol", 1), attachment, rotated.pin.reference());
         require(drafts.checkpointNow(), "resized transform checkpoint writes");
     }

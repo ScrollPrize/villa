@@ -819,11 +819,12 @@ void CState::closeAll(const std::function<void()>& afterSave)
 // --- Surface methods (from CSurfaceCollection) ---
 
 void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend, bool isEditUpdate,
-                        bool fullDraft)
+                        SurfaceDraftMode draftMode)
 {
+    const bool fullDraft = draftMode == SurfaceDraftMode::Full;
     auto it = _surfs.find(name);
     const bool sameSurface = it != _surfs.end() && it->second == surf;
-    if (sameSurface && !isEditUpdate && surf != nullptr) {
+    if (sameSurface && !isEditUpdate && !fullDraft && surf != nullptr) {
         return;
     }
     if (_surfaceBatchDepth == 0 && it != _surfs.end() && it->second &&
@@ -851,9 +852,13 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 
     _surfs[name] = surf;
-    if (name == "segmentation" && (fullDraft || !sameSurface || (isEditUpdate && !_activeSurfaceEditing))) {
-        // A surface newly set without an edit is the one opened from its store.
-        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf), !fullDraft && !sameSurface && !isEditUpdate, fullDraft);
+    if (name == "segmentation") {
+        if (!sameSurface || draftMode != SurfaceDraftMode::Automatic)
+            _segmentationPreviewOnly = draftMode == SurfaceDraftMode::KeepExisting;
+        if (fullDraft || !sameSurface || (isEditUpdate && !_activeSurfaceEditing)) {
+            // A new surface without an edit is the one opened from its store.
+            draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf), !fullDraft && !sameSurface && !isEditUpdate, fullDraft);
+        }
     }
     if (!sameSurface) {
         // Edit updates re-set the same pointer every frame; only a mapping
@@ -879,8 +884,9 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
 
 void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved, bool fullChannels)
 {
+    // Display-only previews must also survive volume changes without replacing a draft.
     // Workspaces sharing the main session draft their own surfaces.
-    if (_objectStoreOwner || !_objectStoreSession) {
+    if (_segmentationPreviewOnly || _objectStoreOwner || !_objectStoreSession) {
         return;
     }
     if (!_activeSurfaceDraft.empty() && (!surface || surface->id != _activeSurfaceDraft)) {

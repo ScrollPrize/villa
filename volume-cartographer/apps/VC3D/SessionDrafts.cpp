@@ -69,6 +69,9 @@ bool SessionDrafts::canRestoreSurface(QuadSurface& surface, const vc::geometry::
     const auto* grid = surface.rawPointsPtr();
     if (!grid) return false;
     if (grid->rows == draft.rows && grid->cols == draft.columns) return true;
+    // Like Apply, refuse resized grids while component column ranges cannot follow them.
+    const auto components = surface.meta.find("components");
+    if (components != surface.meta.end() && components->is_array() && !components->empty()) return false;
     const auto recorded = [&](const std::string& name) {
         return std::any_of(draft.channels.begin(), draft.channels.end(),
                            [&](const auto& channel) { return channel.name == name; });

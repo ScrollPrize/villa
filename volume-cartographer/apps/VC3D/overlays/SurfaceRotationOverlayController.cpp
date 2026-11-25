@@ -640,7 +640,7 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
 
-    synchronizeTransformPersistenceCompatibility();
+    const bool persistenceAvailable = synchronizeTransformPersistenceCompatibility();
     const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
     if (transform.isNoOp()) {
         _previewSurface.reset();
@@ -653,16 +653,17 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
     transform.applyInMemory(*_previewSurface);
-    showActive(_previewSurface);
+    showActive(_previewSurface, persistenceAvailable);
 }
 
-void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface)
+void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface, bool publishDraft)
 {
     // Showing a preview replaces the selected surface, so CWindow drops it as the active one
     // (onSurfaceWillBeDeleted): the segment stays selected while the tool shows it.
     const bool selected = sourceSelected();
-    // Include the transformed exclusions and channels in preview checkpoints.
-    _state->setSurface("segmentation", surface, false, true, true);
+    // A transformation that Apply rejects remains a display-only preview.
+    const auto draftMode = publishDraft ? CState::SurfaceDraftMode::Full : CState::SurfaceDraftMode::KeepExisting;
+    _state->setSurface("segmentation", surface, false, true, draftMode);
     _shownSurface = surface;
     if (selected) {
         _state->setActiveSurface(_sourceSurfaceId, _sourceSurface);
@@ -675,7 +676,7 @@ void SurfaceRotationOverlayController::endPreview(const std::shared_ptr<QuadSurf
     _state->setActiveSurface(_sourceSurfaceId, surface);
     // A saved result is already shown. Avoid republishing it as an unsaved draft.
     if (_state->surface("segmentation") != surface)
-        _state->setSurface("segmentation", surface, false, true, true);
+        _state->setSurface("segmentation", surface, false, true, CState::SurfaceDraftMode::Full);
     _shownSurface = surface;
 }
 

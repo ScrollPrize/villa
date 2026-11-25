@@ -396,7 +396,7 @@ bool SegmentationCommandHandler::publishSurface(QuadSurface* surface, const QStr
 {
     if (_state)
         if (const auto live = activeSurface(surface->id))
-            _state->setSurface("segmentation", live, false, true, true);
+            _state->setSurface("segmentation", live, false, true, CState::SurfaceDraftMode::Full);
     if (_surfaceSaver && _surfaceSaver(surface)) {
         return true;
     }
@@ -1692,7 +1692,7 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
         surface->setChannel("generations", cv::Mat());
     }
     surface->invalidateCache();
-    if (_state) _state->setSurface("segmentation", surf, false, true, true);
+    if (_state) _state->setSurface("segmentation", surf, false, true, CState::SurfaceDraftMode::Full);
     if (!_surfaceSaver || !_surfaceSaver(surface)) {
         return fail(tr("Failed to save the cropped surface %1.").arg(QString::fromStdString(segmentId)));
     }
