@@ -188,6 +188,14 @@ def _gc_freeze_acquire(owner):
         return _GC_FREEZE_EPOCH
 
 
+def _gc_forget(ctx):
+    """Forget a context's share of the collector policy: the freeze epoch it took, and the pressure policy's watermark (both belong to the old model; a smaller rebuilt model needs a fresh baseline).
+
+    A module function, not only a method, so the rebuild and close paths work on the lightweight contexts the existing rebuild checks use (a SimpleNamespace borrowing FitContext's methods has no _reset_gc_state)."""
+    ctx._gc_epoch = None
+    ctx._gc_floor_bytes = 0
+
+
 def _gc_freeze_release(owner):
     """End any fitter-owned freeze on a context's teardown or rebuild, for every context. `owner` need not be registered: its heap may have been
     frozen by another session before its first step, or after a release cleared the registrations while it stayed alive. A no-op only when no freeze
@@ -2705,7 +2713,7 @@ class FitContext:
         # largest allocations; hand the arena back before asking for their
         # replacements rather than peaking at twice the model.
         _gc_freeze_release(self)
-        self._reset_gc_state()
+        _gc_forget(self)
         gc.collect()
         torch.cuda.empty_cache()
         if self.device.type == 'mps':
@@ -4021,9 +4029,8 @@ class FitContext:
         return loss, losses, log_metrics, shell_metrics
 
     def _reset_gc_state(self):
-        """Forget this context's share of the collector policy: the freeze epoch it took, and the pressure policy's watermark (it belongs to the old model; a smaller rebuilt model needs a fresh baseline)."""
-        self._gc_epoch = None
-        self._gc_floor_bytes = 0
+        """Forget this context's share of the collector policy (see _gc_forget)."""
+        _gc_forget(self)
 
     def _collect_garbage_after_step(self, iteration):
         """The FIT_SPIRAL_GC_POLICY collection that follows one optimiser step (see the policy block at the top of this module)."""
@@ -4393,14 +4400,19 @@ class FitContext:
         process simply exits).
         """
         try:
-            store, self._lasagna_store = self._lasagna_store, None
+            # The interactive driver sets _lasagna_store; a headless fit never does, so its pools (page-locked host memory when FIT_SPIRAL_POOL_OFFLOAD=1) would be left to object
+            # lifetime. The context owns the store it prepared either way.
+            store = getattr(self, '_lasagna_store', None)
+            if store is None:
+                store = (getattr(self, 'lasagna_volume', None) or {}).get('store')
+            self._lasagna_store = None
             if store is not None:
                 store.close()
             self.winding_inference = None
         finally:
             # The freeze is process-wide: end this context's share of it even when releasing the store failed.
             _gc_freeze_release(self)
-            self._reset_gc_state()
+            _gc_forget(self)
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,

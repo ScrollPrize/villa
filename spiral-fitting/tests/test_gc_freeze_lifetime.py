@@ -205,11 +205,52 @@ def test_a_non_cuda_fit_never_touches_cuda_counters(monkeypatch):
 
 
 def test_rebuild_and_close_forget_the_pressure_watermark_together_with_the_freeze_epoch():
-    """Review: after a rebuild to a smaller model the pressure policy must establish a fresh baseline, not wait for the old model's watermark."""
-    import inspect
+    """Review: after a rebuild to a smaller model the pressure policy must establish a fresh baseline, not wait for the old model's watermark.
+
+    Behavioural, on the lightweight contexts the existing rebuild checks use (a SimpleNamespace borrowing FitContext's methods, so the reset must not depend on a method of the context)."""
     import types
-    ctx = types.SimpleNamespace(_gc_epoch=3, _gc_floor_bytes=10 ** 9)
+    import torch
+
+    def lightweight():
+        return types.SimpleNamespace(
+            _gc_epoch=3, _gc_floor_bytes=10 ** 9, device=torch.device("cpu"), profiler=None,
+            _MODEL_STAGE_ATTRIBUTES=(), _build_model_state=lambda: None, _lasagna_store=None, winding_inference=object())
+
+    ctx = lightweight()
     fs.FitContext._reset_gc_state(ctx)
     assert ctx._gc_epoch is None and ctx._gc_floor_bytes == 0
-    for name in ("rebuild_model_state", "close"):
-        assert "_reset_gc_state" in inspect.getsource(getattr(fs.FitContext, name)), name
+    ctx = lightweight()
+    fs.FitContext.rebuild_model_state(ctx)
+    assert ctx._gc_epoch is None and ctx._gc_floor_bytes == 0
+    ctx = lightweight()
+    fs.FitContext.close(ctx)
+    assert ctx._gc_epoch is None and ctx._gc_floor_bytes == 0 and ctx.winding_inference is None
+    bare = types.SimpleNamespace(_gc_epoch=3, _gc_floor_bytes=7, winding_inference=object())      # no _lasagna_store at all (headless contexts)
+    fs.FitContext.close(bare)
+    assert bare._gc_epoch is None and bare._gc_floor_bytes == 0
+
+
+def test_close_releases_the_pools_of_a_headless_fit_and_retries_after_a_refused_release():
+    """Review: a headless fit never sets _lasagna_store, so close() left the pools to object lifetime. close() releases the prepared store either way, tries every pool even when one
+    refuses, and a second close() retries the one that is still open."""
+    import types
+    import sparse_cuda_cache as scc
+
+    class Pool:
+        def __init__(self, fail_times=0):
+            self.closed, self.fail_times, self.attempts = False, fail_times, 0
+
+        def close(self):
+            self.attempts += 1
+            if self.fail_times:
+                self.fail_times -= 1
+                raise RuntimeError("cuMemHostUnregister failed with 201")
+            self.closed = True
+    normal, grad = Pool(fail_times=1), Pool()
+    store = scc.SparseLasagnaStore(normal_cache=normal, grad_cache=grad)
+    ctx = types.SimpleNamespace(lasagna_volume={"store": store}, winding_inference=object(), _gc_epoch=None, _gc_floor_bytes=0)
+    with pytest.raises(RuntimeError, match="201"):
+        fs.FitContext.close(ctx)
+    assert grad.closed and not normal.closed, "one refused pool must not stop the other from being closed"
+    fs.FitContext.close(ctx)                           # the driver can release it now
+    assert normal.closed

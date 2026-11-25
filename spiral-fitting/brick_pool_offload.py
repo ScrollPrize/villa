@@ -36,29 +36,74 @@ def _module(dev_index):
     return _MODS[dev_index]
 
 
-def _register(arr, dev_index):
-    """page-lock + map a numpy array; returns its device pointer (int)"""
-    from host_pool_cuda import _libs, _chk
-    _, cuda = _libs(); torch.cuda.set_device(dev_index); torch.zeros(1, device=f"cuda:{dev_index}")
-    p = ctypes.c_void_p(arr.ctypes.data)
-    _chk(cuda.cuMemHostRegister_v2(p, ctypes.c_size_t(arr.nbytes), ctypes.c_uint(0x02)), "cuMemHostRegister(DEVICEMAP)")
-    dptr = ctypes.c_uint64()
+_CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED = 713       # the driver says the range is not (or no longer) registered: nothing left to release
+_PARKED = []                                        # registrations the driver refused to release, kept ALIVE (with their backing arrays) so the page-locked memory is never freed underneath the driver; see retry_parked_registrations()
+
+
+class _HostRegistration:
+    """One cuMemHostRegister'ed numpy array and its owner device. It OWNS the backing array until the driver has released the registration:
+    release() frees nothing itself, and clears the reference to the array only after cuMemHostUnregister succeeded (or the driver reports the range was not registered).
+    A failed or interrupted release leaves the registration (and the backing memory) intact, so close() can be retried once the driver can release it."""
+
+    def __init__(self, arr, dev_index):
+        import threading
+        self.dev_index = int(dev_index); self._arr = arr; self._lock = threading.Lock(); self.dptr = None
+
+    @property
+    def array(self):
+        return self._arr
+
+    def register(self):
+        """page-lock + map the array on its own card; sets and returns the device pointer (int). Unregisters again when the mapping cannot be queried."""
+        from host_pool_cuda import _libs, _chk
+        _, cuda = _libs()
+        with torch.cuda.device(self.dev_index):
+            torch.zeros(1, device=f"cuda:{self.dev_index}")                  # make sure the card's primary context exists and is current
+            p = ctypes.c_void_p(self._arr.ctypes.data)
+            _chk(cuda.cuMemHostRegister_v2(p, ctypes.c_size_t(self._arr.nbytes), ctypes.c_uint(0x02)), "cuMemHostRegister(DEVICEMAP)")
+            dptr = ctypes.c_uint64()
+            try:
+                _chk(cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), p, ctypes.c_uint(0)), "cuMemHostGetDevicePointer")
+            except BaseException:
+                self.release()                                                  # registered but unusable: do not leave the pages page-locked (raises if even that fails; the array stays owned)
+                raise
+        self.dptr = int(dptr.value)
+        return self.dptr
+
+    def release(self):
+        """Unregister on the OWNING card's context (never the caller's current one), after that card's outstanding gathers finished (they read this memory asynchronously).
+        Raises RuntimeError when the driver refuses; the array then stays owned and registered, and release() may be called again. Idempotent after success."""
+        with self._lock:
+            if self._arr is None:
+                return
+            from host_pool_cuda import _libs
+            cuda = _libs()[1]
+            with torch.cuda.device(self.dev_index):
+                torch.cuda.synchronize(self.dev_index)
+                r = int(cuda.cuMemHostUnregister(ctypes.c_void_p(self._arr.ctypes.data)))
+            if r not in (0, _CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED):
+                raise RuntimeError(f"cuMemHostUnregister failed with {r} on cuda:{self.dev_index}: the pool's host memory stays allocated and registered; call close() again once the driver can release it")
+            self._arr = None                                                    # released: only now may the backing memory go
+
+
+def _release_or_park(reg):
+    """weakref finalizer of an offloaded pool: release the registration; when the driver refuses (or the release is interrupted), PARK it so its backing array stays alive."""
     try:
-        _chk(cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), p, ctypes.c_uint(0)), "cuMemHostGetDevicePointer")
+        reg.release()
     except BaseException:
-        _unregister(arr)                                                 # registered but unusable: do not leave the pages page-locked
-        raise
-    return int(dptr.value)
+        _PARKED.append(reg)
+        print(f"brick_pool_offload: could not unregister {reg.dev_index=}: the host memory is kept alive (parked); retry_parked_registrations() can release it later", flush=True)
 
 
-def _unregister(arr):
-    """Undo _register (idempotent enough: a second call is refused by the driver and ignored). Also the weakref finalizer of an offloaded pool: it holds `arr`
-    strongly, so the registered memory is only released after it was unregistered, whichever way the pool ends (close(), a failed construction, or garbage)."""
-    try:
-        from host_pool_cuda import _libs
-        _libs()[1].cuMemHostUnregister(ctypes.c_void_p(arr.ctypes.data))
-    except Exception:
-        pass
+def retry_parked_registrations():
+    """Try to release every parked registration again (e.g. after the failing driver state was fixed); returns how many remain parked."""
+    for reg in list(_PARKED):
+        try:
+            reg.release()
+            _PARKED.remove(reg)
+        except Exception:
+            pass
+    return len(_PARKED)
 
 
 def offload_class(scc):
@@ -106,9 +151,9 @@ def offload_class(scc):
                     ids = kept_ids[lo:lo + slab]; self.host_pool[channel, lo:lo + len(ids)] = mm[ids]; done += len(ids)
                     if progress_callback is not None: progress_callback(done, total, f"channel {channel + 1}/{self.channels} (host RAM)")
             di = dev.index if dev.index is not None else torch.cuda.current_device()
-            with torch.cuda.device(di):                                  # _register() sets the device: leave the caller's current device as it was
-                self._dptr = _register(self.host_pool, di)
-            self._finalizer = weakref.finalize(self, _unregister, self.host_pool)   # ownership of the registration starts here and ends in close(), a failed construction or garbage collection
+            self._reg = _HostRegistration(self.host_pool, di)           # the registration owns the backing array until the driver released it
+            self._dptr = self._reg.register()
+            self._finalizer = weakref.finalize(self, _release_or_park, self._reg)   # ownership of the registration starts here and ends in close(), a failed construction or garbage collection (a refused release parks it)
             try:
                 with torch.cuda.device(di):
                     self._mod = _module(di)
@@ -129,7 +174,7 @@ def offload_class(scc):
                 print(f"{self.label}: OFFLOADED pool {self.resident_bricks:,}/{rows:,} bricks of {brick} x{self.channels} channel(s) "
                       f"({self.pool_bytes / 1024**3:.2f} GiB) in mapped host RAM (FIT_SPIRAL_POOL_OFFLOAD=1), loaded in {self.load_seconds:.1f}s", flush=True)
             except BaseException:
-                self._finalizer()                                              # unregister before the host array is released
+                self._finalizer()                                              # unregister (or park, when the driver refuses) before the host array is released
                 self.host_pool = None
                 raise
 
@@ -159,8 +204,13 @@ def offload_class(scc):
                 return out.reshape(*original_shape, self.channels)
 
         def close(self):
-            finalizer = getattr(self, "_finalizer", None)
-            if finalizer is not None: finalizer()                        # unregisters once; later calls (and garbage collection) do nothing
+            """Release the registration FIRST and free the host memory only after the driver let go of it. When the driver refuses, close() raises and the pool keeps its memory and
+            its registration (so close() can be called again, and an outstanding gather stays valid); an interrupted close leaves the same state."""
+            reg = getattr(self, "_reg", None)
+            if reg is not None:
+                reg.release()                                              # raises RuntimeError on a driver failure: nothing below runs, nothing was freed
+                self._finalizer.detach()                                   # released: the finalizer has nothing left to do
+                self._reg = None
             self.host_pool = None
             self.pool = None; self.table = None
             self._shadow = None; self._verify_left = 0          # the VERIFY-mode resident mirror is a full copy of the pool on the card: a closed pool must not keep it

@@ -90,9 +90,16 @@ def test_factory_default_is_resident_and_env_selects_offload(monkeypatch):
 
 
 def _count_unregisters(monkeypatch):
+    """Count the registrations the driver was actually asked to release (a release of an already released registration does nothing and is not counted)."""
     calls = []
-    real = brick_pool_offload._unregister
-    monkeypatch.setattr(brick_pool_offload, "_unregister", lambda arr: (calls.append(arr.ctypes.data), real(arr))[1])
+    real = brick_pool_offload._HostRegistration.release
+
+    def counted(self):
+        before = self._arr
+        real(self)
+        if before is not None:
+            calls.append(before.ctypes.data)
+    monkeypatch.setattr(brick_pool_offload._HostRegistration, "release", counted)
     return calls
 
 
@@ -148,3 +155,34 @@ def test_verify_mirror_is_released_on_close_and_the_exit_callback_does_not_hold_
     del pool
     gc.collect()
     assert ref() is None, "something (the exit callback) still holds the closed pool"
+
+
+def test_a_refused_unregister_keeps_the_pool_memory_and_close_can_be_retried(sidecar, monkeypatch):
+    """Review: with the driver refusing cuMemHostUnregister (CUDA_ERROR_INVALID_CONTEXT) close() must raise and keep the registered backing memory; once the driver can release it
+    a second close() succeeds. Before, close() discarded the driver status and freed the NumPy backing of memory the driver still had registered."""
+    import host_pool_cuda
+    Off = brick_pool_offload.offload_class(scc)
+    pool = Off(sidecar[0], device="cuda", label="refused")
+    backing = pool.host_pool
+    real_libs = host_pool_cuda._libs
+    state = {"refuse": True, "calls": 0}
+
+    class Cuda:
+        def __init__(self, real):
+            self._real = real
+
+        def cuMemHostUnregister(self, ptr):
+            state["calls"] += 1
+            return 201 if state["refuse"] else self._real.cuMemHostUnregister(ptr)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+    monkeypatch.setattr(host_pool_cuda, "_libs", lambda: (real_libs()[0], Cuda(real_libs()[1])))
+    with pytest.raises(RuntimeError, match="cuMemHostUnregister failed with 201"):
+        pool.close()
+    assert pool.host_pool is backing and pool._reg is not None, "a refused unregister freed the pool's host memory"
+    state["refuse"] = False
+    pool.close()
+    assert pool.host_pool is None and pool._reg is None and state["calls"] == 2
+    pool.close()                                       # idempotent once released
+    assert state["calls"] == 2

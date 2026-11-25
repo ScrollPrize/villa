@@ -237,7 +237,16 @@ class SparseLasagnaStore:
         return normals, gradient
 
     def close(self):
-        if self.normal_cache is not None:
-            self.normal_cache.close()
-        if self.grad_cache is not None:
-            self.grad_cache.close()
+        """Close both pools. A pool whose close() fails (an offloaded pool the driver would not unregister) does not stop the other from being closed; the first failure is raised
+        afterwards, and calling close() again retries only what is still open (closing a pool twice is a no-op)."""
+        first = None
+        for pool in (self.normal_cache, self.grad_cache):
+            if pool is None:
+                continue
+            try:
+                pool.close()
+            except BaseException as error:                  # noqa: BLE001 - re-raised below, after the other pool was tried
+                if first is None:
+                    first = error
+        if first is not None:
+            raise first
