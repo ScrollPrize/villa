@@ -1,5 +1,6 @@
 #include "LasagnaServiceManager.hpp"
 #include "ObjectStoreRegions.hpp"
+#include "PythonExecutable.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include <QCoreApplication>
@@ -105,6 +106,11 @@ QString findPythonExecutable()
         candidates.append(QDir(condaPrefix).filePath("bin/python3"));
     }
 
+    const QString installed = vc3d::installedPythonEnvironment(QStringLiteral("lasagna"));
+    if (!installed.isEmpty()) {
+        candidates.append(installed);
+    }
+
     QString home = QDir::homePath();
     candidates.append(QDir(home).filePath("miniconda3/bin/python"));
     candidates.append(QDir(home).filePath("miniconda3/bin/python3"));
@@ -140,6 +146,8 @@ QString findLasagnaServiceScript()
         QDir(appDir).filePath("../share/vesuvius/exps_2d_model/fit_service.py"),
         // Environment variable
         qEnvironmentVariable("LASAGNA_SERVICE_PATH"),
+        // The installed Python tools
+        vc3d::installedPythonToolsSource(QStringLiteral("lasagna/fit_service.py")),
     };
 
     for (const QString& path : searchPaths) {

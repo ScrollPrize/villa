@@ -1,5 +1,6 @@
 #include "SpiralServiceManager.hpp"
 
+#include "PythonExecutable.hpp"
 #include "SpiralArtifactCache.hpp"
 #include "SpiralArtifactPins.hpp"
 #include "SpiralPreviewProvenance.hpp"
@@ -185,6 +186,7 @@ QString SpiralServiceManager::findPython() const
         qEnvironmentVariable("SPIRAL_PYTHON"),
         qEnvironmentVariable("PYTHON_EXECUTABLE"),
         QDir(qEnvironmentVariable("CONDA_PREFIX")).filePath(QStringLiteral("bin/python")),
+        vc3d::installedPythonEnvironment(QStringLiteral("spiral")),
         QStandardPaths::findExecutable(QStringLiteral("python3")),
         QStandardPaths::findExecutable(QStringLiteral("python")),
     };
@@ -203,6 +205,7 @@ QString SpiralServiceManager::findService()
         QDir(app).filePath(QStringLiteral("../../../spiral-fitting/spiral_service.py")),
         QDir(app).filePath(QStringLiteral("../../../../spiral-fitting/spiral_service.py")),
         QDir(app).filePath(QStringLiteral("../share/volume-cartographer/spiral/spiral_service.py")),
+        vc3d::installedPythonToolsSource(QStringLiteral("spiral-fitting/spiral_service.py")),
     };
     for (const QString& candidate : candidates)
         if (!candidate.isEmpty() && QFileInfo(candidate).isFile()) return QFileInfo(candidate).absoluteFilePath();

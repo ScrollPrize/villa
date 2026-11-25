@@ -92,8 +92,9 @@ std::optional<Event> parseEvent(const QByteArray& line);
 // the volume allows. All values are XYZ voxels.
 std::array<int, 3> zoneOrigin(const std::array<int, 3>& center, const std::array<int, 3>& size, const std::array<int, 3>& shape);
 
-// vesuvius/src of the source tree VC3D was built from, or empty when vesuvius
-// must be installed in the Python environment.
+// vesuvius/src of the source tree VC3D was built from, else of the installed
+// Python tools (installedPythonToolsSource), or empty when vesuvius must be
+// installed in the Python environment.
 QString vesuviusSourceDirectory(const QString& applicationDirectory);
 
 // The Python of the environment next to `vesuviusSource` (vesuvius/.venv, as
