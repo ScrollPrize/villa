@@ -23,6 +23,50 @@ class FinalizeConfig:
     target_info: Optional[dict] = None
 
 
+def _is_constant(logits_np):
+    """`np.allclose(logits_np, logits_np.flat[0], rtol=1e-6)` and whether every value is finite.
+
+    allclose builds several arrays as large as the chunk. For floats the test it applies
+    to each value, |x - first| <= atol + rtol * |first|, holds for everything between
+    two values it holds for (the rounded difference grows with x), so asking it about
+    the minimum and the maximum gives the same answer. A NaN anywhere makes both NaN,
+    which fails, as it does in allclose.
+    """
+    first_value = logits_np.flat[0]
+    if logits_np.dtype.kind != 'f':
+        return bool(np.allclose(logits_np, first_value, rtol=1e-6)), False
+    extremes = np.array([logits_np.min(), logits_np.max()], dtype=logits_np.dtype)
+    return bool(np.allclose(extremes, first_value, rtol=1e-6)), bool(np.isfinite(extremes).all())
+
+
+def _softmax_foreground(logits_np, all_finite):
+    """Channel 1 of the softmax over the channels of `logits_np`, as (1, Z, Y, X).
+
+    For two finite channels the general expression exp(l - max) / sum(exp(l - max))
+    has one term equal to exp(0) = 1 and the other equal to e = exp(-|l1 - l0|), so
+    the foreground is 1 / (1 + e) where channel 1 is the maximum and e / (1 + e)
+    elsewhere. Those are the same floating-point operations on the same values, so
+    the result is identical, with one exp per voxel instead of two and without the
+    (2, Z, Y, X) temporaries. (1 / (1 + exp(l0 - l1)) everywhere would be shorter but
+    rounds differently where channel 0 wins, which can move a uint8 by one.)
+    """
+    if logits_np.shape[0] != 2 or not all_finite:
+        exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
+        softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+        return softmax[1:2]
+
+    difference = logits_np[1:2] - logits_np[0:1]
+    foreground_wins = difference >= 0
+    other = np.abs(difference, out=difference)
+    np.negative(other, out=other)
+    np.exp(other, out=other)                   # exp(min - max); the maximum's term is 1
+    total = other + other.dtype.type(1)
+    np.divide(other, total, out=other)         # foreground where channel 0 is the maximum
+    np.divide(other.dtype.type(1), total, out=total)
+    np.copyto(other, total, where=foreground_wins)
+    return other
+
+
 def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
     """
     Apply softmax + mode logic to normalized logits, producing uint8 output.
@@ -38,8 +82,7 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
         (output_uint8, is_empty) — finalized uint8 array or (None, True) for empty chunks
     """
     # Check if this is an empty chunk (all values are the same)
-    first_value = logits_np.flat[0]
-    is_empty = np.allclose(logits_np, first_value, rtol=1e-6)
+    is_empty, all_finite = _is_constant(logits_np)
 
     if is_empty:
         return None, True
@@ -81,9 +124,7 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
                     binary_mask = (target_logits[1] - target_logits[0] > logit_cutoff).astype(np.float32)
                     target_results.append(binary_mask)
                 else:
-                    exp_logits = np.exp(target_logits - np.max(target_logits, axis=0, keepdims=True))
-                    softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-                    target_results.append(softmax[1])
+                    target_results.append(_softmax_foreground(target_logits, all_finite)[0])
             output_data = np.stack(target_results, axis=0)
         elif num_classes == 1:
             # Single-channel logits: interpret channel as foreground logit.
@@ -98,10 +139,7 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
                 binary_mask = (logits_np[1] - logits_np[0] > logit_cutoff).astype(np.float32)
                 output_data = binary_mask[np.newaxis, ...]
             else:
-                exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
-                softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-                fg_prob = softmax[1:2]
-                output_data = fg_prob
+                output_data = _softmax_foreground(logits_np, all_finite)
     else:  # multiclass
         # Quantise on fixed, chunk-independent scales: the class index is
         # written raw and the softmax probabilities use the same [0, 1] ->
@@ -171,6 +209,25 @@ def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
             return (num_classes + 1, *spatial_shape)
 
 
+# --- Worker Process State ---
+_worker_state = {}
+
+
+def _init_worker(input_path, output_path):
+    """Open the input and output stores once per worker process.
+
+    `process_chunk` reuses them for every chunk the worker handles instead of
+    reading both stores' metadata again per chunk.
+    """
+    _worker_state.update({
+        'input_path': input_path,
+        'output_path': output_path,
+        # The worker pool already reads chunks in parallel.
+        'input_store': open_zarr(input_path, threads=1),
+        'output_store': ZarrWriter.open(output_path, skip_empty=True),
+    })
+
+
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
     """
     Process a single chunk of the volume in parallel.
@@ -195,11 +252,15 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         for idx, chunk, shape_dim in zip(chunk_idx, output_chunks[1:], spatial_shape)
     )
     
-    # The worker pool already reads chunks in parallel.
-    input_store = open_zarr(input_path, threads=1)
-    
-    output_store = ZarrWriter.open(output_path, skip_empty=True)
-    
+    if _worker_state.get('input_path') == input_path and _worker_state.get('output_path') == output_path:
+        input_store = _worker_state['input_store']
+        output_store = _worker_state['output_store']
+    else:
+        # Called outside a pool set up by _init_worker (or for other stores): open them here.
+        # The worker pool already reads chunks in parallel.
+        input_store = open_zarr(input_path, threads=1)
+        output_store = ZarrWriter.open(output_path, skip_empty=True)
+
     input_slice = (slice(None),) + spatial_slices
     logits_np = input_store[input_slice]
 
@@ -439,7 +500,8 @@ def finalize_logits(
     
     total_processed = 0
     empty_chunks = 0
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_worker,
+                             initargs=(input_path, output_path)) as executor:
 
         future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunk_infos}
         
