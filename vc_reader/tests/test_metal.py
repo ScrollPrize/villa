@@ -60,6 +60,25 @@ def test_metal_matches_cpu(volume):
         device = reader.metal(cache_bytes=64*int(np.prod(CHUNKS)))
         actual = device.read_affine_batch(shape, origins, axes).cpu().numpy()
     np.testing.assert_allclose(actual, expected, atol=6e-5, rtol=3e-7)
+    np.testing.assert_array_equal(actual[5], expected[5])  # wholly outside the array: exactly fill
+
+
+def test_metal_failed_read_keeps_the_cache(volume):
+    """A chunk read that raises leaves every cache slot free for the retry"""
+    class Failing:
+        def read_many(self, selections):
+            raise OSError('read failed')
+
+    shape = (8, 9, 10)
+    with ZarrReader.open(volume) as reader:
+        device = reader.metal(cache_bytes=8*int(np.prod(CHUNKS)))
+        device.reader = Failing()
+        with pytest.raises(OSError):
+            device.read_affine_batch(shape, np.full((1, 3), 10.), np.eye(3)[None])
+        assert len(device.free) == device.slots
+        device.reader = reader
+        actual = device.read_affine_batch(shape, np.full((1, 3), 10.), np.eye(3)[None]).cpu().numpy()[0]
+        np.testing.assert_allclose(actual, reader.read_affine(shape, np.full(3, 10.), np.eye(3)), atol=6e-5, rtol=3e-7)
 
 
 def test_metal_evicts_and_reuses(volume):

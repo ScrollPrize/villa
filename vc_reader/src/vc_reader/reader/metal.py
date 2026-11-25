@@ -85,6 +85,7 @@ kernel void affine_linear(device float* out [[buffer(0)]],
 '''
 
 _LIBRARY = None
+_SLACK = 1e-3  # voxels; far above the float32 geometry's error at crop sizes in the hundreds
 
 
 def _library():
@@ -149,8 +150,10 @@ class MetalReader:
         """Per crop, the chunk index range (lo, hi inclusive) of the source box its trilinear taps can read."""
         corners = np.array(list(itertools.product(*[(0, n-1) for n in shape])), np.float64)  # (8, 3)
         points = offsets[:, None, :]+np.einsum('brc,kc->bkr', axes, corners)
-        lo = bases+np.floor(points.min(1)).astype(np.int64)
-        hi = bases+np.floor(points.max(1)).astype(np.int64)+1
+        # the shader's float32 geometry can put a corner a few ulps outside this float64 box (127.99998 where the
+        # box has 128.00000002, so the shader reads voxel 127), so the box is widened to keep those taps resident
+        lo = bases+np.floor(points.min(1)-_SLACK).astype(np.int64)
+        hi = bases+np.floor(points.max(1)+_SLACK).astype(np.int64)+1
         size = np.array(self.shape)
         inside = ((hi >= 0) & (lo <= size-1)).all(1)  # crops wholly outside the array read only fill
         lo, hi = np.clip(lo, 0, size-1), np.clip(hi, 0, size-1)
@@ -185,7 +188,11 @@ class MetalReader:
             start = [k*c for k, c in zip(key, chunk)]
             selections.append(tuple(slice(s, min(s+c, n)) for s, c, n in zip(start, chunk, self.shape)))
         start = time.perf_counter()
-        data = self.reader.read_many(selections)
+        try:
+            data = self.reader.read_many(selections)
+        except BaseException:
+            self.free.extend(reversed(slots))  # the slots hold nothing yet, so a retry can take them again
+            raise
         self.counts['read_seconds'] += time.perf_counter()-start
         host = np.full((len(missing), *chunk), self.fill, np.uint8)
         for row, values in enumerate(data):
@@ -242,4 +249,8 @@ class MetalReader:
         _library().affine_linear(out, self.pool, self.table, torch.from_numpy(bases.astype(np.int32)).to(self.device),
                                  torch.from_numpy(geometry).to(self.device), ints.to(self.device), self.fill,
                                  threads=count*int(np.prod(shape)))
+        if not inside.all():
+            # a crop wholly outside the array is fill, as on the CPU; the kernel's float32 sum of eight fill taps
+            # would add rounding noise that a crop z-score turns into signal
+            out[torch.from_numpy(np.flatnonzero(~inside)).to(self.device)] = self.fill
         return out
