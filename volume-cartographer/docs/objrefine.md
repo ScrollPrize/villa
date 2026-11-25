@@ -64,7 +64,10 @@ vc_objrefine volume.zarr paths/my_segment reports/my_segment params.json
 
 The report folder must be new, empty, or an earlier report (replaced when
 `overwrite` is true). The tool refuses the source segment, a folder inside
-it, and any folder that holds other files, such as another segment.
+it, and any folder that holds anything but the three report files as regular
+files, such as another segment. It checks this when the run starts and again
+when it writes the report, so a file added during the run is kept and the
+report refused.
 
 With `"refine": true` the refined surface is written as usual and the report
 goes into its `alphacomp_offset/` subfolder.
@@ -88,19 +91,27 @@ goes into its `alphacomp_offset/` subfolder.
   `beyond_threshold_fraction` is a share of the vertices where papyrus was
   found and `no_sheet_fraction` a share of the measured ones.
 
-The three files are written to a temporary folder and moved into place
-together. If that fails after a refine run has saved the surface, the tool
-exits with 1 and says the surface was saved without its report.
+The three files are written to a new hidden folder beside the report folder
+and moved into place together; nothing else beside it is touched. An
+earlier report is moved aside whole first and deleted only once the new one
+is in place, so a failed replacement leaves the earlier report, never a mix
+of the two. If its old copy cannot be deleted, the tool warns and names the
+hidden folder that holds it. If writing the report fails after a refine run
+has saved the surface, the tool exits with 1 and says the surface was saved
+without its report.
 
 ### Reading the map
 
 - The offset is the opacity-weighted mean of the sample positions from
   `start` to `stop`, so it lies in that range and is resolved to about
   `step`.
-- It is one-sided: it finds the first papyrus ahead along the normal. A
-  vertex inside papyrus reads `start`; a trace past its sheet reads the next
-  papyrus ahead, or "no sheet", never a negative distance. It is an offset
-  readout, not a sheet-switch detector.
+- The scan range is signed and measured from the vertex along the normal:
+  with the defaults it runs from -2 voxels (just behind the vertex) to 30
+  ahead. Negative offsets therefore occur, but never below `start`.
+- It is one-sided: it finds the first papyrus from `start` onward. A vertex
+  inside papyrus reads about `start` (-2 by default); a trace past its sheet
+  reads the next papyrus ahead, or "no sheet", never the sheet behind it. It
+  is an offset readout, not a sheet-switch detector.
 - Where nothing was found the offset reads 0, the same as a vertex on a
   papyrus face. Read it only where `opacity.tif` is at least
   `offset_min_opacity`, as the summary does.
@@ -109,6 +120,8 @@ exits with 1 and says the surface was saved without its report.
   voxels off with the defaults). With `"refine": true` each vertex moved by
   exactly `offset + border_off`.
 
-A later `vc_objrefine` run into the same output removes an old
-`alphacomp_offset/` folder, so a report never outlives the geometry it
-measured.
+A later `vc_objrefine` run into the same output moves an old
+`alphacomp_offset/` folder aside before saving and deletes it once the new
+surface is saved, so a report never outlives the geometry it measured. If the
+save fails, the old surface and its report are both kept. If the old folder
+cannot be moved aside, nothing is saved.

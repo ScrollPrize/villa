@@ -1,5 +1,6 @@
 #include <nlohmann/json.hpp>
 #include "vc_objrefine_offset_report.hpp"
+#include "vc_objrefine_report_publish.hpp"
 
 
 #include <vc_reader/grid.hpp>
@@ -350,14 +351,10 @@ fs::path normalizedPath(const fs::path& p)
     return c;
 }
 
-bool isReportFile(const fs::path& name)
-{
-    return name == "offset.tif" || name == "opacity.tif" || name == "report.json";
-}
-
 // A report-only run writes a plain folder with the three report files and no
 // surface. Refuse any output that is, is inside, or holds a segment, so the
 // run can never rewrite or delete a segment's files. Empty when allowed.
+// publishReport checks the folder again when the report is written.
 std::string reportOnlyRefusal(const fs::path& src, const fs::path& dst, bool overwrite)
 {
     const fs::path s = normalizedPath(src);
@@ -366,63 +363,34 @@ std::string reportOnlyRefusal(const fs::path& src, const fs::path& dst, bool ove
     if (!rel.empty() && *rel.begin() != "..") {
         return "the output must not be the source segment or a folder inside it";
     }
-    std::error_code ec;
-    if (!fs::exists(d, ec)) {
-        return {};
-    }
-    if (!fs::is_directory(d, ec)) {
-        return d.string() + " exists and is not a folder";
-    }
-    bool hasReport = false;
-    fs::directory_iterator it(d, ec);
-    for (; !ec && it != fs::directory_iterator(); it.increment(ec)) {
-        if (!isReportFile(it->path().filename())) {
-            return d.string() + " holds " + it->path().filename().string() +
-                   "; write the report to a new or empty folder, not into a segment";
-        }
-        hasReport = true;
-    }
-    if (ec) {
-        return "cannot read " + d.string() + ": " + ec.message();
-    }
-    if (hasReport && !overwrite) {
-        return d.string() + " already holds a report and overwrite is false";
-    }
-    return {};
+    return vc_objrefine::reportFolderRefusal(d, overwrite, d);
 }
 
-// Write the maps and report.json into a hidden sibling folder, then swap it
-// in, so `dir` ends up with a whole report or none. `dir` holds only report
-// files (reportOnlyRefusal) or is the tool's own alphacomp_offset/ folder.
+// Write the maps and report.json into a fresh staging folder beside `dir`,
+// then swap it in (vc_objrefine::publishReport), so `dir` ends up with the
+// whole new report or keeps what it had.
 void writeOffsetReport(const fs::path& dir,
+                       bool overwrite,
                        const cv::Mat_<float>& offsetMap,
                        const cv::Mat_<float>& opacityMap,
                        const nlohmann::json& report,
                        float dpi)
 {
-    const fs::path tmp = dir.parent_path() / ("." + dir.filename().string() + ".tmp");
-    std::error_code ec;
-    fs::remove_all(tmp, ec);
-    try {
-        fs::create_directories(tmp);
+    const std::string warning = vc_objrefine::publishReport(dir, overwrite, [&](const fs::path& tmp) {
         vcr::sources::TiffOptions tiff;
         if (dpi > 0) tiff.pixelUm = 25400.0 / dpi;
         const cv::Mat_<float> offsets = offsetMap.isContinuous() ? offsetMap : offsetMap.clone();
         const cv::Mat_<float> opacities = opacityMap.isContinuous() ? opacityMap : opacityMap.clone();
         vcr::sources::writeTiff(tmp / "offset.tif", offsets.ptr(), "<f4", offsets.rows, offsets.cols, 1, tiff);
         vcr::sources::writeTiff(tmp / "opacity.tif", opacities.ptr(), "<f4", opacities.rows, opacities.cols, 1, tiff);
-        {
-            std::ofstream out(tmp / "report.json");
-            out << report.dump(4) << std::endl;
-            if (!out) {
-                throw std::runtime_error("cannot write " + (tmp / "report.json").string());
-            }
+        std::ofstream out(tmp / "report.json");
+        out << report.dump(4) << std::endl;
+        if (!out) {
+            throw std::runtime_error("cannot write " + (tmp / "report.json").string());
         }
-        fs::remove_all(dir);
-        fs::rename(tmp, dir);
-    } catch (...) {
-        fs::remove_all(tmp, ec);
-        throw;
+    });
+    if (!warning.empty()) {
+        std::cerr << "warning: " << warning << std::endl;
     }
 }
 
@@ -536,18 +504,46 @@ int process_tifxyz(const std::filesystem::path& src,
     if (!reportOnly) {
         outSurf->id = dst.filename().string();
 
+        // An earlier report describes the geometry about to be replaced, and
+        // saving over a segment keeps its subfolders. Move it aside first, so
+        // it goes with the old surface: deleted once the new surface is
+        // saved, put back if the save fails. If it cannot be moved, nothing
+        // is saved.
+        fs::path staleReport;
+        if (vc_objrefine::pathExists(reportDir)) {
+            try {
+                staleReport = vc_objrefine::freeSibling(reportDir, "stale");
+                fs::rename(reportDir, staleReport);
+            } catch (const std::exception& e) {
+                std::cerr << "cannot move the earlier offset report " << reportDir
+                          << " aside, so the surface was not saved: " << e.what() << std::endl;
+                return EXIT_FAILURE;
+            }
+        }
+
         try {
             outSurf->saveEdited(src, dst, cfg.overwrite);
         } catch (const std::exception& e) {
             std::cerr << "failed to save tifxyz: " << e.what() << std::endl;
+            if (!staleReport.empty()) {
+                std::error_code ec;
+                fs::rename(staleReport, reportDir, ec);
+                if (ec) {
+                    std::cerr << "the earlier offset report could not be put back and is in "
+                              << staleReport << ": " << ec.message() << std::endl;
+                }
+            }
             return EXIT_FAILURE;
         }
 
-        if (!cfg.offset_report) {
-            // An earlier report described the geometry just replaced, and
-            // saving over a segment keeps its subfolders, so remove it.
+        if (!staleReport.empty()) {
             std::error_code ec;
-            std::filesystem::remove_all(reportDir, ec);
+            fs::remove_all(staleReport, ec);
+            if (ec) {
+                std::cerr << "warning: the earlier offset report no longer matches the surface; it was moved"
+                          << " out of the way to " << staleReport << " but could not be deleted: "
+                          << ec.message() << std::endl;
+            }
         }
     }
 
@@ -585,7 +581,7 @@ int process_tifxyz(const std::filesystem::path& src,
             cfg.offset_threshold, cfg.offset_min_opacity);
 
         try {
-            writeOffsetReport(reportDir, offsetMap, opacityMap, report, surf->dpi());
+            writeOffsetReport(reportDir, cfg.overwrite, offsetMap, opacityMap, report, surf->dpi());
         } catch (const std::exception& e) {
             if (!reportOnly) {
                 std::cerr << "the surface was saved to " << dst << ", but ";

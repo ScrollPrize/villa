@@ -471,6 +471,9 @@ vc_add_test(NAME test_lasagna_normal_sampler LIBS doctest::doctest vc_lasagna)
 # apps/src, shared with the tool) always, and the binary's end-to-end
 # contract when the apps are built.
 vc_add_test(NAME test_objrefine_offset_report)
+# How the report folder is published: never deletes other files, honors
+# overwrite at publication, keeps the earlier report on failure.
+vc_add_test(NAME test_objrefine_report_publish)
 
 if(TARGET vc_objrefine)
     vc_add_test(NAME test_objrefine_offset_report_cli

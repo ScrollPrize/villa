@@ -161,6 +161,19 @@ cv::Mat read_f32(const fs::path& p)
     return m;
 }
 
+// Hidden entries beside `dir` that start with ".<name>.": the staging and
+// moved-aside folders, which a finished run must not leave behind.
+std::vector<std::string> hidden_beside(const fs::path& dir)
+{
+    const std::string prefix = "." + dir.filename().string() + ".";
+    std::vector<std::string> names;
+    for (const auto& e : fs::directory_iterator(dir.parent_path())) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind(prefix, 0) == 0) names.push_back(name);
+    }
+    return names;
+}
+
 struct TempDir {
     fs::path path;
     TempDir()
@@ -200,7 +213,7 @@ TEST_CASE("offset report: known offset, grid-aligned maps, surface unchanged")
     REQUIRE(run_cli({vol.string(), src.string(), reportDir.string(),
                      pReport.string()}) == 0);
     CHECK(listing(reportDir) == REPORT_FILES);
-    CHECK_FALSE(fs::exists(tmp.path / ".measured.tmp"));
+    CHECK(hidden_beside(reportDir).empty());
 
     const cv::Mat off = read_f32(reportDir / "offset.tif");
     const cv::Mat alpha = read_f32(reportDir / "opacity.tif");
@@ -294,12 +307,60 @@ TEST_CASE("offset report: known offset, grid-aligned maps, surface unchanged")
                 CHECK(dz == 0.f);
         }
 
+    // A save that fails (here: overwrite false onto an existing segment)
+    // keeps the old surface, and with it the old report.
+    const std::string bothX = slurp(outBoth / "x.tif");
+    const std::string bothReport = slurp(outBoth / "alphacomp_offset" / "report.json");
+    const fs::path pNoOverwrite = tmp.path / "no_overwrite.json";
+    {
+        std::ofstream p(pNoOverwrite);
+        p << "{\"refine\": true, \"overwrite\": false, \"border_off\": " << BORDER_OFF
+          << ", \"scale_group\": 0, \"cache_mb\": 64}\n";
+        REQUIRE(p.good());
+    }
+    CHECK(run_cli({vol.string(), src.string(), outBoth.string(),
+                   pNoOverwrite.string()}) == 1);
+    CHECK(slurp(outBoth / "x.tif") == bothX);
+    CHECK(slurp(outBoth / "alphacomp_offset" / "report.json") == bothReport);
+    CHECK(hidden_beside(outBoth / "alphacomp_offset").empty());
+
     // A later run into the same folder (here without the flag) drops the old
     // report, so it cannot outlive the geometry it measured.
     REQUIRE(run_cli({vol.string(), src.string(), outBoth.string(),
                      pPlain.string()}) == 0);
     CHECK(fs::exists(outBoth / "x.tif"));
     CHECK_FALSE(fs::exists(outBoth / "alphacomp_offset"));
+    CHECK(hidden_beside(outBoth / "alphacomp_offset").empty());
+
+    // A report folder whose files cannot be deleted one by one (read-only)
+    // still never outlives its geometry: it is moved out of the way whole,
+    // with or without a new report. Permissions do not bind root.
+    if (::geteuid() != 0) {
+        for (const auto& params : {pPlain, pBoth}) {
+            REQUIRE(run_cli({vol.string(), src.string(), outBoth.string(),
+                             pBoth.string()}) == 0);
+            const fs::path rep = outBoth / "alphacomp_offset";
+            const std::string oldReport = slurp(rep / "report.json");
+            fs::permissions(rep, fs::perms::owner_write | fs::perms::group_write |
+                                     fs::perms::others_write,
+                            fs::perm_options::remove);
+            CHECK(run_cli({vol.string(), src.string(), outBoth.string(),
+                           params.string()}) == 0);
+            if (params == pPlain) {
+                CHECK_FALSE(fs::exists(rep));
+            } else {
+                CHECK(listing(rep) == REPORT_FILES);
+            }
+            // The old copy is left whole under a hidden name; tidy it.
+            const auto left = hidden_beside(rep);
+            CHECK(left.size() == 1);
+            for (const auto& name : left) {
+                CHECK(slurp(outBoth / name / "report.json") == oldReport);
+                fs::permissions(outBoth / name, fs::perms::owner_all, fs::perm_options::add);
+                fs::remove_all(outBoth / name);
+            }
+        }
+    }
 
     // A report-only run never writes into a segment: not the source, not a
     // folder inside it, not another segment. Each is refused untouched.
@@ -315,6 +376,13 @@ TEST_CASE("offset report: known offset, grid-aligned maps, surface unchanged")
     CHECK(run_cli({vol.string(), src.string(), outPlain.string(),
                    pReport.string()}) == 1);
     CHECK(listing(outPlain) == plainFiles);
+    // Nor into a folder whose entries only look like a report.
+    const fs::path fakeReport = tmp.path / "fake_report";
+    fs::create_directories(fakeReport / "report.json");
+    CHECK(run_cli({vol.string(), src.string(), fakeReport.string(),
+                   pReport.string()}) == 1);
+    CHECK(fs::is_directory(fakeReport / "report.json"));
+    CHECK(hidden_beside(fakeReport).empty());
 
     // An earlier report is replaced. Relative paths are recorded absolute.
     const std::string firstReport = slurp(reportDir / "report.json");
