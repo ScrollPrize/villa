@@ -309,17 +309,20 @@ python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --fibers 
   --batch 64 --across-fibers --crops gpu --workers 10 --compile max-autotune-no-cudagraphs
 ```
 
-On an RTX 5090, with PHerc0211 fibers (the letter-box set) whose CT was already in the disk cache:
+On an RTX 5090, with 1,152 PHerc0211 fibers (the letter-box set) whose CT was already in the disk cache:
 
 | Run | Decisions/s |
 | --- | --- |
 | 12 per-fiber shards, `--batch 4 --threads 1` | about 230-270 |
-| batched, `--batch 64 --across-fibers --crops gpu --workers 10` | about 360 |
-| the same with `--compile max-autotune-no-cudagraphs` | about 480 (x1.37 over eager in a paired A/B) |
+| batched, `--batch 64 --across-fibers --crops gpu --workers 10` | 360-365 |
+| the same with `--compile max-autotune-no-cudagraphs` | 465-480 (x1.37 over eager in a paired A/B) |
+| batched, `--batch 64 --across-fibers --workers 10` with CPU crops | 43 |
 
-Batched mode peaks at about 14-16 GiB of GPU memory. Each worker holds its own CT reader with a 256 MiB memory cache
+With CPU crops the shard's one process samples every crop and runs the frame model on the CPU, so batched mode needs
+`--crops gpu` to be fast. Batched mode peaks at about 12.5-16 GiB of GPU memory. Each worker holds its own CT reader with a 256 MiB memory cache
 (it reads the CT only around each fiber's seed). Like any change of batch size, `--across-fibers` at batch 64 moves
-the bf16 heights by up to about 0.25 voxels per node. On 200 PHerc0211 fibers scored against per-fiber `--batch 4`,
+nodes by up to about 0.35 voxels under bf16; the per-fiber runner at `--batch 32` moves them by 0.34 against its own
+`--batch 4`, and the mean distance stays under 0.01 voxels for both. On 200 PHerc0211 fibers scored against per-fiber `--batch 4`,
 the paired difference in strip error was within noise (confidence intervals straddle zero) for both eager batch 64 and
 compiled batch 64. Compiling without emulated casts was measurably worse (strip_mean +1.8e-4).
 
