@@ -8,6 +8,7 @@ find_package(concurrentqueue CONFIG REQUIRED)
 file(GLOB_RECURSE _vc_native_headers CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/*.hpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/*.cuh")
 list(FILTER _vc_native_headers EXCLUDE REGEX "(^|/)([^/]*_)?bindings\\.hpp$")
+list(FILTER _vc_native_headers EXCLUDE REGEX "^hip_compat/")
 set(_vc_native_link "${CMAKE_CURRENT_BINARY_DIR}/include/vc_reader/native")
 if(EXISTS "${_vc_native_link}" AND NOT IS_SYMLINK "${_vc_native_link}")
     file(REMOVE_RECURSE "${_vc_native_link}")

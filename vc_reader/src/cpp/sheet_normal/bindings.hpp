@@ -100,7 +100,7 @@ inline void bind(nb::module_& m) {
           try { out=cuda(image.data(),floating,centers.data(),n,image.device_id(),std::move(out)); }
           catch (...) {
               // External inputs/outputs may be released as soon as we unwind.
-              cudaStreamSynchronize(device::stream());
+              gpu::stream_synchronize(device::stream());
               throw;
           } }
         if (!destination.is_none()) return nb::none();

@@ -35,7 +35,7 @@ inline void bind(nb::module_& m) {
     nb::class_<Owned>(m,"CudaStorage")
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
         .def("export",[](Owned& o) { o.storage->exported=true; });
-    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : cudaStreamPerThread; });
+    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : gpu::per_thread_stream(); });
     m.def("_get_stream",[] { return reinterpret_cast<std::uintptr_t>(device::current_stream()); });
     m.def("_dlpack_stream",[] { return device::dlpack_handle(); });
     m.def("_set_pool_release_threshold",[](int id,std::uint64_t bytes) { device::set_pool_release_threshold(id,bytes); });
@@ -75,12 +75,12 @@ inline void bind(nb::module_& m) {
     m.def("_cuda_download",[](Device input,Bytes out) {
         if (input.nbytes()!=out.nbytes()) throw nb::value_error("download size mismatch");
         nb::gil_scoped_release release; device::Guard guard(input.device_id());
-        if (out.nbytes()) { device::check(cudaMemcpyAsync(out.data(),input.data(),out.nbytes(),cudaMemcpyDeviceToHost,device::stream())); device::complete(); }
+        if (out.nbytes()) { device::check(gpu::memcpy_async(out.data(),input.data(),out.nbytes(),gpu::device_to_host,device::stream())); device::complete(); }
     });
     m.def("_cuda_upload",[](Host input,int id) {
         device::Storage storage;
         { nb::gil_scoped_release release; device::Guard guard(id); storage=device::allocate(input.nbytes(),id);
-          if (input.nbytes()) device::check(cudaMemcpyAsync(storage->ptr,input.data(),input.nbytes(),cudaMemcpyHostToDevice,device::stream())); device::complete(); }
+          if (input.nbytes()) device::check(gpu::memcpy_async(storage->ptr,input.data(),input.nbytes(),gpu::host_to_device,device::stream())); device::complete(); }
         std::size_t count=1; for (std::size_t a=0;a<input.ndim();++a) count*=input.shape(a);
         return owned(std::move(storage),count,input.dtype(),id);
     });
@@ -139,7 +139,7 @@ inline void bind(nb::module_& m) {
               catch (...) {
                   // Keep borrowed output storage alive until outstanding writes finish.
                   device::Guard guard(r.device_id());
-                  cudaStreamSynchronize(device::stream());
+                  gpu::stream_synchronize(device::stream());
                   throw;
               } }
             if (!out.is_none()) {

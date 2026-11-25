@@ -1,5 +1,6 @@
 #include <vc_reader/transforms.hpp>
 #include <vc_reader/cuda.hpp>
+#include <cuda_runtime.h>
 #ifdef VCR_TEST_READER
 #include <vc_reader/cuda_reader.hpp>
 #endif

@@ -3,6 +3,7 @@
 // (blocking), with layers, composites and level fallback.
 #include <vc_reader/array.hpp>
 #include <vc_reader/native/reader_cuda/reader.hpp>
+#include <cuda_runtime.h>
 #include <vc_reader/grid.hpp>
 #include <vc_reader/zarr.hpp>
 #include <vc_reader/native/cuda_available.hpp>

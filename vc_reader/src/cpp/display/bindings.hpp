@@ -57,11 +57,11 @@ inline void bind(nb::module_& m) {
             Slab slab{layers.data(),count,rows,cols,margins[0],margins[1],width,height,projection,colors.data(),opacity.data(),lighting};
             if(cuda) {
 #ifdef VC_READER_CUDA
-                int gpu;device::check(cudaGetDevice(&gpu));
+                int gpu;device::check(gpu::get_device(&gpu));
                 device::Buffer v(values.size(),gpu),c(mask.size(),gpu),ls(layers.size()*sizeof(SlabLayer),gpu),
                     cs(1024,gpu),op(1024,gpu),os(offsets.size()*sizeof(float),gpu),ns(layerNum.size()*sizeof(float),gpu),
                     out(n*3,gpu),cov(n,gpu);
-                auto upload=[](void* dst,const void* src,std::size_t bytes){device::check(cudaMemcpyAsync(dst,src,bytes,cudaMemcpyHostToDevice,device::stream()));};
+                auto upload=[](void* dst,const void* src,std::size_t bytes){device::check(gpu::memcpy_async(dst,src,bytes,gpu::host_to_device,device::stream()));};
                 upload(v.ptr,values.data(),values.size());upload(c.ptr,mask.data(),mask.size());
                 for(int i=0;i<count;++i){layers[i].values=static_cast<uint8_t*>(v.ptr)+std::size_t(i)*rows*cols;layers[i].coverage=static_cast<uint8_t*>(c.ptr)+std::size_t(i)*rows*cols;}
                 upload(ls.ptr,layers.data(),layers.size()*sizeof(SlabLayer));upload(cs.ptr,colors.data(),1024);upload(op.ptr,opacity.data(),1024);
@@ -69,8 +69,8 @@ inline void bind(nb::module_& m) {
                 slab.layers=static_cast<SlabLayer*>(ls.ptr);slab.colors=static_cast<uint32_t*>(cs.ptr);slab.opacity=static_cast<float*>(op.ptr);
                 slab.projection.layerOffsets=static_cast<float*>(os.ptr);slab.projection.layerNum=static_cast<float*>(ns.ptr);
                 display::cuda::compositeSlab(slab,static_cast<uint8_t*>(out.ptr),static_cast<uint8_t*>(cov.ptr));
-                device::check(cudaMemcpyAsync(rgb,out.ptr,n*3,cudaMemcpyDeviceToHost,device::stream()));
-                device::check(cudaMemcpyAsync(coverage,cov.ptr,n,cudaMemcpyDeviceToHost,device::stream()));device::complete();
+                device::check(gpu::memcpy_async(rgb,out.ptr,n*3,gpu::device_to_host,device::stream()));
+                device::check(gpu::memcpy_async(coverage,cov.ptr,n,gpu::device_to_host,device::stream()));device::complete();
 #else
                 throw std::runtime_error("CUDA support is not built");
 #endif

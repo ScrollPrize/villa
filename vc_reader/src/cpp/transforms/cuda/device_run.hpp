@@ -54,7 +54,7 @@ inline DeviceRun run_device(const Pipeline& pipeline, const std::map<std::string
 struct DeviceOutputs {
     std::vector<std::shared_ptr<void>> sessions;
     int device = 0;
-    cudaStream_t stream = vcr::device::stream();
+    gpu::Stream stream = vcr::device::stream();
     // Arrays are marked exported (their destruction then synchronizes the device) only when shared.
     void mark_exported() { for (auto& s:sessions) export_outputs(s.get()); }
     void check() {
@@ -65,7 +65,7 @@ struct DeviceOutputs {
     void wait() {
         vcr::device::Guard guard(device); vcr::device::StreamScope scope(stream);
         check_devices(sessions);
-        vcr::device::check(cudaStreamSynchronize(stream));
+        vcr::device::check(gpu::stream_synchronize(stream));
     }
 };
 // A target of a batch: one stacked (B, ...) array when samples agree, else one array per sample.

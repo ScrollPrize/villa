@@ -1,10 +1,12 @@
-#ifndef VC_READER_HIP
-#error "The installed HIP package must propagate VC_READER_HIP"
-#endif
-
 #include <cuda_runtime.h>
+#include <type_traits>
+
+static_assert(std::is_same_v<cudaError_t, enum cudaError>);
+
+bool hip_available();
 
 int main() {
-    int count = 0;
-    return cudaGetDeviceCount(&count) == cudaSuccess ? 0 : 1;
+    int cuda_version = 0;
+    (void)cudaRuntimeGetVersion(&cuda_version);
+    return hip_available() ? 0 : 77;
 }

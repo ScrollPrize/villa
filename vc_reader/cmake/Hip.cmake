@@ -60,11 +60,12 @@ find_package(hipcub REQUIRED CONFIG)
 # discover the NVIDIA toolkit in the same CMake project.
 add_library(vc_reader_hip_runtime INTERFACE)
 set_target_properties(vc_reader_hip_runtime PROPERTIES EXPORT_NAME hip_runtime)
-target_include_directories(vc_reader_hip_runtime INTERFACE
-    "$<BUILD_INTERFACE:${VC_READER_HIP_COMPAT_DIR}>"
-    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/hip_compat>")
 target_compile_definitions(vc_reader_hip_runtime INTERFACE VC_READER_HIP=1)
 target_link_libraries(vc_reader_hip_runtime INTERFACE hip::host)
+
+# CUDA-named shims are implementation headers. An installed consumer can
+# include the real NVIDIA headers alongside vc_reader headers.
+include_directories(BEFORE "${VC_READER_HIP_COMPAT_DIR}")
 
 add_library(vc_reader_hip_fft INTERFACE)
 set_target_properties(vc_reader_hip_fft PROPERTIES EXPORT_NAME hip_fft)

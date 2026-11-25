@@ -250,7 +250,7 @@ std::shared_ptr<const GeometryTile> Geometry::tile(const Pair& start, const Pair
                     auto storage = std::static_pointer_cast<device::Buffer>(array.device);
                     Block host = Block::allocate(array.shape, array.dtype);
                     device::Guard guard(storage->device);
-                    if (host.nbytes) device::check(cudaMemcpyAsync(host.data.get(), storage->ptr, host.nbytes, cudaMemcpyDeviceToHost, device::stream()));
+                    if (host.nbytes) device::check(gpu::memcpy_async(host.data.get(), storage->ptr, host.nbytes, gpu::device_to_host, device::stream()));
                     device::complete();
                     array.host = host.data;
                     array.device.reset();
@@ -1093,7 +1093,7 @@ SampleResult SurfaceProjection::Impl::read(const Triple& at, const Triple& exten
                 auto storage = std::static_pointer_cast<device::Buffer>(uvState.device);
                 Block host = Block::allocate(uvState.shape, uvState.dtype);
                 device::Guard guard(storage->device);
-                if (host.nbytes) device::check(cudaMemcpyAsync(host.data.get(), storage->ptr, host.nbytes, cudaMemcpyDeviceToHost, device::stream()));
+                if (host.nbytes) device::check(gpu::memcpy_async(host.data.get(), storage->ptr, host.nbytes, gpu::device_to_host, device::stream()));
                 device::complete();
                 uvState.host = host.data;
                 uvState.device.reset();

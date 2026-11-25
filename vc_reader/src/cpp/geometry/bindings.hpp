@@ -44,7 +44,7 @@ inline void bind(nb::module_& m){
     nb::class_<CudaVoxels>(m,"GeometryCudaVoxels").def_prop_ro("nbytes",[](const CudaVoxels& v){return v.keys->bytes;});
     m.def("_geometry_voxels_cuda",[](const Voxels& cpu,int id){
         CudaVoxels out{cpu.grid,{},cpu.keys.size(),id};execute(id,[&]{out.keys=device::allocate(out.count*8,id);
-            if(out.count)device::check(cudaMemcpyAsync(out.keys->ptr,cpu.keys.data(),out.count*8,cudaMemcpyHostToDevice,device::stream()));device::complete();});return out;
+            if(out.count)device::check(gpu::memcpy_async(out.keys->ptr,cpu.keys.data(),out.count*8,gpu::host_to_device,device::stream()));device::complete();});return out;
     });
 #endif
     m.def("_geometry_gather",[](nb::object obj,Array ids,bool segments,Array out,Array arc,Array owners,Array valid){
