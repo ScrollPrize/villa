@@ -1,5 +1,67 @@
 """Discover segment directories and select versioned label assets.
 
+v8 -- focused LABELED discovery for PR #2677 (review: villa-review,
+25/11/2026, seventh review of the v7 head at 8f34af3). The reviewer
+still recommends merging a FOCUSED discovery change after repair.
+v8 repairs the six points of review 7 on top of the v7 base:
+
+1. Mirror completeness (point 1, both directions). The v7 cross-level
+   fill proof's UPWARD direction (a present coarser chunk whose
+   footprint is all fill proves the missing fine chunk is fill) is
+   UNSOUND for thin features: nearest-neighbour downsampling erases a
+   one-voxel stroke, so a deleted chunk holding one reads as fill at
+   the coarser level. The upward direction is dropped. What replaces
+   it: (a) the downward proof is kept (finer chunks present and fill
+   prove the coarser chunk is fill -- sound for nearest and mean);
+   (b) the upward NON-FILL proof is kept (a coarser chunk present and
+   non-fill in the footprint proves the missing chunk is NOT fill --
+   sound); (c) NEW: a missing chunk whose covering chunks at the
+   immediately coarser level are ALL ABSENT, in a store that holds at
+   least one chunk somewhere, is fill -- the writer omitted a
+   chunk-aligned empty region at every resolution (review 7, point 2).
+   Deliberate, disclosed trade-off: the review-6 F1 writer mask (1
+   populated + 1 omitted fill chunk, admitted by v7 via the upward
+   proof) is now REJECTED -- it is observationally identical to the
+   review-7 1b tamper (one fine chunk deleted, thin stroke erased at
+   the coarser level), and no signal in the store distinguishes them.
+   The fully-stripped 6-level mask (review 7, point 1a) is
+   byte-identical to a genuine uniform mask and stays admitted by the
+   uniform exception: provably undecidable, documented, not fixed.
+2. Sparse ink pyramids (point 2). A complete writer pyramid whose
+   empty area spans chunks at every level is now admitted by the new
+   coarser-absent rule (1c above): the writer omitted those fill
+   chunks, and no coarser chunk exists to prove otherwise. The rule
+   requires at least one present chunk in the store, so the review-6
+   V2 metadata-only 2-level store stays rejected.
+3. Chunk-key validation (point 3). The key parser now validates the
+   EXACT storage key against the store's declared format and
+   separator: v2 dot-separated canonical integers only (no leading
+   zeros, no slashes, no backslashes); v2 slash-separated nested
+   paths only; v3 ``c/<ints>`` only, with no backslash anywhere. A
+   file named ``0\\0\\0`` is ONE filename, never a nested path.
+4. Reader agreement (point 4). Readiness content reads go through
+   ``open_volume`` (vc_reader) -- the same reader the training path
+   uses -- instead of Python zarr. Discovery therefore works in the
+   documented ``models`` install (which declares ``vc-reader`` but no
+   Python ``zarr``) and agrees with the training reader on v3 stores.
+   segment.py no longer imports zarr at all.
+5. Unlabeled missing image (point 5). In unlabeled mode a missing
+   local image is ALWAYS skipped, whether flat or explicitly mapped:
+   that is main's rule (``continue``), and v7's H1a raise for an
+   explicitly configured image contradicted it. The V8 control now
+   expects main's KeyError (the ready segment has no map entry).
+6. Cache-first discovery (point 6). ``gather_segments`` takes a
+   ``light`` mode (filesystem checks only, no chunk decoding); the
+   dataset gathers lightly, tries the cache, and only on a miss
+   re-gathers with full content validation. A store fingerprint
+   (exact chunk inventory -- relative paths, sizes, mtimes -- hashed
+   per store) is recorded at cache-write time and verified on a hit
+   by listing only, so a chunk removed after caching invalidates the
+   cache and the fresh run detects it. Selection helpers
+   (``_is_selected_segment``, ``_is_main_discovered_segment``) live
+   here now instead of being mirrored in dataset.py and
+   patch_cache.py.
+
 v6 -- focused LABELED discovery for PR #2677 (review: villa-review,
 25/11/2026, fifth review of the v5 head at 3a46e88). The reviewer
 still recommends merging a FOCUSED discovery change after repair, and
@@ -287,30 +349,113 @@ def _zarr_level_array_meta(store: str | Path, level: int | str) -> tuple | None:
 _WRITER_DEFAULT_LEVELS = 6
 
 
-def _grid_index_for_chunk_file(relpath: str, ndim: int) -> tuple[int, ...] | None:
+def _zarr_level_format(store: str | Path, level: int | str) -> str | None:
+    """\"v2\" or \"v3\" for the array at the level, or None when not an array.
+
+    The format decides which storage keys the real reader looks up:
+    v2 joins chunk indices with the declared dimension separator
+    ("." or "/"), v3 prefixes them with ``c`` and joins with the
+    chunk-key-encoding separator. A store whose format cannot be
+    determined is not an array (see :func:`_zarr_level_array_meta`).
+    """
+    level_dir = _zarr_level_dir(store, level)
+    if level_dir is None:
+        return None
+    if (level_dir / ".zarray").is_file():
+        return "v2"
+    zarr_json = level_dir / "zarr.json"
+    if zarr_json.is_file():
+        try:
+            meta = json.loads(zarr_json.read_text())
+        except (OSError, ValueError):
+            return None
+        if meta.get("node_type") == "array":
+            return "v3"
+    return None
+
+
+def _zarr_v3_chunk_separator(store: str | Path, level: int | str) -> str:
+    """Declared v3 chunk-key separator ("/" when absent or unreadable).
+
+    Zarr v3's ``chunk_key_encoding`` names the separator explicitly;
+    the default encoding uses "/". The reader joins chunk indices
+    with exactly this separator, so a key written with any other
+    separator is not a chunk.
+    """
+    level_dir = _zarr_level_dir(store, level)
+    if level_dir is None:
+        return "/"
+    zarr_json = level_dir / "zarr.json"
+    if not zarr_json.is_file():
+        return "/"
+    try:
+        meta = json.loads(zarr_json.read_text())
+    except (OSError, ValueError):
+        return "/"
+    encoding = meta.get("chunk_key_encoding") or {}
+    separator = encoding.get("separator", "/")
+    return separator if isinstance(separator, str) and separator else "/"
+
+
+def _grid_index_for_chunk_file(
+    relpath: str,
+    ndim: int,
+    *,
+    format: str,
+    separator: str,
+    grid_counts: tuple[int, ...] | None = None,
+) -> tuple[int, ...] | None:
     """Chunk-grid index for a file under a level directory, or None.
 
-    Maps the file's relative path to a chunk index: v2 "." separator
-    (``0.0.1``), v2 "/" separator (``0/0/1``), v3 (``c/0/0/1``). A
-    file that is not at a grid position -- an unrelated file dropped
-    into the store, a backup, a note -- is not a chunk: it is ignored,
-    never counted. A file AT a grid position is a chunk candidate; its
-    content is validated separately.
+    The file must sit at EXACTLY the storage key the real reader
+    looks up for a chunk (review 7, point 3): v2 joins the indices
+    with the declared dimension separator, v3 prefixes them with
+    ``c`` and joins with the chunk-key-encoding separator, and every
+    component is a canonical integer (``str(int(part)) == part``: no
+    leading zeros, no signs, no whitespace). A file at any other key
+    is not a chunk -- it is ignored, never counted -- even when the
+    sampler would read fill for the tile it pretends to cover.
+
+    A backslash anywhere rejects the file outright: on Linux a
+    filename may literally contain backslashes, so ``0\\0\\0`` is ONE
+    filename, not a nested path, and must never be read as the chunk
+    ``(0, 0, 0)``. The old code replaced backslashes with slashes
+    before splitting, which is exactly the bug.
     """
-    parts = relpath.replace("\\", "/").split("/")
-    if parts and parts[0] == "c":
+    if "\\" in relpath:
+        return None
+    if format == "v3":
+        parts = relpath.split(separator) if separator else [relpath]
+        if not parts or parts[0] != "c":
+            return None
         parts = parts[1:]
-    if len(parts) == 1:
-        parts = parts[0].split(".")
+    elif separator == "/":
+        parts = relpath.split("/")
+    elif separator == ".":
+        if "/" in relpath:
+            return None
+        parts = relpath.split(".")
+    else:
+        return None
     if len(parts) != ndim:
         return None
-    try:
-        index = tuple(int(part) for part in parts)
-    except ValueError:
+    index: list[int] = []
+    for part in parts:
+        try:
+            value = int(part)
+        except ValueError:
+            return None
+        if str(value) != part:
+            return None
+        index.append(value)
+    if grid_counts is not None:
+        if len(grid_counts) != ndim:
+            return None
+        if any(value < 0 or value >= count for value, count in zip(index, grid_counts)):
+            return None
+    elif any(value < 0 for value in index):
         return None
-    if any(value < 0 for value in index):
-        return None
-    return index
+    return tuple(index)
 
 
 def _zarr_level_chunk_presence(
@@ -327,7 +472,7 @@ def _zarr_level_chunk_presence(
     meta = _zarr_level_array_meta(store, level)
     if meta is None:
         return None
-    shape, chunks, _separator = meta
+    shape, chunks, separator = meta
     ndim = len(shape)
     grid_counts = [
         -(-int(size) // int(chunk)) for size, chunk in zip(shape, chunks)
@@ -338,6 +483,15 @@ def _zarr_level_chunk_presence(
     level_dir = _zarr_level_dir(store, level)
     if level_dir is None:
         return None
+    # The storage key depends on the store's declared format: v2 joins
+    # indices with the dimension separator, v3 prefixes them with "c"
+    # and joins with the chunk-key-encoding separator (review 7,
+    # point 3). A file at any other key is not a chunk.
+    format = _zarr_level_format(store, level)
+    if format is None:
+        return None
+    if format == "v3":
+        separator = _zarr_v3_chunk_separator(store, level)
     present: set[tuple[int, ...]] = set()
     try:
         for root, _dirs, files in os.walk(level_dir, followlinks=True):
@@ -345,7 +499,13 @@ def _zarr_level_chunk_presence(
                 if name in _ZARR_METADATA_NAMES:
                     continue
                 rel = os.path.relpath(os.path.join(root, name), level_dir)
-                index = _grid_index_for_chunk_file(rel, ndim)
+                index = _grid_index_for_chunk_file(
+                    rel,
+                    ndim,
+                    format=format,
+                    separator=separator,
+                    grid_counts=tuple(grid_counts),
+                )
                 if index is not None and index in expected:
                     present.add(index)
     except OSError:
@@ -353,23 +513,32 @@ def _zarr_level_chunk_presence(
     return (meta, present, expected)
 
 
-def _open_level_array(level_dir: Path | None):
-    """Open a level directory as a zarr array for content reads, or None.
+def _open_level_volume(store: str | Path, level: int | str):
+    """Open one resolution level through the training reader, or None.
 
-    Lazy zarr import (segment.py otherwise reads only JSON metadata).
-    None when zarr is unavailable or the array cannot be opened (a v3
-    store under zarr 2.x, a corrupt ``.zarray``): callers treat present
-    chunks as corrupt -- fail closed, since the run could not read the
-    level anyway.
+    The content reads go through ``open_volume`` (vc_reader) -- the
+    same reader the training path uses (dataset ``_open``) -- instead
+    of Python zarr (review 7, point 4). The documented ``models``
+    extra declares ``vc-reader`` but no Python ``zarr``, so a
+    zarr-based readiness rejected stores the training reader opens
+    (a complete published v2 crop with zarr unimportable, and a v3
+    re-encoded crop even with zarr 2.18.7 installed). Reading through
+    the training reader makes readiness agree with training by
+    construction, in the documented install and on v3 stores.
+
+    Lazy import (segment.py otherwise reads only JSON metadata).
+    None when the reader is unavailable or the level cannot be opened
+    (a corrupt store): callers treat present chunks as corrupt --
+    fail closed, since the run could not read the level anyway.
     """
-    if level_dir is None:
+    if _zarr_level_dir(store, level) is None:
         return None
     try:
-        import zarr
+        from vesuvius.ink_detection.volume_io import open_volume
     except ImportError:
         return None
     try:
-        return zarr.open_array(str(level_dir), mode="r")
+        return open_volume(store, level)
     except Exception:
         return None
 
@@ -392,8 +561,8 @@ def _zarr_level_chunk_states(
     counted every non-metadata file, so an unrelated file kept the
     count unchanged and an accepted patch loaded as zeros. A file at a
     grid position still has to prove it is a chunk: the voxel read is
-    the content check, codec-agnostic (it goes through zarr, so any
-    compressor the array uses is honoured). Residual hole, documented:
+    the content check, codec-agnostic (it goes through the training
+    reader, so any compressor the array uses is honoured). Residual hole, documented:
     a chunk file that is a valid compressed chunk for the same
     shape/dtype but from another store is indistinguishable -- zarr v2
     carries no checksum or manifest.
@@ -408,7 +577,7 @@ def _zarr_level_chunk_states(
     }
     if not present:
         return (meta, states)
-    array = _open_level_array(_zarr_level_dir(store, level))
+    array = _open_level_volume(store, level)
     if array is None:
         for index in present:
             states[index] = "corrupt"
@@ -547,7 +716,7 @@ def _region_fill_state(
     True when every voxel in the region is the fill value (0); False
     when any voxel is non-zero; None when the region cannot be read
     (a chunk covering it is missing or corrupt, or the level is not an
-    array). The presence check matters: zarr reads a missing chunk as
+    array). The presence check matters: the reader reads a missing chunk as
     fill, so a region read alone cannot tell a genuinely all-fill
     region from a missing one -- the chunks covering the footprint
     must be present first. Only the covering chunks are validated
@@ -560,7 +729,7 @@ def _region_fill_state(
     covering = _chunk_indices_intersecting(shape, chunks, footprint)
     if not covering or not covering.issubset(present):
         return None
-    array = _open_level_array(_zarr_level_dir(store, level))
+    array = _open_level_volume(store, level)
     if array is None:
         return None
     try:
@@ -570,12 +739,68 @@ def _region_fill_state(
     return not bool(region.any())
 
 
+def _level_has_any_chunk(store: str | Path, level: int | str) -> bool:
+    """True when the level holds at least one chunk.
+
+    Listing only, no content reads. Used by the coarser-absent rule
+    below: the rule requires a chunk at the IMMEDIATELY COARSER level
+    itself, not merely somewhere in the store -- a store whose L0
+    chunks arrived but whose coarser levels are all empty is an
+    interrupted transfer mid-L0 (the writer writes L0 first), not a
+    sparse pyramid (red-team R2).
+    """
+    result = _zarr_level_chunk_presence(store, level)
+    return result is not None and bool(result[1])
+
+
+def _coarser_level_covering_absent(
+    store: str | Path, level: int | str, chunk_index: tuple[int, ...]
+) -> bool:
+    """True when every chunk covering the missing chunk at the
+    immediately coarser level is absent.
+
+    The covering chunks are the ones intersecting the missing chunk's
+    footprint at level ``level + 1``. When they are all absent, the
+    region is chunk-aligned empty at the coarser resolution: the
+    writer (``skip_empty``) omitted them because the region was empty
+    there, and a single deleted chunk in a populated area cannot
+    satisfy this -- its coarser parents are present via its
+    neighbours. False when there is no coarser level, when the
+    footprint cannot be mapped, or when any covering chunk is present.
+    """
+    result = _zarr_level_chunk_presence(store, level)
+    if result is None:
+        return False
+    (shape, chunks, _sep), _present, _expected = result
+    extent = tuple(
+        (i * c, min(i * c + c, size))
+        for i, c, size in zip(chunk_index, chunks, shape)
+    )
+    levels = _store_array_levels(store)
+    coarser = [other for other in levels if other > level]
+    if not coarser:
+        return False
+    other = min(coarser)
+    other_result = _zarr_level_chunk_presence(store, other)
+    if other_result is None:
+        return False
+    (other_shape, other_chunks, _other_sep), other_present, _other_expected = other_result
+    footprint = _footprint_at_level(shape, extent, other_shape)
+    if footprint is None:
+        return False
+    covering = _chunk_indices_intersecting(other_shape, other_chunks, footprint)
+    if not covering:
+        return False
+    return covering.isdisjoint(other_present)
+
+
 def _missing_chunk_is_proven_fill(
     store: str | Path, level: int | str, chunk_index: tuple[int, ...]
 ) -> bool:
     """True when cross-level evidence proves a missing chunk is fill.
 
-    Two sound directions and one heuristic (see DESIGN_NOTE_V7.md):
+    Three directions (see DESIGN_NOTE_V8.md for the proofs and the
+    residual holes):
 
     - Downward (sound): the finer level's chunks over the footprint
       are all present and all-fill, so the coarser chunk is fill
@@ -583,21 +808,44 @@ def _missing_chunk_is_proven_fill(
     - Upward non-fill (sound): a coarser chunk over the footprint is
       present and non-fill, so the finer chunk is NOT fill -- the
       proof returns False immediately (proven non-fill).
-    - Upward fill (heuristic): a coarser chunk over the footprint is
-      present and all-fill. For region/stroke masks this proves the
-      finer chunk is fill (a non-fill region spans many voxels, and
-      the downsampled footprint would show it); it is not a proof for
-      an isolated single-voxel signal, which nearest sampling (or mean
-      rounding to uint8) can hide. The writer's masks are regions, so
-      this is the direction that admits a complete writer mask with an
-      omitted fill chunk (review 6, point 1).
+    - Coarser-absent (review 7, point 2): every chunk covering the
+      missing chunk at the immediately coarser level is ABSENT, and
+      that immediately coarser level holds at least one chunk
+      somewhere else. The writer omitted a chunk-aligned empty region
+      at every resolution, so the missing chunk is fill. A single
+      deleted chunk in a populated area cannot satisfy this (its
+      coarser parents are present via its neighbours), and a store
+      whose coarser levels are ALL empty cannot satisfy it either:
+      that is an interrupted transfer mid-L0, since the writer writes
+      L0 first (red-team R2: rule (c) used to require only "some
+      chunk somewhere in the store", which an interrupted transfer
+      satisfies).
+
+    The v7 UPWARD-FILL direction is GONE: a present coarser chunk
+    whose footprint is all fill proves nothing about the missing
+    chunk, because nearest-neighbour downsampling erases a
+    one-voxel stroke (review 7, point 1b: deleting the fine chunk
+    holding a thin validation stroke left the coarser footprint all
+    fill, so v7 admitted the tampered mask). A present all-fill
+    coarser footprint is now NO evidence, and the chunk is unproven
+    unless a sound direction or the coarser-absent rule applies.
+
+    Deliberate trade-off: the review-6 F1 writer mask (1 populated +
+    1 omitted fill chunk, admitted by v7 via the upward proof) is
+    now REJECTED -- it is observationally identical to the review-7
+    1b tamper (same missing chunk, same present coarser chunk, same
+    all-fill footprint), and no signal in the store distinguishes
+    them. The fully-stripped 6-level mask (review 7, point 1a) is
+    byte-identical to a genuine uniform mask and stays admitted by
+    the uniform exception: provably undecidable.
 
     The proof walks outward from the missing chunk's level (coarser
-    levels first, then finer) and uses the first level that gives
-    evidence. A level whose covering chunks are missing or corrupt
-    gives no evidence and is skipped. When no level gives evidence,
-    the chunk is unproven: an interrupted transfer and a complete
-    uniform mask are indistinguishable there (the residual hole).
+    levels first, checking non-fill only, then the coarser-absent
+    rule, then finer) and uses the first level that gives evidence.
+    A level whose covering chunks are missing or corrupt gives no
+    evidence and is skipped. When no level gives evidence, the chunk
+    is unproven: an interrupted transfer and a complete uniform mask
+    are indistinguishable there (the residual hole).
     """
     result = _zarr_level_chunk_presence(store, level)
     if result is None:
@@ -616,10 +864,27 @@ def _missing_chunk_is_proven_fill(
         if footprint is None:
             continue
         fill = _region_fill_state(store, other, footprint)
-        if fill is True:
-            return True
+        # Only NON-fill is evidence here: a present coarser chunk
+        # whose footprint is non-fill proves the missing chunk is NOT
+        # fill. An all-fill footprint proves nothing (a thin signal
+        # can be erased by downsampling) and is skipped.
         if fill is False:
             return False
+    # Coarser-absent (review 7, point 2): the writer omitted the
+    # whole coarser neighbourhood of this chunk, so the region was
+    # empty at the coarser resolution too. Tightened after the
+    # red-team R2 attack: the immediately coarser level must itself
+    # hold at least one chunk -- requiring only "some chunk somewhere
+    # in the store" admits an interrupted transfer mid-L0 (the writer
+    # writes L0 first, so L0 chunks present + all coarser levels
+    # empty is exactly a transfer that died after L0).
+    coarser_levels = sorted(l for l in levels if l > level)
+    if (
+        coarser_levels
+        and _coarser_level_covering_absent(store, level, chunk_index)
+        and _level_has_any_chunk(store, coarser_levels[0])
+    ):
+        return True
     for other in sorted((l for l in levels if l < level), reverse=True):
         other_result = _zarr_level_chunk_presence(store, other)
         if other_result is None:
@@ -1034,6 +1299,7 @@ def _gather_pr_admitted(
     markers: dict[str, bool],
     held_out: bool,
     is_allowlisted: bool,
+    light: bool = False,
 ) -> Segment | None:
     """Gather a flat mirror main would not discover (no x.tif, no explicit surface).
 
@@ -1093,20 +1359,26 @@ def _gather_pr_admitted(
     # level 1 reads as all zeros at volume_scale=0 (review 4,
     # point 4). No uniform exception: an image is never legitimately
     # chunkless.
-    for level in levels:
-        if _zarr_level_store_state(image_volume, level) != "complete":
-            _fail_or_skip(
-                segment_dir,
-                strict=strict,
-                message=(
-                    "image volume "
-                    f"{image_volume} is incomplete at resolution {level} "
-                    "(unfinished mirror: a chunk is missing, or the level "
-                    "is not an array); it will be picked up once its "
-                    "store is filled."
-                ),
-            )
-            return None
+    #
+    # Light gather (review 7, point 6): skip the content gates --
+    # they decode chunks. A light segment is only used to look up the
+    # patch cache; the fingerprint check there (patch_cache) and the
+    # full re-gather on a miss are what catch an unfinished store.
+    if not light:
+        for level in levels:
+            if _zarr_level_store_state(image_volume, level) != "complete":
+                _fail_or_skip(
+                    segment_dir,
+                    strict=strict,
+                    message=(
+                        "image volume "
+                        f"{image_volume} is incomplete at resolution {level} "
+                        "(unfinished mirror: a chunk is missing, or the level "
+                        "is not an array); it will be picked up once its "
+                        "store is filled."
+                    ),
+                )
+                return None
 
     # (b) Labels: a partly synced sibling is skipped (point 2), a
     # version mismatch always raises.
@@ -1140,22 +1412,26 @@ def _gather_pr_admitted(
     # yield validation patches (C3, Z8). A corrupt chunk (an unrelated
     # file at a grid position, a truncated chunk) fails here, not at
     # the first sample.
-    for kind in ("supervision_mask", "inklabels"):
-        store = getattr(segment, kind)
-        for level in levels:
-            state = _zarr_level_store_state(store, level)
-            if state not in ("complete", "fill", "uniform", "empty"):
-                _fail_or_skip(
-                    segment_dir,
-                    strict=strict,
-                    message=(
-                        f"{kind} store {store} is {state} at "
-                        f"resolution {level} (unfinished mirror: a chunk "
-                        "is missing or does not read as a chunk); it will "
-                        "be picked up once its store is filled."
-                    ),
-                )
-                return None
+    #
+    # Light gather (review 7, point 6): skip the content gates (see
+    # gate (a) above).
+    if not light:
+        for kind in ("supervision_mask", "inklabels"):
+            store = getattr(segment, kind)
+            for level in levels:
+                state = _zarr_level_store_state(store, level)
+                if state not in ("complete", "fill", "uniform", "empty"):
+                    _fail_or_skip(
+                        segment_dir,
+                        strict=strict,
+                        message=(
+                            f"{kind} store {store} is {state} at "
+                            f"resolution {level} (unfinished mirror: a chunk "
+                            "is missing or does not read as a chunk); it will "
+                            "be picked up once its store is filled."
+                        ),
+                    )
+                    return None
     # (d) A validation mask, when present, must be COMPLETE at every
     # required level -- every expected chunk present -- or FILL (every
     # missing chunk proven fill by cross-level evidence, review 6
@@ -1171,7 +1447,7 @@ def _gather_pr_admitted(
     # and a 2-5-level zero-chunk store is not a writer product either
     # (review 6, point 1, F2): both wait until their validation
     # regions can be read.
-    if segment.validation_mask is not None:
+    if not light and segment.validation_mask is not None:
         for level in levels:
             if _zarr_level_store_state(segment.validation_mask, level) not in (
                 "complete",
@@ -1216,6 +1492,7 @@ def _gather_one(
     *,
     native_mode: bool,
     explicit_surface: bool,
+    light: bool = False,
 ) -> Segment | None:
     """Gather one directory, or None (with a warning) when it is not usable.
 
@@ -1242,9 +1519,6 @@ def _gather_one(
     held_out = source.split == "validation"
     markers = _segment_markers(segment_dir)
     is_native = has_tifxyz_geometry(segment_dir)
-    # A segment is "selected" when the user asked for it by name, gave
-    # it an explicit volume, or when it belongs to the validation set.
-    strict = held_out or is_allowlisted or explicit_surface
     required_labels = config.discovery_mode != "unlabeled"
 
     if native_mode:
@@ -1267,7 +1541,6 @@ def _gather_one(
                 f"datasets[{dataset_idx}].volume_path is required for {config.mode}"
             )
         image_volume: str | Path = source.volume_path
-        image_explicit = True
     elif source.surface_volume_paths:
         explicit = source.surface_volume_paths.get(
             relpath, source.surface_volume_paths.get(segment_dir.name)
@@ -1294,7 +1567,6 @@ def _gather_one(
             # Unrelated folder next to an explicitly mapped source: skip it.
             return None
         image_volume = explicit
-        image_explicit = True
     elif source.surface_volume_path is not None:
         if len(allowlist) != 1:
             raise ValueError(
@@ -1302,7 +1574,6 @@ def _gather_one(
                 "allowlisted segment; use surface_volume_paths for multiple segments"
             )
         image_volume = source.surface_volume_path
-        image_explicit = True
     else:
         # Flat, no explicit surface. A mirror with native geometry is a
         # main-discovered segment; a TIFF-free mirror is the PR's
@@ -1317,9 +1588,9 @@ def _gather_one(
                 markers=markers,
                 held_out=held_out,
                 is_allowlisted=is_allowlisted,
+                light=light,
             )
         image_volume = segment_dir / f"{segment_dir.name}.zarr"
-        image_explicit = False
 
     # ---- Segments main already discovers: name-based acceptance. ----
     segment = Segment(
@@ -1339,18 +1610,16 @@ def _gather_one(
     )
     if not image_is_remote and not Path(image_volume).exists():
         if config.discovery_mode == "unlabeled":
-            if strict and markers["recognized"] and image_explicit:
-                # A selected segment must not disappear silently (H1a):
-                # its folder exists and carries segment markers, and
-                # its image volume was explicitly configured, but the
-                # volume is missing.
-                raise ValueError(
-                    f"{segment_dir.name} is missing its image volume {image_volume}"
-                )
-            # A flat local <name>.zarr image that is missing is main's
-            # silent skip (review 6, point 4): the scan continues on
-            # the ready segments instead of stopping before patch
-            # finding.
+            # Main's rule (review 7, point 5): in unlabeled mode a
+            # missing local image is ALWAYS skipped, whether flat or
+            # explicitly mapped -- main does ``continue`` here, with
+            # no exception for an explicitly configured volume. v7's
+            # H1a raise (ValueError for an explicitly configured
+            # image) contradicted main: with two mapped segments and
+            # one missing image, main yields the ready segment's
+            # patches, and a ready segment with no map entry then
+            # raises KeyError at map validation. Skipping here
+            # reproduces exactly that.
             return None
         raise ValueError(
             f"{segment_dir.name} is missing its image volume {image_volume}"
@@ -1368,8 +1637,163 @@ def _gather_one(
     return segment
 
 
-def gather_segments(config: InkDataConfig) -> tuple[Segment, ...]:
-    """Discover usable segment representations in stable directory-name order."""
+def _store_chunk_inventory_digest(store: str | Path | None) -> str:
+    """Short digest of one store's exact chunk inventory (listing only).
+
+    Hashes every file under the store (relative path, size, mtime_ns),
+    sorted -- the same philosophy as ``patch_cache.label_asset_fingerprint``:
+    it reads no chunk contents, so it costs one directory walk, and any
+    change (a chunk removed, added, renamed, or rewritten) changes the
+    digest and invalidates the cache. A missing store digests as
+    ``missing``; a remote store (``s3://``, ``http://``, ``https://``)
+    digests its URL, since its chunks cannot be listed locally.
+
+    Residual limitation, documented: a chunk replaced by a different
+    file with the SAME name, size and mtime is undetectable without
+    reading contents -- that is deliberate forgery, not a sync issue,
+    and the fresh run's content validation is what catches it.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    if store is None:
+        digest.update(b"\0none")
+        return digest.hexdigest()[:16]
+    text = str(store)
+    digest.update(text.encode())
+    if text.lower().startswith(_REMOTE_VOLUME_PREFIXES):
+        return digest.hexdigest()[:16]
+    root = Path(store)
+    if not root.exists():
+        digest.update(b"\0missing")
+        return digest.hexdigest()[:16]
+    entries: list[tuple[str, int, int]] = []
+    stack = [("", str(root))]
+    while stack:
+        relative, current = stack.pop()
+        try:
+            children = sorted(os.scandir(current), key=lambda entry: entry.name)
+        except OSError:
+            continue
+        for child in children:
+            name = f"{relative}/{child.name}" if relative else child.name
+            if child.is_dir(follow_symlinks=False):
+                stack.append((name, child.path))
+                continue
+            try:
+                stat = child.stat()
+                size, mtime_ns = stat.st_size, stat.st_mtime_ns
+            except OSError:
+                size, mtime_ns = -1, -1
+            entries.append((name, size, mtime_ns))
+    for name, size, mtime_ns in sorted(entries):
+        digest.update(name.encode())
+        digest.update(str(size).encode())
+        digest.update(str(mtime_ns).encode())
+    return digest.hexdigest()[:16]
+
+
+def _segment_store_fingerprint(segment: Segment) -> str:
+    """Short digest of a segment's stores' exact chunk inventories.
+
+    Covers the image volume AND the ink, supervision and validation
+    stores (review 7, point 6): the patch cache's label fingerprint
+    covers labels only, so an image chunk removed after caching would
+    not invalidate it. Recorded at cache-write time and verified on a
+    cache hit by listing only (no chunk decoding), so a chunk removed
+    after caching invalidates the cache and the fresh run detects it.
+    """
+    import hashlib
+
+    digest = hashlib.sha256()
+    for label, store in (
+        ("image", segment.image_volume),
+        ("inklabels", segment.inklabels),
+        ("supervision_mask", segment.supervision_mask),
+        ("validation_mask", segment.validation_mask),
+    ):
+        digest.update(label.encode())
+        digest.update(_store_chunk_inventory_digest(store).encode())
+    return digest.hexdigest()[:16]
+
+
+def _is_selected_segment(segment) -> bool:
+    """True when the user explicitly selected this segment.
+
+    A segment is selected when its name is in the source's allowlist,
+    when it has an explicit surface volume (a single
+    ``surface_volume_path`` or a ``surface_volume_paths`` entry for
+    its relpath or name), or when its source is held out
+    (``split == "validation"``). A read failure on a selected segment
+    must stop the run before it trains or scores a subset (review 4,
+    point 5): main stops there too, when patch finding opens its
+    masks. An auto-discovered segment in the same state is warned
+    about and skipped instead, and picked up on a later run.
+
+    Single definition (review 7, point 6): dataset.py and
+    patch_cache.py import it from here instead of mirroring it.
+    """
+    source = segment.source
+    if source.split == "validation":
+        return True
+    if segment.segment_name in set(source.segment_names):
+        return True
+    if source.surface_volume_path is not None:
+        return True
+    if (
+        segment.segment_relpath in source.surface_volume_paths
+        or segment.segment_name in source.surface_volume_paths
+    ):
+        return True
+    return False
+
+
+def _is_main_discovered_segment(segment) -> bool:
+    """True when main would discover this segment without the PR.
+
+    Main discovers a flat segment when it carries native tifxyz
+    geometry (``x.tif`` in its directory) or when it has an explicit
+    surface volume (a single ``surface_volume_path`` or a
+    ``surface_volume_paths`` entry for its relpath or name). A
+    TIFF-free flat mirror with no explicit surface exists only
+    because of the PR's discovery. A patch-finding failure on a
+    main-discovered segment must stop the run (review 5, point 3):
+    main stops there too, and silently dropping one would train or
+    score a subset while reporting the full set -- and the broad
+    catch also reaches native discovery, where removing a segment
+    changes which neighbours contribute labels.
+
+    Single definition (review 7, point 6): dataset.py and
+    patch_cache.py import it from here instead of mirroring it.
+    """
+    if (Path(segment.segment_dir) / "x.tif").is_file():
+        return True
+    source = segment.source
+    if source.surface_volume_path is not None:
+        return True
+    if (
+        segment.segment_relpath in source.surface_volume_paths
+        or segment.segment_name in source.surface_volume_paths
+    ):
+        return True
+    return False
+
+
+def gather_segments(
+    config: InkDataConfig, *, light: bool = False
+) -> tuple[Segment, ...]:
+    """Discover usable segment representations in stable directory-name order.
+
+    ``light=True`` (review 7, point 6) gathers with filesystem checks
+    only -- segment markers, label resolution by name, image
+    existence -- and skips the content gates (chunk completeness),
+    which decode chunks. A light gather is only ever used to look up
+    the patch cache; on a cache miss the caller re-gathers with full
+    validation, and the cache's store fingerprint (patch_cache) is
+    what catches a chunk removed after caching. The Segment objects
+    a light gather returns are identical to a full gather's (same
+    fields, same paths); only the admission decision differs.
+    """
     segments: list[Segment] = []
     native_mode = config.mode in {"full_3d", "full_3d_single_wrap"}
     skipped = 0
@@ -1390,6 +1814,7 @@ def gather_segments(config: InkDataConfig) -> tuple[Segment, ...]:
                 segment_dir,
                 native_mode=native_mode,
                 explicit_surface=explicit_surface,
+                light=light,
             )
             if segment is None:
                 skipped += 1
