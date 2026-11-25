@@ -10,6 +10,7 @@ import multiprocessing
 from pathlib import Path
 import pickle
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -969,6 +970,16 @@ class RemoteTests(RemoteFixtureCase):
             self.assertLessEqual(total, maximum)
             self.assertEqual(maximum, limit)
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+
+
+class CachePathTests(unittest.TestCase):
+    def test_host_with_a_port_names_a_directory_that_can_be_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(decoded_cache_path(directory, 'http://127.0.0.1:8080/volume.zarr/0'))
+            host = path.relative_to(directory).parts[1]
+            self.assertEqual(host, '127.0.0.1%3A8080' if sys.platform == 'win32' else '127.0.0.1:8080')
+            path.mkdir(parents=True)
+            self.assertTrue(path.is_dir())
 
 
 if __name__ == '__main__':

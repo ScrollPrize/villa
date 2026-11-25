@@ -469,6 +469,11 @@ fs::path decodedCachePath(const fs::path& cacheDir, const std::string& input)
     const auto query = rest.find_first_of("?#");
     if (query != std::string::npos)
         rest.erase(query);
+#ifdef _WIN32
+    // ':' (host:port, IPv6 hosts, keys) names an NTFS stream, not a directory, so it is percent-encoded.
+    for (std::size_t at = 0; (at = rest.find(':', at)) != std::string::npos; at += 3)
+        rest.replace(at, 1, "%3A");
+#endif
     const auto slash = rest.find('/');
     auto out = cacheDir / url.substr(0, scheme) / rest.substr(0, slash);
     if (slash != std::string::npos)
