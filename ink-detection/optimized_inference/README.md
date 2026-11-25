@@ -33,6 +33,7 @@ GPU-accelerated, containerized inference for ink detection models. The GPU image
 | `PART_ID` | Partition ID (0-indexed) when NUM_PARTS > 1 | `0` |
 | `SURFACE_VOLUME_ZARR` | Path to pre-created surface volume zarr | - |
 | `ZARR_OUTPUT_DIR` | Directory for partition outputs | `/tmp/partitions` |
+| `WORK_DIR` | Directory for downloaded layers and model weights | `/workspace` |
 | `USE_ZARR_COMPRESSION` | Enable zarr compression | `false` |
 | `COMPILE` | Enable torch.compile | `1` |
 | `COMPILE_MODE` | torch.compile mode | `reduce-overhead` |

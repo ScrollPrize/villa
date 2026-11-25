@@ -63,6 +63,7 @@ class Inputs:
     num_parts: int = 1
     part_id: int = 0
     zarr_output_dir: str = "/tmp/partitions"
+    work_dir: str = "/workspace"  # Downloaded layers and model weights (WORK_DIR)
     surface_volume_zarr: str = ""  # Path to pre-created surface volume zarr
     chunk_size: int = 1024  # Chunk size for zarr array creation (SURFACE_VOLUME_CHUNK_SIZE)
     use_zarr_compression: bool = False  # Enable/disable zarr compression
@@ -98,6 +99,7 @@ def parse_env() -> Inputs:
         num_parts = int(os.getenv("NUM_PARTS", "1"))
         part_id = int(os.getenv("PART_ID", "0"))
         zarr_output_dir = os.getenv("ZARR_OUTPUT_DIR", "/tmp/partitions").strip()
+        work_dir = os.getenv("WORK_DIR", "/workspace").strip() or "/workspace"
         surface_volume_zarr = os.getenv("SURFACE_VOLUME_ZARR", "").strip()
         chunk_size = int(os.getenv("SURFACE_VOLUME_CHUNK_SIZE", "1024"))
         use_zarr_compression = os.getenv("USE_ZARR_COMPRESSION", "false").lower() == "true"
@@ -187,6 +189,7 @@ def parse_env() -> Inputs:
             num_parts=num_parts,
             part_id=part_id,
             zarr_output_dir=zarr_output_dir,
+            work_dir=work_dir,
             surface_volume_zarr=surface_volume_zarr,
             chunk_size=chunk_size,
             use_zarr_compression=use_zarr_compression,
@@ -628,7 +631,7 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
     layer_start, layer_end = contiguous_layer_window([base for _, base in layer_objects])
 
     # Download layers to temporary directory
-    work_dir = "/workspace"
+    work_dir = inputs.work_dir
     input_dir = os.path.join(work_dir, "input", "layers")
     logger.info(f"Ensuring clean input directory at {os.path.join(work_dir, 'input')}")
     ensure_clean_dir(os.path.join(work_dir, "input"))
@@ -725,7 +728,7 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     )
 
     # Prepare models directory
-    work_dir = "/workspace"
+    work_dir = inputs.work_dir
     models_dir = os.path.join(work_dir, "models")
     logger.info(f"Ensuring models directory exists at {models_dir}")
     os.makedirs(models_dir, exist_ok=True)
