@@ -96,15 +96,17 @@ window's menu, **Tracing / annotation normals** selects:
 - **Lasagna normals** — explicitly uses the external Lasagna dataset even when
   the fiber volume supplies normals.
 
-There is no Automatic option. Attaching the first dataset initializes an unset
-project choice to **Predicted fiber normals** when the selected fiber dataset
-contains `sheet_nx` and `sheet_ny`; otherwise it selects
-**Lasagna normals**. An existing Lasagna selection is preserved. Subsequent
-attachments and dataset changes never override the saved choice. User changes
-are persisted in the `.vcproj` view field `annotation_normal_source` (`fiber`
-or `lasagna`), independently for each project and across reopening. Legacy
-projects without that field use Lasagna until initial attachment setup or an
-explicit user selection. Tracing never silently switches sources.
+**Predicted fiber normals** are always the default, whatever datasets are
+attached and in whatever order. Lasagna normals are used only after choosing
+**Lasagna normals** in this menu; attaching or selecting a Lasagna dataset does
+not do it. The choice is stored for the selected fiber dataset, in the project
+view field `lasagna_normal_choices`, and does not carry over to another fiber
+dataset. Choosing **Predicted fiber normals** removes it. Choices written by
+versions that set `annotation_normal_source` on attachment are ignored. Tracing
+never silently switches sources.
+
+Without a selected fiber dataset, the first attached one with predicted normals
+is used, else the first attached one.
 
 A compound volume with predicted normals needs **no attached Lasagna volume**
 for seeding, tracing, reoptimization, generated views, or alignment metrics.

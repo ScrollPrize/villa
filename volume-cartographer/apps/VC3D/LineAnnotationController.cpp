@@ -8447,10 +8447,8 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
     double workingToBaseScale = 1.0;
     const auto normalPreference = vpkg->annotationNormalSource();
     if (normalPreference != "lasagna") {
-        std::string fiberLocation = vpkg->selectedFiberInferenceDataset();
+        const std::string fiberLocation = vpkg->selectedFiberInferenceDataset();
         const auto entries = vpkg->fiberInferenceDatasetEntries();
-        if (fiberLocation.empty() && entries.size() == 1)
-            fiberLocation = entries.front().location;
         if (!fiberLocation.empty()) {
             try {
                 if (session.usingFiberNormals && session.normalSampler &&
@@ -8465,6 +8463,9 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
                     ? fiberLocation : vc::project::resolveLocalPath(
                         fiberLocation, vpkg->path().parent_path()).string();
                 const auto opened = vc::lasagna::LasagnaDataset::openLocation(location, options);
+                // Displaying a fiber needs no normals; using them does.
+                if (!required && !vc3d::line_annotation::hasPredictedFiberNormals(opened.manifest()))
+                    return true;
                 if (vc3d::line_annotation::usePredictedFiberNormals(opened.manifest(), normalPreference)) {
                     auto manifest = vc::lasagna::fiberNormalManifest(opened.manifest());
                     // Annotation points are in the displayed volume's grid. A
@@ -8488,8 +8489,6 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
                     session.workingToBaseScale = session.dataset->manifest().workingToBaseScale;
                     session.traceNormalDataset.reset();
                     session.traceNormalSampler.reset();
-                    if (vpkg->selectedFiberInferenceDataset() != fiberLocation)
-                        vpkg->setSelectedFiberInferenceDataset(fiberLocation);
                     return true;
                 }
             } catch (const std::exception& ex) {
@@ -8499,7 +8498,8 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
             }
         } else if (normalPreference == "fiber") {
             if (required)
-                showError(tr("Select a fiber dataset with predicted normals in the Fiber dataset menu."), headless);
+                showError(tr("Select a fiber dataset with predicted normals in the Fiber dataset menu, or choose "
+                             "Lasagna normals explicitly in the Tracing / annotation normals menu."), headless);
             return !required;
         }
     }
@@ -8738,8 +8738,7 @@ void LineAnnotationController::handleNormalSourceSelectionChanged(const std::str
     auto vpkg = _state->vpkg();
     const bool changed = vpkg->annotationNormalSource() != source;
     try {
-        // Persist an explicit Lasagna choice even when it equals the unset
-        // project's fallback, so a later attachment cannot override it.
+        // The only place Lasagna normals are ever chosen.
         vpkg->setAnnotationNormalSource(source);
     } catch (const std::exception& ex) {
         showError(tr("Could not save normal source: %1").arg(QString::fromUtf8(ex.what())),
@@ -8768,8 +8767,11 @@ void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
     if (vpkg->selectedFiberInferenceDataset() == location) {
         return;
     }
+    // The normal choice belongs to the fiber dataset, so it may change too.
+    const auto previous = vpkg->annotationNormalSource();
     vpkg->setSelectedFiberInferenceDataset(location);
-    invalidateAnnotationInputs(true, vpkg->annotationNormalSource() == "fiber");
+    const auto current = vpkg->annotationNormalSource();
+    invalidateAnnotationInputs(true, current == "fiber" || current != previous);
 }
 
 bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
@@ -8785,10 +8787,6 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     auto vpkg = _state->vpkg();
     std::string selected = vpkg->selectedFiberInferenceDataset();
     const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
-    if (selected.empty() && fiberEntries.size() == 1) {
-        selected = fiberEntries.front().location;
-        vpkg->setSelectedFiberInferenceDataset(selected);
-    }
     std::string selectedIdentity = selected;
     const auto selectedEntry = std::find_if(
         fiberEntries.begin(), fiberEntries.end(), [&](const auto& entry) {
@@ -12728,10 +12726,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
 
     ResolvedFiberOptimizationInputs result;
     QStringList failures;
-    auto selectedFiber = vpkg->selectedFiberInferenceDataset();
-    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
-    if (selectedFiber.empty() && fiberEntries.size() == 1)
-        selectedFiber = fiberEntries.front().location;
+    const auto selectedFiber = vpkg->selectedFiberInferenceDataset();
     const std::vector<std::string> fiberCandidates = {
         selectedFiber, fallbackFiberLocation};
     for (const auto& candidate : fiberCandidates) {

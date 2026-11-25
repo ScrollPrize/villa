@@ -451,10 +451,7 @@ void VolumePkg::readDocument()
     };
     selectedLasagnaDataset_ = selection("selected_lasagna_dataset");
     selectedFiberInferenceDataset_ = selection("selected_fiber_inference_dataset");
-    annotationNormalSource_ = selection("annotation_normal_source");
-    if (annotationNormalSource_ && *annotationNormalSource_ != "fiber" &&
-        *annotationNormalSource_ != "lasagna")
-        throw std::invalid_argument("Unknown project annotation normal source");
+    lasagnaNormalChoices_ = view.value("lasagna_normal_choices", std::set<std::string>{});
     currentVolumeId_ = view.value("current_volume", std::string{});
     focusBounds_.reset();
     focusBoundsEnabled_ = false;
@@ -510,21 +507,24 @@ nlohmann::json VolumePkg::viewJson() const
     auto view = nlohmann::json::object();
     if (selectedLasagnaDataset_) view["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) view["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
-    if (annotationNormalSource_) view["annotation_normal_source"] = *annotationNormalSource_;
+    if (!lasagnaNormalChoices_.empty()) view["lasagna_normal_choices"] = lasagnaNormalChoices_;
     if (!currentVolumeId_.empty()) view["current_volume"] = currentVolumeId_;
     if (focusBounds_) view["focus_bounds"] = boundsJson(*focusBounds_, focusBoundsEnabled_);
     return view;
 }
 std::string VolumePkg::annotationNormalSource() const
 {
-    return annotationNormalSource_.value_or("lasagna");
+    return lasagnaNormalChoices_.contains(selectedFiberInferenceDataset()) ? "lasagna" : "fiber";
 }
 
 void VolumePkg::setAnnotationNormalSource(std::string source)
 {
     if (source != "fiber" && source != "lasagna")
         throw std::invalid_argument("Annotation normal source must be fiber or lasagna");
-    annotationNormalSource_ = std::move(source);
+    if (source == "lasagna")
+        lasagnaNormalChoices_.insert(selectedFiberInferenceDataset());
+    else
+        lasagnaNormalChoices_.erase(selectedFiberInferenceDataset());
     writeView();
 }
 
@@ -732,8 +732,7 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     const std::string& requestedManifestLocation,
     std::vector<std::string> manifestTags,
     bool fiberInference,
-    const std::vector<PreparedVolumeAttachment>& preparedVolumes,
-    bool updateSelection)
+    const std::vector<PreparedVolumeAttachment>& preparedVolumes)
 {
     const auto manifestLocation = portableResource(requestedManifestLocation, directory());
     if (manifestLocation.empty())
@@ -751,8 +750,14 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         tags.erase(std::remove(tags.begin(), tags.end(), vc::project::kFiberLasagnaTag), tags.end());
     };
     removeFiberTag(manifestTags);
-    if (fiberInference)
+    if (fiberInference) {
+        // The role tag stays last, where reattaching puts it.
+        if (std::any_of(preparedVolumes.begin(), preparedVolumes.end(), [&](const auto& volume) {
+                return hasTag(volume.tags, vc::project::kPredictedFiberNormalsTag);
+            }))
+            addUniqueTags(manifestTags, {std::string(vc::project::kPredictedFiberNormalsTag)});
         manifestTags.emplace_back(vc::project::kFiberLasagnaTag);
+    }
 
     std::set<std::string> incomingLocations;
     std::vector<std::pair<std::string, std::string>> incomingIdLocations;
@@ -796,7 +801,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
     const auto oldVolumeTags = volumeTagsByID_;
     const auto oldSelected = selectedLasagnaDataset_;
     const auto oldSelectedFiber = selectedFiberInferenceDataset_;
-    const auto oldNormalSource = annotationNormalSource_;
     bool changed = false;
     try {
         auto manifest = std::find_if(lasagnaDatasets_.begin(), lasagnaDatasets_.end(), [&](const auto& entry) {
@@ -816,29 +820,14 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
             }
         }
 
-        if (updateSelection && !annotationNormalSource_) {
-            const bool hasFiberNormals = std::any_of(
-                preparedVolumes.begin(), preparedVolumes.end(), [&](const auto& volume) {
-                    return hasTag(volume.tags, vc::project::kPredictedFiberNormalsTag);
-                });
-            // Do not override a legacy project's existing Lasagna selection,
-            // nor select normals from an incoming but unselected fiber dataset.
-            annotationNormalSource_ = fiberInference && hasFiberNormals &&
-                !selectedLasagnaDataset_ &&
-                (!selectedFiberInferenceDataset_ || selectedFiberInferenceDataset_ == manifestLocation)
-                ? "fiber" : "lasagna";
-            changed = true;
-        }
-        if (updateSelection && fiberInference) {
-            if (!selectedFiberInferenceDataset_) {
-                selectedFiberInferenceDataset_ = manifestLocation;
-                changed = true;
-            }
+        // A fiber dataset needs no selection: an unset one defaults to the
+        // attached datasets. Normals are never chosen here.
+        if (fiberInference) {
             if (selectedLasagnaDataset_ == manifestLocation) {
                 selectedLasagnaDataset_.reset();
                 changed = true;
             }
-        } else if (updateSelection) {
+        } else {
             if (!selectedLasagnaDataset_) {
                 selectedLasagnaDataset_ = manifestLocation;
                 changed = true;
@@ -900,7 +889,6 @@ VolumePkg::AttachLasagnaResult VolumePkg::attachPreparedLasagnaDataset(
         volumeTagsByID_ = oldVolumeTags;
         selectedLasagnaDataset_ = oldSelected;
         selectedFiberInferenceDataset_ = oldSelectedFiber;
-        annotationNormalSource_ = oldNormalSource;
         // Some of the writes may have landed: follow what the store holds.
         try { reload(); } catch (...) {}
         throw;
@@ -922,6 +910,8 @@ bool VolumePkg::removeEntry(const std::string& requestedLocation)
     if (!removed) return false;
     for (const auto* key : {"selected_lasagna_dataset", "selected_fiber_inference_dataset"})
         if (data["view"].value(key, std::string{}) == location) data["view"].erase(key);
+    if (auto choices = data["view"].find("lasagna_normal_choices"); choices != data["view"].end())
+        choices->erase(std::remove(choices->begin(), choices->end(), location), choices->end());
     document_.replace(std::move(data));
     const auto previous = volumes_;
     readDocument();
@@ -990,7 +980,25 @@ void VolumePkg::clearSelectedLasagnaDataset()
 
 std::string VolumePkg::selectedFiberInferenceDataset() const
 {
-    return selectedFiberInferenceDataset_.value_or(std::string{});
+    if (selectedFiberInferenceDataset_) return *selectedFiberInferenceDataset_;
+    const auto entries = fiberInferenceDatasetEntries();
+    const auto withNormals = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
+        return hasPredictedFiberNormals(entry.location);
+    });
+    if (withNormals != entries.end()) return withNormals->location;
+    return entries.empty() ? std::string{} : entries.front().location;
+}
+
+bool VolumePkg::hasPredictedFiberNormals(const std::string& fiberDataset) const
+{
+    const auto location = portableResource(fiberDataset, directory());
+    for (const auto& entry : lasagnaDatasets_)
+        if (entry.location == location && vc::project::hasEntryTag(entry, vc::project::kPredictedFiberNormalsTag)) return true;
+    // Attached before the dataset entry carried the tag: its volumes do.
+    const auto manifestTag = "vc-lasagna-manifest:" + location;
+    return std::any_of(volumes_.begin(), volumes_.end(), [&](const auto& entry) {
+        return vc::project::hasEntryTag(entry, manifestTag) && vc::project::hasEntryTag(entry, vc::project::kPredictedFiberNormalsTag);
+    });
 }
 
 void VolumePkg::setSelectedFiberInferenceDataset(std::string location)
