@@ -947,24 +947,56 @@ def run_block_inference(
         if device.type == "cuda"
         else nullcontext()
     )
+
+    def skip_blocks(skipped_metadata: torch.Tensor) -> None:
+        for values in skipped_metadata.numpy():
+            y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
+            if roi_bounds is not None:
+                clipped = clip_block_to_roi(
+                    Block(y0, x0, valid_h, valid_w), roi_bounds
+                )
+                if clipped is None:
+                    continue
+                y0, x0 = clipped.y0, clipped.x0
+                valid_h, valid_w = clipped.valid_h, clipped.valid_w
+            accumulator.skip_tile(
+                y0=y0, x0=x0, valid_h=valid_h, valid_w=valid_w
+            )
+
+    def add_blocks(probabilities_np: np.ndarray, kept_metadata: torch.Tensor) -> None:
+        for probability, values in zip(probabilities_np, kept_metadata.numpy()):
+            y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
+            tile = probability[:valid_h, :valid_w]
+            weights = weight_map[:valid_h, :valid_w]
+            if mask_f32 is not None:
+                weights = weights * mask_f32[
+                    y0 : y0 + valid_h, x0 : x0 + valid_w
+                ]
+            if roi_bounds is not None:
+                clipped = clip_block_to_roi(Block(y0, x0, valid_h, valid_w), roi_bounds)
+                if clipped is None:
+                    continue
+                source_y0 = clipped.y0 + roi_bounds[0] - y0
+                source_x0 = clipped.x0 + roi_bounds[2] - x0
+                source = (
+                    slice(source_y0, source_y0 + clipped.valid_h),
+                    slice(source_x0, source_x0 + clipped.valid_w),
+                )
+                tile, weights = tile[source], weights[source]
+                y0, x0 = clipped.y0, clipped.x0
+            accumulator.add_tile(
+                y0=y0,
+                x0=x0,
+                tile=tile,
+                tile_weights=weights,
+            )
+
     with torch.inference_mode(), autocast:
         for images_BCZYX, metadata in loader:
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
-            for values in metadata[~keep].numpy():
-                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
-                if roi_bounds is not None:
-                    clipped = clip_block_to_roi(
-                        Block(y0, x0, valid_h, valid_w), roi_bounds
-                    )
-                    if clipped is None:
-                        continue
-                    y0, x0 = clipped.y0, clipped.x0
-                    valid_h, valid_w = clipped.valid_h, clipped.valid_w
-                accumulator.skip_tile(
-                    y0=y0, x0=x0, valid_h=valid_h, valid_w=valid_w
-                )
+            skip_blocks(metadata[~keep])
             if not bool(keep.any()):
                 continue
             if not bool(keep.all()):
@@ -992,33 +1024,7 @@ def run_block_inference(
                     model(images_BCZYX),
                     image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
                 )
-            probabilities_np = probabilities.cpu().numpy()[:, 0]
-            for probability, values in zip(probabilities_np, metadata.numpy()):
-                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
-                tile = probability[:valid_h, :valid_w]
-                weights = weight_map[:valid_h, :valid_w]
-                if mask_f32 is not None:
-                    weights = weights * mask_f32[
-                        y0 : y0 + valid_h, x0 : x0 + valid_w
-                    ]
-                if roi_bounds is not None:
-                    clipped = clip_block_to_roi(Block(y0, x0, valid_h, valid_w), roi_bounds)
-                    if clipped is None:
-                        continue
-                    source_y0 = clipped.y0 + roi_bounds[0] - y0
-                    source_x0 = clipped.x0 + roi_bounds[2] - x0
-                    source = (
-                        slice(source_y0, source_y0 + clipped.valid_h),
-                        slice(source_x0, source_x0 + clipped.valid_w),
-                    )
-                    tile, weights = tile[source], weights[source]
-                    y0, x0 = clipped.y0, clipped.x0
-                accumulator.add_tile(
-                    y0=y0,
-                    x0=x0,
-                    tile=tile,
-                    tile_weights=weights,
-                )
+            add_blocks(probabilities.cpu().numpy()[:, 0], metadata)
 
 
 def iter_probability_tiles(
