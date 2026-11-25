@@ -16,6 +16,22 @@ and main's loader never reads the sidecar, so an older loader reading
 a v6 cache sees exactly the same records as before. A sidecar entry
 whose identity no longer matches (labels arrived, segment removed)
 invalidates the cache, exactly like a stale patch record.
+
+v7 (PR #2677, review 6, point 3) -- sidecar selection re-validation:
+
+A sidecar entry records only that the segment yielded no patches --
+not the selection it was found under. A cached automatic scan of a
+ready mirror and a complete below-threshold mirror, then both
+allowlisted, returned the ready mirror's patches: the fresh run would
+have raised on the low-ink mirror (a selected segment that yields no
+patches fails patch finding loudly), but the cache hit never ran patch
+finding. The fix re-validates each sidecar-covered segment against
+the CURRENT selection: a sidecar entry must not cover a segment that
+is now selected (allowlisted, explicitly mapped, held out) or
+main-discovered (x.tif, explicit surface) -- such a segment
+invalidates the cache, so fresh discovery runs and raises, matching a
+fresh run. Patch records need no such check (a segment that yielded
+patches yields them under any selection).
 """
 
 from __future__ import annotations
@@ -253,6 +269,55 @@ def save_patch_cache(path: str | Path, patches: Iterable[Patch], zero_patch_segm
             pass
 
 
+def _is_selected_segment(segment) -> bool:
+    """True when the user explicitly selected this segment.
+
+    Mirror of ``dataset._is_selected_segment`` (duplicated here to
+    avoid a circular import: dataset imports patch_cache). Keep in
+    sync. A segment is selected when its name is in the source's
+    allowlist, when it has an explicit surface volume (a single
+    ``surface_volume_path`` or a ``surface_volume_paths`` entry for
+    its relpath or name), or when its source is held out
+    (``split == "validation"``).
+    """
+    source = segment.source
+    if source.split == "validation":
+        return True
+    if segment.segment_name in set(source.segment_names):
+        return True
+    if source.surface_volume_path is not None:
+        return True
+    if (
+        segment.segment_relpath in source.surface_volume_paths
+        or segment.segment_name in source.surface_volume_paths
+    ):
+        return True
+    return False
+
+
+def _is_main_discovered_segment(segment) -> bool:
+    """True when main would discover this segment without the PR.
+
+    Mirror of ``dataset._is_main_discovered_segment`` (duplicated here
+    to avoid a circular import: dataset imports patch_cache). Keep in
+    sync. Main discovers a flat segment when it carries native tifxyz
+    geometry (``x.tif`` in its directory) or when it has an explicit
+    surface volume (a single ``surface_volume_path`` or a
+    ``surface_volume_paths`` entry for its relpath or name).
+    """
+    if (Path(segment.segment_dir) / "x.tif").is_file():
+        return True
+    source = segment.source
+    if source.surface_volume_path is not None:
+        return True
+    if (
+        segment.segment_relpath in source.surface_volume_paths
+        or segment.segment_name in source.surface_volume_paths
+    ):
+        return True
+    return False
+
+
 def load_patch_cache(
     path: str | Path,
     *,
@@ -330,6 +395,19 @@ def load_patch_cache(
             )
             segment = segments_by_key.get(key)
             if segment is None:
+                return None
+            # (review 6, point 3) A sidecar entry covers a segment that
+            # legitimately yielded no patches -- but only under the
+            # selection that produced it. A segment that is now
+            # selected (allowlisted, explicitly mapped, held out) or
+            # main-discovered would RAISE on a fresh run (no patches
+            # from a selected segment is a patch-finding failure, and
+            # failures on selected/main-discovered segments re-raise),
+            # so the sidecar must not cover it: invalidate the cache
+            # so fresh discovery runs and raises, matching a fresh
+            # run. An auto-discovered PR mirror below the threshold
+            # keeps its coverage (the W9/R6 rerun behaviour).
+            if _is_selected_segment(segment) or _is_main_discovered_segment(segment):
                 return None
             covered.add(segment.cache_key)
         if any(segment.cache_key not in covered for segment in segments_by_key.values()):
