@@ -1514,7 +1514,7 @@ void FiberCollectionController::createCollection()
     generatorPython_ = python;
     auto* process = new QProcess(this);
     generator_ = process;
-    process->setProcessEnvironment(vc3d::fibergen::environment(QProcessEnvironment::systemEnvironment(), vesuviusSource));
+    process->setProcessEnvironment(vc3d::fibergen::environment(vc3d::pythonServiceEnvironment(), vesuviusSource));
     connect(process, &QProcess::readyReadStandardOutput, this, &FiberCollectionController::readGeneratorOutput);
     connect(process, &QProcess::readyReadStandardError, this, [this, process]() {
         const auto text = QString::fromUtf8(process->readAllStandardError());

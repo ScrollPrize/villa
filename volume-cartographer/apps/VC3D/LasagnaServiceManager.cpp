@@ -392,7 +392,7 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
     QDir scriptDir(QFileInfo(scriptPath).absolutePath());
     QString exps2dPath = scriptDir.absolutePath();
 
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment env = vc3d::pythonServiceEnvironment();
     QString existing = env.value("PYTHONPATH");
     if (existing.isEmpty()) {
         env.insert("PYTHONPATH", exps2dPath);

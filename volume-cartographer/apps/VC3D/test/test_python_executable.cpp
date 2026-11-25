@@ -1,5 +1,6 @@
-// The installed Python tools VC3D falls back to when nothing else names an
-// interpreter (opened from Finder, with no virtualenv or conda env active).
+// How VC3D starts its Python services: the installed Python tools it falls
+// back to when nothing else names an interpreter (opened from Finder, with no
+// virtualenv or conda env active), and the environment the services get.
 
 #include "PythonExecutable.hpp"
 
@@ -84,6 +85,25 @@ private slots:
         QCOMPARE(pythonExecutableForServices(), active);
 
         QCOMPARE(pythonExecutableForServices("/opt/chosen/bin/python"), QString("/opt/chosen/bin/python"));
+    }
+
+    void pythonServicesGetTheLaunchValuesBack()
+    {
+        qputenv("VC3D_TEST_THREADS", "8");
+        qunsetenv("VC3D_TEST_UNSET");
+        rememberLaunchEnvironmentValue("VC3D_TEST_THREADS");
+        rememberLaunchEnvironmentValue("VC3D_TEST_UNSET");
+        // VC3D's own caps, as setThreadPoliciesEarly() sets them
+        qputenv("VC3D_TEST_THREADS", "1");
+        qputenv("VC3D_TEST_UNSET", "1");
+        // a second record of a name keeps the launch value
+        rememberLaunchEnvironmentValue("VC3D_TEST_THREADS");
+
+        const QProcessEnvironment environment = pythonServiceEnvironment();
+        QCOMPARE(environment.value("VC3D_TEST_THREADS"), QString("8"));
+        QVERIFY(!environment.contains("VC3D_TEST_UNSET"));
+        QCOMPARE(qgetenv("VC3D_TEST_THREADS"), QByteArray("1"));
+        QVERIFY(environment.contains("PATH"));
     }
 
 private:

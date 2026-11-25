@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QProcessEnvironment>
 #include <QString>
 
 namespace vc3d {
@@ -30,5 +31,17 @@ QString installedPythonToolsSource(const QString& relative);
 // Virtualenv paths are kept as given (not canonicalized), so the venv's
 // site-packages stay in effect.
 QString pythonExecutableForServices(const QString& preferred = {});
+
+// Records `name` as VC3D was launched with it (set or unset), before VC3D
+// overrides it for its own process, such as the OMP_NUM_THREADS=1 cap at
+// startup. Only the first call for a name counts. Safe to call before static
+// initialization (from .preinit_array): it uses constant-initialized storage.
+void rememberLaunchEnvironmentValue(const char* name);
+
+// The environment for the Python services VC3D starts: VC3D's own, with every
+// variable passed to rememberLaunchEnvironmentValue() back at its launch value,
+// so a service's PyTorch and NumPy get the thread counts the user chose rather
+// than the caps VC3D sets for itself. Native tools keep VC3D's caps.
+QProcessEnvironment pythonServiceEnvironment();
 
 }  // namespace vc3d

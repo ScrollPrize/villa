@@ -427,7 +427,7 @@ void SpiralServiceManager::startLocalProcess()
     }
     _credential = QString::number(QRandomGenerator::global()->generate64(), 16)
         + QString::number(QRandomGenerator::global()->generate64(), 16);
-    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment environment = vc3d::pythonServiceEnvironment();
     const QString moduleDir = QFileInfo(service).absolutePath();
     const QString oldPythonPath = environment.value(QStringLiteral("PYTHONPATH"));
     environment.insert(QStringLiteral("PYTHONPATH"), oldPythonPath.isEmpty() ? moduleDir : moduleDir + QDir::listSeparator() + oldPythonPath);

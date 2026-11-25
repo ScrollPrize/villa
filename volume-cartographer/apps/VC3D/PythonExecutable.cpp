@@ -4,9 +4,23 @@
 #include <QFileInfo>
 #include <QStandardPaths>
 
+#include <cstdlib>
+#include <cstring>
+
 namespace vc3d {
 
 namespace {
+
+// Launch values recorded by rememberLaunchEnvironmentValue(). Plain
+// zero-initialized storage, so recording works before any static
+// constructor has run; written only while VC3D starts, before other threads
+struct LaunchValue {
+    const char* name;
+    char* value;  // null when the variable was unset
+};
+constexpr std::size_t kMaxLaunchValues = 16;
+LaunchValue launchValues[kMaxLaunchValues];
+std::size_t launchValueCount = 0;
 
 bool isExecutableFile(const QString& path)
 {
@@ -87,6 +101,41 @@ QString pythonExecutableForServices(const QString& preferred)
         }
     }
     return QStringLiteral("python3");
+}
+
+void rememberLaunchEnvironmentValue(const char* name)
+{
+    for (std::size_t i = 0; i < launchValueCount; ++i) {
+        if (std::strcmp(launchValues[i].name, name) == 0) {
+            return;
+        }
+    }
+    if (launchValueCount == kMaxLaunchValues) {
+        std::abort();  // a fixed list of startup overrides outgrew the table
+    }
+    char* copy = nullptr;
+    if (const char* value = std::getenv(name)) {
+        const std::size_t size = std::strlen(value) + 1;
+        copy = static_cast<char*>(std::malloc(size));
+        if (copy) {
+            std::memcpy(copy, value, size);
+        }
+    }
+    launchValues[launchValueCount++] = {name, copy};
+}
+
+QProcessEnvironment pythonServiceEnvironment()
+{
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    for (std::size_t i = 0; i < launchValueCount; ++i) {
+        const QString name = QString::fromLatin1(launchValues[i].name);
+        if (launchValues[i].value) {
+            environment.insert(name, QString::fromLocal8Bit(launchValues[i].value));
+        } else {
+            environment.remove(name);
+        }
+    }
+    return environment;
 }
 
 }  // namespace vc3d
