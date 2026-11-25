@@ -115,6 +115,31 @@ TEST_CASE("LasagnaDatasetManifest parses channel groups from canonical Lasagna J
     fs::remove_all(dir);
 }
 
+TEST_CASE("LasagnaDatasetManifest resolves validity declarations")
+{
+    using vc::lasagna::LasagnaDatasetManifest;
+    // Legacy manifests keep their historical validity channel.
+    CHECK(LasagnaDatasetManifest::parseText(R"({"version":2,"groups":{
+        "pred":{"zarr":"pred.zarr","channels":["grad_mag","nx","ny"]}}})").validityChannel=="grad_mag");
+    CHECK(LasagnaDatasetManifest::parseText(R"({"version":2,"groups":{
+        "pred":{"zarr":"pred.zarr","channels":["presence","nx","ny","sheet_grad_mag"]}}})").validityChannel=="presence");
+    CHECK(LasagnaDatasetManifest::parseText(R"({"version":2,"groups":{
+        "pred":{"zarr":"pred.zarr","channels":["nx","ny"]}}})").validityChannel.empty());
+    // Declared channels and the chunk marker.
+    const auto declared=LasagnaDatasetManifest::parseText(R"({"version":2,"validity_channel":"presence","groups":{
+        "pred":{"zarr":"pred.zarr","channels":["presence","grad_mag","nx","ny"]}}})");
+    CHECK(declared.validityChannel=="presence");
+    CHECK_FALSE(declared.validityByChunks());
+    const auto chunks=LasagnaDatasetManifest::parseText(R"({"version":3,"validity_channel":"chunks","groups":{
+        "sd0":{"zarr":"sd0/0","scaledown":0,"channels":["presence","nx","ny"]}}})");
+    CHECK(chunks.validityByChunks());
+    CHECK_THROWS(LasagnaDatasetManifest::parseText(R"({"version":2,"validity_channel":"missing","groups":{
+        "pred":{"zarr":"pred.zarr","channels":["nx","ny"]}}})"));
+    // An embedded v3 manifest requires the declaration.
+    CHECK_THROWS(LasagnaDatasetManifest::parseText(R"({"lasagna":{"version":3,"validity_channel":"chunks","groups":{
+        "sd0":{"zarr":"sd0/0","scaledown":0,"channels":["nx","chunks"]}}}})"));
+}
+
 TEST_CASE("LasagnaDataset wraps manifest and reports missing normal source")
 {
     auto manifest = vc::lasagna::LasagnaDatasetManifest::parseText(R"({

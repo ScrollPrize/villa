@@ -3,6 +3,7 @@
 #include "FiberLengthDisplay.hpp"
 #include "FiberNameDisplay.hpp"
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationCsplineOnly.hpp"
 
 #include <QAbstractItemView>
 #include <QAction>
@@ -374,6 +375,20 @@ void CFiberWidget::setupUi()
     _calcMetricsCheckBox->setToolTip(
         tr("Sample normal alignment errors for the listed fibers using the annotation normal source."));
     layout->addWidget(_calcMetricsCheckBox);
+
+    auto* csplineOnlyCheckBox = new QCheckBox(tr("Cspline only (no Lasagna / predictions)"), mainWidget);
+    csplineOnlyCheckBox->setObjectName(QStringLiteral("fiberCsplineOnlyCheckBox"));
+    csplineOnlyCheckBox->setToolTip(
+        tr("Line annotation interpolates each span it solves with a cubic spline "
+           "through the control points and draws straight rays past the end points. "
+           "Spans of a reopened fiber keep their geometry until they are edited. No "
+           "Lasagna dataset, fiber predictions or fiber-follow model is opened. Applies "
+           "from the next solve; set it before opening Line Annotation for a clean session."));
+    csplineOnlyCheckBox->setChecked(vc3d::line_annotation::csplineOnlyAnnotationEnabled());
+    layout->addWidget(csplineOnlyCheckBox);
+    connect(csplineOnlyCheckBox, &QCheckBox::toggled, this, [](bool checked) {
+        vc3d::line_annotation::setCsplineOnlyAnnotationEnabled(checked);
+    });
     connect(_calcMetricsCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
         refreshMetricDisplays();
         if (checked) {

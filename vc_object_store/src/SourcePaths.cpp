@@ -29,6 +29,54 @@ void ObjectStore::validateExportDestination(const Txn& txn, const std::filesyste
     }
 }
 
+namespace {
+// A track's dataset: its dataset_ref below the root its owning store resolves
+// source locators from.
+std::filesystem::path trackDatasetPath(const std::filesystem::path& root, const std::string& datasetRef)
+{
+    return (std::filesystem::absolute(root).lexically_normal() / datasetRef).lexically_normal();
+}
+}
+
+std::filesystem::path detail::storeDirectory(sqlite3* source)
+{
+    namespace fs = std::filesystem;
+    fs::path ownerPath = sqlite3_db_filename(source, "main");
+    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
+    return fs::absolute(ownerPath).parent_path();
+}
+
+std::string trackDatasetIdentity(const std::filesystem::path& resolved)
+{
+    return std::filesystem::weakly_canonical(resolved).generic_string();
+}
+
+void detail::TrackDatasetResolver::append(const std::optional<ResolvedObjectVersion>& resolved)
+{
+    int32_t index = -1;
+    if (resolved && resolved->revision.record.kind == "track" && resolved->revision.record.track
+        && !resolved->revision.record.track->datasetRef.empty()) {
+        const std::pair key{resolved->source, resolved->revision.record.track->datasetRef};
+        auto found = resolved_.find(key);
+        if (found == resolved_.end()) {
+            const auto identity = trackDatasetIdentity(trackDatasetPath(storeDirectory(key.first), key.second));
+            auto known = identities_.find(identity);
+            if (known == identities_.end()) {
+                known = identities_.emplace(identity, int32_t(out_.datasets.size())).first;
+                out_.datasets.push_back(identity);
+            }
+            found = resolved_.emplace(key, known->second).first;
+        }
+        index = found->second;
+    }
+    out_.objects.push_back(index);
+}
+
+void detail::TrackDatasetResolver::finish()
+{
+    if (out_.datasets.empty()) out_.objects.clear();
+}
+
 std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     const Txn& txn, const std::string& objectUuid,
     const std::optional<std::filesystem::path>& datasetRoot) const
@@ -37,11 +85,9 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     const auto resolved = resolveObject(static_cast<sqlite3*>(connection(txn)), objectUuid);
     if (!resolved) return std::nullopt;
     const auto* object = &resolved->record;
-    fs::path ownerPath = sqlite3_db_filename(resolved->source, "main");
-    if (isPackedDatabasePath(ownerPath)) ownerPath = packedContainerPath(ownerPath);
-    const auto root = fs::absolute(datasetRoot.value_or(fs::absolute(ownerPath).parent_path())).lexically_normal();
+    const auto root = fs::absolute(datasetRoot.value_or(storeDirectory(resolved->source))).lexically_normal();
     if (object->track && !object->track->datasetRef.empty())
-        return (root / object->track->datasetRef).lexically_normal();
+        return trackDatasetPath(root, object->track->datasetRef);
     if ((object->storageKind != "file" && object->storageKind != "sqlite") ||
         (object->kind != "surface" && object->kind != "fiber" && object->kind != "point_collection"))
         return std::nullopt;

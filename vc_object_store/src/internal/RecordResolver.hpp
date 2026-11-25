@@ -88,6 +88,23 @@ inline ObjectVersion versionReferenceFromBytes(std::span<const uint8_t> bytes)
     return {ids[0],ids[1],ids[2],int64_t(version)};
 }
 struct ResolvedObjectVersion {sqlite3* source;ObjectRevision revision;};
+// Where a physical store's relative source locators start: its file's directory.
+std::filesystem::path storeDirectory(sqlite3* source);
+// The datasets of track states, each resolved in the physical store that
+// holds the state. One filesystem resolution per (physical store, dataset_ref).
+class TrackDatasetResolver {
+public:
+    explicit TrackDatasetResolver(TrackDatasets& out) : out_(out) {}
+    // Appends the entry of one selected object: `resolved` is its exact
+    // state and the store holding it, or absent for an unanswered reference.
+    void append(const std::optional<ResolvedObjectVersion>& resolved);
+    // Drops the per-object column when no object named a dataset.
+    void finish();
+private:
+    TrackDatasets& out_;
+    std::map<std::pair<sqlite3*,std::string>,int32_t> resolved_;
+    std::map<std::string,int32_t> identities_;
+};
 std::optional<ResolvedObjectVersion> resolveObjectVersion(sqlite3*,const ObjectVersion&);
 std::optional<ResolvedObjectVersion> resolveObjectRevision(sqlite3*,const std::string&);
 inline std::optional<ResolvedObjectVersion> resolveObjectRevisionKey(sqlite3* db, const ObjectRevisionKey& key)

@@ -6,6 +6,7 @@
 #include "vc_reader/zarr_write.hpp"
 #include "vc_reader/native/http.hpp"
 #include "vc_reader/native/thread_pool.hpp"
+#include "files.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -13,6 +14,28 @@
 namespace fs = std::filesystem;
 
 namespace vcr::zarr {
+
+namespace {
+bool isArrayMetadata(const std::string& name)
+{
+    const auto base = fs::path(name).filename();
+    return base == ".zarray" || base == "zarr.json";
+}
+
+// Once this process has changed an array's metadata at a remote store, or
+// removed it, the document readArrayDocument keeps for it (and for arrays
+// below it) is dropped, also when the change failed part way.
+struct ForgetKnownArrays {
+    const std::string& location;
+    const Access& access;
+    bool active;
+    ~ForgetKnownArrays()
+    {
+        if (active)
+            detail::forgetKnownArrays(location, access);
+    }
+};
+}  // namespace
 
 struct Store::Impl {
     std::string location;
@@ -93,6 +116,7 @@ std::optional<std::string> Store::read(const std::string& name) const
 
 void Store::write(const std::string& name, std::string_view data, Durability durability) const
 {
+    const ForgetKnownArrays forget{impl_->location, impl_->access, impl_->remote && isArrayMetadata(name)};
     if (!impl_->remote) {
         atomicWrite(fs::path(impl_->location) / name, data.data(), data.size(), durability);
         return;
@@ -103,6 +127,7 @@ void Store::write(const std::string& name, std::string_view data, Durability dur
 
 void Store::writeFile(const std::string& name, const fs::path& file) const
 {
+    const ForgetKnownArrays forget{impl_->location, impl_->access, impl_->remote && isArrayMetadata(name)};
     const auto bytes = fs::file_size(file);
     if (!impl_->remote) {
         const auto target = fs::path(impl_->location) / name;
@@ -225,6 +250,7 @@ bool Store::remove(const std::string& name) const
 
 void Store::discard(const std::string& name) const
 {
+    const ForgetKnownArrays forget{impl_->location, impl_->access, impl_->remote && isArrayMetadata(name)};
     if (!impl_->remote) {
         remove(name);
         return;
@@ -237,6 +263,7 @@ bool Store::removeAll() const
 {
     if (!impl_->remote)
         return fs::remove_all(impl_->location) > 0;
+    const ForgetKnownArrays forget{impl_->location, impl_->access, true};
     impl_->needWritable();
     const auto objects = list();
     ThreadPool pool(std::size_t(std::max(impl_->connections - 1, 0)));

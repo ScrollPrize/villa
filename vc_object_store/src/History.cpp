@@ -812,6 +812,22 @@ std::vector<std::optional<ObjectRevision>> ObjectStore::objectsAtVersions(const 
     return result;
 }
 
+std::vector<std::optional<ObjectRevision>> ObjectStore::objectsAtVersions(const Txn& txn,const std::vector<ObjectVersion>& references,
+                                                                         TrackDatasets& datasets)const
+{
+    auto* db=static_cast<sqlite3*>(connection(txn));
+    datasets={};
+    TrackDatasetResolver resolver(datasets);
+    std::vector<std::optional<ObjectRevision>> result;result.reserve(references.size());
+    for(const auto& reference:references){
+        auto value=resolveObjectVersion(db,reference);
+        resolver.append(value);
+        result.push_back(value?std::optional(std::move(value->revision)):std::nullopt);
+    }
+    resolver.finish();
+    return result;
+}
+
 std::optional<ObjectRevision> ObjectStore::currentObjectRevision(const Txn& txn, const std::string& uuid) const
 {
     auto* db=static_cast<sqlite3*>(connection(txn));

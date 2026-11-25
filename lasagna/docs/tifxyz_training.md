@@ -778,7 +778,7 @@ Output is a JSON manifest describing channel groups, each stored in a separate z
 | `lasagna/lasagna_volume.py` | `.lasagna.json` manifest read/write: `LasagnaVolume`, `ChannelGroup` dataclasses |
 | `lasagna/preprocess_cos_omezarr.py` | Inference: per-axis 2D preprocessing and tiled 3D `predict3d` mode (writes `.lasagna.json`) |
 | `lasagna/fit_data.py` | `load_3d()` reads `.lasagna.json`, `FitData3D` with per-channel spacing and `grid_sample_fullres()` |
-| `lasagna/scripts/download_omezarr.py` | Parallel S3 OME-Zarr chunk downloader with progress display |
+| `lasagna/scripts/prefill_omezarr.py` | Prefills OME-Zarr levels (or a base-voxel region of them) into the vc_reader disk cache via `ZarrReader.prefill`; `prefill_volume_list.py` does it for a list of public volumes. |
 | `lasagna/lasagna3d/` | `python -m lasagna3d` analysis CLI — see [`lasagna3d_cli.md`](lasagna3d_cli.md) |
 | `vesuvius/src/vesuvius/models/build/build_network_from_config.py` | `NetworkFromConfig` — shared encoder + decoder/task-heads UNet builder |
 | `vesuvius/src/vesuvius/neural_tracing/datasets/patch_finding.py` | `find_world_chunk_patches()` — world-chunk patch discovery |

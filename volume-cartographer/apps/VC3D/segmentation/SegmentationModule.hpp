@@ -123,7 +123,9 @@ public:
     void setStorePinResolver(StorePinResolver resolver) { _storePinResolver = std::move(resolver); }
     // Synchronously publish `surface` to its store object: its changed vertices
     // (with `vertices`) and its loaded `channels` (every channel when empty).
-    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {});
+    // With `geometryRevision`, only over that stored geometry (SurfaceStoreEdit::save).
+    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {},
+                     const std::optional<std::string>& geometryRevision = std::nullopt);
     // The store revisions the surface's edits continue from.
     std::optional<vc::objects::PinnedObject> storePin(QuadSurface* surface);
     void endEditingSession();

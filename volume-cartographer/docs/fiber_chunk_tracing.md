@@ -580,8 +580,9 @@ must be chosen explicitly for the intended baseline, not inferred from a model):
 when trace coordinates equal base coordinates. `scaledown_power` is the existing
 prediction-to-trace coordinate adapter, not an extra downsampling operation.
 CPU construction uses an empty/omitted `gpu_library`. Omit `normal_manifest` only
-when predictions actually contain `sheet_nx/sheet_ny/sheet_grad_mag`; native
-normal aliasing preserves packed channel indices. Missing normal heads fail
+when predictions actually contain `sheet_nx/sheet_ny`; native normal aliasing
+preserves packed channel indices and uses the prediction's declared validity
+(chunk existence, or a channel such as `presence`). Missing normal heads fail
 explicitly. This example illustrates the schema, not a tuned benchmark preset.
 
 Sparse enumeration supports local Zarr v2 ZYX/CZYX arrays, dot/slash chunk keys,
@@ -1015,8 +1016,9 @@ from the host-only refinement tests.
 spatial-companion weighting, float widths and axial tensor direction/normal
 averaging. `source`, `source_level` and/or a `channels` mapping are explicit;
 channel paths may be relative to source. Compatibility default level is 1.
-Seven required channels: presence, nx, ny, width, sheet_nx, sheet_ny,
-sheet_grad_mag. Output width metadata must be `<f4`; other channels `|u1`.
+Six required channels: presence, nx, ny, width, sheet_nx, sheet_ny (an old
+`sheet_grad_mag` channel is ignored). Output width metadata must be `<f4`;
+other channels `|u1`.
 Output is raw, C-order, slash-separated chunks with half the source chunk size
 and ceiling-half shape. Source chunks must be even-sized and aligned.
 

@@ -146,7 +146,8 @@ public:
     // Every recorded revision of an object (empty when it never existed).
     std::vector<ObjectRevision> objectHistory(const std::string& objectUuid, StoreStatus* asOf = nullptr, bool ifRetained = false);
     std::vector<SelectedRelationship> relationshipsAt(const std::vector<ObjectVersion>&, StoreStatus* asOf = nullptr);
-    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus&);
+    SelectedInputs selectedInputs(const std::vector<ObjectVersion>&, const StoreStatus&,
+        const std::optional<std::vector<ObjectVersion>>& relationshipVersions = std::nullopt);
     // Budgets above the server's limits are clamped; the result's stop reason
     // reports a budget stop (complete() is false).
     RegionResult geometryRegion(const RegionSlice&, const RegionOptions& = {}, StoreStatus* asOf = nullptr);
