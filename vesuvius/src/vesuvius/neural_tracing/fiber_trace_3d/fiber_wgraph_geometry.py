@@ -494,7 +494,7 @@ def _flat_settings(settings,counts,config):
     if settings['optimizer']=='lemon':
         flat.update(lemon_capacity_scale=int(settings['lemon']['capacity_scale']))
     else:
-        flat.update({k:config.get(k,v) for k,v in dict(irls=15,cg=500,eps=.05,prior_weight=1e-6).items()})
+        flat.update({k:config.get(k,v) for k,v in dict(irls=15,cg=500,eps=.05,prior_weight=1e-6,max_node_update=.05).items()})
     if settings['manual_links'] is not None:
         flat.update(manual_include_auto=bool(settings['manual_links']['include_auto']))
     for group,values in counts.items():
@@ -554,11 +554,15 @@ def _solve_winding_direct(config):
         # The solver states a one-sided constraint as "step at least the target": an at-most one is
         # the same constraint read from b to a.
         most=g['side']<0
+        solver_stats={}
         x,_=solve_l1(n,np.where(most,g['b'],g['a']),np.where(most,g['a'],g['b']),np.where(most,-g['target'],g['target']),
             g['weight'],np.zeros(n),
             config.get('prior_weight',1e-6),dev='cuda',irls=config.get('irls',15),
             cg_iters=config.get('cg',500),eps=config.get('eps',.05),log=lambda x:print(x,flush=True),
-            ineq=g['side']!=0 if g['side'].any() else None)
+            ineq=g['side']!=0 if g['side'].any() else None,
+            max_node_update=config.get('max_node_update',.05),stats=solver_stats)
+        counts['irls']=dict(largest_node_update=solver_stats['largest_node_update'],
+                            largest_solution_range=solver_stats['largest_solution_range'])
         if not np.isfinite(x).all():raise RuntimeError('IRLS returned nonfinite winding potentials')
         labels=round_components(x,component)
         residual=arc_residual(x[g['b']]-x[g['a']],g['target'],g['side'])

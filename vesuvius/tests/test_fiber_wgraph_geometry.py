@@ -20,6 +20,21 @@ def test_linear_irls_recovers_integer_chain_without_wrapping():
     np.testing.assert_allclose(residual,np.abs(x[b]-x[a]-target),atol=1e-6)
 
 
+def test_linear_irls_reports_and_refuses_an_unconverged_solve():
+    # A chain of 200 nodes cannot be solved in two CG iterations.
+    n=200;a=np.arange(n-1);b=a+1;target=np.ones(n-1);weight=np.ones(n-1)
+    with pytest.raises(RuntimeError,match='did not converge'):
+        solve_l1(n,a,b,target,weight,np.zeros(n),1e-6,dev='cpu',irls=2,cg_iters=2,log=lambda _:None)
+    stats={}
+    x,_=solve_l1(n,a,b,target,weight,np.zeros(n),1e-6,dev='cpu',irls=2,cg_iters=400,log=lambda _:None,stats=stats)
+    assert x.dtype==np.float64
+    assert len(stats['node_update'])==3 and stats['largest_node_update']<=.05
+    assert stats['largest_solution_range']==pytest.approx(n-1,abs=.1)
+    stats={}
+    solve_l1(n,a,b,target,weight,np.zeros(n),1e-6,dev='cpu',irls=2,cg_iters=2,log=lambda _:None,max_node_update=None,stats=stats)
+    assert stats['largest_node_update']>.05
+
+
 def test_uv_can_explicitly_retain_all_components():
     d=dict(source_id=np.array(['a','b','c']),family=np.array([0,1,0]),start=np.zeros(3),
         end=np.ones(3)*10,node_ds=np.array([[0.,-10],[0,10],[0,10]]),links=np.empty((0,4)),
@@ -217,6 +232,7 @@ def test_winding_stage_uses_typed_inputs_and_writes_referenced_results(tmp_path,
     def solve(*args,**kwargs):
         assert args[0]==2
         np.testing.assert_array_equal(args[1],[0]);np.testing.assert_array_equal(args[2],[1])
+        kwargs['stats'].update(largest_node_update=0.,largest_solution_range=.01)
         return np.array([4.01,4.02]),np.array([.01])
     def forbidden(*args,**kwargs):raise AssertionError('Production winding arrays must not pass through tensor files')
     monkeypatch.setattr(adapter,'_read_winding_inputs',inputs)
