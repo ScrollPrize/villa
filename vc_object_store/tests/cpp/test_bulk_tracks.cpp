@@ -2,6 +2,7 @@
 // Local data, referenced data (an editable overlay root over the sealed bulk collection), one file and a sharded directory,
 // source/destination history policies (history-off sealed base, history-on root), the failure cases, and a write through the
 // overlay that leaves the sealed base untouched.
+#include <iostream>
 #include "TestSupport.hpp"
 #include <set>
 #include "vc_object_store/objects/GeometryIngest.hpp"
@@ -222,6 +223,34 @@ int main()
         ingestTracksBulkOverlay(packed, first, "bulk-test", frame, tags, 1); ingestTracksBulkOverlay(packed, second, "bulk-test", frame, tags, 1);
         fs::remove(first); fs::copy_file(second, first);
         require(stageOf([&] { ingestTracksBulkOverlay(packed, first, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Overlay, "an overlay over another store is refused");
+    }
+    {   // Review of #2588 (second round): a retry verifies the COMPLETE sealed publication it attaches. A different valid store, a one-shard stand-in for a four-shard
+        // collection and a removed base (marker left behind) are all refused in preflight, nothing is re-ingested and no overlay is created.
+        for (const std::size_t shards : {std::size_t(1), std::size_t(4)}) {
+            const auto name = std::string("swap") + std::to_string(shards);
+            const auto overlay = dir.path / (name + ".vcobj"), other = dir.path / (name + "_other.vcobj");
+            const auto tracksPath = fs::path(overlay.string() + ".tracks"), marker = fs::path(overlay.string() + ".tracks.bulk.json");
+            const auto blocker = fs::path(overlay.string() + "-owner"), otherBlocker = fs::path(other.string() + "-owner");
+            fs::create_directories(blocker); fs::create_directories(otherBlocker);
+            require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, shards); }) == BulkOverlayError::Stage::Overlay, "stage 3 fails and leaves the sealed tracks");
+            const auto smaller = writePackedTracks(dir.path / (name + "_small.vctracks"), 7);          // a valid sealed store with only 7 tracks, as in the review's reproduction
+            require(stageOf([&] { ingestTracksBulkOverlay(smaller, other, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Overlay, "a second, smaller sealed store exists");
+            fs::remove_all(blocker);
+            { std::error_code ec; for (const char* suffix : {"", "-wal", "-shm"}) fs::remove(fs::path(overlay.string() + suffix), ec); }          // the overlay the failed run may have left: the retry starts from sealed tracks + marker only
+            const auto otherTracks = fs::path(other.string() + ".tracks");
+            if (shards == 1) { fs::remove_all(tracksPath); fs::copy(otherTracks, tracksPath, fs::copy_options::recursive); }
+            else { fs::remove(tracksPath / "collection.vcobj"); fs::copy_file(otherTracks, tracksPath / "collection.vcobj"); }
+            const auto replacedStage = stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, shards); });
+            require(replacedStage == BulkOverlayError::Stage::Preflight, "a replaced base is refused before an overlay is attached");
+            require(!fs::exists(overlay) && fs::exists(marker), "no overlay was created and the marker is preserved");
+        }
+        const auto overlay = dir.path / "gone.vcobj"; const auto tracksPath = fs::path(overlay.string() + ".tracks"), marker = fs::path(overlay.string() + ".tracks.bulk.json");
+        fs::create_directories(fs::path(overlay.string() + "-owner"));
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Overlay, "sealed tracks published");
+        fs::remove_all(fs::path(overlay.string() + "-owner")); fs::remove_all(tracksPath);
+        { std::error_code ec; for (const char* suffix : {"", "-wal", "-shm"}) fs::remove(fs::path(overlay.string() + suffix), ec); }
+        require(stageOf([&] { ingestTracksBulkOverlay(packed, overlay, "bulk-test", frame, tags, 1); }) == BulkOverlayError::Stage::Preflight, "a removed base with its marker left is reported, not re-ingested");
+        require(fs::exists(marker) && !fs::exists(tracksPath) && !fs::exists(overlay), "nothing was created or replaced");
     }
     return 0;
 }

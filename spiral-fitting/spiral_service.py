@@ -2282,10 +2282,15 @@ class ServiceState:
         """
         session = None
         try:
-            if previous is not None:
-                previous.close()
+            # Every retiring session (this rebuild's previous one and any whose earlier close was refused) must release its resources before the
+            # replacement allocates; a refusal fails this build and leaves the session retiring, so the next rebuild or the lease release retries.
+            with self.lock:
+                retiring = tuple(self._retiring_sessions)
+            for old_session in retiring:
+                old_session.close()
                 with self.lock:
-                    self._retiring_sessions.remove(previous)
+                    if old_session in self._retiring_sessions:
+                        self._retiring_sessions.remove(old_session)
             from spiral_runtime import create_session
             session = create_session(
                 paths, run, preview, scroll, self._status_changed,

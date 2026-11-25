@@ -940,12 +940,25 @@ class InteractiveFitSession:
                     command.fail(self._error or "Resident fitter closed")
                 self._commands.clear()
                 self._condition.notify_all()
+            # Resource release runs here, on the owning fitter thread. A refused release (a driver that will not unregister a pinned pool)
+            # must not skip the rest of the cleanup and must not look like success: the context is kept, the failure recorded, and close()
+            # retries the release and raises until it succeeded, so a rebuild or a lease release cannot proceed while the old pool is still pinned.
             if context is not None:
-                # Resource release runs here, on the owning fitter thread.
-                context.close()
+                try:
+                    context.close()
+                except BaseException as exc:                      # noqa: BLE001 - recorded and retried by close()
+                    self._unreleased_context = context
+                    self._release_error = f"{type(exc).__name__}: {exc}"
+                    traceback.print_exc(limit=6)
             if dist_context is not None:
-                maybe_destroy_distributed(dist_context)
-            self._progress_reporter().close()
+                try:
+                    maybe_destroy_distributed(dist_context)
+                except BaseException:                             # noqa: BLE001 - the remaining cleanup still runs
+                    traceback.print_exc(limit=4)
+            try:
+                self._progress_reporter().close()
+            except BaseException:                                 # noqa: BLE001
+                traceback.print_exc(limit=4)
 
     def _input_line(self, line):
         """One line of the object-store adapter's report: printed as the CLI
@@ -2229,6 +2242,16 @@ class InteractiveFitSession:
         self._thread.join(timeout)
         if self._thread.is_alive():
             raise TimeoutError("Spiral fitter did not stop at a safe boundary")
+        pending = getattr(self, "_unreleased_context", None)
+        if pending is not None:
+            try:
+                pending.close()                                   # retry the release the fitter thread could not finish
+            except BaseException as exc:                          # noqa: BLE001
+                self._release_error = f"{type(exc).__name__}: {exc}"
+                raise RuntimeError(f"The old fit context could not release its resources ({self._release_error}); "
+                                   "its pinned memory is still held, so close() stays retryable and no replacement may allocate yet") from exc
+            self._unreleased_context = None
+            self._release_error = None
 
 
 def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,

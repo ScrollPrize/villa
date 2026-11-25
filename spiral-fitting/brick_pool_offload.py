@@ -54,20 +54,25 @@ class _HostRegistration:
         return self._arr
 
     def register(self):
-        """page-lock + map the array on its own card; sets and returns the device pointer (int). Unregisters again when the mapping cannot be queried."""
+        """page-lock + map the array on its own card; sets and returns the device pointer (int).
+        The module owns this registration (it is parked in _PARKED) from BEFORE the driver call until the whole sequence succeeded, so a KeyboardInterrupt / SIGINT / any error at any point
+        after cuMemHostRegister returned (before the device-pointer lookup, inside it, or while unwinding) never lets Python free an array the driver still has registered:
+        on failure the release is tried at once (713 = not registered counts as released) and, when the driver refuses or the release is interrupted too, the registration stays parked, alive."""
         from host_pool_cuda import _libs, _chk
         _, cuda = _libs()
-        with torch.cuda.device(self.dev_index):
-            torch.zeros(1, device=f"cuda:{self.dev_index}")                  # make sure the card's primary context exists and is current
-            p = ctypes.c_void_p(self._arr.ctypes.data)
-            _chk(cuda.cuMemHostRegister_v2(p, ctypes.c_size_t(self._arr.nbytes), ctypes.c_uint(0x02)), "cuMemHostRegister(DEVICEMAP)")
-            dptr = ctypes.c_uint64()
-            try:
+        _PARKED.append(self)
+        try:
+            with torch.cuda.device(self.dev_index):
+                torch.zeros(1, device=f"cuda:{self.dev_index}")                  # make sure the card's primary context exists and is current
+                p = ctypes.c_void_p(self._arr.ctypes.data)
+                _chk(cuda.cuMemHostRegister_v2(p, ctypes.c_size_t(self._arr.nbytes), ctypes.c_uint(0x02)), "cuMemHostRegister(DEVICEMAP)")
+                dptr = ctypes.c_uint64()
                 _chk(cuda.cuMemHostGetDevicePointer_v2(ctypes.byref(dptr), p, ctypes.c_uint(0)), "cuMemHostGetDevicePointer")
-            except BaseException:
-                _release_or_park(self)  # Keep the backing alive if unregister fails.
-                raise
-        self.dptr = int(dptr.value)
+            self.dptr = int(dptr.value)
+        except BaseException:
+            _release_or_park(self)                                                # released -> leaves _PARKED; refused or interrupted -> stays parked
+            raise
+        _PARKED.remove(self)                                                      # fully registered: from here the pool's finalizer owns it
         return self.dptr
 
     def release(self):
@@ -90,8 +95,9 @@ def _release_or_park(reg):
     """weakref finalizer of an offloaded pool: release the registration; when the driver refuses (or the release is interrupted), PARK it so its backing array stays alive."""
     try:
         reg.release()
+        if reg in _PARKED: _PARKED.remove(reg)
     except BaseException:
-        _PARKED.append(reg)
+        if reg not in _PARKED: _PARKED.append(reg)
         print(f"brick_pool_offload: could not unregister {reg.dev_index=}: the host memory is kept alive (parked); retry_parked_registrations() can release it later", flush=True)
 
 

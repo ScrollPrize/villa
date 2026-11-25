@@ -511,6 +511,25 @@ nlohmann::json bulkOptions(const std::string& coordinateContext, const std::vect
     std::vector<std::string> sorted = tags; std::sort(sorted.begin(), sorted.end()); sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
     return {{"coordinate_context", nlohmann::json::parse(coordinateContext)}, {"tags", sorted}, {"author", author}};
 }
+// Identity of the COMPLETE sealed publication (every member of the base collection: store and lineage UUIDs, generation, exact commit sequence), sorted.
+// Recorded in the marker when the sealed tracks are published and compared on every retry, so a replacement store (a different valid base, one shard of a
+// four-shard collection, an emptier collection) is refused before an overlay is attached to it.
+nlohmann::json bulkMembersIdentity(const std::vector<CollectionMember>& members, std::size_t first = 0)
+{
+    std::vector<nlohmann::json> rows;
+    for (std::size_t i = first; i < members.size(); ++i)
+        rows.push_back({{"database_uuid", members[i].databaseUuid}, {"store_uuid", members[i].storeUuid}, {"generation", members[i].generation}, {"commit_sequence", members[i].commitSequence}});
+    std::sort(rows.begin(), rows.end(), [](const nlohmann::json& a, const nlohmann::json& b) { return a.dump() < b.dump(); });
+    return nlohmann::json(rows);
+}
+nlohmann::json bulkBaseIdentity(const fs::path& base)
+{
+    OpenOptions readOnly; readOnly.readOnly = true;
+    auto root = ObjectCollection::open(base, readOnly);
+    std::int64_t objects = 0;
+    { auto txn = root.read(); root.scanObjects(txn, [&](const CollectionObject&) { ++objects; return true; }); }          // the number of tracks the publication really holds
+    return {{"members", bulkMembersIdentity(root.members())}, {"objects", objects}};
+}
 bool bulkMarkerMatches(const nlohmann::json& marker, const std::string& packed, const std::string& fingerprint, const nlohmann::json& options, std::size_t shards, std::size_t rows)
 {
     return marker.is_object() && marker.value("kind", std::string()) == "vc_object_ingest_bulk" && marker.value("source", std::string()) == packed
@@ -551,31 +570,40 @@ BulkOverlayReport ingestTracksBulkOverlay(const fs::path& source, const fs::path
 
     if (fs::exists(overlayPath) || fs::is_symlink(overlayPath)) {
         if (!ours) throw BulkOverlayError(Stage::Preflight, "bulk ingest: the overlay path exists and this command did not make it: " + overlayPath.string());
-        // Read-only: opening verifies every dependency pin; then the overlay must depend on THESE sealed tracks, not on another valid store at that path.
+        // Read-only: opening verifies every dependency pin; then the overlay must depend on EXACTLY the sealed publication recorded when this command made it
+        // (every shard, same UUIDs and commit sequences), and the base that sits there now must still be that publication.
         try {
+            const auto& wanted = recorded.at("base_members");
             OpenOptions readOnly; readOnly.readOnly = true;
-            auto root = ObjectCollection::open(overlayPath, readOnly); auto baseRoot = ObjectCollection::open(base, readOnly);
-            const auto key = [](const CollectionMember& m) { return m.databaseUuid + "|" + m.storeUuid + "|" + m.generation + "|" + std::to_string(m.commitSequence); };
-            std::multiset<std::string> expected, have;
-            for (const auto& m : baseRoot.members()) expected.insert(key(m));
+            if (bulkBaseIdentity(base) != wanted) throw std::runtime_error("the sealed tracks at " + out.tracksPath.string() + " are no longer the publication this command made (a different or partial store sits there)");
+            auto root = ObjectCollection::open(overlayPath, readOnly);
             const auto members = root.members();
-            for (std::size_t i = 1; i < members.size(); ++i) have.insert(key(members[i]));
-            if (members.size() < 2 || have != expected) throw std::runtime_error("it does not depend on the sealed tracks recorded for this command (" + out.tracksPath.string() + ")");
+            if (members.size() < 2 || bulkMembersIdentity(members, 1) != wanted.at("members")) throw std::runtime_error("it does not depend on the complete sealed tracks recorded for this command (" + out.tracksPath.string() + ")");
             auto writableRoot = ObjectCollection::open(overlayPath, rootOptions);
             (void)writableRoot;
         } catch (const std::exception& error) { throw overlayError(error); }
         out.overlayAlreadyComplete = true; out.reusedSealedTracks = true; out.ingest.ingested = int64_t(rows);
         return out;
     }
-    if (fs::exists(out.tracksPath) || fs::is_symlink(out.tracksPath)) {
+    const bool tracksPresent = fs::exists(out.tracksPath) || fs::is_symlink(out.tracksPath);
+    if (ours && !tracksPresent)
+        throw BulkOverlayError(Stage::Preflight, "bulk ingest: " + out.marker.string() + " records sealed tracks that are missing now (" + out.tracksPath.string()
+            + "); nothing was re-ingested and no file was touched. Remove the marker to start over, or restore the tracks.");
+    if (tracksPresent) {
         if (!ours) throw BulkOverlayError(Stage::Preflight, "bulk ingest: the tracks destination exists and this command did not make it (no matching "
             + out.marker.string() + "); it is left untouched: " + out.tracksPath.string());
+        try {
+            if (!recorded.contains("base_members") || bulkBaseIdentity(base) != recorded.at("base_members"))
+                throw std::runtime_error("the sealed tracks at " + out.tracksPath.string() + " are not the complete publication this command made (a different, partial or replaced store); "
+                    "they and the marker are left untouched, no overlay was created");
+        } catch (const std::exception& error) { throw BulkOverlayError(Stage::Preflight, std::string("bulk ingest: ") + error.what()); }
         out.reusedSealedTracks = true; out.ingest.ingested = int64_t(rows);
     } else {
         try { out.ingest = ingestTracksBulk(source, out.tracksPath, author, coordinateContext, tags, shards); }
         catch (const std::exception& error) { throw BulkOverlayError(Stage::SealedTracks, std::string("bulk ingest: ") + error.what()); }
         try {
-            bulkMarkerWrite(out.marker, {{"kind", "vc_object_ingest_bulk"}, {"source", packedText}, {"fingerprint", fingerprint}, {"options", options}, {"shards", shards}, {"tracks", rows}, {"author", author},
+            const auto baseMembers = bulkBaseIdentity(base);
+            bulkMarkerWrite(out.marker, {{"base_members", baseMembers}, {"kind", "vc_object_ingest_bulk"}, {"source", packedText}, {"fingerprint", fingerprint}, {"options", options}, {"shards", shards}, {"tracks", rows}, {"author", author},
                                          {"tracks_path", out.tracksPath.string()}});
         } catch (const std::exception& error) {
             throw BulkOverlayError(Stage::Marker, std::string("bulk ingest: the sealed tracks were published at ") + out.tracksPath.string() + " but could not be recorded ("
@@ -584,6 +612,20 @@ BulkOverlayReport ingestTracksBulkOverlay(const fs::path& source, const fs::path
     }
     try { auto root = ObjectCollection::create(overlayPath, {base}, rootOptions); (void)root; }
     catch (const std::exception& error) { throw overlayError(error); }
+    // A base swapped between the check above and the attach must not leave a usable overlay over the wrong tracks behind a reported failure:
+    // re-verify what the new overlay actually depends on and, if it is not the recorded publication, remove the overlay THIS call created.
+    try {
+        OpenOptions readOnly; readOnly.readOnly = true;
+        const auto wanted = bulkBaseIdentity(base);
+        auto attached = ObjectCollection::open(overlayPath, readOnly);
+        const auto members = attached.members();
+        const auto recordedBase = recorded.contains("base_members") ? recorded.at("base_members") : wanted;
+        if (members.size() < 2 || bulkMembersIdentity(members, 1) != recordedBase.at("members") || wanted != recordedBase) throw std::runtime_error("the sealed tracks changed while the overlay was attached");
+    } catch (const std::exception& error) {
+        std::error_code ignored;
+        for (const char* suffix : {"", "-wal", "-shm"}) fs::remove(fs::path(overlayPath.string() + suffix), ignored);
+        throw BulkOverlayError(Stage::Overlay, std::string("bulk ingest: the overlay was removed again: ") + error.what() + ". The sealed tracks are kept at " + out.tracksPath.string() + ".");
+    }
     return out;
 }
 }
