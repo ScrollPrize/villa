@@ -270,8 +270,10 @@ FiberStripNormalResult solveChain(
             for (size_t i = 0; i < n; ++i) {
                 const auto& target = (*targets)[i];
                 const cv::Vec3d current = u[i] * std::cos(theta[i]) + v[i] * std::sin(theta[i]);
-                if (!target.fixed && target.signedWeight > 0.0) vote += target.signedWeight * unit(target.signedAxis).dot(current);
-                if (!target.fixed || !(target.weight > 0.0)) continue;
+                // A node held on an axis only still hears its signed target on the facing.
+                if ((!target.fixed || target.axisOnly) && target.signedWeight > 0.0)
+                    vote += target.signedWeight * unit(target.signedAxis).dot(current);
+                if (!target.fixed || target.axisOnly || !(target.weight > 0.0)) continue;
                 const cv::Vec3d a = unit(target.axis);
                 if (cv::norm(a) == 0.0) continue;
                 vote += target.weight * a.dot(current);
@@ -311,16 +313,31 @@ FiberStripNormalResult solveChain(
                     angle = std::atan2(av, au);
                     return true;
                 };
+                // An axis-only anchor takes the direction of its axis nearest
+                // to the angle the chain arrives with.
+                const auto nearestOnAxis = [](double angle, double reference) {
+                    while (angle - reference > kPi / 2) angle -= kPi;
+                    while (angle - reference < -kPi / 2) angle += kPi;
+                    return angle;
+                };
                 double first = 0.0;
                 bool anchorSeen = false;
-                if (anchorAngle(0, first)) { stepped[0] = first; anchorSeen = true; }
+                if (anchorAngle(0, first)) {
+                    if ((*targets)[0].axisOnly) stepped[0] = nearestOnAxis(first, theta[0]);
+                    else { stepped[0] = first; anchorSeen = true; }
+                }
                 for (size_t i = 1; i < n; ++i) {
                     const double before = stepped[i - 1];
                     double fixedAngle = 0.0;
                     if (anchorAngle(i, fixedAngle)) {
+                        if ((*targets)[i].axisOnly) {
+                            stepped[i] = nearestOnAxis(fixedAngle, before);
+                            continue;
+                        }
                         // An anchor is a boundary condition: its own angle, in
-                        // the turn nearest the previous node. The first anchor
-                        // also decides the facing of the nodes before it.
+                        // the turn nearest the previous node. The first signed
+                        // anchor also decides the facing of the nodes before it
+                        // (axis-only anchors among them turn over with the rest).
                         double previous = before;
                         if (!anchorSeen && std::cos(fixedAngle - before) < 0.0) {
                             for (size_t j = 0; j < i; ++j) stepped[j] += kPi;
@@ -386,8 +403,8 @@ FiberStripNormalResult solveChain(
                 bool anchored = false, signedSeen = false;
                 for (size_t i = 0; i < n; ++i) {
                     const auto& target = (*targets)[i];
-                    if (target.fixed && target.weight > 0.0) anchored = true;
-                    if (!target.fixed && target.signedWeight > 0.0) {
+                    if (target.fixed && !target.axisOnly && target.weight > 0.0) anchored = true;
+                    if ((!target.fixed || target.axisOnly) && target.signedWeight > 0.0) {
                         signedSeen = true;
                         signedVote += target.signedWeight * unit(target.signedAxis).dot(u[i] * std::cos(stepped[i]) + v[i] * std::sin(stepped[i]));
                     }

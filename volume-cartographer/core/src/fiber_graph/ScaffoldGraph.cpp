@@ -221,6 +221,7 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
             const auto rows = objects::readFiberPieceApprovals(reader, fiber.uuid);
             graph.report.pieceApprovalRows += std::int64_t(rows.size());
             fiber.approvals = objects::fiberPieceApprovalStates(fiber.content, rows);
+            fiber.approvedLineNormals = objects::approvedFiberLineNormals(fiber.content, fiber.approvals);
         }
         // The polylines live once, packed for seam transport; the per-fiber
         // copy would double a scaffold's largest allocation.

@@ -1076,10 +1076,16 @@ the session side is `apps/VC3D/LineAnnotationPieceLock.hpp`.
   the lock controls and, in the same transaction, crops every live approval
   reaching into the piece to its part outside (a row entirely inside is
   revoked). The overlap taken over this way needs the new piece's approval.
-- **Lock set.** With a piece open: every span outside it and every lock-tagged
-  control. Opened normally: the spans approved by current rows (geometry
-  aspect) and, for display-normal edits, those approved for normals, plus every
-  lock-tagged control. CP placement, moves, deletes, direction and tag edits,
+- **Lock set.** With a piece open: every span outside it. Opened normally: the
+  spans approved by current rows (geometry aspect) and, for display-normal
+  edits, those approved for normals. A lock control is held only for the sake
+  of an approved stretch that ends on it: with a piece open, a current
+  approval on the control's other side; opened normally, on either side. A
+  lock control nothing approved depends on can still be corrected - otherwise
+  the end of the first piece of a fiber could never be fixed. Moving such an
+  end of the open piece takes the one span beyond it along (that span stays
+  locked for every other edit, and the commit holds everything further out);
+  it cannot be deleted while it bounds the open piece. CP placement, moves, deletes, direction and tag edits,
   interpolation goals, splits and merges that would dirty a locked span or
   touch a lock control are refused with the approver's name and time; the
   way to change an approved stretch is to open its piece. The solver never
@@ -1092,7 +1098,15 @@ the session side is `apps/VC3D/LineAnnotationPieceLock.hpp`.
   (enabled with editing on, no solve running) or `fiber.approve_piece`: the
   session is saved first, then one row is appended expecting the saved
   version. A row some spans of which no longer match shows as "(stale)" and
-  unchecked. Unchecking appends a revocation. The overview bar underlines
+  unchecked. Unchecking appends a revocation.
+  "Normal approved" approves the normals the views show: the strip's normal
+  at every line point of the piece is stored with the approval, whether or
+  not a control point carries a manual normal, and the scaffold solve holds
+  the stretch on exactly those (as axes; which side faces outward is the
+  solve's to resolve). It is refused while the views do not show normals for
+  the line as it is. A normals approval goes stale when its stretch's line or
+  its controls' display normals change, and one made before the normals were
+  stored is stale from the start: approve the stretch again. The overview bar underlines
   approved stretches green and stale ones amber; lock controls draw a light
   grey ring.
 - **Lock release.** A lock control no live row references any more (its rows

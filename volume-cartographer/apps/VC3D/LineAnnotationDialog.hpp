@@ -235,6 +235,9 @@ public:
     // A stored fiber opens read-only with an Enable editing button (disabled
     // when canEdit is false); the fiber settings are locked meanwhile.
     void setReadOnly(bool readOnly, bool canEdit = true);
+    // Called by the receiver of an edit commit (crossSectionDragFinished,
+    // controlDirectionCreated, controlDirectionChanged) as it takes it over.
+    void acknowledgeEditCommit() { _editCommitReceived = true; }
     // Menu texts and the Fiber model combo label from the fiber-follow settings.
     void updateFiberFollowMenu();
     void setModelOnlySession(bool enabled);
@@ -256,6 +259,10 @@ signals:
     void crossSectionDragFinished(const std::string& surfaceName, cv::Vec3f point,
                                   double linePosition, cv::Vec3f lineAnchor,
                                   cv::Vec3f normal, bool edge);
+    // An edit gesture the user made that is not applied: which gesture, and
+    // why. Connected for every window (read-only ones too), so no edit is
+    // ever dropped without saying so.
+    void editGestureRefused(const QString& gesture, const QString& reason);
     void paneClosed(const std::string& surfaceName);
     void lineSeedRequested(const std::string& surfaceName, cv::Vec3f volumePoint, QPointF scenePoint);
     // lineAnchor: the 3D point of linePosition on the DISPLAYED line, so the
@@ -653,8 +660,21 @@ private:
     QPointer<QObject> _directionPreview;
     bool handleDirectionDragEvent(QObject* watched, QEvent* event);
     void cancelDirectionDrag();
-    void cancelCrossSectionDrag();
+    // `discardedBecause`: why a drag is thrown away rather than committed. A
+    // stroke the user made is then reported (crossSectionDragRefused), never
+    // dropped in silence; empty for the commit path and for "nothing pending".
+    // Receipt of an edit commit: the receiver acknowledges while the commit
+    // signal is being delivered; a commit nobody acknowledged is reported.
+    bool _editCommitReceived = false;
+    // Shown while an edit's re-trace is running or queued (setLineSolveActivity).
+    QPointer<QWidget> _lineSolveNotice;
+    void reportUnreceivedEditCommit(const QString& gesture, const class QMetaMethod& commitSignal);
+    void cancelCrossSectionDrag(const QString& discardedBecause = {});
     void finishCrossSectionDrag();
+    // The Shift key-up that commits a pending cross-view drag can go to
+    // another widget; while a stroke is pending this timer looks at the
+    // keyboard itself and commits once Shift is up.
+    QTimer* _crossSectionCommitPoll = nullptr;
     void drawCrossSectionDragPreview(const vc::fiber_tracer::FiberWidthDragResult& result);
     void updateFiberDisplayControlsAndGuides();
     void updateFiberWidthCursor(CChunkedVolumeViewer* viewer, std::optional<QPointF> scenePoint);

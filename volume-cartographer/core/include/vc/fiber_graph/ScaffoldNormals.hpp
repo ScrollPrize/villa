@@ -14,20 +14,29 @@
 // otherwise; scaffoldFallingWindingSign() is that one conversion, and nothing
 // else flips a normal.
 //
-// The annotation fixes the sign wherever it states one, in this order of
-// precedence:
+// The annotation fixes the normal where it states one, as an axis: the
+// annotator approves the cross-section they see, and cannot know which of its
+// two sides faces outward.
 //
-//   1. a control point's `display_normal` with source `manual`. The fiber
-//      format's display normals point outward, so it is taken as stored;
-//   2. the display normals of the spans approved for the normals aspect,
-//      whatever source they carry;
-//   3. an adjacent link: the V fiber lies one winding below the H fiber, so
-//      the direction from the H anchor to the V anchor is the one of falling
-//      winding, and the outward normal of both fibers there follows from it.
+//   1. a stretch approved for the normals aspect: the normals shown at its
+//      line points when it was approved are stored with the approval
+//      (FiberPieceApproval::spanNormals). Every chain node on the stretch is
+//      held on that axis, and the stretch's line points come out with the
+//      stored normals themselves;
+//   2. a control point's `display_normal` with source `manual` outside an
+//      approved stretch: the one chain node at that control point is held on
+//      its axis - without an approval nothing says how far it reaches.
 //
-// A fiber with at least one anchor comes out in the outward gauge: its whole-
-// fiber sign is decided here. A fiber with none keeps the arbitrary gauge of
-// its geometry solve, and its sign is left to the sign solve
+// The strip solve faces those nodes by continuity along the fiber, so a fiber
+// has one facing, and that facing is resolved like any other fiber's. Only an
+// adjacent link states a facing: the V fiber lies one winding below the H
+// fiber, so the direction from the H anchor to the V anchor is the one of
+// falling winding, and the outward normal of both fibers there follows.
+//
+// A fiber an adjacent link anchors comes out in the outward gauge: its whole-
+// fiber sign is decided here. Any other fiber takes its facing from the
+// neighbour normals where they cover it, or keeps the arbitrary gauge of its
+// geometry solve, and its sign is left to the sign solve
 // (ScaffoldConstraints.hpp) - that is what the `normalSign` column of the
 // winding assembly means.
 //
@@ -56,6 +65,8 @@
 namespace vc::fiber_graph {
 
 // What fixed a fiber's gauge, in precedence order: a smaller value wins.
+// `Manual` and `ApprovedPiece` name an anchor's kind only: they fix an axis,
+// never a fiber's gauge.
 // `Crossings` is not set here - it is what the sign solve
 // (ScaffoldConstraints.hpp) reports for the fibers it decided itself.
 // `Neighbours` is a fiber no anchor fixed, faced by the neighbour normals.
@@ -203,7 +214,13 @@ struct ScaffoldNormalReport {
     std::int64_t reused = 0, cached = 0;
     std::int64_t fibers = 0, solved = 0, degenerate = 0, converged = 0;
     std::int64_t anchoredFibers = 0, unanchoredFibers = 0;
+    // Manual control-point normals that fix a node, chain nodes an approved
+    // stretch fixes, and adjacent-link anchors.
     std::int64_t manualAnchors = 0, approvedPieceAnchors = 0, adjacentLinkAnchors = 0;
+    // Line points that carry an approved normal, and live normals approvals
+    // that approve nothing as they stand (the fiber changed since, or the
+    // approval predates stored normals): those need approving again.
+    std::int64_t approvedNormalPoints = 0, staleNormalApprovals = 0;
     // Anchors dropped because the two link anchors coincide, or because the
     // stored display normal is parallel to the fiber there.
     std::int64_t degenerateAnchors = 0;

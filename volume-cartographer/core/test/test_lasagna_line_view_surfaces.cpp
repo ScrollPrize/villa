@@ -675,3 +675,45 @@ TEST_CASE("LineViewBuilder validates target spacing")
     CHECK_THROWS_AS(vc::lasagna::buildLineViewSurfaces(simpleLine(), config),
                     std::invalid_argument);
 }
+
+TEST_CASE("A normal set by hand is shown as set at its control point, not smoothed away")
+{
+    // A straight fiber along x, one line point per voxel, control points every
+    // 40 voxels. The control point at 120 carries a normal turned 40 degrees
+    // about the fiber; the display normals blend back to the baseline (z) at
+    // its neighbours, as the annotation's display field does.
+    vc::lasagna::LineModel line;
+    const int count = 241;
+    for (int i = 0; i < count; ++i)
+        line.points.push_back({{double(i), 0.0, 0.0}, normal({0.0, 0.0, 1.0}), true});
+    vc::lasagna::LineViewConfig config;
+    for (int i = 0; i < count; i += 40) config.controlPointLinePositions.push_back(double(i));
+    const double peak = 40.0 * std::acos(-1.0) / 180.0;
+    for (int i = 0; i < count; ++i) {
+        const double t = std::clamp(1.0 - std::abs(double(i) - 120.0) / 40.0, 0.0, 1.0);
+        const double angle = peak * t * t * (3.0 - 2.0 * t);
+        config.displayPointNormals.push_back(cv::Vec3f(0.f, float(std::sin(angle)), float(std::cos(angle))));
+        config.orientedPointNormals.push_back(cv::Vec3f(0.f, 0.f, 1.f));
+    }
+    config.buildLineZSlices = false;
+    const auto shownAngle = [&](const vc::lasagna::LineViewConfig& c, int index) {
+        const auto views = vc::lasagna::buildLineViewSurfaces(line, c);
+        const cv::Vec3d shown = toVec3d(views.lineUpVectors.at(size_t(index)));
+        return std::atan2(std::abs(shown[1]), std::abs(shown[2])) * 180.0 / std::acos(-1.0);
+    };
+    // Unpinned, the roll smoothing along the strip flattens the peak.
+    CHECK(shownAngle(config, 120) < 37.0);
+    // Pinned, the strip shows what was set, and still blends to the baseline beside it.
+    config.pinnedNormalLinePositions = {120.0};
+    CHECK(shownAngle(config, 120) == doctest::Approx(40.0).epsilon(0.01));
+    CHECK(shownAngle(config, 100) > 10.0);
+    // Its neighbours are not held here: the smoothing carries part of the turn onto them.
+    CHECK(shownAngle(config, 80) > 3.0);
+    // Held as well (as the annotation does), the correction ends where the display field ends it.
+    config.pinnedNormalLinePositions = {80.0, 120.0, 160.0};
+    CHECK(shownAngle(config, 120) == doctest::Approx(40.0).epsilon(0.01));
+    CHECK(shownAngle(config, 80) < 0.5);
+    CHECK(shownAngle(config, 160) < 0.5);
+    CHECK(shownAngle(config, 100) > 10.0);
+    CHECK(shownAngle(config, 40) < 0.5);
+}

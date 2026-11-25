@@ -136,12 +136,30 @@ library states those exactly as the automatic pipeline does
   the inward one otherwise; `scaffoldFallingWindingSign` is that single
   conversion. A fiber whose geometry carries no normal (fewer than three
   distinct points) fails the run: a solve has a normal for every fiber.
-  The annotation fixes the sign where it states one, in this precedence: a
-  control point's `display_normal` with source `manual`; the display normals
-  of the spans approved for the normals aspect (both stored outward, taken as
-  they are); an adjacent link, whose two anchors give the direction of
-  falling winding (the V fiber lies one winding below the H fiber) and with
-  it the outward normal of both fibers.
+  The annotation fixes the normal where it states one, as an **axis**: the
+  annotator approves the cross-section they see and cannot know which of its
+  two sides faces outward.
+  A stretch approved for the normals aspect carries the normals that were
+  shown at its line points when it was approved (stored with the approval,
+  `vc_object_store/docs/fiber-piece-approval.md`). Every chain node on the
+  stretch is held on that axis (the principal axis of the stored normals of
+  the line points nearest to it), and the stretch's line points come out with
+  the stored normals themselves. This holds for a stretch nobody corrected
+  too: approving it approves what was shown.
+  A control point's `display_normal` with source `manual` outside an approved
+  stretch holds the one chain node at that control point on its axis; without
+  an approval nothing says how far it reaches.
+  Between held nodes the strip solve runs as everywhere else, and it faces the
+  held nodes by continuity along the fiber, so a fiber has one facing. That
+  facing is resolved like any other fiber's: by an adjacent link, whose two
+  anchors give the direction of falling winding (the V fiber lies one winding
+  below the H fiber) and with it the outward normal of both fibers; by the
+  neighbour normals; or by the sign solve. A link that lands on a held node
+  keeps the annotated axis and only says which way it faces.
+  A normals approval that no longer matches its stretch (the line moved, or
+  the approval predates stored normals) is not used. The run counts those
+  (`normal_approvals_stale`) and the dock's summary names them: approve the
+  stretch again.
   With a prediction bound (*variant B*) every chain node is also pulled
   towards the sheet axis the fiber-inference volume states there: the axes
   are sampled at the fibers' own vertices, which lie in the sheet, weighted
@@ -166,10 +184,11 @@ library states those exactly as the automatic pipeline does
   each connector comes from a Lasagna normal volume's `grad_mag` density
   through a sampler the caller supplies; without one every relation keeps a
   NaN separation, which asserts no arc but still witnesses an enclosure.
-- **signs**. The fibers no anchor fixed are decided by the perpendicular
-  crossings, with the native sign solve (`vc/fiber_tracer/FiberNormalSign.hpp`,
-  `irls` or `ceres`), from the radial prior of each fiber's own normals. An
-  anchored fiber's sign is held. The run records how many signs each source
+- **signs**. The fibers neither an adjacent link nor the neighbour normals
+  faced are decided by the perpendicular crossings, with the native sign solve
+  (`vc/fiber_tracer/FiberNormalSign.hpp`, `irls` or `ceres`), from the radial
+  prior of each fiber's own normals. A faced fiber's sign is held. An approved
+  or manual normal fixes an axis and never a sign. The run records how many signs each source
   decided, and how many anchored fibers the crossings disagreed with.
 - **relations**. A perpendicular crossing asserts the rounded separation plus
   the half winding between the two families, a parallel one the separation
@@ -261,7 +280,8 @@ and signed by the scaffold's few crossings:
    crossing's own frame and no crossing is weighted by its agreement with a
    prediction.
 
-Annotation anchors still win at the nodes they fix. A fiber without an anchor
+Annotated normals still hold the nodes they fix, and those nodes' signed
+targets still vote on the fiber's facing. A fiber no adjacent link faces
 whose chain nodes got a target on at least a quarter of its length is faced by
 the field (`ScaffoldSignSource::Neighbours`) and held in the sign solve like an
 anchored one; a fiber the field does not cover is left to the crossings. The
@@ -390,7 +410,8 @@ vc_scaffold_solve config.json
 | `constraints.crossing_filter` | `true` | follow every perpendicular crossing through its two fibers' normal surfaces and apply the shared crossing rule (vc_object_store `geometry/FiberCrossingFilter.hpp`, the one the traced volume's sign and winding stages use): the sign solve drops crossings with nothing left or mixed relations, the constraints drop crossings with nothing left and those that disagree under the solved signs but have an agreeing crossing in the same encounter |
 | `winding.manifest`, `winding.remote_cache` | — | the Lasagna normal dataset the separations are measured on |
 | `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `300`, `1`, `64`, `64` | the strip solve, at the whole-volume pipeline's settings |
-| `normals.manual_display_normals`, `.approved_pieces`, `.adjacent_links` | `true` | which anchors fix a sign |
+| `normals.manual_display_normals`, `.approved_pieces` | `true` | which annotated normals are held as axes |
+| `normals.adjacent_links` | `true` | whether adjacent links fix a fiber's facing |
 | `normals.source` | `geometry` | `geometry` (variant A), `fused` (variant B) or `neighbours` |
 | `neighbours.samples` | — | the signed strip samples a `neighbours` run reads |
 | `neighbours.weight`, `.sigma`, `.minimum_coverage` | `300`, `32`, `0.25` | the signed target's weight, its arc sigma, and the share of a fiber the field must cover to face it |

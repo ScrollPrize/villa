@@ -250,6 +250,18 @@ struct LineAnnotationController::LineAnnotationSession {
     // query fingerprint so a landed solve (or rollback) that happens to
     // reuse the previous vector's allocation is still seen as a change.
     uint64_t lineRevision = 0;
+    // The normal the views show at each line point (the strip's own), and the
+    // line revision it was built for: what a normals approval stores.
+    std::vector<cv::Vec3f> shownLineNormals;
+    uint64_t shownLineNormalsRevision = 0;
+    // A normal set in the cross view that has not been seen in rebuilt views yet.
+    struct PendingNormalCheck {
+        cv::Vec3d point, normal;
+        uint64_t serial = 0;
+        bool seenInViews = false; // confirmed in rebuilt views at least once
+        int finalLooks = 0;       // final looks postponed because a re-trace was still running
+    };
+    std::optional<PendingNormalCheck> pendingNormalCheck;
     // A landing's epilogue holds the queue's pending request in a local
     // while it publishes and then re-dispatches it: in that window the
     // queue reads empty although work is still owed. Reported as pending.
@@ -2173,6 +2185,14 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
     } else {
         connectSessionEditing(dialog, surfaceName);
     }
+    // Connected for every window, read-only ones included: an edit gesture
+    // that is not applied always says why.
+    connect(dialog, &LineAnnotationDialog::editGestureRefused, this,
+            [this, surfaceName](const QString& gesture, const QString& reason) {
+                auto* pane = paneForSurface(surfaceName);
+                showError(tr("%1 was NOT applied: %2.").arg(gesture, reason),
+                          pane && pane->session && pane->session->suppressErrorDialogs);
+            }, Qt::QueuedConnection); // it can be emitted from inside a view rebuild; the modal runs after it
     connect(dialog, &QObject::destroyed, this, [this, surfaceName, dialog]() {
         // Emitted from the widget's destructor, after the dialog's own
         // members are gone: the cleanup installs a running save and applies
@@ -2303,10 +2323,27 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
         auto* pane = paneForSurface(surfaceName);
         if (!pane || !pane->session) return;
         auto& session = *pane->session;
-        if (index >= session.controlPoints.size() || index >= session.displayField.controlBaselines.size()) return;
+        if (index >= session.controlPoints.size()) return;
+        // A normal that cannot be set is said, never dropped: without a
+        // baseline normal and a tangent at the control point there is nothing
+        // the angle is measured from.
+        if (index >= session.displayField.controlBaselines.size()) {
+            showError(tr("The normal of control point %1 was not changed: the views have no normals for this line "
+                         "(%2 line points, %3 control points with a baseline).")
+                          .arg(index + 1).arg(session.optimizedLine.points.size())
+                          .arg(session.displayField.controlBaselines.size()),
+                      session.suppressErrorDialogs);
+            return;
+        }
         const auto baseline = vc::fiber_tracer::displayUnit(session.displayField.controlBaselines[index]);
         const auto tangent = vc::fiber_tracer::displayUnit(session.displayField.controlTangents[index]);
-        if (!baseline || !tangent) return;
+        if (!baseline || !tangent) {
+            showError(tr("The normal of control point %1 was not changed: there is no %2 at this control point to "
+                         "measure the angle from.")
+                          .arg(index + 1).arg(!baseline ? tr("baseline normal") : tr("line tangent")),
+                      session.suppressErrorDialogs);
+            return;
+        }
         {
             std::vector<size_t> dirty;
             if (index > 0) dirty.push_back(index - 1);
@@ -2384,15 +2421,17 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
     connect(dialog, &LineAnnotationDialog::clearControlCorrectionsRequested, this,
             [clearCorrections](size_t index) { clearCorrections(index); });
     connect(dialog, &LineAnnotationDialog::controlDirectionCreated, this,
-            [this, surfaceName](cv::Vec3f point, double position,
+            [this, surfaceName, window = QPointer<LineAnnotationDialog>(dialog)](cv::Vec3f point, double position,
                                 cv::Vec3f anchor, cv::Vec3f direction) {
+        if (window) window->acknowledgeEditCommit();
         handleGeneratedControlPoint(surfaceName,
             point, position,
             anchor, std::nullopt,
             vc::fiber_tracer::displayUnit(cv::Vec3d(direction)));
     });
     connect(dialog, &LineAnnotationDialog::controlDirectionChanged, this,
-            [this, surfaceName](size_t index, cv::Vec3f value) {
+            [this, surfaceName, window = QPointer<LineAnnotationDialog>(dialog)](size_t index, cv::Vec3f value) {
+        if (window) window->acknowledgeEditCommit();
         auto* pane = paneForSurface(surfaceName);
         if (!pane || !pane->session) return;
         auto& session=*pane->session;
@@ -2457,11 +2496,15 @@ void LineAnnotationController::connectSessionEditing(LineAnnotationDialog* dialo
     connect(dialog,
             &LineAnnotationDialog::crossSectionDragFinished,
             this,
-            [this](const std::string& name, cv::Vec3f point, double position,
+            [this, window = QPointer<LineAnnotationDialog>(dialog)](const std::string& name, cv::Vec3f point, double position,
                    cv::Vec3f anchor, cv::Vec3f normal, bool edge) {
+                if (window) window->acknowledgeEditCommit();
+                Logger()->info("Line annotation: cross-view drag committed by the window: surface '{}', line position {}, "
+                               "normal changed {}", name, position, edge);
                 handleGeneratedControlPoint(name, point,
                     position, anchor,
                     edge ? std::optional<cv::Vec3d>(toVec3d(normal)) : std::nullopt);
+                Logger()->info("Line annotation: cross-view drag handled");
             });
     connect(dialog,
             &LineAnnotationDialog::generatedControlPointRequested,
@@ -6181,7 +6224,26 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     // made meanwhile).
     const HostedStatusScope statusScope(*this);
     auto* pane = paneForSurface(surfaceName);
+    if (displayNormal)
+        Logger()->info("Line annotation: cross-view normal edit received for surface '{}' at line position {}, point ({}, {}, {}), "
+                       "normal ({}, {}, {}); pane {} session {}",
+                       surfaceName, linePosition, volumePoint[0], volumePoint[1], volumePoint[2], (*displayNormal)[0],
+                       (*displayNormal)[1], (*displayNormal)[2], pane ? "found" : "NOT FOUND",
+                       pane && pane->session ? "present" : "MISSING");
     if (!pane || !pane->session) {
+        if (displayNormal) {
+            QStringList known;
+            for (const auto& other : _panes) {
+                QStringList generated;
+                if (other.session)
+                    for (const auto& name : other.session->generatedSurfaceNames) generated << QString::fromStdString(name);
+                known << QStringLiteral("'%1' [%2]").arg(QString::fromStdString(other.surfaceName), generated.join(QStringLiteral(", ")));
+            }
+            showError(tr("The normal set in the cross view was NOT applied: no annotation pane owns the surface '%1' "
+                         "(%2). Panes and their surfaces: %3.")
+                          .arg(QString::fromStdString(surfaceName), pane ? tr("the pane has no session") : tr("no pane"),
+                               known.join(QStringLiteral("; "))), false);
+        }
         return;
     }
 
@@ -6189,23 +6251,34 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     // is re-resolved by name afterwards (it can be erased meanwhile).
     const std::shared_ptr<LineAnnotationSession> owned = pane->session;
     auto& session = *owned;
+    // A normal set in the cross view is never dropped without saying why.
+    const bool suppressNormalError = session.suppressErrorDialogs;
+    const auto normalDropped = [&](const QString& reason) {
+        if (displayNormal)
+            showError(tr("The normal set in the cross view was NOT applied: %1").arg(reason), suppressNormalError);
+    };
     // Control-point edits deliberately do NOT refuse while a solve is in
     // flight: the session is mutated immediately, the in-flight solve is
     // superseded (epoch bump + cooperative cancel), and one solve over the
     // coalesced dirty spans follows. Only a seed solve still excludes edits,
     // via the empty-line check below.
     if (session.optimizedLine.points.empty() || session.controlPoints.empty()) {
+        normalDropped(tr("the fiber has no line or no control points yet (%1 line points, %2 control points)")
+                          .arg(session.optimizedLine.points.size()).arg(session.controlPoints.size()));
         return;
     }
     if (!placementAllowedByFocusBounds(
             toVec3d(volumePoint), session.suppressErrorDialogs)) {
+        normalDropped(tr("the point lies outside the active focus bounding box"));
         return;
     }
     if (!prepareSessionForControlPlacement(surfaceName, owned, {})) {
+        normalDropped(tr("the session could not be prepared for the edit (pending save or normal dataset; see the message before this one)"));
         return;
     }
     pane = paneForSurface(surfaceName);
     if (!pane || pane->session != owned) {
+        normalDropped(tr("the annotation pane was replaced while the edit was prepared"));
         return;
     }
 
@@ -6251,6 +6324,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     // enforced here for every caller.
     if (vc3d::line_annotation::generatedLinePositionBeyondTaggedEnd(
             controlLinePositions, kollesisTerminations, linePosition)) {
+        normalDropped(tr("line position %1 lies beyond a kollesis termination, which declares the fiber's end").arg(linePosition));
         return;
     }
     // Nothing is placed inside a gap span (two consecutive break points)
@@ -6264,6 +6338,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                                        session.controlPoints[upper].linePosition);
         }
         if (vc3d::line_annotation::generatedLinePositionInsideGap(gapLineRanges, linePosition)) {
+            normalDropped(tr("line position %1 lies inside a gap between two break points").arg(linePosition));
             return;
         }
     }
@@ -6275,6 +6350,8 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
                 controlLinePositions,
                 static_cast<double>(
                     pane->dialog->maxControlPointExtrapolationDistanceVx()))) {
+            normalDropped(tr("line position %1 lies more than the extrapolation distance (%2 vx) from every control point")
+                              .arg(linePosition).arg(pane->dialog->maxControlPointExtrapolationDistanceVx()));
             return;
         }
     }
@@ -6289,6 +6366,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     if (!confirmLinkedControlPointEdits(session,
                                         nearbyControlIndices,
                                         tr("Replacing the nearby control points"))) {
+        normalDropped(tr("replacing the linked control points here was declined"));
         return;
     }
     // The replacement point takes the union of the collapsed points' tags; a
@@ -6317,8 +6395,187 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     edit.displayNormal = displayNormal;
     edit.manualDisplayNormal = displayNormal.has_value();
     edit.direction = direction;
-    (void)placeControlInSession(surfaceName, owned, currentLinePoints, cumulativeArclengths,
-                                controlLinePositions, std::move(edit), {});
+    const auto placed = placeControlInSession(surfaceName, owned, currentLinePoints, cumulativeArclengths,
+                                              controlLinePositions, std::move(edit), {});
+    if (displayNormal) armNormalCheck(surfaceName, clicked, *displayNormal, placed);
+}
+
+namespace {
+// Angle between two axes (a normal and its negative are the same), degrees; NaN where one is no direction.
+double axisAngleDegrees(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    const double na = cv::norm(a), nb = cv::norm(b);
+    if (!(na > 0) || !(nb > 0) || !std::isfinite(na) || !std::isfinite(nb)) return std::numeric_limits<double>::quiet_NaN();
+    return std::acos(std::clamp(std::abs(a.dot(b)) / (na * nb), 0.0, 1.0)) * 180.0 / std::acos(-1.0);
+}
+QString vectorText(const cv::Vec3d& v)
+{
+    return QStringLiteral("(%1, %2, %3)").arg(v[0], 0, 'f', 3).arg(v[1], 0, 'f', 3).arg(v[2], 0, 'f', 3);
+}
+} // namespace
+
+void LineAnnotationController::armNormalCheck(const std::string& surfaceName, const cv::Vec3d& point,
+                                              const cv::Vec3d& normal, std::optional<size_t> placedIndex)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        showError(tr("The normal set in the cross view was NOT applied: the annotation pane is gone."), false);
+        return;
+    }
+    auto& session = *pane->session;
+    if (!placedIndex || *placedIndex >= session.controlPoints.size()) {
+        showError(tr("The normal set in the cross view was NOT applied: no control point was placed for it "
+                     "(see the message before this one)."), session.suppressErrorDialogs);
+        return;
+    }
+    const auto& control = session.controlPoints[*placedIndex];
+    if (!control.displayNormal || control.displayNormalSource != "manual" ||
+        !(axisAngleDegrees(*control.displayNormal, normal) < 0.5)) {
+        showError(tr("The normal set in the cross view was NOT applied: control point %1 carries %2 (source '%3') "
+                     "instead of the requested %4.")
+                      .arg(*placedIndex + 1)
+                      .arg(control.displayNormal ? vectorText(*control.displayNormal) : tr("no normal"))
+                      .arg(QString::fromStdString(control.displayNormalSource)).arg(vectorText(normal)),
+                  session.suppressErrorDialogs);
+        return;
+    }
+    static uint64_t serial = 0;
+    session.pendingNormalCheck = LineAnnotationSession::PendingNormalCheck{control.volumePoint, normal, ++serial};
+    Logger()->info("Line annotation: normal {} set on control point {} at {}; awaiting the rebuilt views",
+                   vectorText(normal).toStdString(), *placedIndex + 1, vectorText(control.volumePoint).toStdString());
+    // The views must show it: if they are not rebuilt at all, that is said too.
+    const uint64_t armed = serial;
+    QTimer::singleShot(30000, this, [this, surfaceName, armed]() {
+        auto* later = paneForSurface(surfaceName);
+        if (!later || !later->session || !later->session->pendingNormalCheck ||
+            later->session->pendingNormalCheck->serial != armed) return;
+        verifyNormalCheck(surfaceName, false);
+    });
+}
+
+void LineAnnotationController::verifyNormalCheck(const std::string& surfaceName, bool viewsRebuilt)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session || !pane->session->pendingNormalCheck) return;
+    auto& session = *pane->session;
+    const auto check = *session.pendingNormalCheck;
+    const bool solving = session.taskState == LineAnnotationSession::TaskState::Running || session.solveQueue.hasPending();
+    const bool finalLook = !viewsRebuilt;
+    // A re-trace still running is not a lost edit: look again when it has
+    // had more time, for up to 10 minutes, and say that it is being waited for.
+    if (finalLook && solving && check.finalLooks < 20) {
+        ++session.pendingNormalCheck->finalLooks;
+        Logger()->info("Line annotation: normal check postponed, the re-trace after the edit is still running ({} s so far)",
+                       30 * session.pendingNormalCheck->finalLooks);
+        const uint64_t armed = check.serial;
+        QTimer::singleShot(30000, this, [this, surfaceName, armed]() {
+            auto* later = paneForSurface(surfaceName);
+            if (!later || !later->session || !later->session->pendingNormalCheck ||
+                later->session->pendingNormalCheck->serial != armed) return;
+            verifyNormalCheck(surfaceName, false);
+        });
+        return;
+    }
+    const bool underSolveReview = session.fiberId != 0 && _solverLineNormals.contains(session.fiberId);
+    const QString context = tr("\nBaseline normals: %1. Volume shown: %2. Line: %3 points, revision %4; views built for revision %5. "
+                               "Task state %6, optimization state %7, pending solve work: %8. Last view error: '%9'.")
+        .arg(underSolveReview ? tr("the scaffold solve under review")
+                              : (session.usingFiberNormals ? tr("fiber prediction '%1'").arg(QString::fromStdString(session.selectedDatasetLocation))
+                                                           : tr("Lasagna '%1'").arg(QString::fromStdString(session.selectedDatasetLocation))))
+        .arg(_state ? QString::fromStdString(_state->currentVolumeId()) : tr("none"))
+        .arg(session.optimizedLine.points.size()).arg(session.lineRevision).arg(session.shownLineNormalsRevision)
+        .arg(int(session.taskState)).arg(int(session.optimizationState)).arg(solving ? tr("yes") : tr("no"))
+        .arg(QString::fromStdString(session.error));
+    const auto report = [&](const QString& what) {
+        session.pendingNormalCheck.reset();
+        showError(tr("The normal set in the cross view is NOT in effect: %1%2").arg(what, context), session.suppressErrorDialogs);
+    };
+    // The final look, 30 s after the edit: it must have been seen in rebuilt
+    // views, still be there, and be in the store.
+    if (finalLook && !check.seenInViews) {
+        report(tr("it was never seen in rebuilt views within %1 s of the edit.").arg(30 * (check.finalLooks + 1)));
+        return;
+    }
+    // The control point that carries it: by position, the nearest within 2 voxels.
+    std::optional<size_t> index;
+    double best = 4.0;
+    for (size_t i = 0; i < session.controlPoints.size(); ++i) {
+        const cv::Vec3d delta = session.controlPoints[i].volumePoint - check.point;
+        if (delta.dot(delta) <= best) { best = delta.dot(delta); index = i; }
+    }
+    if (!index) {
+        // A solve still running may yet move things; once nothing is pending this is final.
+        if (!solving || finalLook) report(tr("no control point is left within 2 voxels of %1, where it was set.").arg(vectorText(check.point)));
+        return;
+    }
+    const auto& control = session.controlPoints[*index];
+    if (!control.displayNormal) {
+        report(tr("control point %1 lost its manual normal.").arg(*index + 1));
+        return;
+    }
+    const double storedAngle = axisAngleDegrees(*control.displayNormal, check.normal);
+    if (!(storedAngle < 15.0)) {
+        report(tr("control point %1 now carries %2, %3 degrees from the requested %4.")
+                   .arg(*index + 1).arg(vectorText(*control.displayNormal)).arg(storedAngle, 0, 'f', 1).arg(vectorText(check.normal)));
+        return;
+    }
+    if (session.shownLineNormalsRevision != session.lineRevision || session.shownLineNormals.size() != session.optimizedLine.points.size()) {
+        if (!solving || finalLook) report(tr("the views show the normals of another line revision (%1 normals for %2 line points).")
+                                 .arg(session.shownLineNormals.size()).arg(session.optimizedLine.points.size()));
+        return;
+    }
+    const cv::Vec3d shown = vc::fiber_tracer::displayVectorAt(session.shownLineNormals, control.linePosition);
+    const cv::Vec3d baseline = *index < session.displayField.controlBaselines.size()
+        ? session.displayField.controlBaselines[*index] : cv::Vec3d(0, 0, 0);
+    const double shownAngle = axisAngleDegrees(shown, *control.displayNormal);
+    Logger()->info("Line annotation: normal check at control point {}: stored {} shown {} ({:.1f} degrees apart), baseline {} "
+                   "({:.1f} degrees from the stored normal), solve pending {}",
+                   *index + 1, vectorText(*control.displayNormal).toStdString(), vectorText(shown).toStdString(), shownAngle,
+                   vectorText(baseline).toStdString(), axisAngleDegrees(baseline, *control.displayNormal), solving);
+    // What was set is what must be shown at its control point: 3 degrees of slack, no more.
+    if (!(shownAngle < 3.0)) {
+        // While a solve is pending the views may be the previous ones; the final look reports regardless.
+        if (solving && !finalLook) return;
+        report(tr("control point %1 carries %2, but the views show %3 there, %4 degrees off (baseline %5, %6 degrees "
+                  "from the stored normal; offset applied %7 degrees).")
+                   .arg(*index + 1).arg(vectorText(*control.displayNormal)).arg(vectorText(shown))
+                   .arg(shownAngle, 0, 'f', 1).arg(vectorText(baseline))
+                   .arg(axisAngleDegrees(baseline, *control.displayNormal), 0, 'f', 1)
+                   .arg(*index < session.displayField.controlOffsets.size()
+                            ? session.displayField.controlOffsets[*index] * 180.0 / std::acos(-1.0) : 0.0, 0, 'f', 1));
+        return;
+    }
+    if (solving && !finalLook) return; // confirmed again when the pending solve has landed
+    if (!finalLook) {
+        if (!session.pendingNormalCheck->seenInViews)
+            Logger()->info("Line annotation: normal on control point {} seen in the rebuilt views ({:.1f} degrees from the stored "
+                           "normal, {:.1f} from the requested one); checked again 30 s after the edit",
+                           *index + 1, shownAngle, storedAngle);
+        session.pendingNormalCheck->seenInViews = true;
+        return;
+    }
+    // In the store: the saved fiber's control point at that position carries it.
+    if (!session.suppressFiberSave && session.storePin && session.storePin->stored()) {
+        const auto stored = readStoredFiber(session.fiberId, true);
+        std::optional<cv::Vec3d> storedNormal;
+        bool found = false;
+        if (stored)
+            for (const auto& saved : stored->controlPoints)
+                if (pointsApproximatelyEqual(cv::Vec3d(saved), control.volumePoint)) { found = true; storedNormal = saved.displayNormal; break; }
+        if (!stored || !found || !storedNormal || !(axisAngleDegrees(*storedNormal, *control.displayNormal) < 0.5)) {
+            report(tr("it is shown, but NOT saved: %1.")
+                       .arg(!stored ? tr("the stored fiber could not be read")
+                            : !found ? tr("the stored fiber has no control point at %1 (the session's control point %2 is unsaved)")
+                                           .arg(vectorText(control.volumePoint)).arg(*index + 1)
+                            : !storedNormal ? tr("the stored control point carries no normal")
+                            : tr("the stored control point carries %1 instead of %2")
+                                  .arg(vectorText(*storedNormal), vectorText(*control.displayNormal))));
+            return;
+        }
+    }
+    Logger()->info("Line annotation: normal on control point {} confirmed 30 s after the edit: shown ({:.1f} degrees from the "
+                   "stored normal) and saved", *index + 1, shownAngle);
+    session.pendingNormalCheck.reset();
 }
 
 bool LineAnnotationController::prepareSessionForControlPlacement(
@@ -6408,6 +6665,7 @@ std::optional<size_t> LineAnnotationController::placeControlInSession(
     // made superseded-solve merging impossible. Only the solve bookkeeping
     // at the end differs by mode.
     const auto updateStart = Clock::now();
+    const bool normalEdit = edit.displayNormal.has_value() && edit.manualDisplayNormal;
     vc3d::line_annotation::PreparedControlPointEdit prepared;
     try {
         const int initialCenterlineLengthVx = pane->dialog
@@ -6574,6 +6832,20 @@ std::optional<size_t> LineAnnotationController::placeControlInSession(
     session.solveQueue.addPending(prepared.dirtySegmentIndices, false);
     if (autoReoptimize) {
         scheduleSolveDispatch(session);
+        // A normal set by hand is shown at once, on the provisional geometry:
+        // the re-trace can take a long time, and until it lands the views
+        // would show the old normal as if the edit were lost. The landing
+        // rebuilds them again on the final geometry.
+        if (normalEdit && !session.suppressGeneratedViews) {
+            materializeGeneratedViews(session, stillValid);
+            if (!alive || (stillValid && !stillValid())) {
+                return std::nullopt;
+            }
+            pane = paneForSurface(surfaceName);
+            if (!pane || pane->session != owned) {
+                return std::nullopt;
+            }
+        }
     } else if (!session.suppressGeneratedViews &&
                session.taskState != LineAnnotationSession::TaskState::Running) {
         // Manual mode has no landing to publish the spliced line into the
@@ -8308,6 +8580,15 @@ void LineAnnotationController::handleGeneratedControlPointDelete(const std::stri
         if (size_t(deletedControlIndex) + 1 < session.controlPoints.size()) dirty.push_back(size_t(deletedControlIndex));
         const std::array<size_t, 1> touched{size_t(deletedControlIndex)};
         if (refuseLockedEdit(session, dirty, touched)) return;
+        // A free lock control can be corrected, but the open piece is defined by its two ends.
+        if (session.pieceLock.openedControls &&
+            (session.pieceLock.openedControls->first == size_t(deletedControlIndex) ||
+             session.pieceLock.openedControls->second == size_t(deletedControlIndex)) &&
+            vc3d::line_annotation::isLockControl(*selected)) {
+            showError(tr("This edit is refused: control point %1 bounds the open piece; it can be moved but not deleted.")
+                          .arg(deletedControlIndex + 1), session.suppressErrorDialogs);
+            return;
+        }
     }
     if (!confirmLinkedControlPointEdit(session,
                                        deletedControlIndex,
@@ -8939,6 +9220,29 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     if (!ensureDatasetForSession(session, true, stillValid)) return false;
     if (stillValid && !stillValid()) return false;
     const double traceToNormalBase = session.fiberTraceToBaseScale * session.workingToBaseScale;
+    {
+        // Stated once per change: which data the trace reads and at which
+        // scale the annotation's coordinates are mapped into it.
+        const auto shapeText = [](const std::optional<std::array<std::size_t, 3>>& shape) {
+            return shape ? "[" + std::to_string((*shape)[0]) + ", " + std::to_string((*shape)[1]) + ", " +
+                               std::to_string((*shape)[2]) + "]" : std::string("unknown");
+        };
+        const std::string statement =
+            "volume shown '" + (_state ? _state->currentVolumeId() : std::string()) + "' shape zyx " + shapeText(annotationShapeZYX(_state)) +
+            "; fiber prediction '" + session.selectedFiberInferenceDatasetLocation + "' base shape zyx " +
+            shapeText(session.fiberInferenceDataset->manifest().baseShapeZYX) + ", its working-to-base scale " +
+            std::to_string(session.fiberInferenceDataset->manifest().workingToBaseScale) +
+            ", annotation-to-trace scale 1/" + std::to_string(session.fiberTraceToBaseScale) +
+            "; normals '" + session.selectedDatasetLocation + "' (" + (session.usingFiberNormals ? "fiber prediction" : "Lasagna") +
+            ") base shape zyx " + shapeText(session.dataset ? session.dataset->manifest().baseShapeZYX : std::nullopt) +
+            ", annotation-to-normal scale " + std::to_string(session.workingToBaseScale) +
+            ", trace-to-normal scale " + std::to_string(traceToNormalBase);
+        static std::string last;
+        if (statement != last) {
+            last = statement;
+            Logger()->info("Line annotation trace inputs: {}", statement);
+        }
+    }
     if (!session.traceNormalDataset || !session.traceNormalSampler ||
         session.traceNormalDatasetLocation != session.selectedDatasetLocation ||
         !approximatelyEqual(
@@ -12035,6 +12339,24 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
                 normals.push_back(solver.normals[nearest]);
                 distances.push_back(best);
             }
+            // The solve read the annotated line only (first to last control
+            // point). The session's line also carries the extrapolated tails
+            // past its end controls, which can be most of its points after a
+            // re-trace and lie nowhere near the solve's line: they take the
+            // nearest normal like every point, but only the annotated part
+            // says whether this is the line the solve read.
+            if (!session.controlPoints.empty()) {
+                double firstControl = std::numeric_limits<double>::infinity(), lastControl = -firstControl;
+                for (const auto& control : session.controlPoints) {
+                    firstControl = std::min(firstControl, control.linePosition);
+                    lastControl = std::max(lastControl, control.linePosition);
+                }
+                const auto count = distances.size();
+                const std::size_t from = std::min(count - 1, std::size_t(std::max(0.0, std::floor(firstControl))));
+                const std::size_t to = std::min(count - 1, std::size_t(std::max(0.0, std::ceil(lastControl))));
+                if (to >= from) distances = std::vector<float>(distances.begin() + std::ptrdiff_t(from),
+                                                               distances.begin() + std::ptrdiff_t(to) + 1);
+            }
             std::nth_element(distances.begin(), distances.begin() + distances.size() / 2, distances.end());
             // Half of the line within 64 voxels of the solve's: the same frame.
             if (distances[distances.size() / 2] <= 64.f * 64.f) return normals;
@@ -12182,10 +12504,27 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         const bool underSolveReview = session.fiberId != 0 && _solverLineNormals.contains(session.fiberId);
         if (hasManualNormals || underSolveReview)
             viewConfig.displayPointNormals = session.displayField.normals;
+        // What was set by hand is what is shown at its control point, and
+        // the correction ends at the control points next to it (the display
+        // field blends to their own normal there): those three are held, so
+        // the strip's smoothing neither flattens the set normal nor carries
+        // it past its neighbours.
+        for (size_t i = 0; i < session.controlPoints.size(); ++i) {
+            if (!session.controlPoints[i].displayNormal) continue;
+            if (i > 0) viewConfig.pinnedNormalLinePositions.push_back(session.controlPoints[i - 1].linePosition);
+            viewConfig.pinnedNormalLinePositions.push_back(session.controlPoints[i].linePosition);
+            if (i + 1 < session.controlPoints.size())
+                viewConfig.pinnedNormalLinePositions.push_back(session.controlPoints[i + 1].linePosition);
+        }
         // Only lineUpVectors is consumed below; skip the per-line-point
         // PlaneSurface allocations.
         viewConfig.buildLineZSlices = false;
         views = vc::lasagna::buildLineViewSurfaces(displayLine, viewConfig);
+        session.shownLineNormals = views.lineUpVectors;
+        session.shownLineNormalsRevision = session.lineRevision;
+        // Deferred: the check can show a modal, which must not run inside this rebuild.
+        if (session.pendingNormalCheck)
+            QTimer::singleShot(0, this, [this, surfaceName = session.surfaceName]() { verifyNormalCheck(surfaceName, true); });
     } catch (const std::exception& ex) {
         session.error = ex.what();
         showError(tr("Could not create line annotation views: %1")
@@ -18054,9 +18393,12 @@ void LineAnnotationController::buildFiberCommitOperations(FiberCommitJob& job, c
                     snapshot.pieceCheck->openedStored->first, snapshot.pieceCheck->openedStored->second,
                     request.author, QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString());
                 if (!crops.empty()) {
-                    std::vector<ExtensionRow> values;
-                    for (const auto& crop : crops) values.push_back(fiberPieceApprovalRow(crop));
-                    operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(values)});
+                    auto values = fiberPieceApprovalRows(crops);
+                    operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(values.approvals)});
+                    if (!values.normals.empty()) {
+                        operations.push_back(CreateExtensionTableOp{fiberPieceNormalsTable()});
+                        operations.push_back(AppendExtensionRowsOp{kFiberPieceNormalsTable, std::move(values.normals)});
+                    }
                 }
             }
         }
@@ -18087,7 +18429,7 @@ void LineAnnotationController::buildFiberCommitOperations(FiberCommitJob& job, c
     // new fiber that received all of the piece's control points (the slice is
     // geometrically identical at this commit); a piece cut by a split is lost.
     if (!retired.empty()) {
-        std::vector<ExtensionRow> copies;
+        std::vector<FiberPieceApproval> copies;
         const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
         for (const auto& old : retired) {
             const auto rows = liveFiberPieceApprovals(readFiberPieceApprovals(reader, old.uuid));
@@ -18113,17 +18455,32 @@ void LineAnnotationController::buildFiberCommitOperations(FiberCommitJob& job, c
                     const auto childRange = fiberPieceRange(*carry.content, remap.at(row.lockCpA),
                         row.lockCpB ? std::optional<int64_t>(remap.at(*row.lockCpB)) : std::nullopt, remap.at(row.insideCp));
                     if (!childRange) continue;
+                    // A normals approval takes its stored normals along; one
+                    // that has none (or whose spans no longer match) approved
+                    // nothing and is not copied.
+                    std::vector<vc::geometry::Point> lineNormals;
+                    if (row.aspect == FiberPieceAspect::Normals) {
+                        lineNormals = fiberPieceLineNormals(*carry.content, row, remap);
+                        if (lineNormals.empty()) break;
+                    }
                     auto copy = approveFiberPiece(*carry.content, childUuid, *childRange, row.aspect, 1,
-                                                  row.author, row.approvedAt, row.host);
+                                                  row.author, row.approvedAt, row.host, lineNormals);
                     copy.approvalUuid = row.approvalUuid;
                     copy.changedBy = request.author;
                     copy.changedAt = now;
-                    copies.push_back(fiberPieceApprovalRow(copy));
+                    copies.push_back(std::move(copy));
                     break;
                 }
             }
         }
-        if (!copies.empty()) operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(copies)});
+        if (!copies.empty()) {
+            auto values = fiberPieceApprovalRows(copies);
+            operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(values.approvals)});
+            if (!values.normals.empty()) {
+                operations.push_back(CreateExtensionTableOp{fiberPieceNormalsTable()});
+                operations.push_back(AppendExtensionRowsOp{kFiberPieceNormalsTable, std::move(values.normals)});
+            }
+        }
     }
     std::set<std::string> retiredUuids;
     for (const auto& fiber : retired) retiredUuids.insert(fiber.uuid);
@@ -18438,8 +18795,9 @@ void LineAnnotationController::pushPieceDisplayToDialog(LineAnnotationSession& s
     for (auto& pane : _panes) {
         if (pane.session.get() != &session || !pane.dialog) continue;
         std::vector<size_t> lockControls;
-        for (size_t i = 0; i < session.pieceLock.lockedControls.size(); ++i)
-            if (session.pieceLock.lockedControls[i]) lockControls.push_back(i);
+        // Every lock-tagged control is marked, held by an approval or not.
+        for (size_t i = 0; i < session.controlPoints.size(); ++i)
+            if (la::isLockControl(session.controlPoints[i])) lockControls.push_back(i);
         pane.dialog->setPieceLockDisplay(
             la::pieceDisplayRanges(session.pieceLock, session.controlPoints, session.optimizedLine.points.size()),
             lockControls, la::pieceApprovalBoxState(session.pieceLock),
@@ -18487,9 +18845,19 @@ std::optional<QString> LineAnnotationController::setFiberPieceApproval(uint64_t 
     auto request = connection->newRequest(attachment);
     const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
     const std::string host = QSysInfo::machineHostName().toStdString();
-    std::vector<ExtensionRow> values;
+    std::vector<FiberPieceApproval> approvalRows;
     std::optional<ObjectRevision> revision;
     QString error;
+    // Approving normals stores the normals the views show right now, one per
+    // line point of the saved fiber.
+    std::vector<vc::geometry::Point> shownNormals;
+    if (approved && aspect == FiberPieceAspect::Normals) {
+        if (session.shownLineNormalsRevision != session.lineRevision ||
+            session.shownLineNormals.size() != session.optimizedLine.points.size())
+            return tr("The views do not show the normals of the line as it is now; wait for them to rebuild and approve again.");
+        shownNormals.reserve(session.shownLineNormals.size());
+        for (const auto& normal : session.shownLineNormals) shownNormals.push_back({normal[0], normal[1], normal[2]});
+    }
     connection->readStore(attachment, [&](const StoreReader& reader, const auto&) {
         const auto revisions = reader.objectsAtVersions({session.storePin->reference()});
         if (revisions.empty() || !revisions.front() || revisions.front()->deleted) { error = tr("The fiber's saved version cannot be read."); return; }
@@ -18499,24 +18867,39 @@ std::optional<QString> LineAnnotationController::setFiberPieceApproval(uint64_t 
         const auto range = la::openedPieceRange(session.pieceLock, session.controlPoints, content);
         if (!range) { error = tr("The piece's lock control points are not in the saved fiber."); return; }
         if (approved) {
-            for (const auto& crop : cropFiberPieceApprovals(content, live, range->first, range->last, request.author, now))
-                values.push_back(fiberPieceApprovalRow(crop));
-            values.push_back(fiberPieceApprovalRow(approveFiberPiece(content, session.fiberUuid, *range, aspect,
-                                                                     revision->version, request.author, now, host)));
+            if (aspect == FiberPieceAspect::Normals && shownNormals.size() != content.linePoints.size()) {
+                error = tr("The saved fiber has %1 line points, the views show normals for %2.")
+                            .arg(content.linePoints.size()).arg(shownNormals.size());
+                return;
+            }
+            try {
+                auto row = approveFiberPiece(content, session.fiberUuid, *range, aspect, revision->version,
+                                             request.author, now, host, shownNormals);
+                for (auto& crop : cropFiberPieceApprovals(content, live, range->first, range->last, request.author, now))
+                    approvalRows.push_back(std::move(crop));
+                approvalRows.push_back(std::move(row));
+            } catch (const std::invalid_argument& ex) {
+                error = tr("The piece cannot be approved: %1").arg(QString::fromUtf8(ex.what()));
+            }
         } else {
             for (const auto& row : live) {
                 if (row.aspect != aspect) continue;
                 const auto covered = fiberPieceRange(content, row);
                 if (covered && covered->first <= range->first && covered->last >= range->last)
-                    values.push_back(fiberPieceApprovalRow(revokeFiberPieceApproval(row, request.author, now)));
+                    approvalRows.push_back(revokeFiberPieceApproval(row, request.author, now));
             }
-            if (values.empty()) error = tr("The piece carries no approval to revoke.");
+            if (approvalRows.empty()) error = tr("The piece carries no approval to revoke.");
         }
     });
     if (!error.isEmpty()) return error;
     expectObject(request, *revision);
+    auto values = fiberPieceApprovalRows(approvalRows);
     request.operations.push_back(CreateExtensionTableOp{fiberPieceApprovalTable()});
-    request.operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(values)});
+    request.operations.push_back(AppendExtensionRowsOp{kFiberPieceApprovalTable, std::move(values.approvals)});
+    if (!values.normals.empty()) {
+        request.operations.push_back(CreateExtensionTableOp{fiberPieceNormalsTable()});
+        request.operations.push_back(AppendExtensionRowsOp{kFiberPieceNormalsTable, std::move(values.normals)});
+    }
     try {
         connection->submitDurably(attachment, request);
     } catch (const std::exception& ex) {

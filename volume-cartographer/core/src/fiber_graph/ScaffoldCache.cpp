@@ -29,7 +29,9 @@ std::string scaffoldNormalInputs(const ScaffoldNormalOptions& options, const std
 {
     Statement s;
     // 2: axis targets oriented by continuity along the fiber (FiberStripNormals.cpp).
-    s.words("normals", "2");
+    // 3: annotated normals are axes without a facing; an approved stretch
+    //    holds every node and comes out with its stored normals.
+    s.words("normals", "3");
     // Rows solved on the whole line (tails included) never match.
     s.words("line", "annotated");
     s.words("frame", frame);

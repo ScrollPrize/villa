@@ -55,13 +55,42 @@ consume approvals yet.
 Index `{fiber_uuid, aspect}`. Provisioning:
 `{"fingerprint":"fnv1a64-v1","aspects":{"geometry":0,"normals":1},"states":{"approved":1,"revoked":2}}`.
 
+### Approved normals: `ext_fiber_piece_normals`
+
+A normals approval approves the normals that were shown on the stretch, so it
+stores them: one row per approval row that carries normals, in a second table
+of the same extension.
+
+| column | type | meaning |
+| --- | --- | --- |
+| `fiber_uuid` | BLOB, key | owner fiber |
+| `row_uuid` | BLOB, key | the approval row these normals belong to |
+| `normals` | BLOB | uint64 span count; per span uint64 point count, then 3×float64 per line point |
+
+One list per covered span, in the row's walking order. Inside a span the
+normals run from the control with the lower stable id to the one with the
+higher id, both controls included, one per line point. A normal is a unit
+**axis**: the annotator approves the cross-section they see and cannot know
+which of its two sides faces outward, so its facing means nothing and every
+consumer resolves it itself. `readFiberPieceApprovals` returns each row with
+its normals attached (`FiberPieceApproval::spanNormals`);
+`fiberPieceApprovalRows` gives both tables' rows for a list of approvals.
+
+A normals row without stored normals (written before they were stored, or
+whose normals row is missing) approves nothing: its spans read as stale until
+the stretch is approved again.
+
 ## Fingerprints
 
 FNV-1a 64 over canonical little-endian bytes (`fnv1a64-v1`); the store
 (`fiberPieceContent(reader, revision)`) and VC3D's save snapshot
 (`pieceContentOfStoredFiber`) produce identical bytes.
 
-- **Span hash** (geometry aspect only): the span's line points, walked from the
+- **Span hash**, normals: the span's line points and then its approved
+  normals, both walked from the control with the lower stable id to the one
+  with the higher id (count first, 3×float64 each). A moved line point makes
+  the span's normals approval stale, as it does the geometry approval.
+- **Span hash**, geometry: the span's line points, walked from the
   control with the lower stable id to the one with the higher id (3×float64
   each, count first), then the canonical JSON of the owner's `segment_to_next`.
   Keyed by the unordered id pair, so reversing the fiber changes nothing.

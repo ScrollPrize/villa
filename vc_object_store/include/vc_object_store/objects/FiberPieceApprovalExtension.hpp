@@ -9,6 +9,7 @@
 #include "vc_object_store/objects/Extensions.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>
+#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -22,6 +23,9 @@ struct ObjectRevision;
 inline constexpr const char* kFiberPieceApprovalTable = "ext_fiber_piece_approval";
 inline constexpr const char* kFiberPieceApprovalExtension = "fiber-piece-approval";
 inline constexpr int64_t kFiberPieceApprovalFormat = 1;
+// The normals a normals approval was given for, one row per approval row.
+inline constexpr const char* kFiberPieceNormalsTable = "ext_fiber_piece_normals";
+inline constexpr int64_t kFiberPieceNormalsFormat = 1;
 // Control-point tag of a lock control point (the `tags` array of its annotation).
 inline constexpr const char* kFiberLockControlPointTag = "lock";
 
@@ -29,6 +33,7 @@ enum class FiberPieceAspect : int64_t { Geometry = 0, Normals = 1 };
 enum class FiberPieceState : int64_t { Approved = 1, Revoked = 2 };
 
 ExtensionTable fiberPieceApprovalTable();
+ExtensionTable fiberPieceNormalsTable();
 
 struct FiberSpanFingerprint {
     int64_t idLow = 0, idHigh = 0; // the span's two control-point ids, ordered
@@ -56,12 +61,31 @@ struct FiberPieceApproval {
     int64_t fiberVersion = 0;
     std::string author, approvedAt, host;
     std::optional<std::string> changedBy, changedAt; // who wrote a crop/revocation row
-    std::vector<FiberSpanFingerprint> spans;        // geometry aspect only
+    // Geometry: one per span. Normals: one per span over the span's line
+    // points and its approved normals; a normals row without them (written
+    // before the normals were stored) approves nothing and reads as stale.
+    std::vector<FiberSpanFingerprint> spans;
     std::vector<FiberControlFingerprint> controls;  // in walking order
+    // Normals aspect: the normal shown at every line point of each span when
+    // it was approved, as an axis (unit length, its facing means nothing).
+    // One list per span in walking order; inside a span from the control with
+    // the lower id to the one with the higher id, both controls included.
+    // Stored in `ext_fiber_piece_normals`, not in the approval row itself.
+    std::vector<std::vector<geometry::Point>> spanNormals;
     bool operator==(const FiberPieceApproval&) const = default;
 };
+// The approval row alone; decoding leaves `spanNormals` empty.
 ExtensionRow fiberPieceApprovalRow(const FiberPieceApproval&);
 FiberPieceApproval decodeFiberPieceApprovalRow(const ExtensionRow&);
+// The row of `ext_fiber_piece_normals` that belongs to an approval row, or
+// nullopt when it carries no normals. attach reads one back into its row.
+std::optional<ExtensionRow> fiberPieceNormalsRow(const FiberPieceApproval&);
+void attachFiberPieceNormals(FiberPieceApproval&, const ExtensionRow&);
+// Both tables' rows for a list of approval rows, as one append each.
+struct FiberPieceApprovalRows {
+    std::vector<ExtensionRow> approvals, normals;
+};
+FiberPieceApprovalRows fiberPieceApprovalRows(std::span<const FiberPieceApproval>);
 // Typed row blobs, exposed for other encoders (Python, tests).
 std::vector<uint8_t> encodeFiberSpanFingerprints(std::span<const FiberSpanFingerprint>);
 std::vector<FiberSpanFingerprint> decodeFiberSpanFingerprints(std::span<const uint8_t>);
@@ -110,6 +134,12 @@ uint64_t fiberControlHash(const FiberPieceContent&, size_t index, FiberPieceAspe
 // from the control with the lower id to the one with the higher id (stable
 // under fiber reversal, independent of the piece's walking direction).
 uint64_t fiberSpanHash(const FiberPieceContent&, size_t lower);
+// Normals aspect: the span's line points and the normals approved on them
+// (both walked from the lower control id to the higher). nullopt when the
+// span's controls are not on the line or the count of normals is not the
+// count of its line points.
+std::optional<uint64_t> fiberNormalsSpanHash(const FiberPieceContent&, size_t lower,
+                                             std::span<const geometry::Point> normals);
 struct FiberPieceFingerprints {
     std::vector<FiberSpanFingerprint> spans;
     std::vector<FiberControlFingerprint> controls;
@@ -135,6 +165,16 @@ struct FiberPieceApprovalStates {
     std::set<int64_t> releasableLockCpIds; // referenced by superseded rows only
 };
 FiberPieceApprovalStates fiberPieceApprovalStates(const FiberPieceContent&, std::span<const FiberPieceApproval>);
+// The approved normal at every line point of the content: the stored axis on
+// the spans approved for the normals aspect, zero everywhere else. Empty when
+// no span is approved.
+std::vector<geometry::Point> approvedFiberLineNormals(const FiberPieceContent&, const FiberPieceApprovalStates&);
+// The normals of a normals row laid out on the line points of another fiber
+// that received the row's control points (`controlIds` maps the row's control
+// ids to that fiber's), zero outside the piece. Empty when the row carries no
+// normals or a span does not have the same number of line points there.
+std::vector<geometry::Point> fiberPieceLineNormals(const FiberPieceContent& target, const FiberPieceApproval& row,
+                                                   const std::map<int64_t, int64_t>& controlIds);
 
 // The rows that crop every live row reaching into the opened control range
 // [openedFirst, openedLast]: a row sharing spans with it is replaced by its
@@ -147,10 +187,14 @@ std::vector<FiberPieceApproval> cropFiberPieceApprovals(const FiberPieceContent&
     std::span<const FiberPieceApproval> live, size_t openedFirst, size_t openedLast,
     const std::string& changedBy, const std::string& now);
 
-// A fresh approval row for the piece, fingerprinted over `content`.
+// A fresh approval row for the piece, fingerprinted over `content`. The
+// normals aspect approves `lineNormals`, the normal shown at every line point
+// of the content (only the piece's are read): it throws when they are not
+// one per line point or one inside the piece is zero or not finite.
 FiberPieceApproval approveFiberPiece(const FiberPieceContent&, const std::string& fiberUuid,
     const FiberPieceRange&, FiberPieceAspect, int64_t fiberVersion,
-    const std::string& author, const std::string& approvedAt, const std::string& host);
+    const std::string& author, const std::string& approvedAt, const std::string& host,
+    std::span<const geometry::Point> lineNormals = {});
 FiberPieceApproval revokeFiberPieceApproval(const FiberPieceApproval& live,
     const std::string& changedBy, const std::string& now);
 

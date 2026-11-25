@@ -49,6 +49,10 @@ struct ScaffoldFiber {
     objects::FiberPieceContent content;
     // The live piece-approval rows and the spans they currently cover.
     objects::FiberPieceApprovalStates approvals;
+    // The normal approved at each of this fiber's line points: the stored
+    // axis on the spans approved for the normals aspect, zero elsewhere.
+    // Empty when no span is approved.
+    std::vector<geometry::Point> approvedLineNormals;
 };
 
 // One annotation link between two fibers. Both anchors are the annotated

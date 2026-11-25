@@ -1,4 +1,6 @@
 #include "LineAnnotationDialog.hpp"
+#include <QGuiApplication>
+#include <QMetaMethod>
 #include "fibers3d/Fiber3DPanel.hpp"
 #include <QDockWidget>
 #include "vc/fiber_tracer/FiberDisplay.hpp"
@@ -1930,6 +1932,34 @@ void LineAnnotationDialog::setLineSolveActivity(bool running, bool pending)
     const bool changed = _lineSolveRunning != running || _lineSolvePending != pending;
     _lineSolveRunning = running;
     _lineSolvePending = pending;
+    // Say so while an edit's re-trace is running or queued: the strips keep
+    // their old geometry until it lands, and without this an edit looks lost.
+    if (auto* content = centralWidget()) {
+        if (!_lineSolveNotice) {
+            auto* notice = new QLabel(content);
+            notice->setObjectName(QStringLiteral("lineAnnotationLineSolveNotice"));
+            notice->setAttribute(Qt::WA_TransparentForMouseEvents, true);
+            notice->setAttribute(Qt::WA_StyledBackground, true);
+            notice->setAlignment(Qt::AlignCenter);
+            notice->setStyleSheet(QStringLiteral(
+                "#lineAnnotationLineSolveNotice { background-color: rgba(200, 120, 20, 220); color: white;"
+                " font-weight: 600; border-radius: 4px; padding: 4px 14px; }"));
+            notice->hide();
+            _lineSolveNotice = notice;
+        }
+        auto* notice = static_cast<QLabel*>(_lineSolveNotice.data());
+        if (running || pending) {
+            notice->setText(running && pending ? tr("Re-tracing after your edit… more edits queued. Your edits are kept; the strips update when it lands.")
+                            : running ? tr("Re-tracing after your edit… Your edit is kept; the strips update when it lands.")
+                                      : tr("Edit queued for re-tracing… Your edit is kept; the strips update when it lands."));
+            notice->adjustSize();
+            notice->move(std::max(0, (content->width() - notice->width()) / 2), 40);
+            notice->show();
+            notice->raise();
+        } else {
+            notice->hide();
+        }
+    }
     // Every geometry publish arrives BEFORE the controller's report on it
     // (a placement publishes its spliced controls, then queues the solve;
     // a landing publishes, then reports the solve finished), so a publish
@@ -2647,7 +2677,7 @@ bool LineAnnotationDialog::setGeneratedLineViews(
     GeneratedViews views,
     const CChunkedVolumeViewer::CameraState& camera)
 {
-    cancelCrossSectionDrag();
+    cancelCrossSectionDrag(tr("the views were rebuilt while it was pending"));
     if (!_viewerManager || !_layout || views.linePoints.empty() ||
         views.lineUpVectors.size() != views.linePoints.size() ||
         !views.lineSurface || !views.lineSideSlice ||
@@ -3881,7 +3911,8 @@ void LineAnnotationDialog::setCurrentLinePosition(double position,
     if (!currentChanged) {
         return;
     }
-    cancelCrossSectionDrag();
+    cancelCrossSectionDrag(tr("the current line position changed from %1 to %2 while it was pending (the cut follows "
+                              "the mouse over the strips, an arrow pan, or a navigation)").arg(_currentLinePosition).arg(position));
     if (currentChanged && _generatedViews.currentCutSurface) {
         _currentCutNormalOffsetVx = 0.0;
         _currentCutStraightAheadActive = false;
@@ -5111,7 +5142,7 @@ void LineAnnotationDialog::updateStaticStripOverlaysForPan()
 
 void LineAnnotationDialog::clearFastGeneratedOverlayItemRefs()
 {
-    cancelCrossSectionDrag();
+    cancelCrossSectionDrag(tr("the views' overlay items were replaced while it was pending"));
     _crossSectionDragPreview = nullptr;
     _fiberGuides = {};
     _fastStripOverlayItems.clear();
@@ -6115,7 +6146,7 @@ bool LineAnnotationDialog::event(QEvent* event)
 
 void LineAnnotationDialog::stopArrowPanForFocusLoss()
 {
-    cancelCrossSectionDrag();
+    cancelCrossSectionDrag(tr("the annotation window lost focus or was deactivated while it was pending"));
     // The key-up goes to whichever window took focus (Alt-Tab mid-hold), and
     // an inactive window must not keep rendering a pan at all: braking into
     // the next target can mean minutes of four-pane rendering at low speeds
@@ -6127,7 +6158,7 @@ void LineAnnotationDialog::stopArrowPanForFocusLoss()
 
 void LineAnnotationDialog::hideEvent(QHideEvent* event)
 {
-    cancelCrossSectionDrag();
+    cancelCrossSectionDrag(tr("the annotation window was hidden while it was pending"));
     QMainWindow::hideEvent(event);
     // Hiding the workspace in place (an embedding tab switch) fires no
     // activation change, and the key-up then goes elsewhere; a pan running in
@@ -6191,7 +6222,7 @@ bool LineAnnotationDialog::handleKeyPress(QKeyEvent* event)
         return false;
     }
     if (_crossSectionDrag) {
-        if (event->key() == Qt::Key_Escape) cancelCrossSectionDrag();
+        if (event->key() == Qt::Key_Escape) cancelCrossSectionDrag(tr("Escape was pressed"));
         event->accept();
         return true;
     }
@@ -6280,6 +6311,7 @@ bool LineAnnotationDialog::handleKeyRelease(QKeyEvent* event)
         return false;
     }
     if (_crossSectionDrag && event->key() == Qt::Key_Shift && !event->isAutoRepeat()) {
+        Logger()->info("Line annotation cross drag: Shift key-up received; mouse still down {}", _crossSectionDrag->mouseDown);
         // If the mouse is still down, its release will finish the last stroke.
         if (!_crossSectionDrag->mouseDown) finishCrossSectionDrag();
         event->accept();
@@ -6320,10 +6352,20 @@ bool LineAnnotationDialog::handleKeyRelease(QKeyEvent* event)
     return true;
 }
 
-void LineAnnotationDialog::cancelCrossSectionDrag()
+void LineAnnotationDialog::cancelCrossSectionDrag(const QString& discardedBecause)
 {
     cancelDirectionDrag();
     const bool wasDragging = _crossSectionDrag.has_value();
+    // A stroke the user made (committed to the preview, or still held) that
+    // is thrown away is said, with the reason.
+    if (wasDragging && !discardedBecause.isEmpty() &&
+        (_crossSectionDrag->changed || (_crossSectionDrag->mouseDown && _crossSectionDrag->moved))) {
+        Logger()->warn("Line annotation cross drag: discarded ({}); changed {} normalChanged {} mouseDown {}",
+                       discardedBecause.toStdString(), _crossSectionDrag->changed, _crossSectionDrag->normalChanged,
+                       _crossSectionDrag->mouseDown);
+        emit editGestureRefused(tr("The Shift-drag in the cross view"), tr("the pending drag was discarded because %1").arg(discardedBecause));
+    }
+    if (_crossSectionCommitPoll) _crossSectionCommitPoll->stop();
     _crossSectionDrag.reset();
     if (auto* item = dynamic_cast<QGraphicsPathItem*>(_crossSectionDragPreview.data()))
         item->hide();
@@ -6338,16 +6380,34 @@ void LineAnnotationDialog::cancelCrossSectionDrag()
     }
 }
 
+void LineAnnotationDialog::reportUnreceivedEditCommit(const QString& gesture, const QMetaMethod& commitSignal)
+{
+    if (_editCommitReceived) return;
+    const bool connected = isSignalConnected(commitSignal);
+    Logger()->warn("Line annotation: {} was committed but not received ({})", gesture.toStdString(),
+                   connected ? "the receiver did not acknowledge it" : "nothing is connected to the commit");
+    emit editGestureRefused(gesture, connected
+        ? tr("it was committed, but its receiver did not take it over")
+        : tr("it was committed, but nothing is connected to receive it (the window is not set up for editing)"));
+}
+
 void LineAnnotationDialog::finishCrossSectionDrag()
 {
     if (!_crossSectionDrag) return;
     const auto edit = *_crossSectionDrag;
+    Logger()->info("Line annotation cross drag: commit; changed {} normalChanged {} handle {} width {} line position {}",
+                   edit.changed, edit.normalChanged, edit.handle, edit.width, edit.linePosition);
     cancelCrossSectionDrag();
+    if (!edit.changed)
+        emit editGestureRefused(tr("The Shift-drag in the cross view"), tr("no stroke of it changed the cross-section (the mouse did not move, or every stroke was discarded)"));
     if (edit.changed) {
         const uint64_t token = recordPendingPlacement(cv::Vec3f(edit.center), edit.linePosition);
+        _editCommitReceived = false;
         emit crossSectionDragFinished(_generatedViews.currentCutName, cv::Vec3f(edit.center),
             edit.linePosition, cv::Vec3f(edit.lineAnchor), cv::Vec3f(edit.normal), edit.normalChanged);
         retirePendingPlacement(token);
+        reportUnreceivedEditCommit(tr("The Shift-drag in the cross view"),
+                                   QMetaMethod::fromSignal(&LineAnnotationDialog::crossSectionDragFinished));
     }
 }
 
@@ -6383,6 +6443,13 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
     const QPointF scene=view->mapToScene(mouse->pos());
     if (event->type()==QEvent::MouseButtonPress) {
         if (mouse->button()!=Qt::LeftButton || mouse->modifiers()!=Qt::ShiftModifier) return false;
+        // A read-only window has none of its edit signals connected.
+        if (_readOnly) {
+            emit editGestureRefused(tr("The direction drag in the strip"),
+                                    tr("this fiber is open read only; click \"Enable editing\" first (or check "
+                                       "\"Open fibers editable\" in the menu)"));
+            return true;
+        }
         if (_optimizationInputBlocked || !_hasGeneratedViews) return true;
         auto surface=strip==0 ? _generatedViews.lineSurface : _generatedViews.lineSideSlice;
         if (!surface) return true;
@@ -6457,13 +6524,18 @@ bool LineAnnotationDialog::handleDirectionDragEvent(QObject* watched, QEvent* ev
         const auto completed=drag;
         cancelDirectionDrag();
         if (result) {
+            _editCommitReceived = false;
             if (completed.createControl) {
                 const uint64_t token = recordPendingPlacement(completed.point, completed.linePosition);
                 emit controlDirectionCreated(completed.point, completed.linePosition,
                                              completed.lineAnchor, cv::Vec3f(*result));
                 retirePendingPlacement(token);
+                reportUnreceivedEditCommit(tr("The direction drag in the strip"),
+                                           QMetaMethod::fromSignal(&LineAnnotationDialog::controlDirectionCreated));
             } else {
                 emit controlDirectionChanged(index,cv::Vec3f(*result));
+                reportUnreceivedEditCommit(tr("The direction drag in the strip"),
+                                           QMetaMethod::fromSignal(&LineAnnotationDialog::controlDirectionChanged));
             }
         }
     }
@@ -6491,9 +6563,23 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
         if (_crossSectionDrag && _crossSectionDrag->mouseDown) return true;
         if (mouse->button() != Qt::LeftButton || mouse->modifiers() != Qt::ShiftModifier)
             return _crossSectionDrag.has_value();
-        if (!_hasGeneratedViews || _optimizationInputBlocked ||
-            !controlPointPlacementAllowedAt(_currentLinePosition) || !_generatedViews.currentCutSurface)
+        // A read-only window has none of its edit signals connected: the
+        // gesture would preview and then go nowhere.
+        if (_readOnly) {
+            emit editGestureRefused(tr("The Shift-drag in the cross view"), tr("this fiber is open read only; click \"Enable editing\" first (or check "
+                                            "\"Open fibers editable\" in the menu)"));
             return true;
+        }
+        if (!_hasGeneratedViews || _optimizationInputBlocked ||
+            !controlPointPlacementAllowedAt(_currentLinePosition) || !_generatedViews.currentCutSurface) {
+            emit editGestureRefused(tr("The Shift-drag in the cross view"), 
+                !_hasGeneratedViews ? tr("the views are not built yet")
+                : _optimizationInputBlocked ? tr("input is blocked while the line is being optimized")
+                : !_generatedViews.currentCutSurface ? tr("there is no cross-section plane at this position")
+                : tr("no control point may be placed at line position %1 (beyond a kollesis termination, inside a "
+                     "gap, or further than the extrapolation distance from every control point)").arg(_currentLinePosition));
+            return true;
+        }
         cancelArrowPan();
         CrossSectionDrag drag = _crossSectionDrag.value_or(CrossSectionDrag{});
         _lineUpdatePending = false;
@@ -6515,7 +6601,7 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
         const QPointF y = viewer->surfaceCoordsToScene(0, 1) - zero;
         bool invertible = false;
         const auto inverse = QTransform(x.x(), x.y(), y.x(), y.y(), 0, 0).inverted(&invertible);
-        if (!invertible) return true;
+        if (!invertible) { emit editGestureRefused(tr("The Shift-drag in the cross view"), tr("the cross view's scene transform cannot be inverted")); return true; }
         // The image plane stays fixed between strokes, even though the preview
         // axis/normal have rotated. Convert the mouse with that original plane.
         const cv::Vec3d planeX = _generatedViews.currentCutSurface->basisX();
@@ -6523,7 +6609,10 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
         drag.sceneX = planeX * inverse.m11() + planeY * inverse.m12();
         drag.sceneY = planeX * inverse.m21() + planeY * inverse.m22();
         if (!std::isfinite(cv::norm(drag.center)) || !std::isfinite(cv::norm(drag.sceneX)) ||
-            !std::isfinite(cv::norm(drag.sceneY))) return true;
+            !std::isfinite(cv::norm(drag.sceneY))) {
+            emit editGestureRefused(tr("The Shift-drag in the cross view"), tr("the line point or the cross-section plane at this position is not finite"));
+            return true;
+        }
         double best = std::numeric_limits<double>::infinity();
         for (int handle : {0, -1, 1}) {
             if (handle && drag.width <= 0) continue;
@@ -6537,6 +6626,8 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
                 drag.edgeScene = viewer->volumeToScene(cv::Vec3f(point));
             }
         }
+        Logger()->info("Line annotation cross drag: stroke started; handle {} (0 centre, -1/+1 edges) width {} line position {}",
+                       drag.handle, drag.width, drag.linePosition);
         _crossSectionDrag = drag;
         updateFiberDisplayControlsAndGuides();
         view->setFocus(Qt::MouseFocusReason);
@@ -6552,6 +6643,12 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
     const auto result = vc::fiber_tracer::dragFiberWidth(drag.center, drag.normal, drag.axis,
         drag.planeNormal, drag.width, drag.handle, drag.sceneX * offset.x() + drag.sceneY * offset.y());
     if (event->type() == QEvent::MouseButtonRelease) {
+        Logger()->info("Line annotation cross drag: stroke released; handle {} width {} moved {} applied {} shift still held {}",
+                       drag.handle, drag.width, drag.moved, bool(result), mouse->modifiers().testFlag(Qt::ShiftModifier));
+        if (!result && drag.moved)
+            emit editGestureRefused(tr("The Shift-drag in the cross view"), drag.handle != 0
+                ? tr("this stroke gives no direction (the dragged edge was dropped on the opposite edge); it was discarded")
+                : tr("this stroke could not be applied to the cross-section; it was discarded"));
         if (result && drag.moved) {
             drag.center = result->center;
             drag.normal = result->normal;
@@ -6562,7 +6659,26 @@ bool LineAnnotationDialog::handleCrossSectionDragEvent(QObject* watched, QEvent*
         drag.mouseDown = false;
         if (QWidget::mouseGrabber() == view->viewport()) view->viewport()->releaseMouse();
         if (!mouse->modifiers().testFlag(Qt::ShiftModifier)) finishCrossSectionDrag();
-        else drawCrossSectionDragPreview({drag.center, drag.normal, drag.axis, drag.width});
+        else {
+            drawCrossSectionDragPreview({drag.center, drag.normal, drag.axis, drag.width});
+            // Shift is still held: the key-up commits. It can be delivered
+            // to another widget, so the keyboard itself is watched as well.
+            if (!_crossSectionCommitPoll) {
+                _crossSectionCommitPoll = new QTimer(this);
+                _crossSectionCommitPoll->setInterval(100);
+                connect(_crossSectionCommitPoll, &QTimer::timeout, this, [this] {
+                    if (!_crossSectionDrag || _crossSectionDrag->mouseDown) return;
+                    if (QGuiApplication::queryKeyboardModifiers().testFlag(Qt::ShiftModifier)) return;
+                    auto* focus = QApplication::focusWidget();
+                    Logger()->warn("Line annotation cross drag: Shift is up but its key-up did not reach the annotation window "
+                                   "(focus widget: {} '{}'); committing the pending drag",
+                                   focus ? focus->metaObject()->className() : "none",
+                                   focus ? focus->objectName().toStdString() : std::string());
+                    finishCrossSectionDrag();
+                });
+            }
+            _crossSectionCommitPoll->start();
+        }
         return true;
     }
     if (!result) {

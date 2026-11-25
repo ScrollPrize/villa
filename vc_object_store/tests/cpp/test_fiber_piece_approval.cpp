@@ -5,6 +5,8 @@
 #include "vc_object_store/objects/FiberPieceApprovalExtension.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <algorithm>
+#include <cmath>
+#include <map>
 #include <iostream>
 #include <nlohmann/json.hpp>
 
@@ -41,11 +43,26 @@ FiberPieceRange range(const FiberPieceContent& content, int64_t a, std::optional
     return *r;
 }
 
+// A normal per line point that turns around the fiber (the x axis) with x, so
+// every line point's is its own.
+std::vector<vc::geometry::Point> shownNormals(const FiberPieceContent& content)
+{
+    std::vector<vc::geometry::Point> normals;
+    for (const auto& point : content.linePoints) normals.push_back({0.0, std::cos(0.02 * point[0]), std::sin(0.02 * point[0])});
+    return normals;
+}
+
+bool near(const vc::geometry::Point& a, const vc::geometry::Point& b)
+{
+    return std::abs(a[0] - b[0]) < 1e-12 && std::abs(a[1] - b[1]) < 1e-12 && std::abs(a[2] - b[2]) < 1e-12;
+}
+
 FiberPieceApproval approve(const FiberPieceContent& content, int64_t a, std::optional<int64_t> b, int64_t inside,
                            Aspect aspect = Aspect::Geometry, const char* author = "alice")
 {
+    const auto normals = aspect == Aspect::Normals ? shownNormals(content) : std::vector<vc::geometry::Point>{};
     return approveFiberPiece(content, "40000000-0000-4000-8000-000000000001", range(content, a, b, inside), aspect,
-                             3, author, "2026-11-17T10:00:00Z", "host-a");
+                             3, author, "2026-11-17T10:00:00Z", "host-a", normals);
 }
 
 FiberPieceContent reversed(const FiberPieceContent& source)
@@ -126,9 +143,13 @@ int main() try
         auto normal = content; normal.annotations[4]["display_normal"] = {0.0, 0.0, 1.0}; normal.annotations[4]["display_normal_source"] = "manual";
         require(approve(normal, 40, 60, 50).controls == base.controls, "display normals are not in the geometry hash");
         const auto normalsBase = approve(content, 40, 60, 50, Aspect::Normals), normalsRow = approve(normal, 40, 60, 50, Aspect::Normals);
-        require(normalsBase.spans.empty() && normalsRow.controls[1].hash != normalsBase.controls[1].hash &&
-                normalsRow.controls[0] == normalsBase.controls[0], "normals aspect hashes display normals only");
-        require(approve(moved, 40, 60, 50, Aspect::Normals).controls == normalsBase.controls, "geometry edits leave normals hashes alone");
+        require(normalsBase.spans.size() == 2 && normalsBase.spanNormals.size() == 2 &&
+                normalsRow.controls[1].hash != normalsBase.controls[1].hash &&
+                normalsRow.controls[0] == normalsBase.controls[0], "normals aspect hashes the controls' display normals");
+        const auto movedNormals = approve(moved, 40, 60, 50, Aspect::Normals);
+        require(movedNormals.controls == normalsBase.controls, "geometry edits leave the normals control hashes alone");
+        require(movedNormals.spans[1].hash != normalsBase.spans[1].hash && movedNormals.spans[0] == normalsBase.spans[0],
+                "a moved line point changes exactly its normals span");
         // Reversal of the whole fiber leaves every fingerprint unchanged.
         const auto mirror = reversed(content);
         const auto mirrored = approve(mirror, 40, 60, 50);
@@ -193,6 +214,78 @@ int main() try
         require(states.rowCurrent[0] && states.approvedSpans[0] == std::vector<size_t>{5, 6} && !states.spans[0][7].row,
                 "growth past an end piece is uncovered while the piece stays current");
     }
+    // A normals approval stores the normals it was given for.
+    {
+        auto content = fixture();
+        for (size_t i : {3, 5}) tag(content, i, kFiberLockControlPointTag);
+        const auto shown = shownNormals(content);
+        const auto row = approve(content, 40, 60, 50, Aspect::Normals); // spans 3 and 4, line points 30..50
+        require(row.spanNormals.size() == 2 && row.spanNormals[0].size() == 11 && row.spanNormals[1].size() == 11,
+                "one normal per line point of each span, both controls included");
+        require(near(row.spanNormals[0].front(), shown[30]) && near(row.spanNormals[1].back(), shown[50]), "stored from the lower control id");
+        std::vector<FiberPieceApproval> rows{row};
+        auto states = fiberPieceApprovalStates(content, rows);
+        require(states.approvedSpans[1] == std::vector<size_t>{3, 4}, "the stored normals approve their spans");
+        auto line = approvedFiberLineNormals(content, states);
+        require(line.size() == content.linePoints.size(), "one approved normal per line point");
+        for (size_t i = 0; i < line.size(); ++i)
+            require(near(line[i], i >= 30 && i <= 50 ? shown[i] : vc::geometry::Point{0.0, 0.0, 0.0}),
+                    "the approved normals are the shown ones inside the piece and absent outside");
+        // The two tables' rows round-trip together.
+        const auto normalsRow = fiberPieceNormalsRow(row);
+        require(normalsRow.has_value(), "a normals approval has a normals row");
+        auto decoded = decodeFiberPieceApprovalRow(fiberPieceApprovalRow(row));
+        require(decoded.spanNormals.empty() && decoded.spans == row.spans, "the approval row alone carries the fingerprints");
+        require(fiberPieceApprovalStates(content, std::vector<FiberPieceApproval>{decoded}).approvedSpans[1].empty(),
+                "a normals row without its normals approves nothing");
+        attachFiberPieceNormals(decoded, *normalsRow);
+        require(decoded == row, "the normals row restores the approval");
+        require(!fiberPieceNormalsRow(approve(content, 40, 60, 50)).has_value(), "a geometry approval has no normals row");
+        const auto both = fiberPieceApprovalRows(std::vector<FiberPieceApproval>{row, approve(content, 40, 60, 50)});
+        require(both.approvals.size() == 2 && both.normals.size() == 1, "normals rows only for the rows that carry normals");
+        // A normals row written before the normals were stored: no span fingerprints.
+        auto legacy = row; legacy.spans.clear(); legacy.spanNormals.clear();
+        require(decodeFiberPieceApprovalRow(fiberPieceApprovalRow(legacy)) == legacy, "an old normals row still reads");
+        require(fiberPieceApprovalStates(content, std::vector<FiberPieceApproval>{legacy}).approvedSpans[1].empty(),
+                "an old normals row is stale: it says nothing about the stretch");
+        // The line moved since: exactly that span is stale.
+        auto moved = content; moved.linePoints[45][1] = 0.5;
+        states = fiberPieceApprovalStates(moved, rows);
+        require(states.approvedSpans[1] == std::vector<size_t>{3}, "a moved line point makes its normals span stale");
+        line = approvedFiberLineNormals(moved, states);
+        require(near(line[40], shown[40]) && near(line[41], vc::geometry::Point{0.0, 0.0, 0.0}), "a stale span's normals are not used");
+        // Reversal of the fiber: the same normals on the same points.
+        const auto mirror = reversed(content);
+        states = fiberPieceApprovalStates(mirror, rows);
+        require(states.approvedSpans[1] == std::vector<size_t>{2, 3}, "the stored normals survive a reversal");
+        line = approvedFiberLineNormals(mirror, states);
+        for (size_t i = 0; i < line.size(); ++i) {
+            const size_t source = line.size() - 1 - i;
+            require(near(line[i], source >= 30 && source <= 50 ? shown[source] : vc::geometry::Point{0.0, 0.0, 0.0}),
+                    "a reversed fiber has each normal on its own point");
+        }
+        // Copy onto a fiber that received the piece's controls under new ids.
+        auto child = content;
+        std::map<int64_t, int64_t> ids;
+        for (size_t i = 0; i < child.controlIds.size(); ++i) { ids[content.controlIds[i]] = 1000 - content.controlIds[i]; child.controlIds[i] = 1000 - content.controlIds[i]; }
+        const auto carried = fiberPieceLineNormals(child, row, ids);
+        require(carried.size() == child.linePoints.size(), "the normals lay out on the receiving fiber");
+        for (size_t i = 30; i <= 50; ++i) require(near(carried[i], shown[i]), "each on the line point it was approved on");
+        const auto copy = approveFiberPiece(child, "40000000-0000-4000-8000-000000000002", range(child, ids[40], ids[60], ids[50]),
+                                            Aspect::Normals, 1, "alice", "t", "h", carried);
+        require(fiberPieceApprovalStates(child, std::vector<FiberPieceApproval>{copy}).approvedSpans[1] == std::vector<size_t>{3, 4},
+                "the copy approves the same stretch");
+        require(fiberPieceLineNormals(child, legacy, ids).empty(), "a row without normals has none to copy");
+        // What cannot be approved.
+        mustFail([&] { approveFiberPiece(content, row.fiberUuid, range(content, 40, 60, 50), Aspect::Normals, 3, "a", "t", "h"); });
+        auto missing = shown; missing[40] = {0.0, 0.0, 0.0};
+        mustFail([&] { approveFiberPiece(content, row.fiberUuid, range(content, 40, 60, 50), Aspect::Normals, 3, "a", "t", "h", missing); });
+        missing[40] = shown[40]; missing[10] = {0.0, 0.0, 0.0};
+        require(approveFiberPiece(content, row.fiberUuid, range(content, 40, 60, 50), Aspect::Normals, 3, "a", "t", "h", missing).spans == row.spans,
+                "only the piece's normals are read");
+        auto wrong = row; wrong.spanNormals.pop_back();
+        mustFail([&] { fiberPieceApprovalRow(wrong); });
+    }
     // Cropping at the first edit of a neighbouring piece.
     {
         auto content = fixture();
@@ -219,7 +312,11 @@ int main() try
         const auto revokedC = find(c.approvalUuid);
         require(revokedC.state == FiberPieceState::Revoked && revokedC.supersedes == c.rowUuid && revokedC.author == "carol",
                 "a row entirely inside the opened range is revoked");
-        require(find(n.approvalUuid).aspect == Aspect::Normals && find(n.approvalUuid).spans.empty(), "normals rows are cropped alike");
+        const auto croppedN = find(n.approvalUuid);
+        require(croppedN.aspect == Aspect::Normals && croppedN.spans.size() == 4 && croppedN.spanNormals.size() == 4 &&
+                std::equal(croppedN.spans.begin(), croppedN.spans.end(), n.spans.begin()) &&
+                std::equal(croppedN.spanNormals.begin(), croppedN.spanNormals.end(), n.spanNormals.begin()),
+                "a cropped normals row keeps the normals of its remaining spans");
         std::vector<FiberPieceApproval> all{a, c, n};
         all.insert(all.end(), crops.begin(), crops.end());
         auto states = fiberPieceApprovalStates(content, all);
@@ -290,8 +387,28 @@ int main() try
             const auto values = fiberPieceApprovalRow(row);
             store.appendExtensionRows(txn, kFiberPieceApprovalTable, std::span<const ExtensionRow>(&values, 1));
         });
+        FiberPieceApproval normalsApproval;
+        storeReader(db, [&](const StoreReader& reader, const auto&) {
+            const auto revision = reader.currentObject(uuid);
+            const auto read = fiberPieceContent(reader, *revision);
+            normalsApproval = approveFiberPiece(read, uuid, range(read, 40, 60, 50), Aspect::Normals, revision->version,
+                                                "alice", "2026-11-17T10:00:00Z", "host-a", shownNormals(read));
+        });
+        storeAct(db, {}, [&](auto& store, auto& txn) {
+            const auto values = fiberPieceApprovalRows(std::span<const FiberPieceApproval>(&normalsApproval, 1));
+            store.appendExtensionRows(txn, kFiberPieceApprovalTable, values.approvals);
+            store.createExtensionTable(txn, fiberPieceNormalsTable());
+            store.appendExtensionRows(txn, kFiberPieceNormalsTable, values.normals);
+        });
         storeRead(db, [&](const auto& store, const auto& txn, const auto&) {
-            const auto rows = readFiberPieceApprovals(store, txn, uuid);
+            auto rows = readFiberPieceApprovals(store, txn, uuid);
+            const auto stored = std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.rowUuid == normalsApproval.rowUuid; });
+            require(rows.size() == 2 && stored != rows.end() && *stored == normalsApproval, "a normals approval reads back with its normals");
+            const LocalStoreReader local(store, txn);
+            require(readFiberPieceApprovals(local, uuid) == rows, "and the same through a store reader");
+            require(fiberPieceApprovalStates(fiberPieceContent(local, *local.currentObject(uuid)), rows).approvedSpans[1] ==
+                    std::vector<size_t>{3, 4}, "the stored normals are current against the stored fiber");
+            rows.erase(stored);
             require(rows.size() == 1 && rows[0] == row, "the row reads back by fiber");
             require(readFiberPieceApprovals(store, txn, util::newUuid()).empty(), "other fibers have no rows");
             const LocalStoreReader reader(store, txn);

@@ -73,7 +73,15 @@ struct PieceLockState {
     bool firstEditDone = false;
     // Inclusive session control index range of the open piece.
     std::optional<std::pair<size_t, size_t>> openedControls;
-    std::vector<bool> lockedControls;    // per control: fixed in position, direction and tags
+    // Per control: fixed in position, direction and tags. A lock control is
+    // fixed for the sake of an approved stretch that ends on it: with a piece
+    // open, the stretch on the control's other side; opened normally, either
+    // side. A lock control no current approval depends on can be corrected.
+    std::vector<bool> lockedControls;
+    // Per span: the free lock control bounding the open piece whose move may
+    // change this span, the one just outside the piece on that side. The span
+    // stays locked for every other edit.
+    std::vector<std::optional<size_t>> freeBoundaryControl;
     std::vector<bool> lockedSpans;       // per span (owner control index): no geometry edit
     std::vector<bool> normalsLockedSpans; // per span: no display-normal edit
     // Per aspect and span: the live row covering it (index into states.live)
@@ -91,8 +99,10 @@ struct PieceLockState {
 // The lock set of a session. Without an open piece, locked spans are the
 // approved ones (mapped from the stored content by stable id); with one
 // (`plan`, its ends resolved to control identities), every span outside it.
-// Lock-tagged controls are always locked. A plan whose lock controls are
-// gone from the session opens nothing. `previous` keeps the first-edit flags.
+// A lock-tagged control is locked while a current approval covers a span next
+// to it outside the open piece (PieceLockState::lockedControls). A plan whose
+// lock controls are gone from the session opens nothing. `previous` keeps the
+// first-edit flags.
 PieceLockState computePieceLockState(const std::vector<LineControlPoint>& controls,
                                      std::vector<FiberPieceApproval> rows,
                                      std::optional<FiberPieceContent> storedContent,
@@ -140,8 +150,15 @@ struct PieceSaveCheck {
     // Whether the fiber before / after the opened range is locked (false on
     // the open side of an end piece, whose tail may be re-traced).
     bool leftLocked = true, rightLocked = true;
+    // The lock control on that end of the piece is free (no approval depends
+    // on it): the one span beyond it may change with it, nothing further out.
+    bool leftBoundaryFree = false, rightBoundaryFree = false;
     // Stable id pairs of the spans locked by approvals (normal open).
     std::vector<std::pair<int64_t, int64_t>> lockedSpanIds;
+    // Per locked span: the aspects whose approval locked it (bit 0 geometry,
+    // bit 1 normals). Only those must still be current after the save: an
+    // approval that was stale before the save holds nothing.
+    std::vector<unsigned> lockedSpanAspects;
     // The fiber as read when the session opened (piece open).
     std::optional<FiberPieceContent> baseline;
 };

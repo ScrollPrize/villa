@@ -140,7 +140,7 @@ PieceLockState computePieceLockState(const std::vector<LineControlPoint>& contro
         state.coveringRow[aspect].assign(spans, std::nullopt);
         state.coveringCurrent[aspect].assign(spans, false);
     }
-    for (size_t i = 0; i < n; ++i) state.lockedControls[i] = isLockControl(controls[i]);
+    state.freeBoundaryControl.assign(spans, std::nullopt);
     if (plan) state.openedControls = plannedControlRange(*plan, controls);
     if (state.openedControls) {
         for (size_t s = 0; s < spans; ++s) {
@@ -162,6 +162,28 @@ PieceLockState computePieceLockState(const std::vector<LineControlPoint>& contro
                 (aspect == size_t(FiberPieceAspect::Geometry) ? state.lockedSpans : state.normalsLockedSpans)[s] = true;
             }
         }
+    }
+    // A lock control is held by the approved stretches that end on it. The
+    // open piece's own side does not hold it: that is the stretch being
+    // corrected, and its approval goes stale with the edit like any other.
+    const auto approved = [&](size_t s) {
+        for (size_t aspect = 0; aspect < 2; ++aspect)
+            if (state.coveringRow[aspect][s] && state.coveringCurrent[aspect][s]) return true;
+        return false;
+    };
+    const auto inPiece = [&](size_t s) {
+        return state.openedControls && s >= state.openedControls->first && s < state.openedControls->second;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        if (!isLockControl(controls[i])) continue;
+        const bool before = i > 0 && !inPiece(i - 1) && approved(i - 1);
+        const bool after = i < spans && !inPiece(i) && approved(i);
+        state.lockedControls[i] = before || after;
+    }
+    if (state.openedControls) {
+        const auto [first, last] = *state.openedControls;
+        if (first > 0 && isLockControl(controls[first]) && !state.lockedControls[first]) state.freeBoundaryControl[first - 1] = first;
+        if (last < spans && isLockControl(controls[last]) && !state.lockedControls[last]) state.freeBoundaryControl[last] = last;
     }
     return state;
 }
@@ -198,10 +220,15 @@ std::optional<std::string> pieceLockRefusal(const PieceLockState& state, std::sp
 {
     for (const size_t control : touchedControls)
         if (control < state.lockedControls.size() && state.lockedControls[control])
-            return "control point " + std::to_string(control + 1) + " is a lock control point of an approval piece; it cannot be changed";
+            return "control point " + std::to_string(control + 1) +
+                   " is a lock control point an approved stretch ends on; it cannot be changed";
     const auto& locked = aspect == FiberPieceAspect::Normals ? state.normalsLockedSpans : state.lockedSpans;
     for (const size_t span : dirtySpans) {
         if (span >= locked.size() || !locked[span]) continue;
+        // The span just beyond a free lock control of the open piece moves with that control.
+        if (span < state.freeBoundaryControl.size() && state.freeBoundaryControl[span] &&
+            std::find(touchedControls.begin(), touchedControls.end(), *state.freeBoundaryControl[span]) != touchedControls.end())
+            continue;
         if (state.pieceOpen()) return spanOwnerLabel(span) + " lies outside the open piece; open the piece that covers it to change it";
         return spanOwnerLabel(span) + " is approved" + approvedBy(state, span, aspect) + "; open that piece to change it";
     }
@@ -254,12 +281,16 @@ PieceSaveCheck pieceSaveCheck(const PieceLockState& state, const std::vector<Lin
         const auto [leftLocked, rightLocked] = pieceTailRetention(state, controls);
         check.leftLocked = leftLocked;
         check.rightLocked = rightLocked;
+        check.leftBoundaryFree = first > 0 && first - 1 < state.freeBoundaryControl.size() && state.freeBoundaryControl[first - 1].has_value();
+        check.rightBoundaryFree = last < state.freeBoundaryControl.size() && state.freeBoundaryControl[last].has_value();
         check.baseline = state.storedContent;
     } else {
         for (size_t s = 0; s < state.lockedSpans.size(); ++s) {
             if (!state.lockedSpans[s] && !state.normalsLockedSpans[s]) continue;
             const int64_t a = controls[s].storeId, b = controls[s + 1].storeId;
-            if (a >= 0 && b >= 0) check.lockedSpanIds.emplace_back(a, b);
+            if (a < 0 || b < 0) continue;
+            check.lockedSpanIds.emplace_back(a, b);
+            check.lockedSpanAspects.push_back((state.lockedSpans[s] ? 1u : 0u) | (state.normalsLockedSpans[s] ? 2u : 0u));
         }
     }
     return check;
@@ -284,7 +315,10 @@ std::optional<std::string> pieceSaveViolation(const FiberPieceContent& saved, co
         if (check.leftLocked) {
             for (size_t i = 0; i < first; ++i)
                 if (!sameControl(i, i)) return "control point " + std::to_string(i + 1) + " before the open piece changed";
-            const int64_t lineEnd = saved.controlLineIndex[first];
+            // A free lock control takes the span before it along: the line is
+            // held up to that span's far control only.
+            if (check.leftBoundaryFree && first == 0) return "the open piece has no control before its free lock control";
+            const int64_t lineEnd = saved.controlLineIndex[check.leftBoundaryFree ? first - 1 : first];
             if (lineEnd < 0 || size_t(lineEnd) >= base.linePoints.size()) return "the line before the open piece changed its length";
             for (int64_t i = 0; i <= lineEnd; ++i)
                 if (saved.linePoints[size_t(i)] != base.linePoints[size_t(i)]) return "the line before the open piece changed";
@@ -295,7 +329,8 @@ std::optional<std::string> pieceSaveViolation(const FiberPieceContent& saved, co
             if (after > baseCount) return "control points after the open piece changed";
             for (size_t k = 1; k <= after; ++k)
                 if (!sameControl(savedCount - k, baseCount - k)) return "control point " + std::to_string(savedCount - k + 1) + " after the open piece changed";
-            const int64_t lineStart = saved.controlLineIndex[last];
+            if (check.rightBoundaryFree && last + 1 >= savedCount) return "the open piece has no control after its free lock control";
+            const int64_t lineStart = saved.controlLineIndex[check.rightBoundaryFree ? last + 1 : last];
             if (lineStart < 0) return "the line after the open piece changed its length";
             const size_t tail = saved.linePoints.size() - size_t(lineStart);
             if (tail > base.linePoints.size()) return "the line after the open piece changed its length";
@@ -307,14 +342,17 @@ std::optional<std::string> pieceSaveViolation(const FiberPieceContent& saved, co
     }
     if (check.lockedSpanIds.empty()) return std::nullopt;
     const auto states = vc::objects::fiberPieceApprovalStates(saved, rows);
-    for (const auto& [a, b] : check.lockedSpanIds) {
+    for (size_t locked = 0; locked < check.lockedSpanIds.size(); ++locked) {
+        const auto [a, b] = check.lockedSpanIds[locked];
+        const unsigned aspects = locked < check.lockedSpanAspects.size() ? check.lockedSpanAspects[locked] : 3u;
         const auto ia = saved.indexOf(a), ib = saved.indexOf(b);
         const bool adjacent = ia && ib && (*ib == *ia + 1 || *ia == *ib + 1);
         const size_t span = adjacent ? std::min(*ia, *ib) : 0;
         bool current = adjacent;
         for (size_t aspect = 0; current && aspect < 2; ++aspect) {
+            if (!(aspects & (1u << aspect))) continue;
             const auto& entry = states.spans[aspect];
-            if (span < entry.size() && entry[span].row && !entry[span].current) current = false;
+            if (span >= entry.size() || !entry[span].row || !entry[span].current) current = false;
         }
         if (!current)
             return "approved span between control points " + std::to_string(a) + " and " + std::to_string(b) +

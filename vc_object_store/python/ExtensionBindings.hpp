@@ -249,6 +249,9 @@ inline nb::dict fiberPieceApprovalToPy(const vo::FiberPieceApproval& row)
     for (const auto& span : row.spans) spans.append(nb::make_tuple(span.idLow, span.idHigh, span.hash));
     for (const auto& control : row.controls) controls.append(nb::make_tuple(control.id, control.hash));
     d["spans"] = spans; d["controls"] = controls;
+    nb::list spanNormals;
+    for (const auto& span : row.spanNormals) spanNormals.append(nb::cast(span));
+    d["span_normals"] = spanNormals;
     return d;
 }
 inline vo::FiberPieceApproval fiberPieceApprovalFromPy(const nb::dict& d)
@@ -285,6 +288,8 @@ inline vo::FiberPieceApproval fiberPieceApprovalFromPy(const nb::dict& d)
             const auto t = nb::cast<std::tuple<int64_t, uint64_t>>(item);
             row.controls.push_back({std::get<0>(t), std::get<1>(t)});
         }
+    if (d.contains("span_normals"))
+        row.spanNormals = nb::cast<std::vector<std::vector<std::array<double, 3>>>>(d["span_normals"]);
     return row;
 }
 // {"control_ids": [...], "control_points": [[x,y,z],...], "line_points": [[x,y,z],...], "annotations": [{...},...]}
@@ -444,14 +449,27 @@ inline void bindFiberPieceApproval(nb::module_& module)
     .def("approve_fiber_piece", [](const nb::dict& fiber, const std::string& fiberUuid, int64_t lockCpA,
                                    const std::optional<int64_t>& lockCpB, int64_t insideCp, const std::string& aspect,
                                    int64_t fiberVersion, const std::string& author, const std::string& approvedAt,
-                                   const std::string& host) {
+                                   const std::string& host, const std::vector<std::array<double, 3>>& lineNormals) {
         const auto content = fiberPieceContentFromPy(fiber);
         return fiberPieceApprovalToPy(vo::approveFiberPiece(content, fiberUuid,
             fiberPieceRangeFromPy(content, lockCpA, lockCpB, insideCp), fiberPieceAspectFromPy(aspect),
-            fiberVersion, author, approvedAt, host));
+            fiberVersion, author, approvedAt, host, lineNormals));
     }, nb::arg("fiber"), nb::arg("fiber_uuid"), nb::arg("lock_cp_a"), nb::arg("lock_cp_b"), nb::arg("inside_cp"),
        nb::arg("aspect"), nb::arg("fiber_version"), nb::arg("author"), nb::arg("approved_at"), nb::arg("host") = std::string(),
-       "A fresh approval row (dict) for the piece, fingerprinted over `fiber`.")
+       nb::arg("line_normals") = std::vector<std::array<double, 3>>{},
+       "A fresh approval row (dict) for the piece, fingerprinted over `fiber`. The normals aspect needs `line_normals`, "
+       "the shown normal at every line point; the row's `span_normals` go to ext_fiber_piece_normals.")
+    .def("fiber_piece_normals_table", [] { return extensionTableToPy(vo::fiberPieceNormalsTable()); },
+        "The ext_fiber_piece_normals definition: the normals a normals approval was given for.")
+    .def("fiber_piece_normals_to_row", [](const nb::dict& row) -> nb::object {
+        const auto values = vo::fiberPieceNormalsRow(fiberPieceApprovalFromPy(row));
+        return values ? nb::object(extensionRowToPy(*values)) : nb::none();
+    }, nb::arg("row"), "The ext_fiber_piece_normals row of an approval dict, or None when it carries no normals.")
+    .def("fiber_piece_normals_from_row", [](const nb::dict& row, const nb::sequence& values) {
+        auto approval = fiberPieceApprovalFromPy(row);
+        vo::attachFiberPieceNormals(approval, extensionRowFromPy(values));
+        return fiberPieceApprovalToPy(approval);
+    }, nb::arg("row"), nb::arg("values"), "The approval dict with the normals of its ext_fiber_piece_normals row attached.")
     .def("revoke_fiber_piece_approval", [](const nb::dict& row, const std::string& changedBy, const std::string& now) {
         return fiberPieceApprovalToPy(vo::revokeFiberPieceApproval(fiberPieceApprovalFromPy(row), changedBy, now));
     }, nb::arg("row"), nb::arg("changed_by"), nb::arg("now"), "The revocation row superseding a live approval row.")

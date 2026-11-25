@@ -701,6 +701,15 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                 // A crossing whose geometry and whose H/V tags disagree is
                 // dropped, and that is a question about the tagging: say so
                 // rather than leaving it in the gap between read and used.
+                if (normals && normals->report().approvedNormalPoints > 0)
+                    job->summary += QObject::tr("; approved normals held at %1 line points")
+                                        .arg(normals->report().approvedNormalPoints);
+                // A normals approval the solve could not use approves nothing
+                // until it is given again: say so instead of guessing.
+                if (normals && normals->report().staleNormalApprovals > 0)
+                    job->summary += QObject::tr("; %1 normals approvals are stale or carry no stored normals \n"
+                                                "and were not used: approve those stretches again")
+                                        .arg(normals->report().staleNormalApprovals);
                 if (job->request.measureCrossings && measuredReport.skippedFamilyMismatch > 0)
                     job->summary += QObject::tr("; %1 crossings dropped where the pair's geometry and their H/V \n"
                                                 "tags disagree")

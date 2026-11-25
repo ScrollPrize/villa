@@ -644,6 +644,8 @@ int run(const std::string& configPath)
                                   {"unanchored_fibers", normalReport.unanchoredFibers},
                                   {"manual_anchors", normalReport.manualAnchors},
                                   {"approved_piece_anchors", normalReport.approvedPieceAnchors},
+                                  {"approved_normal_points", normalReport.approvedNormalPoints},
+                                  {"stale_normal_approvals", normalReport.staleNormalApprovals},
                                   {"adjacent_link_anchors", normalReport.adjacentLinkAnchors},
                                   {"degenerate_anchors", normalReport.degenerateAnchors},
                                   {"skipped_links", normalReport.skippedLinks},

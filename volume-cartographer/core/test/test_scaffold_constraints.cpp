@@ -8,6 +8,7 @@
 // expectation below a statement about a direction one can read off the
 // geometry.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <functional>
 #include <doctest/doctest.h>
 
 #include "vc/fiber_graph/ScaffoldCache.hpp"
@@ -135,6 +136,71 @@ struct Scaffold {
                                                 {"display_normal_source", "manual"}};
     }
 
+    // A normals approval of the whole fiber as the loader hands it over: the
+    // approved normal at the given line points (zero elsewhere), every span
+    // approved by one live row.
+    void approveNormals(std::size_t fiber, std::size_t firstPoint, std::size_t lastPoint,
+                        const std::function<Point(std::size_t point, const Point& at)>& normal)
+    {
+        auto& entry = graph.fibers[fiber];
+        entry.approvedLineNormals.assign(std::size_t(entry.pointCount), Point{0., 0., 0.});
+        for (std::size_t j = firstPoint; j <= lastPoint; ++j) {
+            const auto at = std::size_t(3 * (entry.pointFirst + std::int64_t(j)));
+            entry.approvedLineNormals[j] = normal(j, Point{graph.linePoints[at], graph.linePoints[at + 1], graph.linePoints[at + 2]});
+        }
+        vc::objects::FiberPieceApproval row;
+        row.rowUuid = vc::objects::util::newUuid();
+        row.aspect = vc::objects::FiberPieceAspect::Normals;
+        entry.approvals.live = {row};
+        entry.approvals.rowCurrent = {true};
+        const auto aspect = std::size_t(vc::objects::FiberPieceAspect::Normals);
+        entry.approvals.spans[aspect].assign(entry.content.controlIds.size() - 1, {});
+        entry.approvals.approvedSpans[aspect].clear();
+        for (std::size_t span = 0; span + 1 < entry.content.controlIds.size(); ++span) {
+            const auto from = std::size_t(entry.content.controlLineIndex[span]), to = std::size_t(entry.content.controlLineIndex[span + 1]);
+            if (from < firstPoint || to > lastPoint) continue;
+            entry.approvals.spans[aspect][span] = {std::size_t(0), true};
+            entry.approvals.approvedSpans[aspect].push_back(span);
+        }
+    }
+
+    // The test's way to give fibers their outward facing, as a run gets it
+    // from a traced volume: neighbour normals right beside the named fibers'
+    // own lines (8 voxels inside and outside, facing outward) that reach no
+    // other fiber of the scaffold.
+    std::vector<std::size_t> faced;
+    std::shared_ptr<const vc::fiber_tracer::FiberNeighbourField> facingField;
+    void faceOutward(std::size_t fiber) { faced.push_back(fiber); }
+    ScaffoldNormalOptions facing()
+    {
+        std::vector<std::vector<vc::fiber_tracer::FiberStripSample>> beside;
+        for (const auto fiber : faced)
+            for (const double offset : {-8., 8.}) {
+                const auto& entry = graph.fibers.at(fiber);
+                std::vector<vc::fiber_tracer::FiberStripSample> samples;
+                double arc = 0;
+                cv::Vec3d previous;
+                for (std::int64_t j = 0; j < entry.pointCount; ++j) {
+                    const auto at = std::size_t(3 * (entry.pointFirst + j));
+                    const Point point{graph.linePoints[at], graph.linePoints[at + 1], graph.linePoints[at + 2]};
+                    const auto normal = outward(point);
+                    const cv::Vec3d moved{point[0] + offset * normal[0], point[1] + offset * normal[1], point[2]};
+                    if (j > 0) arc += cv::norm(moved - previous);
+                    samples.push_back({arc, moved, {normal[0], normal[1], 0.}, {0., 0., 0.}});
+                    previous = moved;
+                }
+                beside.push_back(std::move(samples));
+            }
+        const auto count = beside.size();
+        facingField = std::make_shared<const vc::fiber_tracer::FiberNeighbourField>(std::move(beside), std::vector<int>(count, 1), 24.);
+        ScaffoldNormalOptions options;
+        options.neighbours.field = facingField.get();
+        options.neighbours.identity = "facing";
+        options.neighbours.volume = graph.volume;
+        options.neighbours.variant.radius = 24.;
+        return options;
+    }
+
     void link(std::size_t a, std::size_t b, const Point& anchorA, const Point& anchorB, bool adjacent)
     {
         ScaffoldLink entry;
@@ -182,6 +248,9 @@ TEST_CASE("the cache reuses unchanged fibers and pairs, and nothing else")
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
     const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
+    scaffold.faceOutward(horizontal);
+    scaffold.faceOutward(vertical);
+    // A manual normal on each: what fixes a fiber's normal is part of its key.
     scaffold.manualOutwardNormal(horizontal, 2);
     scaffold.manualOutwardNormal(vertical, 1);
     // Versions: the store states them, and the cache is keyed on them.
@@ -191,7 +260,7 @@ TEST_CASE("the cache reuses unchanged fibers and pairs, and nothing else")
     ScaffoldCacheSink sink;
     sink.author = "cache-test";
     sink.computedAt = "2026-11-18T12:00:00Z";
-    ScaffoldNormalOptions normalOptions;
+    ScaffoldNormalOptions normalOptions = scaffold.facing();
     normalOptions.sink = &sink;
     const ScaffoldNormals first(scaffold.graph, geometry, normalOptions);
     CHECK(first.report().reused == 0);
@@ -211,7 +280,7 @@ TEST_CASE("the cache reuses unchanged fibers and pairs, and nothing else")
     // Second run, same inputs: everything comes from the cache, and the
     // events are the ones the first run found.
     const ScaffoldCache cache(sink.normals, sink.crossings);
-    ScaffoldNormalOptions reuseNormals;
+    ScaffoldNormalOptions reuseNormals = scaffold.facing();
     reuseNormals.cache = &cache;
     const ScaffoldNormals second(scaffold.graph, geometry, reuseNormals);
     CHECK(second.report().reused == 2);
@@ -273,10 +342,10 @@ TEST_CASE("a fractional separation is split or rounded as the mode says")
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
     const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
-    scaffold.manualOutwardNormal(horizontal, 2);
-    scaffold.manualOutwardNormal(vertical, 1);
+    scaffold.faceOutward(horizontal);
+    scaffold.faceOutward(vertical);
     const ScaffoldGeometry geometry(scaffold.graph);
-    const ScaffoldNormals normals(scaffold.graph, geometry);
+    const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
     ScaffoldEventReport events;
     const auto crossings = scaffoldEvents(scaffold.graph, geometry, normals, {}, constantDistance(1.8), events);
     REQUIRE_FALSE(crossings.empty());
@@ -348,22 +417,74 @@ TEST_CASE("an adjacent link fixes the outward normal of both of its fibers")
     CHECK(normals.radialAgreement()[horizontal] > 0.9);
 }
 
-TEST_CASE("a manual display normal is read outward and fixes the gauge outward")
+TEST_CASE("a manual display normal fixes its axis at the control point, not the fiber's facing")
+{
+    for (const double facing : {1., -1.}) {
+        Scaffold scaffold;
+        const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+        scaffold.manualOutwardNormal(horizontal, 2);
+        // The stored vector's direction says nothing: the annotator sees a cross-section.
+        if (facing < 0) {
+            auto& stored = scaffold.graph.fibers[horizontal].content.annotations.at(2)["display_normal"];
+            for (auto& value : stored) value = -value.get<double>();
+        }
+        const ScaffoldGeometry geometry(scaffold.graph);
+        const ScaffoldNormals normals(scaffold.graph, geometry);
+        REQUIRE(normals.report().manualAnchors == 1);
+        CHECK(normals.signSources()[horizontal] == ScaffoldSignSource::None);
+        CHECK(normals.fixedSigns()[horizontal] == 0);
+        CHECK(normals.report().unanchoredFibers == 1);
+        const auto& control = scaffold.graph.fibers[horizontal].content.controlPoints[2];
+        const auto solved = normals.at(horizontal, geometry.controlArc(horizontal, 2));
+        REQUIRE(solved);
+        CHECK(std::abs(dot(*solved, outward(control))) > 0.99);
+    }
+}
+
+namespace {
+// The outward radial tilted by 25 degrees towards z, about the fiber: a normal
+// the geometry of a flat arc does not give.
+Point tilted(const Point& at)
+{
+    const auto radial = outward(at);
+    const double c = std::cos(radians(25.)), s = std::sin(radians(25.));
+    return {c * radial[0], c * radial[1], s};
+}
+} // namespace
+
+TEST_CASE("an approved stretch comes out with its stored normals, and the fiber's facing stays open")
 {
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    // Stored as axes: every other point faces the other way.
+    scaffold.approveNormals(horizontal, 10, 30, [](std::size_t point, const Point& at) {
+        const auto normal = tilted(at);
+        return point % 2 ? Point{-normal[0], -normal[1], -normal[2]} : normal;
+    });
+    // A manual normal inside the stretch is part of what was approved, not an anchor of its own.
     scaffold.manualOutwardNormal(horizontal, 2);
     const ScaffoldGeometry geometry(scaffold.graph);
     const ScaffoldNormals normals(scaffold.graph, geometry);
-    REQUIRE(normals.report().manualAnchors == 1);
-    CHECK(normals.signSources()[horizontal] == ScaffoldSignSource::Manual);
-    const auto& control = scaffold.graph.fibers[horizontal].content.controlPoints[2];
-    const auto arc = geometry.controlArc(horizontal, 2);
-    const auto solved = normals.at(horizontal, arc);
-    REQUIRE(solved);
-    // The stored direction points outward, and so does the gauge.
-    CHECK(dot(*solved, outward(control)) > 0.99);
-    CHECK(normals.radialAgreement()[horizontal] > 0.9);
+    CHECK(normals.report().approvedNormalPoints == 21);
+    CHECK(normals.report().approvedPieceAnchors > 0);
+    CHECK(normals.report().manualAnchors == 0);
+    CHECK(normals.report().staleNormalApprovals == 0);
+    CHECK(normals.signSources()[horizontal] == ScaffoldSignSource::None);
+    CHECK(normals.fixedSigns()[horizontal] == 0);
+    const auto& fiber = scaffold.graph.fibers[horizontal];
+    const auto solved = normals.normals();
+    const auto at = [&](std::size_t j) {
+        const auto first = std::size_t(3 * (fiber.pointFirst + std::int64_t(j)));
+        return Point{solved[first], solved[first + 1], solved[first + 2]};
+    };
+    const auto point = [&](std::size_t j) {
+        const auto first = std::size_t(3 * (fiber.pointFirst + std::int64_t(j)));
+        return Point{scaffold.graph.linePoints[first], scaffold.graph.linePoints[first + 1], scaffold.graph.linePoints[first + 2]};
+    };
+    // Exactly the approved axis at every approved point ...
+    for (std::size_t j = 10; j <= 30; ++j) CHECK(std::abs(dot(at(j), tilted(point(j)))) == doctest::Approx(1.).epsilon(1e-9));
+    // ... and one facing along the whole fiber, the unapproved ends included.
+    for (std::size_t j = 0; j + 1 < std::size_t(fiber.pointCount); ++j) CHECK(dot(at(j), at(j + 1)) > 0.8);
 }
 
 TEST_CASE("an unanchored fiber keeps no sign of its own")
@@ -504,10 +625,10 @@ TEST_CASE("an H and a V fiber that pass each other cross perpendicularly")
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
     const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
-    scaffold.manualOutwardNormal(horizontal, 2);
-    scaffold.manualOutwardNormal(vertical, 1);
+    scaffold.faceOutward(horizontal);
+    scaffold.faceOutward(vertical);
     const ScaffoldGeometry geometry(scaffold.graph);
-    const ScaffoldNormals normals(scaffold.graph, geometry);
+    const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
 
     ScaffoldEventReport report;
     const auto events = scaffoldEvents(scaffold.graph, geometry, normals, withoutDistances(), {}, report);
@@ -543,10 +664,10 @@ TEST_CASE("a measured separation asserts the integer step of a crossing")
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
     const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
-    scaffold.manualOutwardNormal(horizontal, 2);
-    scaffold.manualOutwardNormal(vertical, 1);
+    scaffold.faceOutward(horizontal);
+    scaffold.faceOutward(vertical);
     const ScaffoldGeometry geometry(scaffold.graph);
-    const ScaffoldNormals normals(scaffold.graph, geometry);
+    const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
 
     ScaffoldEventOptions options;
     options.windingIntegrationStep = 8.;
@@ -584,10 +705,10 @@ TEST_CASE("a pair that crosses twice in opposite order fixes its enclosure exact
     // it inside.
     const auto spiral = scaffold.fiber(ScaffoldFamily::Horizontal, spiralLine(250., 350., 200., 680., 0., 260));
     const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(300., 250., -150., 150., 30));
-    scaffold.manualOutwardNormal(spiral, 1);
-    scaffold.manualOutwardNormal(vertical, 1);
+    scaffold.faceOutward(spiral);
+    scaffold.faceOutward(vertical);
     const ScaffoldGeometry geometry(scaffold.graph);
-    const ScaffoldNormals normals(scaffold.graph, geometry);
+    const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
     CHECK(normals.report().anchoredFibers == 2);
 
     ScaffoldEventReport report;
@@ -646,9 +767,9 @@ TEST_CASE("the sign solve decides the gauge of a fiber no anchor fixed")
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
     const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
-    scaffold.manualOutwardNormal(horizontal, 2);
+    scaffold.faceOutward(horizontal);
     const ScaffoldGeometry geometry(scaffold.graph);
-    const ScaffoldNormals normals(scaffold.graph, geometry);
+    const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
     REQUIRE(normals.report().anchoredFibers == 1);
     REQUIRE(normals.report().unanchoredFibers == 1);
 
@@ -682,9 +803,9 @@ TEST_CASE("the sign stage falls back to the anchors when it is switched off")
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
     scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
-    scaffold.manualOutwardNormal(horizontal, 2);
+    scaffold.faceOutward(horizontal);
     const ScaffoldGeometry geometry(scaffold.graph);
-    const ScaffoldNormals normals(scaffold.graph, geometry);
+    const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
     ScaffoldSignOptions options;
     options.solve = false;
     const auto signs = scaffoldNormalSigns(scaffold.graph, normals, {}, options);
@@ -741,11 +862,11 @@ TEST_CASE("a link whose order the normals contradict accuses both fibers of a fl
         Scaffold scaffold;
         const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
         const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
-        scaffold.manualOutwardNormal(horizontal, 2);
-        scaffold.manualOutwardNormal(vertical, 1);
+        scaffold.faceOutward(horizontal);
+        scaffold.faceOutward(vertical);
         scaffold.link(horizontal, vertical, polar(300., 45., 0.), polar(260., 45., 0.), adjacent);
         const ScaffoldGeometry geometry(scaffold.graph);
-        const ScaffoldNormals normals(scaffold.graph, geometry);
+        const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
         ScaffoldSignOptions signOptions;
         signOptions.solve = false;
         const auto signs = scaffoldNormalSigns(scaffold.graph, normals, {}, signOptions);
@@ -786,10 +907,10 @@ TEST_CASE("a scaffold's measured relations are the ones the bulk assembly builds
     Scaffold scaffold;
     const auto spiral = scaffold.fiber(ScaffoldFamily::Horizontal, spiralLine(250., 350., 200., 680., 0., 260));
     const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(300., 250., -150., 150., 30));
-    scaffold.manualOutwardNormal(spiral, 1);
-    scaffold.manualOutwardNormal(vertical, 1);
+    scaffold.faceOutward(spiral);
+    scaffold.faceOutward(vertical);
     const ScaffoldGeometry geometry(scaffold.graph);
-    const ScaffoldNormals normals(scaffold.graph, geometry);
+    const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
 
     ScaffoldEventReport report;
     ScaffoldEventOptions eventOptions;
@@ -887,10 +1008,10 @@ TEST_CASE("an approval row marks the measured constraint it names")
     Scaffold scaffold;
     const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
     const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
-    scaffold.manualOutwardNormal(horizontal, 2);
-    scaffold.manualOutwardNormal(vertical, 1);
+    scaffold.faceOutward(horizontal);
+    scaffold.faceOutward(vertical);
     const ScaffoldGeometry geometry(scaffold.graph);
-    const ScaffoldNormals normals(scaffold.graph, geometry);
+    const ScaffoldNormals normals(scaffold.graph, geometry, scaffold.facing());
     ScaffoldEventReport report;
     const auto events = scaffoldEvents(scaffold.graph, geometry, normals, {}, constantDistance(1.), report);
     ScaffoldMeasuredReport measuredReport;
@@ -996,4 +1117,44 @@ TEST_CASE("a prediction's sheet axis pulls the strip normals")
     const ScaffoldNormals none(scaffold.graph, geometry, options, weightless);
     CHECK(none.report().verticesWithAxis == 0);
     CHECK(none.report().nodesWithAxis == 0);
+}
+
+TEST_CASE("the neighbour normals face a fiber whose normals are approved, and an adjacent link does")
+{
+    for (const double facing : {1., -1.}) {
+        Scaffold scaffold;
+        const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+        scaffold.approveNormals(horizontal, 0, 40, [](std::size_t, const Point& at) { return tilted(at); });
+        const ScaffoldGeometry geometry(scaffold.graph);
+        ScaffoldNormalOptions options;
+        options.neighbours.identity = "test field";
+        options.neighbours.volume = "test-volume";
+        const auto field = radialField(facing);
+        options.neighbours.field = &field;
+        const ScaffoldNormals normals(scaffold.graph, geometry, options);
+        CHECK(normals.signSources()[horizontal] == ScaffoldSignSource::Neighbours);
+        const auto solved = normals.at(horizontal, geometry.controlArc(horizontal, 2));
+        REQUIRE(solved);
+        // The approved axis, faced the way the neighbours face.
+        const auto expected = tilted(scaffold.graph.fibers[horizontal].content.controlPoints[2]);
+        CHECK(facing * dot(*solved, expected) > 0.999);
+    }
+    {
+        Scaffold scaffold;
+        const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+        const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(250., 45., -150., 150., 30));
+        // Stored facing inward; the link says which side is outward.
+        scaffold.approveNormals(horizontal, 0, 40, [](std::size_t, const Point& at) {
+            const auto normal = tilted(at);
+            return Point{-normal[0], -normal[1], -normal[2]};
+        });
+        scaffold.link(horizontal, vertical, polar(300., 45., 0.), polar(250., 45., 0.), true);
+        const ScaffoldGeometry geometry(scaffold.graph);
+        const ScaffoldNormals normals(scaffold.graph, geometry);
+        CHECK(normals.signSources()[horizontal] == ScaffoldSignSource::AdjacentLink);
+        CHECK(normals.fixedSigns()[horizontal] == 1);
+        const auto solved = normals.at(horizontal, geometry.project(horizontal, polar(300., 45., 0.)).arc);
+        REQUIRE(solved);
+        CHECK(dot(*solved, tilted(polar(300., 45., 0.))) > 0.999);
+    }
 }

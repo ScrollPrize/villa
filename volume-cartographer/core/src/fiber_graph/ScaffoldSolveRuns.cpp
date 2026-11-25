@@ -270,6 +270,8 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         count("normal_fibers_anchored", stages.normals->anchoredFibers, "fibers");
         count("normal_anchors_manual", stages.normals->manualAnchors, "anchors");
         count("normal_anchors_approved_piece", stages.normals->approvedPieceAnchors, "anchors");
+        count("normal_points_approved", stages.normals->approvedNormalPoints, "points");
+        count("normal_approvals_stale", stages.normals->staleNormalApprovals, "approvals");
         count("normal_anchors_adjacent_link", stages.normals->adjacentLinkAnchors, "anchors");
         if (stages.normalOptions && stages.normalOptions->neighbours.field) {
             count("neighbour_samples", stages.normals->neighbourSamples, "samples");

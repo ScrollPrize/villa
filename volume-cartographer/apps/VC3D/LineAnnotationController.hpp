@@ -804,6 +804,12 @@ private:
                                      std::optional<cv::Vec3f> lineAnchor = std::nullopt,
                                      std::optional<cv::Vec3d> displayNormal = std::nullopt,
                                      std::optional<cv::Vec3d> direction = std::nullopt);
+    // A normal set in the cross view is checked until it is seen in the
+    // rebuilt views: stored on its control point as a manual normal, and
+    // shown there. Anything else is reported, never dropped in silence.
+    void armNormalCheck(const std::string& surfaceName, const cv::Vec3d& point, const cv::Vec3d& normal,
+                        std::optional<size_t> placedIndex);
+    void verifyNormalCheck(const std::string& surfaceName, bool viewsRebuilt);
     void handleGeneratedControlPointDelete(const std::string& surfaceName,
                                            double linePosition,
                                            cv::Vec3f volumePoint);

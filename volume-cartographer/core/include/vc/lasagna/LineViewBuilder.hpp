@@ -50,6 +50,12 @@ struct LineViewConfig {
     // fiber otherwise allocates 2000 shared_ptr planes per view rebuild for
     // nothing. Defaults on for the existing consumers/tests.
     bool buildLineZSlices = true;
+    // Line positions (LineModel point-index coordinate) whose display normal
+    // was set by hand. The strip shows exactly that normal there: the roll
+    // smoothing along the line holds those rows and smooths around them.
+    // They must also be control point positions (controlPointLinePositions),
+    // which is what gives them a strip column of their own.
+    std::vector<double> pinnedNormalLinePositions;
 };
 
 // Maps the original LineModel point-index coordinate to the ribbon grid and

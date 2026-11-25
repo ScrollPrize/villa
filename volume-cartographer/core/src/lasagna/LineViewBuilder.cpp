@@ -391,7 +391,9 @@ double unwrapAxisNear(double angle, double reference)
     return angle;
 }
 
-std::vector<double> smoothRollAngles(const std::vector<double>& targets)
+// `pinned`, when given, marks rows whose angle is their target and does not
+// move: the smoothing runs around them.
+std::vector<double> smoothRollAngles(const std::vector<double>& targets, const std::vector<char>& pinned = {})
 {
     std::vector<double> angles = targets;
     if (angles.size() < 2) {
@@ -400,6 +402,7 @@ std::vector<double> smoothRollAngles(const std::vector<double>& targets)
 
     for (int iteration = 0; iteration < kRollSmoothIterations; ++iteration) {
         for (size_t i = 0; i < angles.size(); ++i) {
+            if (i < pinned.size() && pinned[i]) continue;
             double neighborSum = 0.0;
             double neighborCount = 0.0;
             if (i > 0) {
@@ -451,7 +454,8 @@ LineFrame frameFromMeshNormal(cv::Vec3d meshNormal, const cv::Vec3d& tangent)
 }
 
 std::vector<LineFrame> buildFrames(const std::vector<SegmentNormalSample>& samples,
-                                   const std::vector<cv::Vec3d>& normals)
+                                   const std::vector<cv::Vec3d>& normals,
+                                   const std::vector<char>& pinnedRows = {})
 {
     std::vector<LineFrame> frames(samples.size());
     if (samples.empty()) {
@@ -509,7 +513,7 @@ std::vector<LineFrame> buildFrames(const std::vector<SegmentNormalSample>& sampl
         }
     }
 
-    const std::vector<double> rollAngles = smoothRollAngles(rollTargets);
+    const std::vector<double> rollAngles = smoothRollAngles(rollTargets, pinnedRows);
     frames[anchor] = frameFromMeshNormal(rotateAroundAxis(baseNormals[anchor],
                                                           tangents[anchor],
                                                           rollAngles[anchor]),
@@ -936,7 +940,18 @@ LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConf
                          config.controlPointLinePositions);
     const auto ribbonSamples = resampleLine(frameData.samples, positionMap);
     const auto ribbonNormals = resolvedNormals(ribbonSamples);
-    auto ribbonFrames = buildFrames(ribbonSamples, ribbonNormals);
+    // A normal set by hand holds its strip column.
+    std::vector<char> pinnedRows;
+    if (!config.pinnedNormalLinePositions.empty() && config.displayPointNormals.size() == line.points.size()) {
+        pinnedRows.assign(ribbonSamples.size(), 0);
+        for (const double position : config.pinnedNormalLinePositions) {
+            if (!std::isfinite(position) || ribbonSamples.empty()) continue;
+            const double column = std::clamp(positionMap.originalPositionToStripGridColumn(position), 0.0,
+                                             static_cast<double>(ribbonSamples.size() - 1));
+            pinnedRows[static_cast<size_t>(std::llround(column))] = 1;
+        }
+    }
+    auto ribbonFrames = buildFrames(ribbonSamples, ribbonNormals, pinnedRows);
     // Original line-point frames own the persistent orientation decision (including
     // the caller's whole-line hint vote). Pin the derived ribbon to that same
     // global sign without changing the original cut-plane frames.

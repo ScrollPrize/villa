@@ -137,35 +137,37 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
     solved_.assign(fibers, 0);
     normals_.assign(graph.linePoints.size(), 0.);
 
-    // The annotated anchors, in precedence order: a manual display normal
-    // beats an approved span's, which beats an adjacent link's.
-    if (options.manualDisplayNormals || options.approvedNormalPieces) {
+    // Normals approvals that approve nothing as they stand.
+    for (const auto& fiber : graph.fibers)
+        for (std::size_t r = 0; r < fiber.approvals.live.size(); ++r)
+            if (fiber.approvals.live[r].aspect == objects::FiberPieceAspect::Normals &&
+                (r >= fiber.approvals.rowCurrent.size() || !fiber.approvals.rowCurrent[r]))
+                ++report_.staleNormalApprovals;
+    // Manual display normals: an axis on the one chain node at the control
+    // point. Inside an approved stretch the stretch's stored normals say what
+    // was shown there, the manual normal included.
+    if (options.manualDisplayNormals) {
         for (std::size_t i = 0; i < fibers; ++i) {
             const auto& fiber = graph.fibers[i];
-            const auto approved = approvedSpanFlags(fiber, objects::FiberPieceAspect::Normals);
+            const auto approved = options.approvedNormalPieces
+                ? approvedSpanFlags(fiber, objects::FiberPieceAspect::Normals) : std::vector<char>{};
             for (std::size_t control = 0; control < fiber.content.annotations.size(); ++control) {
                 const auto& annotation = fiber.content.annotations[control];
                 const auto normal = fiber_tracer::displayNormalFromJson(annotation);
-                if (!normal) continue;
-                const auto source = fiber_tracer::displayNormalSourceFromJson(annotation);
-                ScaffoldSignSource kind = ScaffoldSignSource::None;
-                if (options.manualDisplayNormals && source == "manual") kind = ScaffoldSignSource::Manual;
-                else if (options.approvedNormalPieces &&
-                         ((control > 0 && control - 1 < approved.size() && approved[control - 1] != 0) ||
-                          (control < approved.size() && approved[control] != 0)))
-                    kind = ScaffoldSignSource::ApprovedPiece;
-                if (kind == ScaffoldSignSource::None) continue;
+                if (!normal || fiber_tracer::displayNormalSourceFromJson(annotation) != "manual") continue;
+                if ((control > 0 && control - 1 < approved.size() && approved[control - 1] != 0) ||
+                    (control < approved.size() && approved[control] != 0))
+                    continue;
                 ScaffoldNormalAnchor anchor;
                 anchor.fiber = std::int64_t(i);
                 anchor.arc = geometry.controlArc(i, control);
-                // The format's display normals point outward, as every signed normal does.
+                // An axis: which of its two directions is outward is not stated.
                 anchor.outward = pointOf(*normal);
-                anchor.source = kind;
+                anchor.source = ScaffoldSignSource::Manual;
                 anchor.control = std::int64_t(control);
                 anchor.weight = options.anchorWeight;
                 anchors_.push_back(anchor);
-                if (kind == ScaffoldSignSource::Manual) ++report_.manualAnchors;
-                else ++report_.approvedPieceAnchors;
+                ++report_.manualAnchors;
             }
         }
     }
@@ -359,9 +361,19 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
                                         graph.fibers[std::size_t(peer)].uuid + "@" + std::to_string(*peerVersion));
         } else {
             anchoredBy[fiber].push_back("control " + std::to_string(anchor.control) + " " +
-                                        scaffoldSignSourceName(anchor.source));
+                                        scaffoldSignSourceName(anchor.source) + " axis");
         }
     }
+    // An approval is not part of the fiber's version: the rows whose normals
+    // a fiber is solved from are named with the spans they cover.
+    if (options.approvedNormalPieces)
+        for (std::size_t i = 0; i < fibers; ++i) {
+            const auto& approvals = graph.fibers[i].approvals;
+            const auto aspect = std::size_t(objects::FiberPieceAspect::Normals);
+            for (const auto span : approvals.approvedSpans[aspect])
+                anchoredBy[i].push_back("approved normals span " + std::to_string(span) + " row " +
+                                        approvals.live.at(*approvals.spans[aspect].at(span).row).rowUuid);
+        }
     std::vector<std::string> inputs(fibers);
     const auto frame = graph.volume + "@" + std::to_string(graph.scale);
     for (std::size_t i = 0; i < fibers; ++i)
@@ -485,20 +497,80 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
         report_.neighbourSeconds =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - neighbourStarted).count();
     }
+    const auto nearestNode = [](const std::vector<double>& arcs, double arc) {
+        const auto upper = std::lower_bound(arcs.begin(), arcs.end(), arc);
+        std::size_t at = std::size_t(upper - arcs.begin());
+        if (at >= arcs.size()) at = arcs.size() - 1;
+        else if (at > 0 && arc - arcs[at - 1] < arcs[at] - arc) at = at - 1;
+        return at;
+    };
+    // `claimed`: 1 a node with a facing (an adjacent link), 2 a node held on
+    // an axis only (an approved stretch, a manual normal).
+    // Approved stretches: every chain node takes the axis of the approved
+    // normals of the line points nearest to it (the principal axis of their
+    // outer products, so their facings do not matter) and is held on it.
+    if (options.approvedNormalPieces) {
+        for (std::size_t i = 0; i < fibers; ++i) {
+            const auto& approved = graph.fibers[i].approvedLineNormals;
+            if (approved.empty() || chainArcs[i].empty()) continue;
+            if (approved.size() != chains[i].vertexArc.size())
+                throw std::runtime_error("scaffold normals: the approved normals of fiber " + graph.fibers[i].uuid +
+                                         " are not one per line point");
+            std::vector<cv::Matx33d> scatter(chainArcs[i].size(), cv::Matx33d::zeros());
+            std::vector<char> seen(chainArcs[i].size(), 0);
+            for (std::size_t j = 0; j < approved.size(); ++j) {
+                const auto normal = vectorOf(approved[j]);
+                if (!(cv::norm(normal) > 0)) continue;
+                ++report_.approvedNormalPoints;
+                const auto node = nearestNode(chainArcs[i], chains[i].vertexArc[j]);
+                scatter[node] += normal * normal.t();
+                seen[node] = 1;
+            }
+            for (std::size_t node = 0; node < seen.size(); ++node) {
+                if (seen[node] == 0) continue;
+                cv::Vec3d eigenvalues;
+                cv::Matx33d eigenvectors;
+                cv::eigen(scatter[node], eigenvalues, eigenvectors);
+                auto& target = targets[i][node];
+                target.axis = {eigenvectors(0, 0), eigenvectors(0, 1), eigenvectors(0, 2)};
+                target.weight = options.anchorWeight;
+                target.fixed = true;
+                target.axisOnly = true;
+                claimed[i][node] = 2;
+                ++report_.approvedPieceAnchors;
+            }
+        }
+    }
     for (const auto& anchor : anchors_) {
         const auto fiber = std::size_t(anchor.fiber);
         const auto& arcs = chainArcs[fiber];
         if (arcs.empty()) continue;
-        const auto upper = std::lower_bound(arcs.begin(), arcs.end(), anchor.arc);
-        std::size_t at = std::size_t(upper - arcs.begin());
-        if (at >= arcs.size()) at = arcs.size() - 1;
-        else if (at > 0 && anchor.arc - arcs[at - 1] < arcs[at] - anchor.arc) at = at - 1;
-        if (claimed[fiber][at]) continue;
+        const auto at = nearestNode(arcs, anchor.arc);
+        auto& target = targets[fiber][at];
+        if (anchor.source != ScaffoldSignSource::AdjacentLink) {
+            // An axis: an approved stretch's node keeps what was approved.
+            if (claimed[fiber][at]) continue;
+            claimed[fiber][at] = 2;
+            target.axis = vectorOf(anchor.outward);
+            target.weight = anchor.weight;
+            target.fixed = true;
+            target.axisOnly = true;
+            continue;
+        }
+        if (claimed[fiber][at] == 1) continue;
+        if (claimed[fiber][at] == 2) {
+            // The annotated axis stays; the link says which way it faces.
+            const double side = target.axis.dot(vectorOf(anchor.outward));
+            if (side == 0.) continue;
+            if (side < 0.) target.axis = -target.axis;
+        } else {
+            target.axis = vectorOf(anchor.outward);
+            target.weight = anchor.weight;
+            target.fixed = true;
+        }
+        target.axisOnly = false;
         claimed[fiber][at] = 1;
-        targets[fiber][at] = {vectorOf(anchor.outward), anchor.weight, true};
-        if (signSources_[fiber] == ScaffoldSignSource::None ||
-            int(anchor.source) < int(signSources_[fiber]))
-            signSources_[fiber] = anchor.source;
+        signSources_[fiber] = ScaffoldSignSource::AdjacentLink;
     }
     // A fiber no anchor fixed takes its facing from the neighbour normals
     // where they cover it: the strip solve faces the fiber by the majority of
@@ -582,6 +654,15 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
         ++report_.solved;
         if (result.converged) ++report_.converged;
         solved_[i] = 1;
+        // An approved stretch comes out with the normals that were approved,
+        // point by point, each facing the way the solve faced the fiber there.
+        if (options.approvedNormalPieces && !fiber.approvedLineNormals.empty())
+            for (std::size_t j = 0; j < fiber.approvedLineNormals.size(); ++j) {
+                const auto approved = vectorOf(fiber.approvedLineNormals[j]);
+                if (!(cv::norm(approved) > 0)) continue;
+                auto& normal = results[i].normals[j];
+                normal = approved.dot(normal) < 0 ? -approved : approved;
+            }
         double weightedDot = 0, totalWeight = 0;
         const auto arcs = geometry.arcs();
         for (std::int64_t j = 0; j < fiber.pointCount; ++j) {

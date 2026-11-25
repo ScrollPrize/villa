@@ -72,6 +72,12 @@ struct FiberStripAxisTarget {
     cv::Vec3d axis{0.0, 0.0, 0.0};
     double weight = 0.0;
     bool fixed = false;
+    // A fixed target whose facing is not known: the node's normal lies on
+    // `axis` and does not move, but which of its two directions it takes is
+    // decided by continuity with the nodes before it, and it has no say in
+    // the fiber's facing (an approved or manually set normal: the annotator
+    // sees a cross-section, not which side is outward).
+    bool axisOnly = false;
     // A second sign-free axis from the geometry of crossing fibers (own tangent x
     // crossing tangent), oriented and pulled exactly like the free axis; its
     // weight is absolute (not scaled by axisWeight). Ignored on fixed nodes.

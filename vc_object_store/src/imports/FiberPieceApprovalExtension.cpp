@@ -126,20 +126,38 @@ void validateApproval(const FiberPieceApproval& row)
     if (row.author.empty() || row.approvedAt.empty()) throw std::invalid_argument("fiber piece approval: author and time required");
     if (row.state == FiberPieceState::Revoked) {
         if (!row.supersedes) throw std::invalid_argument("fiber piece approval: revocation must supersede a row");
-        if (!row.spans.empty() || !row.controls.empty())
+        if (!row.spans.empty() || !row.controls.empty() || !row.spanNormals.empty())
             throw std::invalid_argument("fiber piece approval: revocation carries no fingerprints");
     } else {
         if (row.controls.size() < 2) throw std::invalid_argument("fiber piece approval: a piece covers at least one span");
         if (row.aspect == FiberPieceAspect::Geometry && row.spans.size() + 1 != row.controls.size())
             throw std::invalid_argument("fiber piece approval: span and control fingerprints disagree");
-        if (row.aspect == FiberPieceAspect::Normals && !row.spans.empty())
-            throw std::invalid_argument("fiber piece approval: normals carry no span fingerprints");
+        if (row.aspect == FiberPieceAspect::Normals && !row.spans.empty() && row.spans.size() + 1 != row.controls.size())
+            throw std::invalid_argument("fiber piece approval: span and control fingerprints disagree");
+        if (!row.spanNormals.empty() && (row.aspect != FiberPieceAspect::Normals || row.spanNormals.size() != row.spans.size()))
+            throw std::invalid_argument("fiber piece approval: normals belong to the spans of a normals row");
         if (row.controls.front().id != row.lockCpA || row.controls[1].id != row.insideCp)
             throw std::invalid_argument("fiber piece approval: fingerprints must walk from the lock through the inside control");
         if (row.lockCpB && row.controls.back().id != *row.lockCpB)
             throw std::invalid_argument("fiber piece approval: fingerprints must end at the second lock");
     }
     if (row.supersedes && *row.supersedes == row.rowUuid) throw std::invalid_argument("fiber piece approval: row supersedes itself");
+}
+// The line points of the span between control `lower` and `lower + 1`:
+// first and last line index, and whether walking from the lower control id
+// to the higher one is the line's own direction.
+struct SpanLine {
+    size_t from = 0, to = 0;
+    bool forward = true;
+    size_t count() const { return to - from + 1; }
+    size_t at(size_t k) const { return forward ? from + k : to - k; } // k-th point, lower id first
+};
+std::optional<SpanLine> spanLine(const FiberPieceContent& content, size_t lower)
+{
+    if (lower + 1 >= content.controlIds.size() || lower + 1 >= content.controlLineIndex.size()) return std::nullopt;
+    const int64_t from = content.controlLineIndex[lower], to = content.controlLineIndex[lower + 1];
+    if (from < 0 || to < from || size_t(to) >= content.linePoints.size()) return std::nullopt;
+    return SpanLine{size_t(from), size_t(to), content.controlIds[lower] < content.controlIds[lower + 1]};
 }
 } // namespace
 
@@ -162,6 +180,68 @@ ExtensionTable fiberPieceApprovalTable()
     table.primaryKey = {"fiber_uuid", "row_uuid"};
     table.indexes = {{{"fiber_uuid", "aspect"}, false}};
     return table;
+}
+
+ExtensionTable fiberPieceNormalsTable()
+{
+    ExtensionTable table;
+    table.name = kFiberPieceNormalsTable;
+    table.extension = kFiberPieceApprovalExtension;
+    table.formatVersion = kFiberPieceNormalsFormat;
+    table.provisioning = R"({"normals":"per span: u64 count, count x 3 float64 little-endian; u64 span count first"})";
+    table.keySpace = "objects";
+    table.versioned = false;
+    table.columns = {required("fiber_uuid", Type::Blob), required("row_uuid", Type::Blob), required("normals", Type::Blob)};
+    table.primaryKey = {"fiber_uuid", "row_uuid"};
+    return table;
+}
+
+std::optional<ExtensionRow> fiberPieceNormalsRow(const FiberPieceApproval& row)
+{
+    if (row.spanNormals.empty()) return std::nullopt;
+    validateApproval(row);
+    std::vector<uint8_t> bytes;
+    putU64(bytes, row.spanNormals.size());
+    for (const auto& span : row.spanNormals) {
+        putU64(bytes, span.size());
+        for (const auto& normal : span) for (double c : normal) putU64(bytes, std::bit_cast<uint64_t>(c));
+    }
+    return ExtensionRow{extensionUuid(row.fiberUuid), extensionUuid(row.rowUuid), std::move(bytes)};
+}
+
+void attachFiberPieceNormals(FiberPieceApproval& row, const ExtensionRow& values)
+{
+    if (values.size() != 3) throw std::invalid_argument("fiber piece normals: unexpected column count");
+    if (blobText(values[0], "fiber uuid") != row.fiberUuid || blobText(values[1], "row uuid") != row.rowUuid)
+        throw std::invalid_argument("fiber piece normals: the row belongs to another approval");
+    const auto& bytes = blob(values[2], "normals");
+    size_t at = 0;
+    const auto next = [&] {
+        if (at + 8 > bytes.size()) throw std::invalid_argument("fiber piece normals: truncated");
+        const auto v = getU64(bytes, at);
+        at += 8;
+        return v;
+    };
+    std::vector<std::vector<geometry::Point>> spans(next());
+    for (auto& span : spans) {
+        const auto count = next();
+        if (count > (bytes.size() - at) / 24) throw std::invalid_argument("fiber piece normals: truncated");
+        span.resize(count);
+        for (auto& normal : span) for (double& c : normal) c = std::bit_cast<double>(next());
+    }
+    if (at != bytes.size()) throw std::invalid_argument("fiber piece normals: trailing bytes");
+    row.spanNormals = std::move(spans);
+    validateApproval(row);
+}
+
+FiberPieceApprovalRows fiberPieceApprovalRows(std::span<const FiberPieceApproval> rows)
+{
+    FiberPieceApprovalRows result;
+    for (const auto& row : rows) {
+        result.approvals.push_back(fiberPieceApprovalRow(row));
+        if (auto normals = fiberPieceNormalsRow(row)) result.normals.push_back(std::move(*normals));
+    }
+    return result;
 }
 
 std::vector<uint8_t> encodeFiberSpanFingerprints(std::span<const FiberSpanFingerprint> spans)
@@ -361,6 +441,18 @@ uint64_t fiberSpanHash(const FiberPieceContent& content, size_t lower)
     return hasher.state;
 }
 
+std::optional<uint64_t> fiberNormalsSpanHash(const FiberPieceContent& content, size_t lower,
+                                             std::span<const geometry::Point> normals)
+{
+    const auto line = spanLine(content, lower);
+    if (!line || line->count() != normals.size()) return std::nullopt;
+    Hasher hasher;
+    hasher.u64(line->count());
+    for (size_t k = 0; k < line->count(); ++k) hasher.point(content.linePoints[line->at(k)]);
+    for (const auto& normal : normals) hasher.point(normal);
+    return hasher.state;
+}
+
 FiberPieceFingerprints fingerprintFiberPiece(const FiberPieceContent& content, const FiberPieceRange& range, FiberPieceAspect aspect)
 {
     FiberPieceFingerprints result;
@@ -430,6 +522,18 @@ FiberPieceApprovalStates fiberPieceApprovalStates(const FiberPieceContent& conte
                     spanCurrent = stored.idLow == std::min(idA, idB) && stored.idHigh == std::max(idA, idB) &&
                                   stored.hash == fiberSpanHash(content, lower);
                 }
+                if (spanCurrent && row.aspect == FiberPieceAspect::Normals) {
+                    // Approved normals are the stored ones on the line as it
+                    // was: a row without them, or whose line moved, is stale.
+                    spanCurrent = k - 1 < row.spans.size() && row.spanNormals.size() == row.spans.size();
+                    if (spanCurrent) {
+                        const auto& stored = row.spans[k - 1];
+                        const int64_t idA = content.controlIds[*previous], idB = content.controlIds[*index];
+                        const auto hash = fiberNormalsSpanHash(content, lower, row.spanNormals[k - 1]);
+                        spanCurrent = stored.idLow == std::min(idA, idB) && stored.idHigh == std::max(idA, idB) &&
+                                      hash && stored.hash == *hash;
+                    }
+                }
                 if (!spanCurrent) allCurrent = false;
                 for (size_t s = lower; s < upper; ++s) {
                     if (spans[s].row && *spans[s].row != r) { spanCurrent = false; allCurrent = false; } // overlapping live rows: neither trusted
@@ -449,6 +553,47 @@ FiberPieceApprovalStates fiberPieceApprovalStates(const FiberPieceContent& conte
     return states;
 }
 
+std::vector<geometry::Point> approvedFiberLineNormals(const FiberPieceContent& content, const FiberPieceApprovalStates& states)
+{
+    const size_t aspect = size_t(FiberPieceAspect::Normals);
+    if (states.approvedSpans[aspect].empty()) return {};
+    std::vector<geometry::Point> result(content.linePoints.size(), geometry::Point{0., 0., 0.});
+    for (const size_t s : states.approvedSpans[aspect]) {
+        const auto& row = states.live.at(*states.spans[aspect].at(s).row);
+        const auto line = spanLine(content, s);
+        const int64_t idA = content.controlIds[s], idB = content.controlIds[s + 1];
+        const auto stored = std::find_if(row.spans.begin(), row.spans.end(), [&](const auto& span) {
+            return span.idLow == std::min(idA, idB) && span.idHigh == std::max(idA, idB);
+        });
+        // An approved span is one whose stored normals matched this line.
+        if (!line || stored == row.spans.end())
+            throw std::logic_error("fiber piece approval: an approved normals span without its normals");
+        const auto& normals = row.spanNormals.at(size_t(stored - row.spans.begin()));
+        for (size_t k = 0; k < line->count(); ++k) result[line->at(k)] = normals.at(k);
+    }
+    return result;
+}
+
+std::vector<geometry::Point> fiberPieceLineNormals(const FiberPieceContent& target, const FiberPieceApproval& row,
+                                                   const std::map<int64_t, int64_t>& controlIds)
+{
+    if (row.spanNormals.empty() || row.spanNormals.size() != row.spans.size()) return {};
+    std::vector<geometry::Point> result(target.linePoints.size(), geometry::Point{0., 0., 0.});
+    for (size_t k = 0; k < row.spans.size(); ++k) {
+        const auto low = controlIds.find(row.spans[k].idLow), high = controlIds.find(row.spans[k].idHigh);
+        if (low == controlIds.end() || high == controlIds.end()) return {};
+        const auto a = target.indexOf(low->second), b = target.indexOf(high->second);
+        if (!a || !b || std::max(*a, *b) != std::min(*a, *b) + 1) return {};
+        const int64_t from = target.controlLineIndex.at(*a), to = target.controlLineIndex.at(*b);
+        const auto& normals = row.spanNormals[k];
+        if (from < 0 || to < 0 || size_t(std::abs(to - from)) + 1 != normals.size()) return {};
+        if (size_t(std::max(from, to)) >= result.size()) return {};
+        // Stored from the row's lower control id to its higher one.
+        for (size_t i = 0; i < normals.size(); ++i) result[size_t(from + (to >= from ? int64_t(i) : -int64_t(i)))] = normals[i];
+    }
+    return result;
+}
+
 namespace {
 FiberPieceApproval rowForRange(const FiberPieceContent& content, const FiberPieceApproval& base,
                                const FiberPieceRange& range, std::optional<int64_t> lockCpB)
@@ -459,8 +604,25 @@ FiberPieceApproval rowForRange(const FiberPieceContent& content, const FiberPiec
     row.insideCp = content.controlIds[range.at(1)];
     row.lockCpB = lockCpB;
     auto fingerprints = fingerprintFiberPiece(content, range, row.aspect);
-    row.spans = std::move(fingerprints.spans);
     row.controls = std::move(fingerprints.controls);
+    if (row.aspect == FiberPieceAspect::Geometry) {
+        row.spans = std::move(fingerprints.spans);
+        return row;
+    }
+    // Normals: the part keeps the normals approved on its spans, with their
+    // fingerprints. A base row that lacks one of them approves nothing.
+    row.spans.clear();
+    row.spanNormals.clear();
+    if (base.spanNormals.size() != base.spans.size()) return row;
+    for (size_t k = 0; k < range.spanCount(); ++k) {
+        const int64_t idA = content.controlIds[range.at(k)], idB = content.controlIds[range.at(k + 1)];
+        const auto stored = std::find_if(base.spans.begin(), base.spans.end(), [&](const auto& span) {
+            return span.idLow == std::min(idA, idB) && span.idHigh == std::max(idA, idB);
+        });
+        if (stored == base.spans.end()) { row.spans.clear(); row.spanNormals.clear(); return row; }
+        row.spans.push_back(*stored);
+        row.spanNormals.push_back(base.spanNormals[size_t(stored - base.spans.begin())]);
+    }
     return row;
 }
 } // namespace
@@ -510,7 +672,8 @@ std::vector<FiberPieceApproval> cropFiberPieceApprovals(const FiberPieceContent&
 
 FiberPieceApproval approveFiberPiece(const FiberPieceContent& content, const std::string& fiberUuid,
     const FiberPieceRange& range, FiberPieceAspect aspect, int64_t fiberVersion,
-    const std::string& author, const std::string& approvedAt, const std::string& host)
+    const std::string& author, const std::string& approvedAt, const std::string& host,
+    std::span<const geometry::Point> lineNormals)
 {
     FiberPieceApproval row;
     row.fiberUuid = fiberUuid;
@@ -529,6 +692,29 @@ FiberPieceApproval approveFiberPiece(const FiberPieceContent& content, const std
     auto fingerprints = fingerprintFiberPiece(content, range, aspect);
     row.spans = std::move(fingerprints.spans);
     row.controls = std::move(fingerprints.controls);
+    if (aspect == FiberPieceAspect::Normals) {
+        if (lineNormals.size() != content.linePoints.size())
+            throw std::invalid_argument("fiber piece approval: approving normals needs the shown normal at each of the fiber's " +
+                                        std::to_string(content.linePoints.size()) + " line points, got " +
+                                        std::to_string(lineNormals.size()));
+        for (size_t k = 0; k < range.spanCount(); ++k) {
+            const size_t a = range.at(k), b = range.at(k + 1), lower = std::min(a, b);
+            const auto line = spanLine(content, lower);
+            if (!line) throw std::invalid_argument("fiber piece approval: a control point of the piece is not on the fiber's line");
+            std::vector<geometry::Point> normals(line->count());
+            for (size_t i = 0; i < normals.size(); ++i) {
+                const auto& shown = lineNormals[line->at(i)];
+                const double length = std::sqrt(shown[0] * shown[0] + shown[1] * shown[1] + shown[2] * shown[2]);
+                if (!std::isfinite(length) || !(length > 0.0))
+                    throw std::invalid_argument("fiber piece approval: no normal is shown at line point " +
+                                                std::to_string(line->at(i)) + " of the piece");
+                normals[i] = {shown[0] / length, shown[1] / length, shown[2] / length};
+            }
+            const int64_t idA = content.controlIds[a], idB = content.controlIds[b];
+            row.spans.push_back({std::min(idA, idB), std::max(idA, idB), *fiberNormalsSpanHash(content, lower, normals)});
+            row.spanNormals.push_back(std::move(normals));
+        }
+    }
     validateApproval(row);
     return row;
 }
@@ -546,6 +732,18 @@ FiberPieceApproval revokeFiberPieceApproval(const FiberPieceApproval& live, cons
     return row;
 }
 
+namespace {
+void attachNormals(std::vector<FiberPieceApproval>& rows, const std::vector<ExtensionRow>& normals)
+{
+    for (const auto& values : normals) {
+        if (values.size() != 3) throw std::invalid_argument("fiber piece normals: unexpected column count");
+        const auto uuid = blobText(values[1], "row uuid");
+        const auto row = std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.rowUuid == uuid; });
+        if (row != rows.end()) attachFiberPieceNormals(*row, values);
+    }
+}
+} // namespace
+
 std::vector<FiberPieceApproval> readFiberPieceApprovals(const ObjectStore& store, const Txn& txn, const std::string& fiberUuid)
 {
     std::vector<FiberPieceApproval> rows;
@@ -556,6 +754,14 @@ std::vector<FiberPieceApproval> readFiberPieceApprovals(const ObjectStore& store
         rows.push_back(decodeFiberPieceApprovalRow(row));
         return true;
     }, prefix);
+    if (std::any_of(tables.begin(), tables.end(), [](const auto& t) { return t.name == kFiberPieceNormalsTable; })) {
+        std::vector<ExtensionRow> normals;
+        store.scanExtensionRows(txn, kFiberPieceNormalsTable, [&](const ExtensionRow& row) {
+            normals.push_back(row);
+            return true;
+        }, prefix);
+        attachNormals(rows, normals);
+    }
     return rows;
 }
 
@@ -573,6 +779,17 @@ std::vector<FiberPieceApproval> readFiberPieceApprovals(const StoreReader& reade
         // No such table in this store: nothing approved.
         rows.clear();
     }
+    std::vector<ExtensionRow> normals;
+    try {
+        reader.scanExtensionRows(kFiberPieceNormalsTable, [&](const ExtensionRow& row) {
+            normals.push_back(row);
+            return true;
+        }, prefix);
+    } catch (const std::invalid_argument&) {
+        // No such table in this store: no normals were stored with an approval.
+        normals.clear();
+    }
+    attachNormals(rows, normals);
     return rows;
 }
 } // namespace vc::objects

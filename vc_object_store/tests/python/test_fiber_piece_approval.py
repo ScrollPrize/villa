@@ -7,6 +7,7 @@ from vc_object_store import (
     FIBER_LOCK_CONTROL_POINT_TAG, FIBER_PIECE_APPROVAL_TABLE, approve_fiber_piece,
     crop_fiber_piece_approvals, extension_uuid, fiber_piece_approval_from_row,
     fiber_piece_approval_states, fiber_piece_approval_table, fiber_piece_approval_to_row,
+    fiber_piece_normals_from_row, fiber_piece_normals_table, fiber_piece_normals_to_row,
     fingerprint_fiber_piece, revoke_fiber_piece_approval,
 )
 
@@ -44,6 +45,32 @@ def test_table_and_row_codec(db):
         tx.append_extension_rows(FIBER_PIECE_APPROVAL_TABLE, [values])
     stored = db.extension_rows(FIBER_PIECE_APPROVAL_TABLE, key_prefix=[extension_uuid(row["fiber_uuid"])])
     assert [fiber_piece_approval_from_row(r) for r in stored] == [row]
+
+
+def test_a_normals_approval_stores_the_shown_normals(db):
+    f = fiber(locks=(3, 5))
+    shown = [[0.0, 0.0, 1.0] for _ in f["line_points"]]
+    with pytest.raises(ValueError):
+        approve(f, 40, 60, 50, "normals")  # nothing shown, nothing to approve
+    row = approve_fiber_piece(f, str(uuid.uuid4()), 40, 60, 50, "normals", 3, "alice", "2026-11-17T10:00:00Z", "host",
+                              line_normals=shown)
+    assert [len(span) for span in row["span_normals"]] == [11, 11] and len(row["spans"]) == 2
+    assert fiber_piece_normals_to_row(approve(f, 40, 60, 50)) is None
+    values, normals = fiber_piece_approval_to_row(row), fiber_piece_normals_to_row(row)
+    bare = fiber_piece_approval_from_row(values)
+    assert bare["span_normals"] == [] and bare["spans"] == row["spans"]
+    assert fiber_piece_approval_states(f, [bare])["approved_spans"]["normals"] == []
+    assert fiber_piece_normals_from_row(bare, normals) == row
+    assert fiber_piece_approval_states(f, [row])["approved_spans"]["normals"] == [3, 4]
+    moved = fiber(locks=(3, 5)); moved["line_points"][45][1] = 0.5
+    assert fiber_piece_approval_states(moved, [row])["approved_spans"]["normals"] == [3]
+    with db.write() as tx:
+        tx.create_extension_table(fiber_piece_approval_table())
+        tx.create_extension_table(fiber_piece_normals_table())
+        tx.append_extension_rows(FIBER_PIECE_APPROVAL_TABLE, [values])
+        tx.append_extension_rows(fiber_piece_normals_table()["name"], [normals])
+    stored = db.extension_rows(fiber_piece_normals_table()["name"], key_prefix=[extension_uuid(row["fiber_uuid"])])
+    assert [fiber_piece_normals_from_row(bare, r) for r in stored] == [row]
 
 
 def test_fingerprints_follow_the_native_rules():
