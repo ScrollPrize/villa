@@ -704,6 +704,7 @@ class CpuTrackStorageTests(unittest.TestCase):
     def test_mps_track_upload_falls_back_when_the_budget_is_in_use(self):
         # 32 bytes of points against a 1000-byte budget: 20% of the whole
         # budget fits, 20% of what is left after 900 allocated bytes does not
+        import os
         from unittest import mock
         from tracks import _attach_device_resident_points
         bundle = {
@@ -711,9 +712,13 @@ class CpuTrackStorageTests(unittest.TestCase):
             'flat_zyx_cpu': torch.zeros(2, 3),
             'flat_source_local_cpu': torch.zeros(2, dtype=torch.int32),
         }
-        with mock.patch.object(torch.mps, 'recommended_max_memory', return_value=1000), \
-                mock.patch.object(torch.mps, 'driver_allocated_memory', return_value=900):
+        # the opt-out skips the memory check, so clear it to exercise the budget
+        with mock.patch.dict(os.environ), \
+                mock.patch.object(torch.mps, 'recommended_max_memory', return_value=1000), \
+                mock.patch.object(torch.mps, 'driver_allocated_memory', return_value=900) as allocated:
+            os.environ.pop('VC_DISABLE_TRACK_DEVICE_POINTS', None)
             _attach_device_resident_points(bundle, torch.device('mps'))
+        allocated.assert_called_once()
         self.assertNotIn('flat_zyx', bundle)
         self.assertNotIn('flat_source_local', bundle)
 

@@ -159,7 +159,8 @@ when track length-bin weights are set and the resampled points fit in GPU memory
 sampler plans each batch on the host and gathers it in one dispatch. Neither the radius loss nor
 the sampler compiles per-shape graphs or reads tensor shapes back from the GPU; the track DT loss,
 everything else, and the CPU use the PyTorch paths. On MPS the resampled track points stay on the
-device, as on CUDA. `FIT_SPIRAL_METAL=0` turns the Metal kernels off, and
+device, as on CUDA, while they fit in a fifth of the Metal memory still free; otherwise the fit keeps
+them on the host. `FIT_SPIRAL_METAL=0` turns the Metal kernels off, and
 `FIT_SPIRAL_METAL_TRACKS=0` turns off only the track loss and sampler.
 `tests/test_track_radius_metal.py` checks the fused loss against the eager one.
 
