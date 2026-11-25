@@ -1,5 +1,35 @@
 """Copy the source Zarr chunks selected by tifxyz label-patch geometry.
 
+v4 — targeted fixes for PR #2677 (review: villa-review, 24/11/2026, third
+review of the v3 head at 1d22a4a).
+
+C2. An incomplete plan no longer creates a fresh output. v3 refused to
+    --overwrite an existing output with an incomplete plan, but it still
+    wrote a partial plan as a fresh output — and a normal retry then
+    rejected the saved manifest (exact-plan check), so the user had to
+    --overwrite and recopy everything. v4 refuses to create a fresh
+    output from an incomplete plan, before any mutation: the run fails
+    loudly, nothing is written, and a retry after the labels arrive
+    writes the complete plan normally. The existing-output cases are
+    unchanged: --overwrite with an incomplete plan is still refused,
+    and a plain retry against a stored complete plan still goes through
+    the exact-plan resume check.
+C3. A readable but empty supervision mask is no longer "skipped" —
+    when the neighbouring ink store proves the segment is
+    synchronised. The planning pre-check now tests readability
+    (metadata), not chunk presence, like the training gate in
+    segment.py: an all-zero supervision mask (the label writer omits
+    fill-only chunks) means the segment is ready and yields no patches,
+    so it contributes nothing and is NOT recorded in skipped_segments
+    — the plan stays complete. The ink store must carry chunks for
+    that reading: without the proof (both label stores empty) the
+    segment is unfinished and is still recorded as skipped, so a
+    0-patch plan still fails loudly instead of overwriting an existing
+    output with 0 chunks. An unreadable supervision store (no metadata)
+    is still unfinished and still recorded as skipped. (v3's point 1
+    below is corrected accordingly: the supervision gate is now a
+    metadata gate with an ink synchronisation proof.)
+
 v3 — targeted fixes for PR #2677 (review: villa-review, 24/11/2026, second
 review of the v2 head at 8d50b31), on top of the v2 flat-discovery fix.
 
@@ -12,7 +42,9 @@ review of the v2 head at 8d50b31), on top of the v2 flat-discovery fix.
    when the supervision store has chunks; a supervision store without
    chunks can yield no supervised patches, so the segment still waits.
    An ink store with no metadata at all is unreadable: the segment
-   waits.
+   waits. (v4 corrects the supervision part: a readable supervision
+   store without chunks is an all-zero mask, not an unfinished mirror
+   — it yields no patches and is not recorded as skipped. See C3 above.)
 2. An incomplete plan no longer destroys existing output. When patches
    are empty AND segments were skipped, planning now raises
    RuntimeError instead of returning a 0-chunk plan, and
@@ -568,12 +600,26 @@ def copy_chunks_to_output(
     stored plan would then be rejected as modified on retry. The
     refusal happens before any mutation, so the existing output is
     preserved and the run can be retried after the labels are restored.
+    It must also never CREATE a fresh output (C2): a partial plan
+    written fresh would be rejected as modified by a normal retry once
+    the complete plan is available, leaving --overwrite (and a full
+    recopy) as the only recovery. So an incomplete plan with no
+    existing output fails loudly here too, before any mutation, and a
+    retry after the labels arrive writes the complete plan normally.
     """
     if incomplete and overwrite and output_path.exists():
         raise ValueError(
             f"Refusing to overwrite existing output {output_path} with an "
             "incomplete plan (segments were skipped at planning time); "
             "restore the skipped segments' labels and retry"
+        )
+    if incomplete and not output_path.exists():
+        raise RuntimeError(
+            f"Refusing to create a fresh output {output_path} from an "
+            "incomplete plan (segments were skipped at planning time); "
+            "a partial plan would be rejected as modified on retry. "
+            "Restore the skipped segments' labels and retry — a complete "
+            "plan will then be written."
         )
     source_group = open_volume_root(
         volume_path, auth_json_path=volume_auth_json
@@ -913,19 +959,37 @@ def _build_dataset_download_patches(
             )
             segment = discover_segment_labels(segment, extension=".zarr", required=True)
             # Unfinished mirror: a label store that cannot be opened at
-            # all (no metadata — first-sync state) is unfinished, and a
-            # supervision store without chunks holds no supervised voxels,
-            # so the segment can yield no patches. Skip it now; it is
-            # picked up on a later run once its stores are filled.
+            # all (no metadata — first-sync state) is unfinished. A
+            # supervision store that is READABLE without chunks is NOT
+            # unfinished (C3) when the neighbouring ink store proves
+            # the segment is synchronised: the label writer omits
+            # fill-only chunks, so it is an all-zero supervision mask
+            # — the segment is ready and yields no patches, so it
+            # contributes nothing and is not recorded as skipped (the
+            # plan stays complete). Without that proof (both label
+            # stores empty) the segment is unfinished and is recorded
+            # as skipped, so a 0-patch plan still fails loudly instead
+            # of overwriting an existing output with 0 chunks.
             # An ink store that is READABLE without chunks is NOT
-            # unfinished: the label writer omits fill-only chunks, so a
-            # valid all-background ink store has metadata and no chunks.
-            # It stays eligible whenever the selected filter allows
-            # background examples (the supervision store above proves
-            # the segment is synchronised).
+            # unfinished either: a valid all-background ink store has
+            # metadata and no chunks. It stays eligible whenever the
+            # selected filter allows background examples (the
+            # supervision store above proves the segment is
+            # synchronised).
             if segment.supervision_mask is not None and not zarr_store_has_chunks(
                 segment.supervision_mask
             ):
+                if (
+                    zarr_store_has_metadata(segment.supervision_mask)
+                    and segment.inklabels is not None
+                    and zarr_store_has_chunks(segment.inklabels)
+                ):
+                    # C3: readable but empty supervision, ink store
+                    # with chunks (synchronisation proof) — genuine
+                    # all-zero mask, zero patches, not unfinished.
+                    # Skip planning for this segment without recording
+                    # it as skipped.
+                    continue
                 raise ValueError(
                     f"{segment.supervision_mask} holds no chunks yet "
                     "(unfinished mirror)"
