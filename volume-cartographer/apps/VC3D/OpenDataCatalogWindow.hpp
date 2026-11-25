@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <string>
 #include <vector>
 
 class QCheckBox;
@@ -65,6 +66,9 @@ private slots:
     void createSelectedProject();
 
 private:
+    friend class CatalogProjectDialogTest;
+    explicit OpenDataCatalogWindow(std::string manifestUrl, QWidget* parent = nullptr);
+
     struct ManifestLoadResult {
         vcr::catalog::OpenDataManifest manifest;
         QString sourceLabel;
@@ -81,7 +85,6 @@ private:
     };
 
     void buildUi();
-    void loadCachedManifestIfAvailable();
     void applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache,
                        bool browseOnly = false);
     // Opening and populating projects reads the catalog cache file, so it must be the catalog shown.
@@ -133,6 +136,8 @@ private:
     QPushButton* _refreshSampleButton{nullptr};
     QCheckBox* _doNotShowOnNextOpenCheck{nullptr};
 
+    std::string _manifestUrl{vcr::catalog::kDefaultManifestUrl};
+    std::filesystem::path _cacheFile{vcr::catalog::catalogCacheFile(_manifestUrl)};
     std::optional<vcr::catalog::OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
