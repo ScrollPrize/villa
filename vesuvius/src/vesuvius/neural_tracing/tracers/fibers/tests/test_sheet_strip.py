@@ -270,7 +270,7 @@ def test_predict_many_batches_fibers():
 
     def run(pipeline, across_fibers):
         predictor, launched = object.__new__(StripPredictor), []
-        predictor.batch, predictor.pipeline, predictor.pad_batches = 4, pipeline, False
+        predictor.batch, predictor.pipeline, predictor.pad_batches, predictor.cuda_index = 4, pipeline, False, None
 
         def prepare(part):
             # each decision's value is its fiber's id plus its arclength / 100, so outputs show where they landed

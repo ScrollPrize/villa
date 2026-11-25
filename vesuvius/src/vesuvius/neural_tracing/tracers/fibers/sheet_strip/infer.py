@@ -195,6 +195,13 @@ class StripPredictor:
         chunks); the default builds them on the CPU. ``memory_cache``: bytes of CT chunks the CPU reader keeps."""
         path = resolve_checkpoint(checkpoint)
         self.source = checkpoint_source(checkpoint, path)
+        # the current CUDA device is per thread: predict_many's prepare thread binds the one this predictor was
+        # made under, so a bare 'cuda' names the same GPU there as here
+        self.cuda_index = None
+        if torch.device(device).type == 'cuda':
+            self.cuda_index = torch.device(device).index
+            if self.cuda_index is None:
+                self.cuda_index = torch.cuda.current_device()
         self.model, self.cfg, self.ck = load_strip_model(path, device)
         if torch.device(device).type == 'mps':
             optimize_for_mps(self.model)  # same weights and outputs (models/mps.py)
@@ -254,7 +261,7 @@ class StripPredictor:
         started = deque()  # jobs in order; the front is yielded once all its decisions are collected
         parts = _decision_batches(jobs, self.batch, started, across_fibers)
         done = 0
-        with ThreadPoolExecutor(1, thread_name_prefix='strip-prepare') as pool:
+        with ThreadPoolExecutor(1, thread_name_prefix='strip-prepare', initializer=self._bind_device) as pool:
             prepare = lambda part: pool.submit(self._prepare, part)
             part = next(parts, None)
             pending = None if part is None else prepare(part)
@@ -277,6 +284,10 @@ class StripPredictor:
                     yield started.popleft().result()
         while started:  # jobs without decisions after the last batch
             yield started.popleft().result()
+
+    def _bind_device(self):
+        if self.cuda_index is not None:
+            torch.cuda.set_device(self.cuda_index)
 
     def _prepare(self, part):
         """One batch's decision items and model inputs (frames oriented, crops built, still on the host or the GPU
