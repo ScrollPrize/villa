@@ -15,7 +15,8 @@ StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::stri
 StoreSurfaces::~StoreSurfaces() = default;
 
 std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool applyValidity,
-                                                 const std::optional<vc::objects::VolumeVoxels>& volume)
+                                                 const std::optional<vc::objects::VolumeVoxels>& volume,
+                                                 vc::objects::VolumeAffine* applied)
 {
     std::unique_ptr<QuadSurface> surface;
     std::optional<vc::objects::PinnedObject> pin;
@@ -29,10 +30,12 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
         if (volume) {
             const auto view = vc::objects::GeometrySnapshot(reader).viewTransformedAt(*head, volume->volume, volume->scale);
             identity = view.mapping() == vc::objects::VolumeAffine::identity();
+            if (applied) *applied = view.mapping();
             mapping = view.checkMappingOperation();
             surface = load_quad_from_store(reader, *head, applyValidity, &view);
         } else {
             surface = load_quad_from_store(reader, *head, applyValidity);
+            if (applied) *applied = vc::objects::VolumeAffine::identity();
         }
         pin = vc::objects::pinOf(objects_.attachment(), *head, activeGeneration);
     });

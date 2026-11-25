@@ -1353,16 +1353,39 @@ int main(int argc, char *argv[])
         }
 
         std::unique_ptr<QuadSurface> surf;
+        // The affine the store applied to this surface's stored coordinates (identity for tifxyz input).
+        vcr::catalog::Affine toVolume = vcr::catalog::Affine::identity();
         try {
-            surf = store_mode ? StoreSurfaces(store_options->store, "vc_render_tifxyz").load(seg_folder.string(), true, view_volume)
+            surf = store_mode ? StoreSurfaces(store_options->store, "vc_render_tifxyz").load(seg_folder.string(), true, view_volume, &toVolume)
                               : load_quad_from_tifxyz(seg_folder);
         }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
         // The scale sets the output size below; check it against the grid it describes. Valid vertices are the
-        // ones this renderer uses (not the -1 marker, all coordinates finite).
-        {
-            const auto& points = *surf->rawPointsPtr();
+        // ones this renderer uses (not the -1 marker, all coordinates finite). The store adjusts scale together
+        // with the coordinates only for identity and uniformly scaled mappings; under any other registration the
+        // check runs on a copy of these same loaded points mapped back to the surface's own frame, which the stored
+        // scale describes. The surface is not read a second time, so the checked and rendered revisions are one.
+        do {
+            cv::Mat_<cv::Vec3f> ownFrame;
+            const cv::Mat_<cv::Vec3f>* checked = surf->rawPointsPtr();
+            if (!(toVolume == vcr::catalog::Affine::identity()) && !toVolume.similarityScale()) {
+                std::optional<vcr::catalog::Affine> back;
+                try { back = toVolume.inverse(); }
+                catch (const std::invalid_argument&) {}
+                if (!back) {
+                    logPrintf(stdout, "%s: scale check skipped: non-invertible registration\n", seg_folder.string().c_str());
+                    break;
+                }
+                ownFrame = checked->clone();
+                for (auto& p : ownFrame) {
+                    if (p[0] == -1.0f || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
+                    const auto q = back->apply({double(p[0]), double(p[1]), double(p[2])});
+                    p = {float(q[0]), float(q[1]), float(q[2])};
+                }
+                checked = &ownFrame;
+            }
+            const auto& points = *checked;
             // QuadSurface keeps scale as (x, y) = (columns, rows); vcr::tifxyz takes (rows, columns).
             const std::array<double, 2> scale = {double(surf->_scale[1]), double(surf->_scale[0])};
             vcr::tifxyz::SpacingOptions options;
@@ -1386,7 +1409,7 @@ int main(int argc, char *argv[])
                 logPrintf(stderr, "Not rendering %s (--strict-scale).\n", seg_folder.string().c_str());
                 return false;
             }
-        }
+        } while (false);
 
         // Replace sentinel -1 with NaN
         auto* raw_points = surf->rawPointsPtr();

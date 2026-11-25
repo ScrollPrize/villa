@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 #include <vc_object_store/objects/ToolObjects.hpp>
+#include <vc_object_store/objects/VolumeTransforms.hpp>
 
 #include <filesystem>
 #include <memory>
@@ -39,9 +40,11 @@ public:
     // With `volume`, in those voxels through the store's transformed view
     // (bound to the volume, or registered to it); otherwise in stored units. Only
     // a surface loaded in stored units, or whose mapping to the voxels is the
-    // identity, can be written back.
+    // identity, can be written back. `mapping`, when given, receives the affine
+    // this load applied to the stored coordinates (identity without `volume`).
     std::unique_ptr<QuadSurface> load(const std::string& uuid, bool applyValidity = true,
-                                      const std::optional<vc::objects::VolumeVoxels>& volume = std::nullopt);
+                                      const std::optional<vc::objects::VolumeVoxels>& volume = std::nullopt,
+                                      vc::objects::VolumeAffine* mapping = nullptr);
     // A new surface object holding `surface`. Its meta keeps the surface's meta
     // (e.g. area) except tifxyz file keys and status tags (`tags` are the record's); meta.provenance records the tool, its
     // parameters and the source objects. It is bound to `volume` when given,
