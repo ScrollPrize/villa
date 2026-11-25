@@ -95,7 +95,8 @@ its own slab in RAM, on every platform. `--slab-workers auto`, the default,
 starts one worker for every two CPUs, at most 8 (each worker keeps more than one
 CPU busy, and more than 8 has not been measured). It starts only as many as fit
 in the memory available at the start less 4 GB, which stays free for other
-work, at about 16 bytes per voxel of the largest slab plus 256 MB a worker (a
+work (in a container, the memory its cgroup v2 limit leaves when that is
+less), at about 16 bytes per voxel of the largest slab plus 256 MB a worker (a
 full-width ribbon of a 7948 × 7948 scroll at downsample 2 peaked at 1.8 GB;
 1536 × 1536 crops take about 0.4 GB a worker), and runs one slab at a time when
 the predictions are remote. `--kimimaro-parallel auto`, also the default, gives

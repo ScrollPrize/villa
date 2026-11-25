@@ -435,6 +435,28 @@ def test_cpu_defaults_on_every_os(monkeypatch, tmp_path, platform, serial):
     assert run('--predictions', 's3://b/p.zarr') == (1, serial)
 
 
+def test_available_memory_is_bounded_by_the_cgroup(monkeypatch, tmp_path):
+    # A container's cgroup v2 limit, on its own group or an ancestor, caps what the host reports
+    proc = tmp_path / 'cgroup'
+    proc.write_text('0::/user.slice/job\n')
+    for group, limit, current in [('', None, None), ('user.slice', 20 * 2**30, 4 * 2**30),
+                                  ('user.slice/job', 'max', 2**30)]:
+        (tmp_path / group).mkdir(parents=True, exist_ok=True)
+        if limit is not None:
+            (tmp_path / group / 'memory.max').write_text(f'{limit}\n')
+            (tmp_path / group / 'memory.current').write_text(f'{current}\n')
+    assert est._cgroup_memory_headroom(str(tmp_path), str(proc)) == 16 * 2**30
+    assert est._cgroup_memory_headroom(str(tmp_path), str(tmp_path / 'missing')) is None
+
+    psutil = pytest.importorskip('psutil')
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(psutil, 'virtual_memory', lambda: types.SimpleNamespace(available=50 * 2**30))
+    monkeypatch.setattr(est, '_cgroup_memory_headroom', lambda: 16 * 2**30)
+    assert est._available_memory() == 16 * 2**30
+    monkeypatch.setattr(est, '_cgroup_memory_headroom', lambda: None)
+    assert est._available_memory() == 50 * 2**30
+
+
 def test_command_line_reaches_the_backend(monkeypatch, tmp_path):
     runs = []
     monkeypatch.setattr(est, 'z_min', est.z_min)  # main() sets the z range; restore it after

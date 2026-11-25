@@ -492,17 +492,47 @@ def _physical_memory():
     return None
 
 
+def _cgroup_memory_headroom(cgroup_root='/sys/fs/cgroup', proc_cgroup='/proc/self/cgroup'):
+    # Bytes this process's cgroup v2 and its ancestors let it add (memory.max less memory.current,
+    # the lowest along the path), or None outside cgroup v2 or with no limit. Containers often
+    # limit memory below what the host reports as available.
+    try:
+        with open(proc_cgroup) as f:
+            path = next(line[3:].strip() for line in f if line.startswith('0::'))
+    except (OSError, StopIteration):
+        return None
+    headroom = None
+    parts = [p for p in path.split('/') if p]
+    for depth in range(len(parts), -1, -1):
+        group = os.path.join(cgroup_root, *parts[:depth])
+        try:
+            with open(os.path.join(group, 'memory.max')) as f:
+                limit = f.read().strip()
+            with open(os.path.join(group, 'memory.current')) as f:
+                current = int(f.read())
+        except (OSError, ValueError):
+            continue
+        if limit != 'max':
+            left = max(0, int(limit) - current)
+            headroom = left if headroom is None else min(headroom, left)
+    return headroom
+
+
 def _available_memory():
-    # Bytes of RAM new processes can take now without swapping (free plus reclaimable), or None
-    # when unknown. psutil comes with Kimimaro outside Windows.
+    # Bytes of RAM new processes can take now without swapping (free plus reclaimable), bounded by
+    # the cgroup's headroom, or None when unknown. psutil comes with Kimimaro outside Windows.
     if sys.platform == 'win32':
         status = _windows_memory_status()
         return status.ullAvailPhys if status else None
     try:
         import psutil
+        available = psutil.virtual_memory().available
     except ImportError:
-        return None
-    return psutil.virtual_memory().available
+        available = None
+    headroom = _cgroup_memory_headroom()
+    if headroom is None:
+        return available
+    return headroom if available is None else min(available, headroom)
 
 
 def _slab_worker_memory():
