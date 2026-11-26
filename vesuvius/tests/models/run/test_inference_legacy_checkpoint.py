@@ -188,6 +188,30 @@ def test_load_train_py_model_supports_legacy_checkpoint_with_ema(tmp_path: Path)
     torch.testing.assert_close(loaded_state[floating_key], torch.full_like(loaded_state[floating_key], 2.0))
 
 
+def test_train_py_cuda_forward_without_triton(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "model.pth"
+    torch.save({"model_config": {"in_channels": 1}, "model": {"weight": torch.tensor([[3.0]])}}, checkpoint)
+    model = torch.nn.Linear(1, 1, bias=False)
+    inferer = Inferer.__new__(Inferer)
+    inferer.device = torch.device("cuda")
+    inferer.verbose = False
+
+    def to_device(device):
+        assert device == inferer.device
+        return model  # Keep the weights on CPU so this test runs without a GPU.
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("CUDA prediction should run eagerly when Triton is unavailable")
+
+    monkeypatch.setattr(inference, "NetworkFromConfig", lambda mgr: model)
+    monkeypatch.setattr(model, "to", to_device)
+    monkeypatch.setattr("torch.utils._triton.has_triton", lambda: False)
+    monkeypatch.setattr(torch, "compile", unexpected_compile)
+
+    network = inferer._load_train_py_model(checkpoint)["network"]
+    torch.testing.assert_close(network(torch.tensor([[2.0]])), torch.tensor([[6.0]]))
+
+
 def _normalized(path: Path, scheme: str) -> np.ndarray:
     dataset = VCDataset(input_path=str(path), patch_size=(1, 1, 1), normalization_scheme=scheme,
                         return_as_type="np.float32", skip_empty_patches=False)

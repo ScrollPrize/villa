@@ -6,6 +6,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from vesuvius.models.utilities.compilation import has_triton
+
 
 class _ScaleInputWrapper(torch.nn.Module):
     """Scale raw voxel intensities before forwarding into an external model."""
@@ -105,7 +107,7 @@ def try_load_external_resnet34_model(
     model.load_state_dict(state_dict, strict=True)
     model = _ScaleInputWrapper(model, scale=255.0).to(device)
 
-    if device.type == "cuda":
+    if device.type == "cuda" and has_triton():
         try:
             if verbose:
                 print("Compiling external ResNet model with torch.compile")
