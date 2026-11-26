@@ -41,6 +41,9 @@ python -m pip install -e '.[all]' \
 ```
 
 Use `VC_READER_ENABLE_CUDA=ON` to require CUDA and fail if it is unavailable.
+A toolkit whose nvcc cannot compile the CUDA backend counts as unavailable: with
+automatic detection the build continues without CUDA and prints a warning that
+names the nvcc.
 Explicit settings persist in the CMake build cache, so pass `ON` to enable
 CUDA after a previous CPU-only build.
 

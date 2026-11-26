@@ -25,8 +25,11 @@ just these checks with `ctest --test-dir build-native -R shared_algorithms
 
 For CUDA, set `VC_READER_ENABLE_CUDA=ON` and choose
 `CMAKE_CUDA_ARCHITECTURES` for the deployment GPU. CUDA discovery defaults to
-auto-detection when the option is omitted. The toolkit supplies CUDA Runtime
-and cuFFT. No Python development files are needed when Python is disabled.
+auto-detection when the option is omitted. Configure also compiles a small probe
+of the CUB and libcu++ features the backend uses. A toolkit that fails it is
+treated as unavailable: auto-detection then builds without CUDA and prints a
+warning, and an explicit `ON` stops with an error. The toolkit supplies CUDA
+Runtime and cuFFT. No Python development files are needed when Python is disabled.
 
 Native headers and shared CPU scheduling require Boost headers; the MPMC queue does not link a Boost runtime library. Install `libboost-dev` on Ubuntu or `boost` with Homebrew. The installed headers target propagates the dependency to C++ consumers.
 
