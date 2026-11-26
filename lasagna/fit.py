@@ -2318,7 +2318,8 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 			d = dataclasses.replace(d, atlas_lines=atlas_lines_3d)
 		if data_cfg.winding_volume is not None:
 			wv_t, wv_min, wv_max = fit_data.load_winding_volume(
-				path=data_cfg.winding_volume, device=device,
+				path=data_cfg.winding_volume,
+				device=torch.device("cpu") if device.type == "mps" else device,
 				crop=None, downscale=scaledown)
 			d = dataclasses.replace(d, winding_volume=wv_t,
 						winding_min=wv_min, winding_max=wv_max)
