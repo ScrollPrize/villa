@@ -7,6 +7,7 @@
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_metadata.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -407,5 +408,21 @@ int main()
     writeTextFile(store / "meta.json", R"({"voxelsize": 7.91})");
     require(vcr::zarr::storeVoxelSizeUm((store / "3").string()) == 7.91, "a level reads its store's documents");
     std::filesystem::remove_all(store);
+    {
+        // A level path written with only backslashes, as a Windows user types it.
+        const auto stored = tmpDir("backslash_level");
+        std::filesystem::create_directories(stored / "3");
+        writeTextFile(stored / "meta.json", R"({"voxelsize": 7.91})");
+        auto level = (stored / "3").generic_string();
+        std::replace(level.begin(), level.end(), '/', '\\');
+#ifdef _WIN32
+        require(vcr::zarr::storeVoxelSizeUm(level) == 7.91, "a level path with backslashes finds its store's documents");
+        require(vcr::zarr::storeVoxelSizeUm(level + "\\") == 7.91, "so does one with a trailing backslash");
+#else
+        // A backslash is an ordinary file name character here: that is one directory name, not a level.
+        require(!vcr::zarr::storeVoxelSizeUm(level).has_value(), "a backslash is not a separator");
+#endif
+        std::filesystem::remove_all(stored);
+    }
     std::cout << cases().size() << " voxel size cases passed\n";
 }

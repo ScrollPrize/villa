@@ -3,6 +3,7 @@
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_metadata.hpp"
+#include "vc_reader/native/reader_types.hpp"
 #include "files.hpp"
 
 #include <algorithm>
@@ -170,17 +171,17 @@ void fillFrom(const Json& document, StoreMetadata& out)
 
 StoreMetadata storeMetadata(const std::string& input, const MetadataReader& reader)
 {
+    return detail::storeMetadata(input, reader, locationSeparators(input));
+}
+
+StoreMetadata detail::storeMetadata(const std::string& input, const MetadataReader& reader, const char* separators)
+{
     const auto read = reader ? reader : metadataReader(Access{});
-    auto location = input;
-    while (location.size() > 1 && location.back() == '/')
-        location.pop_back();
+    const auto location = trimSeparators(input, separators);
     std::vector<std::string> nodes{location};
     // The documents sit at the store's root, above a numbered level.
-    const auto slash = location.rfind('/');
-    if (slash != std::string::npos && slash + 1 < location.size() &&
-        std::all_of(location.begin() + std::ptrdiff_t(slash + 1), location.end(),
-                    [](unsigned char c) { return std::isdigit(c) != 0; }))
-        nodes.push_back(location.substr(0, slash));
+    if (const auto level = numberedLevel(location, separators))
+        nodes.push_back(level->parent);
     StoreMetadata out;
     for (const auto& node : nodes) {
         for (const auto* name : {"meta.json", "metadata.json"}) {
