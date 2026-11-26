@@ -483,6 +483,8 @@ vc_scaffold_solve config.json
 | `max_alternative_paths` | `4` | redundancy cap |
 | `workers` | `1` | geometry packing threads |
 | `output`, `windings_output` | — | JSON summary / per-fiber windings |
+| `approvals` | `true` | `false` solves as if nothing had been approved, marked broken or reviewed |
+| `layout_output`, `layout_spacing_vx` | —, `64` | the map of the solve: per fiber part its line as `u` = winding + turns along the fiber + turn fraction around the umbilicus, `v` = height |
 
 The summary holds the input and link counts, the solve metrics, the
 quantization report, the ranked residuals with their cycles and pieces, and

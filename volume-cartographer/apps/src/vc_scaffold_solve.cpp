@@ -81,6 +81,8 @@ ScaffoldLoadOptions loadOptionsFrom(const Json& cfg)
     else if (source == "automatic") options.familySource = ScaffoldFamilySource::Automatic;
     else throw std::invalid_argument("family_source must be any, manual or automatic");
     options.includeUntagged = cfg.value("include_untagged", false);
+    // approvals: false solves as if nothing had been approved, marked broken or reviewed.
+    options.readApprovals = cfg.value("approvals", true);
     // A restricted run: only these fibers are loaded (the GUI's scope
     // selector states the map's selected network here).
     for (const auto& uuid : cfg.value("fibers", Json::array()))
@@ -309,7 +311,7 @@ int run(const std::string& configPath)
         const auto txn = store.read();
         const vc::objects::LocalStoreReader reader(store, txn);
         graph = loadScaffoldGraph(reader, loadOptionsFrom(cfg));
-        constraintApprovals = vc::objects::readFiberConstraintApprovals(reader);
+        if (cfg.value("approvals", true)) constraintApprovals = vc::objects::readFiberConstraintApprovals(reader);
         annotationCommit = scaffoldAnnotationCommit(reader);
         derivedCache = ScaffoldCache(reader);
     }
@@ -895,6 +897,38 @@ int run(const std::string& configPath)
             if (measure) windings["normal_sign"].push_back(signs.sign[i]);
         }
         writeJson(cfg.at("windings_output").get<std::string>(), windings);
+    }
+    // layout_output: the map of the solve as the fiber map lays it out - per fiber part its line
+    // sampled every `layout_spacing_vx` (default 64) as u = winding + turns along the fiber + the
+    // fraction of a turn around the umbilicus, v = height.
+    if (cfg.contains("layout_output")) {
+        const double spacing = cfg.value("layout_spacing_vx", 64.0);
+        if (!(spacing > 0)) throw std::invalid_argument("layout_spacing_vx must be positive");
+        Json rows = Json::array();
+        const auto handedness = double(geometry.seam().handedness());
+        for (std::size_t i = 0; i < graph.fibers.size(); ++i) {
+            const double length = geometry.arcLength(i);
+            // The fiber's parts, or the whole fiber with its one winding.
+            std::vector<vc::fiber_graph::ScaffoldSolveResult::Part> parts;
+            for (const auto& part : result.parts)
+                if (part.fiber == std::int64_t(i)) parts.push_back(part);
+            if (parts.empty())
+                parts.push_back({std::int64_t(i), 0., length, result.winding[i], result.component[i], true, false});
+            for (const auto& part : parts) {
+                Json u = Json::array(), v = Json::array();
+                for (double arc = part.arcFrom;; arc += spacing) {
+                    const auto sample = geometry.packed().sample(std::int64_t(i), std::min(arc, part.arcTo));
+                    u.push_back(double(part.winding + sample.turn) + handedness * geometry.seam().phase(sample.point));
+                    v.push_back(sample.point[2]);
+                    if (arc >= part.arcTo) break;
+                }
+                rows.push_back(Json{{"fiber", graph.fibers[i].uuid}, {"family", int(graph.fibers[i].family)},
+                                    {"component", part.component}, {"winding", part.winding},
+                                    {"arc_from", part.arcFrom}, {"arc_to", part.arcTo},
+                                    {"u", std::move(u)}, {"v", std::move(v)}});
+            }
+        }
+        writeJson(cfg.at("layout_output").get<std::string>(), Json{{"parts", std::move(rows)}});
     }
     if (cfg.contains("output")) writeJson(cfg.at("output").get<std::string>(), summary);
 
