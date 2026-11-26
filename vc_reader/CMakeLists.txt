@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.22)
+# On macOS, CMake runs the first install_name_tool on PATH to fix install rpaths.
+# A conda env's copy (its cctools package) can leave the files it edits with an
+# invalid signature, and macOS then kills any process that loads them.
+if(CMAKE_HOST_APPLE AND EXISTS /usr/bin/install_name_tool)
+    set(CMAKE_INSTALL_NAME_TOOL /usr/bin/install_name_tool CACHE FILEPATH "Tool for install-time rpath changes")
+endif()
 project(vc_reader_extensions LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
