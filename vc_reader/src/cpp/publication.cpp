@@ -107,7 +107,7 @@ std::recursive_mutex& directoryMutex(const std::filesystem::path& dir)
     // Recursive for callers holding a directory lock across snapshot and publication.
     static std::mutex mapMutex;
     static std::unordered_map<std::string, std::recursive_mutex> locks;
-    const std::string key = dir.lexically_normal().string();
+    const std::string key = utf8String(dir.lexically_normal());
     std::lock_guard<std::mutex> guard(mapMutex);
     return locks[key];
 }
@@ -203,7 +203,7 @@ void publishDirectory(const std::filesystem::path& source,
         marker << "ready\n";
         if (!marker) {
             throw std::runtime_error("failed to prepare save rollback journal: " +
-                                     ready.string());
+                                     utf8String(ready));
         }
     }
 
@@ -284,7 +284,7 @@ void snapshot(const std::filesystem::path& path,int maxBackups,std::chrono::seco
         for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
             if (entry.is_directory()) {
                 try {
-                    int backupNum = std::stoi(entry.path().filename().string());
+                    int backupNum = std::stoi(utf8String(entry.path().filename()));
                     if (backupNum >= 0 && backupNum < maxBackups) {
                         existingBackups.push_back(backupNum);
                         std::error_code mtEc;

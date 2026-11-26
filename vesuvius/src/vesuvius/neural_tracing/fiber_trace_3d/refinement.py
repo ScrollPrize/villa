@@ -6,12 +6,19 @@ proposals, ordered by canonical sample index, to shared memory-mapped curves.
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
+import errno
 import functools
 import hashlib
 import json
 import os
 import tempfile
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; file_lock uses msvcrt there.
+    fcntl = None
+    import msvcrt
 
 import numpy as np
 
@@ -425,10 +432,21 @@ _FROZEN_ENV = "VILLA_FIBER_REFINEMENT_FROZEN"
 
 @contextmanager
 def file_lock(path, shared=False):
-    # flock is supported on both target platforms (Ubuntu/macOS).
-    import fcntl
     with open(path, "a+b") as handle:
-        fcntl.flock(handle, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        else:
+            # Windows: msvcrt has no shared mode, so readers also take the
+            # exclusive byte lock (stricter, never weaker). LK_LOCK gives up
+            # after ~10 s, so keep waiting while another holder has it.
+            handle.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                        raise
         yield
 
 

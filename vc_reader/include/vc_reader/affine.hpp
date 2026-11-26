@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_reader/native/utf8_path.hpp"
 #include <array>
 #include <algorithm>
 #include <cmath>
@@ -83,9 +84,9 @@ struct Affine {
     }
     static Affine loadTransformJson(const std::filesystem::path& path, bool allowSingular=false) {
         std::ifstream in(path);
-        if(!in) throw std::invalid_argument("cannot open transform file: " + path.string());
+        if(!in) throw std::invalid_argument("cannot open transform file: " + utf8String(path));
         try { return fromTransformJson(nlohmann::json::parse(in),allowSingular); }
-        catch(const std::exception& e) { throw std::invalid_argument(path.string() + ": " + e.what()); }
+        catch(const std::exception& e) { throw std::invalid_argument(utf8String(path) + ": " + e.what()); }
     }
     // Of the linear part.
     double determinant() const {

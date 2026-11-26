@@ -66,5 +66,46 @@
                 "the worker's sampler matches the pane's");
     }
     std::cout << "metrics_dataset PASS: no GUI-thread sampler, same dataset as panes (lasagna + fiber normals)" << std::endl;
+
+    // Picking the dataset that is already the default saves it; inputs changed
+    // outside the menus (an attachment) invalidate as a menu selection does.
+    state.vpkg()->clearSelectedFiberInferenceDataset();
+    state.vpkg()->attachPreparedLasagnaDataset(fiberDir.string(), {}, true, {});
+    const auto fiberEntries = state.vpkg()->fiberInferenceDatasetEntries();
+    require(fiberEntries.size() == 1 && state.vpkg()->selectedFiberInferenceDataset() == fiberEntries.front().location &&
+            state.vpkg()->document().data()["view"].value("selected_fiber_inference_dataset", std::string{}).empty(),
+            "the attached fiber dataset is the unsaved default");
+    controller.syncAnnotationInputsWithProject();
+    const auto generation = controller._fiberMetricsGeneration;
+    controller.handleFiberInferenceDatasetSelectionChanged(state.vpkg()->selectedFiberInferenceDataset());
+    require(controller._fiberMetricsGeneration == generation, "picking the current dataset invalidates nothing");
+    require(!state.vpkg()->document().data()["view"].value("selected_fiber_inference_dataset", std::string{}).empty(),
+            "picking the current default saves it as the user's choice");
+    controller.syncAnnotationInputsWithProject();
+    require(controller._fiberMetricsGeneration == generation, "unchanged inputs invalidate nothing");
+    state.vpkg()->setSelectedFiberInferenceDataset(lasagnaManifest.string());
+    // Not while a solve runs: its result would land on the invalidated session.
+    auto running = std::make_shared<Controller::LineAnnotationSession>();
+    running->taskState = Controller::LineAnnotationSession::TaskState::Running;
+    controller._panes.push_back({1, Controller::SourceKind::Plane, "running", nullptr, running});
+    controller.syncAnnotationInputsWithProject();
+    require(controller._fiberMetricsGeneration == generation && controller._annotationInputsSyncDeferred,
+            "a change during a solve waits for it");
+    running->taskState = Controller::LineAnnotationSession::TaskState::Idle;
+    controller.syncAnnotationInputsWithProject();
+    controller._panes.clear();
+    require(controller._fiberMetricsGeneration == generation + 1 && !controller._annotationInputsSyncDeferred,
+            "a changed fiber dataset or normal source invalidates once no solve runs");
+    // An unattached fiber dataset without predicted normals falls back to
+    // Lasagna, so changing the Lasagna dataset must invalidate the normals.
+    const auto unattached = (root / "unattached-fiber.lasagna.json").string();
+    controller.handleFiberInferenceDatasetSelectionChanged(unattached);
+    require(state.vpkg()->annotationNormalSource() == "fiber" && !state.vpkg()->hasPredictedFiberNormals(unattached),
+            "an unattached fiber dataset is checked from its manifest when used");
+    const auto beforeLasagna = controller._fiberMetricsGeneration;
+    controller.handleLasagnaDatasetSelectionChanged(fiberDir.string());
+    require(controller._fiberMetricsGeneration == beforeLasagna + 1,
+            "a Lasagna change invalidates when Lasagna may supply the normals");
+    std::cout << "annotation_inputs PASS: explicit picks persist, external changes invalidate" << std::endl;
     state.closeProject();
 }

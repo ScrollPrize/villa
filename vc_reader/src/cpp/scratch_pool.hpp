@@ -187,7 +187,9 @@ public:
 inline ScratchMaintenance& scratchMaintenance() {
     struct Holder {
         std::atomic<ScratchMaintenance*> current{nullptr};
+#ifndef _WIN32
         ~Holder(){auto* p=current.load();if(p&&p->pid==platform::process_id())delete p;}
+#endif
     };
     static Holder holder;
     auto* current=holder.current.load(std::memory_order_acquire);

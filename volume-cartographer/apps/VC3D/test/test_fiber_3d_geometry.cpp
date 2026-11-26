@@ -2,7 +2,7 @@
 #include "fibers3d/Fiber3DGeometry.hpp"
 #include "fibers3d/Fiber3DRenderGeometry.hpp"
 
-#include <QTest>
+#include "support/QtTestCompat.hpp"
 
 using namespace vc3d::fibers3d;
 

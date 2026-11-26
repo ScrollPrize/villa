@@ -16,13 +16,21 @@ void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest
     if (meta.dtype != "|u1")
         throw std::runtime_error("Lasagna channel group '" + group.name +
                                  "' must be uint8");
-    if (group.channels.size() != 1) {
+    // Schema v3 packs the channels of a resolution into one CZYX array whose
+    // chunks span them all; earlier manifests give every channel a 3D array.
+    const std::size_t spatial = manifest.version == 3 ? 1 : 0;
+    if (spatial == 0 && group.channels.size() != 1) {
         throw std::runtime_error("Lasagna channel group '" + group.name +
                                  "' must describe exactly one 3D channel");
     }
-    if (meta.shape.size() != 3 || meta.chunks.size() != 3) {
+    if (meta.shape.size() != spatial + 3 || meta.chunks.size() != spatial + 3) {
+        throw std::runtime_error("Lasagna channel group '" + group.name + "' must be a " +
+                                 (spatial ? "4D (C,Z,Y,X) Zarr" : "3D (Z,Y,X) Zarr"));
+    }
+    if (spatial && (static_cast<std::size_t>(meta.shape[0]) != group.channels.size() ||
+                    meta.chunks[0] != meta.shape[0])) {
         throw std::runtime_error("Lasagna channel group '" + group.name +
-                                 "' must be a 3D (Z,Y,X) Zarr");
+                                 "' does not store its channels in whole chunks");
     }
     if (!manifest.baseShapeZYX) return;
     const double spacing = static_cast<double>(group.scaleFactor()) *
@@ -30,8 +38,8 @@ void validateGroupDescriptor(const vc::lasagna::LasagnaDatasetManifest& manifest
     for (std::size_t axis = 0; axis < 3; ++axis) {
         const auto expected = static_cast<std::size_t>(std::ceil(
             static_cast<double>((*manifest.baseShapeZYX)[axis]) / spacing));
-        const auto actual = static_cast<std::size_t>(meta.shape[axis]);
-        const auto padding = static_cast<std::size_t>(meta.chunks[axis]);
+        const auto actual = static_cast<std::size_t>(meta.shape[spatial + axis]);
+        const auto padding = static_cast<std::size_t>(meta.chunks[spatial + axis]);
         if (actual < expected || actual > expected + padding) {
             throw std::runtime_error("Lasagna channel group '" + group.name +
                                      "' shape is incompatible with base_shape_zyx");
@@ -76,10 +84,28 @@ CatalogDatasetKind validatePrepared(const vcr::catalog::OpenDataVolume& volume,
     return kind;
 }
 
-// The single root manifest in a public catalogue artifact directory.
-std::string discoverManifestUrl(const std::string& artifactUrl)
+// The manifests already cached in an artifact's directory, relative to it.
+std::vector<std::string> cachedManifests(const std::filesystem::path& directory)
 {
-    std::vector<std::string> keys;
+    std::vector<std::string> sidecars, embedded;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, ec)) {
+        const auto name = entry.path().filename().string();
+        if (name.ends_with(".lasagna.json")) {
+            sidecars.push_back(name);
+        } else if (name.ends_with(".zarr") && std::filesystem::is_regular_file(entry.path() / ".zattrs")) {
+            const auto attrs = nlohmann::json::parse(std::ifstream(entry.path() / ".zattrs"), nullptr, false);
+            if (attrs.is_object() && attrs.contains("lasagna")) embedded.push_back(name + "/.zattrs");
+        }
+    }
+    return sidecars.empty() ? embedded : sidecars;
+}
+
+} // namespace
+
+std::string catalogManifestUrl(const std::string& artifactUrl)
+{
+    std::vector<std::string> keys, stores;
     try {
         const auto access = vcr::zarr::resolveAccess(artifactUrl);
         std::string token;
@@ -87,6 +113,10 @@ std::string discoverManifestUrl(const std::string& artifactUrl)
             const auto page = vcr::zarr::listPage(access, artifactUrl, {}, token);
             for (const auto& object : page.objects)
                 if (object.key.ends_with(".lasagna.json")) keys.push_back(object.key);
+            for (auto name : page.children) {
+                while (name.ends_with('/')) name.pop_back();
+                if (name.ends_with(".zarr")) stores.push_back(std::move(name));
+            }
             token = page.nextContinuationToken;
         } while (!token.empty());
     } catch (const std::invalid_argument& e) {
@@ -94,16 +124,19 @@ std::string discoverManifestUrl(const std::string& artifactUrl)
     }
     std::sort(keys.begin(), keys.end());
     keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    if (keys.empty()) {
+        std::sort(stores.begin(), stores.end());
+        stores.erase(std::unique(stores.begin(), stores.end()), stores.end());
+        if (stores.size() == 1)
+            return vcr::catalog::joinOpenDataUrl(artifactUrl, stores.front() + "/.zattrs");
+    }
     if (keys.size() != 1) {
         throw std::runtime_error(
-            "Lasagna artifact must contain exactly one root .lasagna.json; found " +
-            std::to_string(keys.size()));
+            "Lasagna artifact must contain exactly one root .lasagna.json or compact .zarr; found " +
+            std::to_string(keys.size()) + " and " + std::to_string(stores.size()));
     }
     return vcr::catalog::joinOpenDataUrl(artifactUrl, keys.front());
 }
-
-
-} // namespace
 
 // Download the artifact's small dataset manifest beside a remote marker naming
 // it, and open and validate it with its Zarr descriptors.
@@ -145,23 +178,21 @@ CachedCatalogDataset cacheCatalogDataset(
                 }
                 auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
                 const auto kind = validatePrepared(volume, artifact, dataset);
-                return {manifest, std::move(dataset), kind};
+                return {lasagnaDatasetPath(manifest), std::move(dataset), kind};
             }
         }
     }
 
     // A manifest already cached beside its arrays needs no request.
-    std::vector<std::filesystem::path> present;
-    std::error_code listError;
-    for (const auto& file : std::filesystem::directory_iterator(finalDir, listError))
-        if (file.path().filename().string().ends_with(".lasagna.json"))
-            present.push_back(file.path());
+    const auto present = cachedManifests(finalDir);
     std::string relativeName;
     if (present.size() == 1) {
-        relativeName = present.front().filename().string();
+        relativeName = present.front();
     } else {
-        const auto manifestUrl = discoverManifestUrl(artifactUrl);
-        relativeName = manifestUrl.substr(manifestUrl.find_last_of('/') + 1);
+        const auto manifestUrl = catalogManifestUrl(artifactUrl);
+        auto name = manifestUrl.find_last_of('/');
+        if (manifestUrl.ends_with("/.zattrs")) name = manifestUrl.find_last_of('/', name - 1);
+        relativeName = manifestUrl.substr(name + 1);
         LasagnaDatasetOpenOptions options;
         options.remoteCacheRoot = cacheRoot;
         options.discoverAwsCredentials = false;
@@ -190,7 +221,7 @@ CachedCatalogDataset cacheCatalogDataset(
     try {
         auto dataset = vc::lasagna::LasagnaDataset::open(manifest);
         const auto kind = validatePrepared(volume, artifact, dataset);
-        return {manifest, std::move(dataset), kind};
+        return {lasagnaDatasetPath(manifest), std::move(dataset), kind};
     } catch (...) {
         std::error_code ec;
         std::filesystem::remove(markerPath, ec);
@@ -233,7 +264,7 @@ CatalogDatasetKind validateCatalogManifest(
         throw std::runtime_error(
             "Lasagna artifact has invalid creation_info.source_to_base");
     }
-    if (manifest.version != 2) {
+    if (manifest.version != 2 && manifest.version != 3) {
         throw std::runtime_error("Unsupported open-data Lasagna manifest version " +
                                  std::to_string(manifest.version));
     }

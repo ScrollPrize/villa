@@ -22,6 +22,8 @@ import nnunetv2
 import torch.nn as nn
 from torch._dynamo import OptimizedModule
 
+from vesuvius.models.utilities.compilation import has_triton
+
 try:
     from huggingface_hub import snapshot_download
     HF_AVAILABLE = True
@@ -320,6 +322,8 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
         should_compile = device.type == 'cuda'
     else:
         should_compile = compile_setting.lower() in ('true', '1', 't')
+    if should_compile and device.type == 'cuda':
+        should_compile = has_triton()
     if should_compile and not isinstance(network, OptimizedModule):
         if should_print:
             print('Using torch.compile for potential performance improvement')

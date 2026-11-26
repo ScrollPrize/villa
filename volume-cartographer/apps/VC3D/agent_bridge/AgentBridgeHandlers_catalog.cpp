@@ -295,8 +295,13 @@ void AgentBridgeServer::startManifestFetch(
     watcher->setFuture(QtConcurrent::run([]() {
         FetchResult fr;
         try {
-            fr.manifest = vcr::catalog::loadCatalog(std::string(vcr::catalog::kDefaultManifestUrl),
-                {vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)), true}).manifest;
+            auto loaded = vcr::catalog::loadCatalog(std::string(vcr::catalog::kDefaultManifestUrl),
+                {vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)), true});
+            // catalog.open_sample resolves what this returns against the cache file.
+            if (loaded.onDisk)
+                fr.manifest = std::move(loaded.manifest);
+            else
+                fr.error = QString::fromStdString(loaded.warning);
         } catch (const std::exception& e) {
             fr.error = QString::fromUtf8(e.what());
         } catch (...) {

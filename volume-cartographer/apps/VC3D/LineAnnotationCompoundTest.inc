@@ -17,7 +17,7 @@ if (const char* source = std::getenv("VC3D_COMPOUND_TEST_VOLUME")) {
     require(state.vpkg()->selectedLasagnaDataset().empty(), "no Lasagna selected");
     require(state.vpkg()->lasagnaDatasetEntries().empty(), "no Lasagna attached");
 
-    require(state.vpkg()->annotationNormalSource() == "fiber", "attachment initializes project normal source");
+    require(state.vpkg()->annotationNormalSource() == "fiber", "fiber normals are the default");
     const cv::Vec3d seed{6160.2939453125, 8019.69580078125, 26137.80859375};
     const cv::Vec3d direction{0.2243, 0.0238, -0.9740};
     // Exercise the same attachment + progressive scalar display as VC3D. There
@@ -252,6 +252,11 @@ if (const char* source = std::getenv("VC3D_COMPOUND_TEST_VOLUME")) {
     controller.handleLasagnaDatasetSelectionChanged(secondNormalLocation);
     require(controller._fiberMetricsGeneration == generation && live->normalSampler == compoundSampler,
             "changing inactive Lasagna selection does not invalidate predicted normals");
+    // The Lasagna choice belongs to one fiber dataset; make it for both here.
+    state.vpkg()->setSelectedFiberInferenceDataset(source);
+    state.vpkg()->setAnnotationNormalSource("lasagna");
+    state.vpkg()->setSelectedFiberInferenceDataset(secondFiberLocation);
+    require(state.vpkg()->annotationNormalSource() == "fiber", "another fiber dataset's Lasagna choice does not carry over");
     controller.handleNormalSourceSelectionChanged("lasagna");
     require(controller._fiberMetricsGeneration == generation + 1 && !live->normalSampler &&
             live->fiberPredictionField == compoundPredictions, "normal-source switch preserves predictions but invalidates normals");

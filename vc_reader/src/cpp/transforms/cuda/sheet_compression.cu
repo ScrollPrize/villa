@@ -16,7 +16,7 @@ struct compression_prefix_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { compression_prefix(index,args...); }
 };
 template<class T> __device__ void compression_field(KernelIndex vcr_launch, const T* values,float* field,Layout g,int axis) {
-    EACH_INDEX(g.size) for(int a=0;a<g.dim;++a) field[i*g.dim+a]=a==axis?-values[i]*double(g.shape[a]-1)/g.shape[a]:0;
+    EACH_INDEX(g.size) for(int a=0;a<g.dim;++a) field[i*g.dim+a]=a==axis?values[i]:0;
 }
 struct compression_field_launch {
     template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { compression_field(index,args...); }
@@ -33,7 +33,7 @@ Parameters sample_sheet(const SheetCompression& t,const Sample& s,Random& r,bool
     if(smooth>.5) {std::vector<double> sigmas(d,smooth);sigmas[chosen]=0;blur(data,g,sigmas,6,Boundary::Mirror,true);}
     auto field=std::make_shared<Buffer<float>>(g.size*d);
     launch(blocks(g.size),256,0,vcr::device::stream(), compression_field_launch{}, values.ptr,field->ptr,Layout(g),int(chosen));
-    check(cudaGetLastError());p.device_field=field;p.border=true;
+    check(cudaGetLastError());p.device_field=field;
     if(record) {p.field.resize(field->size);field->download(p.field.data());}
     };
     if (image.bytes==4) build.template operator()<float>(); else build.template operator()<double>();

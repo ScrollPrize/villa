@@ -46,13 +46,15 @@ vc::lasagna::LasagnaDataset normalField(const fs::path& root,bool otherAxis=fals
         payload[volume+i]=otherAxis?128:(i%9<4?248:8);
         payload[2*volume+i]=otherAxis?248:128;
     }
-    auto writer=vcr::zarr::Writer::create(root/"channels",{
+    // The embedded-manifest layout: resolution group sd<n> at <root>/sd<n>/<n>.
+    auto writer=vcr::zarr::Writer::create(root/"sd0"/"0",{
         .shape={3,3,4,9},.chunks={3,3,4,9},.compressor=""});
     writer.writeChunk({0,0,0,0},payload.data(),payload.size());
     Json manifest={{"version",3},{"source_to_base",1.},{"base_shape_zyx",{3,4,9}},
         {"grad_mag_encode_scale",255.},{"grad_mag_factor",1.},
         {"mask_invalid_normal_corners",true},
-        {"groups",{{"packed",{{"zarr","channels"},{"scaledown",0},
+        {"validity_channel","grad_mag"},
+        {"groups",{{"sd0",{{"zarr","sd0/0"},{"scaledown",0},
             {"channels",{"grad_mag","nx","ny"}}}}}}};
     vcr::zarr::atomicWrite(root/"normal.lasagna.json",manifest.dump());
     return vc::lasagna::LasagnaDataset::open(root/"normal.lasagna.json");
@@ -74,7 +76,9 @@ void sourceSelection(){
     TemporaryDirectory dir;
     const auto field=normalField(dir.path/"compound.zarr");
     auto manifest=field.manifest().raw;
-    manifest["groups"]["packed"]["channels"]={"sheet_grad_mag","sheet_nx","sheet_ny"};
+    manifest["groups"]["sd0"]["channels"]={"sheet_grad_mag","sheet_nx","sheet_ny"};
+    // An old prediction still carrying its sheet_grad_mag mask declares it as validity.
+    manifest["validity_channel"]="sheet_grad_mag";
     vcr::zarr::atomicWrite(dir.path/"compound.zarr/.zattrs",Json{{"lasagna",manifest}}.dump());
     const Json provenance={{"source",{{"sample_id","sample"},{"volume_id","volume"}}},
         {"artifacts",Json::array({{{"kind","manifest"},{"path","compound.zarr/.zattrs"}}})}};
