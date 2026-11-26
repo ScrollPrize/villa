@@ -42,6 +42,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+from vc_reader.cuda import is_available as vc_reader_cuda
 
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_seed_heading, trace_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import predict_frames, trace_family_kwargs
@@ -88,7 +89,7 @@ class FiberFollow:
         options = SimpleNamespace(
             checkpoint=args.checkpoint, device=args.device, precision=args.precision, confidence=args.confidence,
             n_commit=None, gate=None, out=args.state_dir, max_len=8000.,
-            forward_chunk=64, sampling_seed=0, crops='gpu' if args.device.startswith('cuda') else 'cpu',
+            forward_chunk=64, sampling_seed=0, crops='gpu' if args.device.startswith('cuda') and vc_reader_cuda() else 'cpu',
             gpu_chunks=args.gpu_chunks, axis_workers=0,
             **{k: getattr(args, k) for k in ('ct', 'ct_level', 'ct_grid_scale', 'grid_scale', 'cache_dir', 'frame_checkpoint')})
         Path(args.state_dir).mkdir(parents=True, exist_ok=True)
