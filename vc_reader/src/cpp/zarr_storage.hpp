@@ -11,11 +11,18 @@
 #include <atomic>
 #include <charconv>
 #include <cctype>
+#include <condition_variable>
+#include <exception>
+#include <functional>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
 namespace vcr {
 
@@ -23,19 +30,40 @@ class ZarrStorage {
     struct IndexData {
         std::vector<std::uint8_t> bytes;
         std::uint64_t total = 0, start = 0;
+        std::uint64_t epoch = 0;
         std::string etag;
+    };
+    struct IndexLookup {
+        std::shared_ptr<const IndexData> index;
+        bool retained = false;
+    };
+    struct ActiveFreshVisit {
+        std::string path;
+        std::weak_ptr<const IndexData> index;
+        std::uint64_t epoch = 0;
+    };
+    struct InFlightIndex {
+        std::uint64_t epoch = 0;
+        bool evicted = false;  // guarded by index_mutex_
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        std::shared_ptr<const IndexData> index;
+        std::exception_ptr error;
     };
     struct Position { std::size_t inner, slot; };
     struct ContentRange { std::uint64_t first, last, total; };
     struct RetryShardRange : std::runtime_error { using std::runtime_error::runtime_error; };
 
-    template<class Read>
-    static auto refresh_after_shard_switch(Read&& read)
-    {
-        try { return read(); }
-        catch (const RetryShardRange&) { return read(); }
-    }
+    static constexpr int max_shard_refreshes = 1;
 public:
+    struct BatchChunkResult {
+        bool found = false;
+        std::vector<std::uint8_t> body;
+        std::exception_ptr error;
+    };
+    using ChunkCallback = std::function<void(std::size_t, BatchChunkResult)>;
+
     ZarrStorage(std::string root, std::string prefix, std::string separator, Index shards,
                 bool index_end, bool index_crc, std::size_t chunk_bytes, HttpClient* http,
                 std::atomic<std::uint64_t>& requests, std::atomic<std::uint64_t>& bytes)
@@ -61,15 +89,22 @@ public:
         }
         if (!http_) return LocalShard(utf8Path(path), layout_).readEntry(*position, body);
         const Position requested{*position, 0};
-        return refresh_after_shard_switch([&] {
-            const auto [index, switched] = shard_index(path, {&requested, 1});
-            if (!index) return false;
-            const auto entry = layout_.entry(index->bytes, *position, index->total);
+        bool force_refresh = false;
+        for (int attempt = 0; attempt <= max_shard_refreshes; ++attempt) {
+            const auto lookup = shard_index(path, {&requested, 1}, force_refresh);
+            if (!lookup.index) return false;
+            const auto entry = layout_.entry(lookup.index->bytes, *position, lookup.index->total);
             if (!entry) return false;
             const auto [offset, length] = *entry;
-            read_shard_range(path, index->total, index->etag, offset, length, body, switched);
-            return true;
-        });
+            const bool can_retry = lookup.retained && attempt < max_shard_refreshes;
+            try {
+                read_shard_range(path, lookup, offset, length, body, can_retry);
+                return true;
+            } catch (const RetryShardRange&) {
+                force_refresh = true;
+            }
+        }
+        throw std::logic_error("shard refresh attempts exhausted");
     }
 
     static constexpr std::size_t max_merged_bytes = 512 << 10;
@@ -80,52 +115,95 @@ public:
         return http_ && !layout_.ratios.empty() && !sftp::isSftpUrl(root_);
     }
 
-    // The caller owns these remote misses. Keep the index alive only while
-    // planning its shard, then read the bounded groups on the existing pool.
-    // An empty payload denotes a missing shard or chunk, never valid data.
-    std::vector<std::vector<std::uint8_t>> read_batch(const std::vector<std::string>& keys, ThreadPool& pool)
-    {
-        return refresh_after_shard_switch([&] { return read_batch_once(keys, pool); });
-    }
-
-private:
-    std::vector<std::vector<std::uint8_t>> read_batch_once(const std::vector<std::string>& keys, ThreadPool& pool)
+    // The caller owns these remote misses. Plan and read each shard independently
+    // on the existing pool, delivering every slot exactly once as soon as its
+    // chunk settles so healthy chunks are neither blocked nor poisoned by sibling
+    // errors. Stale retained indexes refresh per shard with a bounded retry limit.
+    void read_batch(const std::vector<std::string>& keys, ThreadPool& pool, const ChunkCallback& deliver)
     {
         if (keys.size() > max_batch_chunks)
             throw std::invalid_argument("shard batch exceeds chunk limit");
-        struct Member {
-            std::uint64_t start, stop;
-            std::size_t slot;
+        struct ShardGroup {
+            std::string path;
+            std::vector<Position> positions;
         };
-        struct Range {
-            const std::string* path;
-            std::uint64_t total, start, stop;
-            std::string etag;
-            bool switched;
-            std::vector<Member> members;
-        };
-        std::map<std::string, std::vector<Position>> shards;
+        std::map<std::string, std::vector<Position>> by_shard;
         for (std::size_t slot = 0; slot < keys.size(); ++slot) {
-            auto [path, position] = location(keys[slot]);
-            shards[std::move(path)].emplace_back(*position, slot);
-        }
-
-        std::vector<Range> ranges;
-        for (const auto& [path, positions] : shards) {
-            const auto [index, switched] = shard_index(path, positions);
-            if (!index) continue;
-            std::vector<Member> members;
-            for (const auto& [position, slot] : positions) {
-                if (auto entry = layout_.entry(index->bytes, position, index->total))
-                    members.push_back({entry->first, entry->first + entry->second, slot});
+            try {
+                auto [path, position] = location(keys[slot]);
+                by_shard[std::move(path)].emplace_back(*position, slot);
+            } catch (...) {
+                deliver(slot, BatchChunkResult{false, {}, std::current_exception()});
             }
+        }
+        std::vector<ShardGroup> groups;
+        groups.reserve(by_shard.size());
+        for (auto& [path, positions] : by_shard)
+            groups.push_back({std::move(path), std::move(positions)});
+
+        pool.parallel_for(groups.size(), [&](std::size_t s) {
+            process_shard(groups[s].path, groups[s].positions, pool, deliver);
+        });
+    }
+
+private:
+    void process_shard(const std::string& path, const std::vector<Position>& all_positions,
+                       ThreadPool& pool, const ChunkCallback& deliver)
+    {
+        std::vector<Position> pending = all_positions;
+        bool force_refresh = false;
+        int refreshes = 0;
+
+        while (!pending.empty()) {
+            IndexLookup lookup;
+            try {
+                lookup = shard_index(path, pending, force_refresh);
+            } catch (...) {
+                auto err = std::current_exception();
+                for (const auto& p : pending)
+                    deliver(p.slot, BatchChunkResult{false, {}, err});
+                return;
+            }
+            if (!lookup.index) {
+                for (const auto& p : pending)
+                    deliver(p.slot, BatchChunkResult{false, {}, nullptr});
+                return;
+            }
+
+            struct Member {
+                std::uint64_t start, stop;
+                std::size_t inner, slot;
+            };
+            struct Range {
+                std::uint64_t start, stop;
+                std::vector<Member> members;
+            };
+
+            std::vector<Member> members;
+            members.reserve(pending.size());
+            for (const auto& p : pending) {
+                try {
+                    if (auto entry = layout_.entry(lookup.index->bytes, p.inner, lookup.index->total)) {
+                        members.push_back({entry->first, entry->first + entry->second, p.inner, p.slot});
+                    } else {
+                        if (lookup.retained)
+                            throw std::logic_error("unexpected missing entry in retained shard index");
+                        deliver(p.slot, BatchChunkResult{false, {}, nullptr});
+                    }
+                } catch (...) {
+                    deliver(p.slot, BatchChunkResult{false, {}, std::current_exception()});
+                }
+            }
+            if (members.empty()) return;
+
             std::sort(members.begin(), members.end(), [](const Member& a, const Member& b) {
                 return a.start < b.start;
             });
-            const auto first_range = ranges.size();
-            const bool strong_etag = is_strong_etag(index->etag);
+
+            std::vector<Range> ranges;
+            const bool strong_etag = is_strong_etag(lookup.index->etag);
             for (const auto& member : members) {
-                if (strong_etag && ranges.size() > first_range) {
+                if (strong_etag && !ranges.empty()) {
                     auto& last = ranges.back();
                     const auto stop = std::max(last.stop, member.stop);
                     if (member.start <= last.stop && stop - last.start <= max_merged_bytes) {
@@ -134,34 +212,66 @@ private:
                         continue;
                     }
                 }
-                ranges.push_back({&path, index->total, member.start, member.stop, index->etag, switched, {member}});
+                ranges.push_back({member.start, member.stop, {member}});
             }
-        }
 
-        std::vector<std::vector<std::uint8_t>> bodies(keys.size());
-        pool.parallel_for(ranges.size(), [&](std::size_t i) {
-            const auto& range = ranges[i];
-            std::vector<std::uint8_t> body;
-            try {
-                read_shard_range(*range.path, range.total, range.etag, range.start, range.stop - range.start,
-                                 body, range.switched);
-            } catch (const HttpRangeRejected&) {
-                if (range.members.size() == 1) throw;
-                for (const auto& member : range.members)
-                    read_shard_range(*range.path, range.total, range.etag, member.start,
-                                     member.stop - member.start, bodies[member.slot], range.switched);
+            std::mutex retry_mutex;
+            std::vector<Position> retry_positions;
+            const bool can_retry = lookup.retained && refreshes < max_shard_refreshes;
+
+            auto read_member = [&](const Member& member) {
+                std::vector<std::uint8_t> body;
+                try {
+                    read_shard_range(path, lookup, member.start, member.stop - member.start, body, can_retry);
+                    deliver(member.slot, BatchChunkResult{true, std::move(body), nullptr});
+                } catch (const RetryShardRange&) {
+                    std::lock_guard lock(retry_mutex);
+                    retry_positions.push_back({member.inner, member.slot});
+                } catch (...) {
+                    deliver(member.slot, BatchChunkResult{false, {}, std::current_exception()});
+                }
+            };
+
+            // Isolate every range and member so no error cancels healthy siblings.
+            pool.parallel_for(ranges.size(), [&](std::size_t i) {
+                const auto& range = ranges[i];
+                if (range.members.size() == 1) {
+                    read_member(range.members.front());
+                    return;
+                }
+                std::vector<std::uint8_t> body;
+                try {
+                    read_shard_range(path, lookup, range.start, range.stop - range.start, body, can_retry);
+                } catch (const HttpRangeRejected&) {
+                    pool.parallel_for(range.members.size(), [&](std::size_t m) {
+                        read_member(range.members[m]);
+                    });
+                    return;
+                } catch (const RetryShardRange&) {
+                    std::lock_guard lock(retry_mutex);
+                    for (const auto& member : range.members)
+                        retry_positions.push_back({member.inner, member.slot});
+                    return;
+                } catch (...) {
+                    auto err = std::current_exception();
+                    for (const auto& member : range.members)
+                        deliver(member.slot, BatchChunkResult{false, {}, err});
+                    return;
+                }
+                for (const auto& member : range.members) {
+                    std::vector<std::uint8_t> slice(
+                        body.data() + (member.start - range.start),
+                        body.data() + (member.stop - range.start));
+                    deliver(member.slot, BatchChunkResult{true, std::move(slice), nullptr});
+                }
+            });
+
+            if (retry_positions.empty())
                 return;
-            }
-            if (range.members.size() == 1) {
-                bodies[range.members.front().slot] = std::move(body);
-                return;
-            }
-            for (const auto& member : range.members) {
-                bodies[member.slot].assign(body.data() + (member.start - range.start),
-                                           body.data() + (member.stop - range.start));
-            }
-        });
-        return bodies;
+            pending = std::move(retry_positions);
+            force_refresh = true;
+            ++refreshes;
+        }
     }
 
 public:
@@ -193,7 +303,7 @@ public:
         std::string etag;
         std::vector<std::uint8_t> prefix;
         if (position) {
-            auto index = shard_index(path).first;
+            auto index = shard_index(path).index;
             if (!index) return std::nullopt;
             const auto entry = layout_.entry(index->bytes, *position, index->total);
             if (!entry) return std::nullopt;
@@ -288,23 +398,40 @@ private:
             throw std::runtime_error("invalid HTTP Content-Range for shard read");
     }
 
-    [[noreturn]] void changed_shard(const std::string& path, const std::string& etag,
-                                   bool switched, const HttpRangeChanged& error)
+    void evict_shard(const std::string& path, const std::string& etag)
     {
-        {
-            std::lock_guard lock(index_mutex_);
-            const auto* cached = indexes_.peek(path);
-            if (cached && (*cached)->etag == etag)
-                indexes_.erase(path);
+        std::lock_guard lock(index_mutex_);
+        ++visit_epoch_;
+        if (pending_fetch_path_ == path)
+            pending_fetch_path_.clear();
+        const auto* cached = indexes_.peek(path);
+        if (cached && (*cached)->etag == etag)
+            indexes_.erase(path);
+        if (active_fresh_.path == path) {
+            const auto current = active_fresh_.index.lock();
+            if (!current || current->etag == etag)
+                active_fresh_ = {};
         }
-        if (switched) throw RetryShardRange(error.what());
+        if (auto it = active_fetches_.find(path); it != active_fetches_.end()) {
+            for (auto& flight : it->second)
+                flight->evicted = true;
+        }
+    }
+
+    [[noreturn]] void changed_shard(const std::string& path, const IndexLookup& lookup,
+                                   bool can_retry, const HttpRangeChanged& error)
+    {
+        evict_shard(path, lookup.index->etag);
+        if (can_retry) throw RetryShardRange(error.what());
         throw error;
     }
 
-    void read_shard_range(const std::string& path, std::uint64_t total, const std::string& etag,
+    void read_shard_range(const std::string& path, const IndexLookup& lookup,
                           std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& body,
-                          bool switched)
+                          bool can_retry)
     {
+        const auto& etag = lookup.index->etag;
+        const auto total = lookup.index->total;
         ++requests_;
         body.reserve(length);
         HttpResponse response;
@@ -312,13 +439,13 @@ private:
             response = http_->get_range(path, body, std::to_string(offset) + "-" + std::to_string(offset + length - 1),
                                         length, etag);
         } catch (const HttpRangeChanged& error) {
-            changed_shard(path, etag, switched, error);
+            changed_shard(path, lookup, can_retry, error);
         }
         bytes_ += response.bytes;
         if (response.status == 404)
-            changed_shard(path, etag, switched, HttpRangeChanged("shard disappeared after index read"));
-        if (is_strong_etag(etag) && !response.etag.empty() && response.etag != etag)
-            changed_shard(path, etag, switched, HttpRangeChanged("shard changed during ranged read"));
+            changed_shard(path, lookup, can_retry, HttpRangeChanged("shard disappeared after index read"));
+        if (!etag.empty() && !response.etag.empty() && response.etag != etag)
+            changed_shard(path, lookup, can_retry, HttpRangeChanged("shard changed during ranged read"));
         validate_range(parse_range(response.content_range), offset, length, total);
     }
 
@@ -344,45 +471,154 @@ private:
         return true;
     }
 
-    std::pair<std::shared_ptr<const IndexData>, bool> shard_index(const std::string& path,
-                                                               std::span<const Position> positions = {})
+    void remove_flight_locked(const std::string& path, const InFlightIndex* target)
     {
-        std::lock_guard lock(index_mutex_);
-        if (auto* cached = indexes_.get(path)) {
-            if (path == last_index_path_) return {*cached, false};
-            const auto& index = **cached;
-            // A missing entry issues no conditional payload request. Refresh it
-            // on a shard switch, as with the single most-recent index policy.
-            if (can_batch() && !positions.empty() && is_strong_etag(index.etag) &&
-                std::all_of(positions.begin(), positions.end(), [&](const Position& p) {
-                    return layout_.entry(index.bytes, p.inner, index.total).has_value();
-                })) {
-                last_index_path_ = path;
-                return {*cached, true};
+        auto it = active_fetches_.find(path);
+        if (it == active_fetches_.end()) return;
+        auto& list = it->second;
+        list.erase(std::remove_if(list.begin(), list.end(),
+            [&](const std::shared_ptr<InFlightIndex>& item) { return item.get() == target; }),
+            list.end());
+        if (list.empty())
+            active_fetches_.erase(it);
+    }
+
+    IndexLookup shard_index(const std::string& path, std::span<const Position> positions = {},
+                            bool force_refresh = false)
+    {
+        std::shared_ptr<InFlightIndex> my_flight;
+        std::shared_ptr<InFlightIndex> join_flight;
+        {
+            std::lock_guard lock(index_mutex_);
+            if (!force_refresh && active_fresh_.epoch != 0 && active_fresh_.path == path) {
+                const auto current = active_fresh_.index.lock();
+                if (auto* cached = indexes_.get(path); current && cached && cached->get() == current.get())
+                    return IndexLookup{current, false};
+                active_fresh_ = {};
+            }
+            if (!force_refresh) {
+                if (const auto* cached = indexes_.peek(path)) {
+                    const auto& index = **cached;
+                    // Reusing a retained index across shard visits requires a strong
+                    // ETag and valid, present entries for every requested position.
+                    // Never trust a missing entry from a retained index, never promote
+                    // a retained index into active_fresh_, and erase/refresh on any
+                    // invalid retained entry. Immediately revoke any previous
+                    // active_fresh_ visit before returning so a pending visit never
+                    // leaves a prior shard trusted.
+                    bool has_invalid = false;
+                    bool all_present = can_batch() && !positions.empty() && is_strong_etag(index.etag);
+                    for (const auto& p : positions) {
+                        const auto state = layout_.probe_entry(index.bytes, p.inner, index.total).state;
+                        if (state == ShardLayout::EntryState::Invalid) {
+                            has_invalid = true;
+                            all_present = false;
+                            break;
+                        }
+                        if (state != ShardLayout::EntryState::Present)
+                            all_present = false;
+                    }
+                    if (has_invalid) {
+                        indexes_.erase(path);
+                    } else if (all_present) {
+                        auto retained = *indexes_.get(path);
+                        ++visit_epoch_;
+                        active_fresh_ = {};
+                        pending_fetch_path_.clear();
+                        return IndexLookup{std::move(retained), true};
+                    }
+                }
+                if (active_fresh_.epoch == 0 && pending_fetch_path_ == path) {
+                    if (auto it = active_fetches_.find(path); it != active_fetches_.end()) {
+                        for (const auto& flight : it->second) {
+                            if (!flight->evicted && flight->epoch == visit_epoch_) {
+                                join_flight = flight;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!join_flight) {
+                ++visit_epoch_;
+                active_fresh_ = {};
+                pending_fetch_path_ = path;
+                my_flight = std::make_shared<InFlightIndex>();
+                my_flight->epoch = visit_epoch_;
+                active_fetches_[path].push_back(my_flight);
             }
         }
-        auto index = std::make_shared<IndexData>();
-        ++requests_;
-        auto response = http_->get_range(path, index->bytes,
-            layout_.indexEnd ? "-"+std::to_string(layout_.indexBytes) : "0-"+std::to_string(layout_.indexBytes-1), layout_.indexBytes);
-        bytes_ += response.bytes;
-        if (response.status == 404) {
-            indexes_.erase(path);
-            return {};
+
+        if (join_flight) {
+            std::unique_lock wait_lock(join_flight->mutex);
+            join_flight->cv.wait(wait_lock, [&] { return join_flight->done; });
+            if (join_flight->error)
+                std::rethrow_exception(join_flight->error);
+            return IndexLookup{join_flight->index, false};
         }
-        const auto range = parse_range(response.content_range);
-        if (range.total < layout_.indexBytes)
-            throw std::runtime_error("invalid HTTP shard index Content-Range");
-        index->start = layout_.indexEnd ? range.total-layout_.indexBytes : 0;
-        index->total = range.total;
-        index->etag = response.etag;
-        validate_range(range, index->start, layout_.indexBytes, range.total);
-        layout_.validate(index->bytes, index->total);
-        const auto cost = index->bytes.capacity() + index->etag.capacity() + 2*path.capacity() + sizeof(IndexData);
-        indexes_.erase(path);
-        indexes_.put(path, index, cost);
-        last_index_path_ = path;
-        return {std::move(index), false};
+
+        std::shared_ptr<IndexData> fetched;
+        std::exception_ptr error;
+        try {
+            auto index = std::make_shared<IndexData>();
+            ++requests_;
+            auto response = http_->get_range(path, index->bytes,
+                layout_.indexEnd ? "-"+std::to_string(layout_.indexBytes) : "0-"+std::to_string(layout_.indexBytes-1),
+                layout_.indexBytes);
+            bytes_ += response.bytes;
+            if (response.status != 404) {
+                const auto range = parse_range(response.content_range);
+                if (range.total < layout_.indexBytes)
+                    throw std::runtime_error("invalid HTTP shard index Content-Range");
+                index->start = layout_.indexEnd ? range.total - layout_.indexBytes : 0;
+                index->total = range.total;
+                index->epoch = my_flight->epoch;
+                index->etag = response.etag;
+                validate_range(range, index->start, layout_.indexBytes, range.total);
+                layout_.validate(index->bytes, index->total);
+                fetched = std::move(index);
+            }
+        } catch (...) {
+            error = std::current_exception();
+        }
+
+        {
+            std::lock_guard lock(index_mutex_);
+            const bool evicted = my_flight->evicted;
+            remove_flight_locked(path, my_flight.get());
+            const bool still_current = !evicted && visit_epoch_ == my_flight->epoch;
+            if (still_current && pending_fetch_path_ == path)
+                pending_fetch_path_.clear();
+            if (!error && !evicted) {
+                if (!fetched) {
+                    if (const auto* existing = indexes_.peek(path); existing && (*existing)->epoch < my_flight->epoch)
+                        indexes_.erase(path);
+                } else {
+                    const auto cost = fetched->bytes.capacity() + fetched->etag.capacity() +
+                                      2 * path.capacity() + sizeof(IndexData);
+                    const auto* existing = indexes_.peek(path);
+                    const bool newer = !existing || (*existing)->epoch < my_flight->epoch;
+                    if (cost <= indexes_.limit() && newer) {
+                        indexes_.erase(path);
+                        indexes_.put(path, fetched, cost);
+                        if (still_current)
+                            active_fresh_ = ActiveFreshVisit{path, fetched, my_flight->epoch};
+                    }
+                }
+            }
+        }
+
+        {
+            std::lock_guard notify_lock(my_flight->mutex);
+            my_flight->index = fetched;
+            my_flight->error = error;
+            my_flight->done = true;
+        }
+        my_flight->cv.notify_all();
+
+        if (error)
+            std::rethrow_exception(error);
+        return IndexLookup{std::move(fetched), false};
     }
 
     std::string root_, prefix_, separator_;
@@ -391,7 +627,10 @@ private:
     std::atomic<std::uint64_t>& requests_;
     std::atomic<std::uint64_t>& bytes_;
     std::mutex index_mutex_;
-    std::string last_index_path_;
+    std::uint64_t visit_epoch_ = 0;
+    ActiveFreshVisit active_fresh_;
+    std::string pending_fetch_path_;
+    std::unordered_map<std::string, std::vector<std::shared_ptr<InFlightIndex>>> active_fetches_;
     Lru<std::shared_ptr<const IndexData>> indexes_{8 << 20};
 };
 } // namespace vcr

@@ -2071,36 +2071,44 @@ private:
         const bool cached_only=op&&bool(op->miss);
         // Explicit uncached raw streaming keeps bounded range I/O: there is no
         // decoder or whole chunk to coalesce, and no full allocation is needed.
-        if(!cache_||stream)for(std::size_t li=0;li<spec_.layers.size();++li) {
-            const auto& l=spec_.layers[li];
-            if(cached_only&&l.kind=="array")continue;
-            if(codecs_[li]!=Codec::Raw)break;
-            {
-                Found found;
-                try {
-                    found = read_raw_pieces(l.root + "/" + k, w, out_strides, op, output);
-                } catch (const std::runtime_error& error) {  // the wrong size: corrupt
-                    corrupt(l.root + "/" + k, error);
-                    if (l.kind == "array") {
-                        fill_pieces(w, out_strides, op, output);
-                        return;
-                    }
-                    continue;
-                }
-                if (found == Found::Copied) {
-                    ++stats_.disk_hits;
-                    return;
-                }
-                if (l.kind == "array" || exists(marker_path(l, k))) {
-                    fill_pieces(w, out_strides, op, output);
-                    return;
-                }
-                continue;
-            }
-        }
+        if ((!cache_ || stream) && try_raw_disk(k, w, out_strides, op, output, cached_only))
+            return;
         const auto [found,chunk]=full_span(w.idx,cached_only);
         if(!found){op->miss(w);return;}
         apply(chunk,w,out_strides,op,output);
+    }
+
+    // Serves a work item directly from leading Codec::Raw disk layers when
+    // whole-chunk memory caching is disabled or streaming, preserving partial
+    // pread ("slab") and cached-mapping ("mmap") I/O without reading whole files.
+    bool try_raw_disk(const std::string& k, const Work& w, const std::vector<Index>& out_strides,
+                      const PointOp* op, const BoxOutput* output, bool cached_only)
+    {
+        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
+            const auto& l = spec_.layers[li];
+            if (cached_only && l.kind == "array") continue;
+            if (codecs_[li] != Codec::Raw) break;
+            Found found;
+            try {
+                found = read_raw_pieces(l.root + "/" + k, w, out_strides, op, output);
+            } catch (const std::runtime_error& error) {  // the wrong size: corrupt
+                corrupt(l.root + "/" + k, error);
+                if (l.kind == "array") {
+                    fill_pieces(w, out_strides, op, output);
+                    return true;
+                }
+                continue;
+            }
+            if (found == Found::Copied) {
+                ++stats_.disk_hits;
+                return true;
+            }
+            if (l.kind == "array" || exists(marker_path(l, k))) {
+                fill_pieces(w, out_strides, op, output);
+                return true;
+            }
+        }
+        return false;
     }
 
     // An offline miss is reader-local evidence, never shared source absence.
@@ -2141,8 +2149,10 @@ private:
         return std::nullopt;
     }
 
-    // Claim remote misses before planning any ranges. Resolve our producers
-    // before waiting on other callers, even when their batches overlap ours.
+    // Claim remote misses before planning any ranges. Preserve partial raw-cache
+    // reads when memory caching is disabled, resolve each owned producer
+    // independently as its chunk settles, and wait on foreign claims only after
+    // our own producers complete.
     void run_sharded(std::span<const Work> work, const std::vector<Index>& out_strides,
                      const PointOp* op, const BoxOutput* output)
     {
@@ -2152,14 +2162,31 @@ private:
             std::optional<Claim> claim;
         };
         std::vector<Slot> slots(work.size());
+        std::mutex error_mutex;
+        std::size_t first_error_slot = work.size();
+        std::exception_ptr first_error;
+        const auto record_error = [&](std::size_t slot_index, std::exception_ptr error) {
+            std::lock_guard lock(error_mutex);
+            if (!first_error || slot_index < first_error_slot) {
+                first_error_slot = slot_index;
+                first_error = std::move(error);
+            }
+        };
+
         try {
             pool_->parallel_for(work.size(), [&](std::size_t i) {
                 auto& slot = slots[i];
                 const auto& item = work[i];
-                slot.key = key(item.idx);
-                const auto ck = spec_.identity + "|" + slot.key;
-                auto value = cached_whole(item.idx, slot.key, ck);
-                if (!value) {
+                try {
+                    slot.key = key(item.idx);
+                    const auto ck = spec_.identity + "|" + slot.key;
+                    auto value = cached_whole(item.idx, slot.key, ck);
+                    if (value) {
+                        apply(*value, item, out_strides, op, output);
+                        return;
+                    }
+                    if (!cache_ && try_raw_disk(slot.key, item, out_strides, op, output, false))
+                        return;
                     auto& claim = slot.claim.emplace(channel_policy_->reads.acquire(flight_key(ck)));
                     if (!claim.owner()) return;
                     value = cached_whole(item.idx, slot.key, ck);
@@ -2170,8 +2197,17 @@ private:
                     if (!value) return;
                     claim.resolve([&] { return chunk_result(true, *value); });
                     slot.claim.reset();
+                    apply(*value, item, out_strides, op, output);
+                } catch (...) {
+                    auto err = std::current_exception();
+                    if (slot.claim && slot.claim->owner()) {
+                        try {
+                            slot.claim->resolve([&]() -> std::shared_ptr<const ChunkLoad> { std::rethrow_exception(err); });
+                        } catch (...) {}
+                        slot.claim.reset();
+                    }
+                    record_error(i, std::move(err));
                 }
-                apply(*value, item, out_strides, op, output);
             });
 
             std::vector<std::string> keys;
@@ -2183,18 +2219,39 @@ private:
                 }
             }
             if (!keys.empty()) {
-                auto bodies = source_->read_batch(keys, *pool_);
-                pool_->parallel_for(owners.size(), [&](std::size_t j) {
-                    const auto i = owners[j];
+                source_->read_batch(keys, *pool_, [&](std::size_t owner_idx, ZarrStorage::BatchChunkResult result) {
+                    const auto i = owners[owner_idx];
                     auto& slot = slots[i];
-                    const auto loaded = slot.claim->resolve([&] {
-                        const bool found = !bodies[j].empty();
-                        auto value = finish_fetch(slot.key, std::move(bodies[j]), found);
-                        if (cache_) cache_->put(spec_.identity + "|" + slot.key, value);
-                        return chunk_result(true, std::move(value));
-                    });
-                    slot.claim.reset();
-                    apply(loaded->whole, work[i], out_strides, op, output);
+                    if (result.error) {
+                        try {
+                            slot.claim->resolve([&]() -> std::shared_ptr<const ChunkLoad> {
+                                std::rethrow_exception(result.error);
+                            });
+                        } catch (...) {}
+                        slot.claim.reset();
+                        record_error(i, std::move(result.error));
+                        return;
+                    }
+                    try {
+                        const auto loaded = slot.claim->resolve([&] {
+                            auto value = finish_fetch(slot.key, std::move(result.body), result.found);
+                            if (cache_) cache_->put(spec_.identity + "|" + slot.key, value);
+                            return chunk_result(true, std::move(value));
+                        });
+                        slot.claim.reset();
+                        apply(loaded->whole, work[i], out_strides, op, output);
+                    } catch (...) {
+                        auto err = std::current_exception();
+                        if (slot.claim && slot.claim->owner()) {
+                            try {
+                                slot.claim->resolve([&]() -> std::shared_ptr<const ChunkLoad> {
+                                    std::rethrow_exception(err);
+                                });
+                            } catch (...) {}
+                        }
+                        slot.claim.reset();
+                        record_error(i, std::move(err));
+                    }
                 });
             }
         } catch (...) {
@@ -2204,10 +2261,13 @@ private:
                     try {
                         slot.claim->resolve([&]() -> std::shared_ptr<const ChunkLoad> { std::rethrow_exception(error); });
                     } catch (...) {}
+                    slot.claim.reset();
                 }
             }
             throw;
         }
+        if (first_error)
+            std::rethrow_exception(first_error);
         if (std::none_of(slots.begin(), slots.end(), [](const Slot& slot) { return slot.claim.has_value(); }))
             return;
         pool_->parallel_for(work.size(), [&](std::size_t i) {

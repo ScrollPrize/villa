@@ -3,6 +3,7 @@
 import copy
 import ctypes
 import ctypes.util
+import hashlib
 import json
 import multiprocessing
 from pathlib import Path
@@ -464,6 +465,524 @@ class V3RemoteTests(RemoteFixtureCase):
                         np.testing.assert_array_equal(reader[:6, :10], expected[:6, :10])
                         self.assertEqual(reader.stats()['remote_fetches'], 6 if mode == 'fallback' else 2)
                 self.assertEqual(len(attempts), 2 if mode == 'retry' else 1)
+
+    def test_shard_visit_safety_pending_late_invalid_and_offline(self):
+        # 1a. Unconfirmed retained index must not trust stale missing entries or persist .missing.
+        with self.subTest(case='unconfirmed_retained_missing_to_present'):
+            name = 'visit-unconfirmed'
+            root = self.root/name
+            write_v3(root, missing=(0, 0))
+            expected_new, _ = write_v3(self.root/(name+'-new'), missing=None)
+            replacement = bytearray((self.root/(name+'-new')/'c/0/0').read_bytes())
+            replacement[0] ^= 1
+            expected_new[0, 0] = int(expected_new[0, 0]) ^ 1
+
+            cond_started = threading.Event()
+            cond_release = threading.Event()
+            hold = False
+
+            def hook(handler):
+                if hold and handler.path == f'/{name}/c/0/0' and handler.headers.get('If-Match'):
+                    cond_started.set()
+                    cond_release.wait(5)
+                return False
+
+            self.server.request_hook = hook
+            uri = self.url + '/' + name
+            cache = self.cache/'visit-1a'
+            with ZarrReader.open(uri, cache_dir=cache, threads=2, memory_cache=None) as reader:
+                _ = reader[0, 5]   # Visit A: chunk (0,0) is missing in A's index.
+                _ = reader[0, 10]  # Visit B.
+                (root/'c/0/0').write_bytes(replacement)
+                hold = True
+                with ThreadPoolExecutor(2) as pool:
+                    fut = pool.submit(lambda: reader[3:6, 0:5])
+                    self.assertTrue(cond_started.wait(5))
+                    try:
+                        actual_new = reader[0:3, 0:5]
+                    finally:
+                        cond_release.set()
+                    np.testing.assert_array_equal(fut.result(timeout=10), expected_new[3:6, 0:5])
+                np.testing.assert_array_equal(actual_new, expected_new[0:3, 0:5])
+            with ZarrReader.open(uri, cache_dir=cache, offline=True, memory_cache=None) as offline:
+                np.testing.assert_array_equal(offline[0:3, 0:5], expected_new[0:3, 0:5])
+
+        # 1b. A pending visit to B must immediately demote previously trusted shard A.
+        with self.subTest(case='pending_visit_demotes_previous_shard'):
+            name = 'visit-pending'
+            root = self.root/name
+            write_v3(root, missing=(0, 0))
+            expected_new, _ = write_v3(self.root/(name+'-new'), missing=None)
+            replacement = bytearray((self.root/(name+'-new')/'c/0/0').read_bytes())
+            replacement[0] ^= 2
+            expected_new[0, 0] = int(expected_new[0, 0]) ^ 2
+
+            b_started = threading.Event()
+            b_release = threading.Event()
+            hold_b = False
+
+            def hook(handler):
+                if hold_b and handler.path == f'/{name}/c/0/1' and handler.headers.get('If-Match'):
+                    b_started.set()
+                    b_release.wait(5)
+                return False
+
+            self.server.request_hook = hook
+            uri = self.url + '/' + name
+            cache = self.cache/'visit-1b'
+            with ZarrReader.open(uri, cache_dir=cache, threads=2, memory_cache=None) as reader:
+                _ = reader[0, 10]  # Visit B (retains B).
+                _ = reader[0, 5]   # Visit A (A is confirmed active; (0,0) is missing).
+                (root/'c/0/0').write_bytes(replacement)
+                hold_b = True
+                with ThreadPoolExecutor(2) as pool:
+                    fut_b = pool.submit(lambda: reader[3:6, 10:15])
+                    self.assertTrue(b_started.wait(5))
+                    try:
+                        actual_a = reader[0:3, 0:5]
+                    finally:
+                        b_release.set()
+                    fut_b.result(timeout=10)
+                np.testing.assert_array_equal(actual_a, expected_new[0:3, 0:5])
+            with ZarrReader.open(uri, cache_dir=cache, offline=True, memory_cache=None) as offline:
+                np.testing.assert_array_equal(offline[0:3, 0:5], expected_new[0:3, 0:5])
+
+        # 1c. Late out-of-order response after A -> B -> A(old) -> B -> A(new pending) must not restore trust.
+        for follow_with_pending in (False, True):
+            with self.subTest(case='late_response_obsolete_trust', follow_with_pending=follow_with_pending):
+                name = f'visit-late-{follow_with_pending}'
+                root = self.root/name
+                write_v3(root, missing=(0, 0))
+                expected_new, _ = write_v3(self.root/(name+'-new'), missing=None)
+                replacement = bytearray((self.root/(name+'-new')/'c/0/0').read_bytes())
+                replacement[0] ^= 4
+                expected_new[0, 0] = int(expected_new[0, 0]) ^ 4
+
+                old_bytes = (root/'c/0/0').read_bytes()
+                old_tag = '"' + hashlib.sha256(old_bytes).hexdigest() + '"'
+                old_started = threading.Event()
+                old_release = threading.Event()
+                pending_started = threading.Event()
+                pending_release = threading.Event()
+                intercept_old = False
+                intercept_pending = False
+
+                def hook(handler):
+                    nonlocal intercept_old, intercept_pending
+                    if (intercept_old and handler.path == f'/{name}/c/0/0' and
+                            handler.headers.get('If-Match') == old_tag and
+                            handler.headers.get('Range') == 'bytes=120-239'):
+                        intercept_old = False
+                        old_started.set()
+                        old_release.wait(5)
+                        handler.send_response(206)
+                        handler.send_header('ETag', old_tag)
+                        handler.send_header('Content-Range', f'bytes 120-239/{len(old_bytes)}')
+                        handler.send_header('Content-Length', '120')
+                        handler.end_headers()
+                        handler.wfile.write(old_bytes[120:240])
+                        return True
+                    if (intercept_pending and handler.path == f'/{name}/c/0/0' and
+                            handler.headers.get('If-Match') == old_tag and
+                            handler.headers.get('Range') == 'bytes=240-359'):
+                        intercept_pending = False
+                        pending_started.set()
+                        pending_release.wait(5)
+                        return False
+                    return False
+
+                self.server.request_hook = hook
+                uri = self.url + '/' + name
+                cache = self.cache/f'visit-1c-{follow_with_pending}'
+                with ZarrReader.open(uri, cache_dir=cache, threads=2, memory_cache=None) as reader:
+                    _ = reader[0, 5]   # Visit A (chunk (0,1), bytes 0..119).
+                    _ = reader[0, 10]  # Visit B.
+                    intercept_old = True
+                    with ThreadPoolExecutor(3) as pool:
+                        f_old = pool.submit(lambda: reader[3:6, 0:5])
+                        self.assertTrue(old_started.wait(5))
+                        _ = reader[3:6, 10:15]  # Newer visit to B.
+                        (root/'c/0/0').write_bytes(replacement)
+                        f_pending = None
+                        try:
+                            if follow_with_pending:
+                                intercept_pending = True
+                                f_pending = pool.submit(lambda: reader[3:6, 5:10])
+                                self.assertTrue(pending_started.wait(5))
+                            old_release.set()
+                            f_old.result(timeout=10)
+                            actual = reader[0:3, 0:5]
+                        finally:
+                            old_release.set()
+                            pending_release.set()
+                        if f_pending is not None:
+                            np.testing.assert_array_equal(f_pending.result(timeout=10), expected_new[3:6, 5:10])
+                    np.testing.assert_array_equal(actual, expected_new[0:3, 0:5])
+                with ZarrReader.open(uri, cache_dir=cache, offline=True, memory_cache=None) as offline:
+                    np.testing.assert_array_equal(offline[0:3, 0:5], expected_new[0:3, 0:5])
+
+        # 1e. Retained-index conditional 206 (without intervening B visit) still must not promote A for missing entries,
+        # and concurrent revisited readers on a replaced shard both recover cleanly without 412.
+        with self.subTest(case='retained_conditional_never_trusts_missing_and_concurrent_revisit'):
+            name = 'visit-r3-f1b'
+            root = self.root/name
+            write_v3(root, missing=(0, 0))
+            expected_new, _ = write_v3(self.root/(name+'-new'), missing=None)
+            replacement = bytearray((self.root/(name+'-new')/'c/0/0').read_bytes())
+            replacement[0] ^= 8
+            expected_new[0, 0] = int(expected_new[0, 0]) ^ 8
+            uri = self.url + '/' + name
+            cache = self.cache/'visit-1e'
+            self.server.request_hook = None
+            with ZarrReader.open(uri, cache_dir=cache, threads=2, memory_cache=None) as reader:
+                _ = reader[0, 5]   # Visit A (chunk (0,0) missing).
+                _ = reader[0, 10]  # Visit B.
+                _ = reader[3:6, 0:5]  # Revisit A via retained index (conditional 206 succeeds on old A).
+                (root/'c/0/0').write_bytes(replacement)  # Replace A without another B visit.
+                # Missing entry (0,0) must still refresh A's index rather than trusting retained A!
+                np.testing.assert_array_equal(reader[0:3, 0:5], expected_new[0:3, 0:5])
+            with ZarrReader.open(uri, cache_dir=cache, offline=True, memory_cache=None) as offline:
+                np.testing.assert_array_equal(offline[0:3, 0:5], expected_new[0:3, 0:5])
+
+            # Concurrent revisited readers on a replaced shard (Defect F1-B).
+            name2 = 'visit-f1b'
+            root2 = self.root/name2
+            write_v3(root2, missing=None)
+            expected2, _ = write_v3(self.root/(name2+'-new'), missing=None)
+            repl2 = bytearray((self.root/(name2+'-new')/'c/0/0').read_bytes())
+            repl2[120] ^= 0x11
+            repl2[240] ^= 0x22
+            expected2[0, 5] = int(expected2[0, 5]) ^ 0x11
+            expected2[3, 0] = int(expected2[3, 0]) ^ 0x22
+            barrier = threading.Barrier(2, timeout=5)
+
+            def sync_412(handler):
+                if handler.path == f'/{name2}/c/0/0' and handler.headers.get('If-Match') and \
+                        handler.headers.get('Range') in ('bytes=120-239', 'bytes=240-359'):
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        pass
+                return False
+
+            with ZarrReader.open(self.url + '/' + name2, threads=2, memory_cache=None) as reader:
+                _ = reader[0, 0]   # Visit A.
+                _ = reader[0, 10]  # Visit B.
+                (root2/'c/0/0').write_bytes(bytes(repl2))
+                self.server.request_hook = sync_412
+                with ThreadPoolExecutor(2) as pool:
+                    fa = pool.submit(lambda: reader[0:3, 5:10])
+                    fb = pool.submit(lambda: reader[3:6, 0:5])
+                    np.testing.assert_array_equal(fa.result(timeout=10), expected2[0:3, 5:10])
+                    np.testing.assert_array_equal(fb.result(timeout=10), expected2[3:6, 0:5])
+
+        # 1d. Invalid offset in a retained index must fall through to fetch a repaired shard.
+        for batched in (False, True):
+            with self.subTest(case='invalid_retained_offset_repaired', batched=batched):
+                name = f'visit-invalid-{batched}'
+                root = self.root/name
+                write_v3(root, missing=None)
+                expected_repaired, _ = write_v3(self.root/(name+'-repaired'), missing=None)
+                repaired = bytearray((self.root/(name+'-repaired')/'c/0/0').read_bytes())
+                repaired[240] ^= 1
+                expected_repaired[3, 0] = int(expected_repaired[3, 0]) ^ 1
+
+                shard_path = root/'c/0/0'
+                broken = bytearray(shard_path.read_bytes())
+                idx_start = len(broken) - 68
+                broken[idx_start + 32 : idx_start + 40] = (2**63).to_bytes(8, 'little')
+                broken[-4:] = crc32c(broken[idx_start:-4]).to_bytes(4, 'little')
+                shard_path.write_bytes(bytes(broken))
+
+                self.server.request_hook = None
+                with ZarrReader.open(self.url + '/' + name, threads=2, memory_cache=None) as reader:
+                    _ = reader[0, 0]   # Visit A (valid chunk (0,0)), caches A with broken entry (1,0).
+                    _ = reader[0, 10]  # Visit B.
+                    shard_path.write_bytes(bytes(repaired))
+                    selection = np.s_[3:6, :10] if batched else np.s_[3:6, 0:5]
+                    np.testing.assert_array_equal(reader[selection], expected_repaired[selection])
+
+    def test_bounded_per_shard_recovery_and_termination(self):
+        # 2a. Three independently replaced shards in one batch with threads=1 recover cleanly,
+        # while an untouched fourth shard keeps its retained index without re-fetching.
+        name = 'recover-three'
+        root = self.root/name
+        expected_old, _ = write_v3(root, missing=None)
+        expected_new, _ = write_v3(self.root/(name+'-new'), missing=None)
+        for rel, coord in (('c/0/0', (3, 5)), ('c/0/1', (3, 15)), ('c/1/0', (9, 5))):
+            raw = bytearray((self.root/(name+'-new')/rel).read_bytes())
+            raw[360] ^= 0x55
+            (self.root/(name+'-new')/rel).write_bytes(bytes(raw))
+            expected_new[coord] = int(expected_new[coord]) ^ 0x55
+
+        index_gets = {}
+
+        def capture(handler):
+            if handler.headers.get('Range') == 'bytes=-68':
+                index_gets[handler.path] = index_gets.get(handler.path, 0) + 1
+            return False
+
+        self.server.request_hook = capture
+        with ZarrReader.open(self.url + '/' + name, threads=1, memory_cache=None) as reader:
+            for coord in ((0, 0), (0, 10), (6, 0), (6, 10)):
+                _ = reader[coord]
+            for rel in ('c/0/0', 'c/0/1', 'c/1/0'):
+                (root/rel).write_bytes((self.root/(name+'-new')/rel).read_bytes())
+            selections = [np.s_[3:6, 5:10], np.s_[3:6, 15:20], np.s_[9:12, 5:10], np.s_[9:12, 15:20]]
+            results = reader.read_many(selections)
+            for actual, sel in zip(results[:3], selections[:3]):
+                np.testing.assert_array_equal(actual, expected_new[sel])
+            np.testing.assert_array_equal(results[3], expected_old[selections[3]])
+        self.assertEqual(index_gets[f'/{name}/c/0/0'], 2)
+        self.assertEqual(index_gets[f'/{name}/c/0/1'], 2)
+        self.assertEqual(index_gets[f'/{name}/c/1/0'], 2)
+        self.assertEqual(index_gets[f'/{name}/c/1/1'], 1)
+
+        # 2b. A shard that repeatedly returns 412 terminates after one refresh while healthy shards succeed and cache.
+        name = 'recover-bound'
+        root = self.root/name
+        expected_old, _ = write_v3(root, missing=None)
+        expected_new, _ = write_v3(self.root/(name+'-new'), missing=None)
+        raw01 = bytearray((self.root/(name+'-new')/'c/0/1').read_bytes())
+        raw01[120] ^= 0x33
+        expected_new[0, 15] = int(expected_new[0, 15]) ^ 0x33
+        (self.root/(name+'-new')/'c/0/1').write_bytes(bytes(raw01))
+
+        churn_index_gets = 0
+        churn_payload_gets = 0
+        force_412 = False
+
+        def churn_hook(handler):
+            nonlocal churn_index_gets, churn_payload_gets
+            if handler.path == f'/{name}/c/0/0':
+                if handler.headers.get('Range') == 'bytes=-68':
+                    churn_index_gets += 1
+                    return False
+                if force_412 and handler.headers.get('If-Match'):
+                    churn_payload_gets += 1
+                    handler.send_error(412)
+                    return True
+            return False
+
+        self.server.request_hook = churn_hook
+        storage = MemoryCache(4096)
+        with ZarrReader.open(self.url + '/' + name, threads=1, memory_cache=storage) as reader:
+            _ = reader[0, 0]
+            _ = reader[0, 10]
+            (root/'c/0/1').write_bytes((self.root/(name+'-new')/'c/0/1').read_bytes())
+            force_412 = True
+            with self.assertRaisesRegex(RuntimeError, '412'):
+                reader.read_many([np.s_[3:6, 0:5], np.s_[0:3, 15:20]])
+            # Bounded: initial prime (1) + at most 1 refresh (1) = 2 index fetches, 2 failed payload attempts.
+            self.assertEqual(churn_index_gets, 2)
+            self.assertEqual(churn_payload_gets, 2)
+            fetches_before = reader.stats()['remote_fetches']
+            np.testing.assert_array_equal(reader[0:3, 15:20], expected_new[0:3, 15:20])
+            self.assertEqual(reader.stats()['remote_fetches'], fetches_before)
+
+    def test_per_chunk_error_isolation_and_singleflight(self):
+        # 3a. Held invalid Content-Range on shard 0/0 must not block or fail concurrent SingleFlight reader of shard 0/1.
+        with self.subTest(case='held_invalid_content_range_concurrent_singleflight'):
+            name = 'iso-content-range'
+            expected, _ = write_v3(self.root/name, missing=None)
+            shard0 = (self.root/name/'c/0/0').read_bytes()
+            bad_held = threading.Event()
+            bad_release = threading.Event()
+
+            def hook(handler):
+                if handler.path == f'/{name}/c/0/0' and handler.headers.get('Range') == 'bytes=0-119':
+                    bad_held.set()
+                    bad_release.wait(5)
+                    handler.send_response(206)
+                    handler.send_header('Content-Range', f'bytes 1-119/{len(shard0)}')
+                    handler.send_header('Content-Length', '120')
+                    handler.end_headers()
+                    handler.wfile.write(shard0[:120])
+                    return True
+                return False
+
+            self.server.request_hook = hook
+            uri = self.url + '/' + name
+            storage = MemoryCache(4096)
+            with ZarrReader.open(uri, threads=2, memory_cache=storage) as r1, \
+                    ZarrReader.open(uri, threads=2, memory_cache=storage) as r2, \
+                    ThreadPoolExecutor(2) as pool:
+                f1 = pool.submit(lambda: r1.read_many([np.s_[0:3, 0:5], np.s_[0:3, 10:15]]))
+                self.assertTrue(bad_held.wait(5))
+                try:
+                    f2 = pool.submit(lambda: r2[0:3, 10:15])
+                    # Must complete BEFORE bad_release is set.
+                    np.testing.assert_array_equal(f2.result(timeout=5), expected[0:3, 10:15])
+                finally:
+                    bad_release.set()
+                with self.assertRaisesRegex(RuntimeError, 'Content-Range'):
+                    f1.result(timeout=10)
+                fetches_before = r2.stats()['remote_fetches']
+                np.testing.assert_array_equal(r2[0:3, 10:15], expected[0:3, 10:15])
+                self.assertEqual(r2.stats()['remote_fetches'], fetches_before)
+
+        # 3b. Bad index offset in shard 0/0 must isolate to that chunk, leaving sibling chunk and shard 0/1 healthy & cached.
+        with self.subTest(case='invalid_index_offset_isolated'):
+            name = 'iso-bad-offset'
+            expected, _ = write_v3(self.root/name, missing=None)
+            shard0_path = self.root/name/'c/0/0'
+            broken = bytearray(shard0_path.read_bytes())
+            idx_start = len(broken) - 68
+            broken[idx_start : idx_start + 8] = (2**63).to_bytes(8, 'little')
+            broken[-4:] = crc32c(broken[idx_start:-4]).to_bytes(4, 'little')
+            shard0_path.write_bytes(bytes(broken))
+
+            self.server.request_hook = None
+            storage = MemoryCache(4096)
+            with ZarrReader.open(self.url + '/' + name, threads=2, memory_cache=storage) as reader:
+                with self.assertRaisesRegex(RuntimeError, 'offset/length'):
+                    reader.read_many([np.s_[0:3, 0:5], np.s_[0:3, 5:10], np.s_[0:3, 10:15]])
+                fetches_before = reader.stats()['remote_fetches']
+                np.testing.assert_array_equal(reader[0:3, 5:10], expected[0:3, 5:10])
+                np.testing.assert_array_equal(reader[0:3, 10:15], expected[0:3, 10:15])
+                self.assertEqual(reader.stats()['remote_fetches'], fetches_before)
+
+        # 3c. HTTP 416 merged-range fallback isolates bad individual chunk from healthy sibling and concurrent reader.
+        with self.subTest(case='http_416_fallback_isolated'):
+            name = 'iso-416'
+            expected, _ = write_v3(self.root/name, missing=None)
+            shard0 = (self.root/name/'c/0/0').read_bytes()
+            bad_held = threading.Event()
+            bad_release = threading.Event()
+
+            def hook(handler):
+                if handler.path != f'/{name}/c/0/0':
+                    return False
+                rng = handler.headers.get('Range')
+                if rng == 'bytes=0-239':
+                    handler.send_error(416)
+                    return True
+                if rng == 'bytes=0-119':
+                    bad_held.set()
+                    bad_release.wait(5)
+                    handler.send_response(206)
+                    handler.send_header('Content-Range', f'bytes 1-119/{len(shard0)}')
+                    handler.send_header('Content-Length', '120')
+                    handler.end_headers()
+                    handler.wfile.write(shard0[:120])
+                    return True
+                return False
+
+            self.server.request_hook = hook
+            uri = self.url + '/' + name
+            storage = MemoryCache(4096)
+            with ZarrReader.open(uri, threads=2, memory_cache=storage) as r1, \
+                    ZarrReader.open(uri, threads=2, memory_cache=storage) as r2, \
+                    ThreadPoolExecutor(2) as pool:
+                f1 = pool.submit(lambda: r1.read_many([np.s_[0:3, 0:5], np.s_[0:3, 5:10]]))
+                self.assertTrue(bad_held.wait(5))
+                try:
+                    f2 = pool.submit(lambda: r2[0:3, 5:10])
+                    np.testing.assert_array_equal(f2.result(timeout=5), expected[0:3, 5:10])
+                finally:
+                    bad_release.set()
+                with self.assertRaisesRegex(RuntimeError, 'Content-Range'):
+                    f1.result(timeout=10)
+                fetches_before = r2.stats()['remote_fetches']
+                np.testing.assert_array_equal(r2[0:3, 5:10], expected[0:3, 5:10])
+                self.assertEqual(r2.stats()['remote_fetches'], fetches_before)
+
+        # 3d. Individual HTTP 400 failure on one shard does not poison healthy shard.
+        with self.subTest(case='individual_request_failure_isolated'):
+            name = 'iso-http-400'
+            expected, _ = write_v3(self.root/name, missing=None)
+
+            def hook(handler):
+                if handler.path == f'/{name}/c/0/0' and handler.headers.get('Range') == 'bytes=0-119':
+                    handler.send_error(400)
+                    return True
+                return False
+
+            self.server.request_hook = hook
+            storage = MemoryCache(4096)
+            with ZarrReader.open(self.url + '/' + name, threads=2, memory_cache=storage) as reader:
+                with self.assertRaisesRegex(RuntimeError, 'HTTP 400'):
+                    reader.read_many([np.s_[0:3, 0:5], np.s_[0:3, 10:15]])
+                fetches_before = reader.stats()['remote_fetches']
+                np.testing.assert_array_equal(reader[0:3, 10:15], expected[0:3, 10:15])
+                self.assertEqual(reader.stats()['remote_fetches'], fetches_before)
+
+    def test_partial_raw_cache_reads_slab_and_mmap(self):
+        name = 'partial-raw'
+        data = np.arange(64 * 64 * 128, dtype=np.uint32).astype(np.uint8).reshape(64, 64, 128)
+        writer = ZarrWriter.create(self.root/name, shape=data.shape, chunks=(64, 64, 64),
+                                   dtype='u1', version=3, shards=data.shape, compressor=None, separator='/')
+        writer[:] = data
+        uri = self.url + '/' + name
+        cache = self.cache/'partial-raw-cache'
+
+        # Warm the raw disk cache with both 256 KiB chunks.
+        with ZarrReader.open(uri, cache_dir=cache, threads=2, memory_cache=None) as reader:
+            warm = reader.read_many([np.s_[0:1, 0:1, 0:1], np.s_[0:1, 0:1, 64:65]])
+            self.assertEqual(warm[0][0, 0, 0], data[0, 0, 0])
+            self.assertEqual(warm[1][0, 0, 0], data[0, 0, 64])
+
+        sels = [np.s_[10:11, 20:21, 30:31], np.s_[10:11, 20:21, 94:95]]
+        proc_io = Path('/proc/self/io')
+
+        def rchar():
+            for line in proc_io.read_text().splitlines():
+                if line.startswith('rchar:'):
+                    return int(line.split(':')[1].strip())
+            return None
+
+        for mode in ('slab', 'mmap'):
+            for offline in (False, True):
+                with self.subTest(mode=mode, offline=offline):
+                    with ZarrReader.open(uri, cache_dir=cache, threads=1, memory_cache=None,
+                                         read_mode=mode, offline=offline) as reader:
+                        # First call warms mmap cache / scratch buffer.
+                        out = reader.read_many(sels)
+                        self.assertEqual(out[0][0, 0, 0], data[10, 20, 30])
+                        self.assertEqual(out[1][0, 0, 0], data[10, 20, 94])
+                        self.assertEqual(reader.stats()['remote_fetches'], 0)
+                        if proc_io.exists():
+                            # Measure 1 iteration vs 21 iterations to cancel /proc/self/io read overhead.
+                            c0 = rchar()
+                            reader.read_many(sels)
+                            c1 = rchar()
+                            for _ in range(21):
+                                reader.read_many(sels)
+                            c2 = rchar()
+                            delta_20 = (c2 - c1) - (c1 - c0)
+                            bytes_per_call = delta_20 / 20.0
+                            if mode == 'slab':
+                                self.assertLessEqual(bytes_per_call, 16.0)
+                            else:
+                                self.assertLessEqual(bytes_per_call, 16.0)
+
+        # Mixed warm + cold batch preserves partial raw hit and still batches cold remote misses.
+        mixed_name = 'partial-mixed'
+        mixed_data = np.arange(64 * 64 * 192, dtype=np.uint32).astype(np.uint8).reshape(64, 64, 192)
+        writer = ZarrWriter.create(self.root/mixed_name, shape=mixed_data.shape, chunks=(64, 64, 64),
+                                   dtype='u1', version=3, shards=mixed_data.shape, compressor=None, separator='/')
+        writer[:] = mixed_data
+        mixed_uri = self.url + '/' + mixed_name
+        mixed_cache = self.cache/'partial-mixed-cache'
+        with ZarrReader.open(mixed_uri, cache_dir=mixed_cache, threads=2, memory_cache=None) as reader:
+            # Warm only chunk 0.
+            self.assertEqual(reader[0, 0, 0], mixed_data[0, 0, 0])
+        ranges = []
+
+        def capture_mixed(handler):
+            if handler.path == f'/{mixed_name}/c/0/0/0' and handler.headers.get('Range'):
+                ranges.append(handler.headers['Range'])
+            return False
+
+        self.server.request_hook = capture_mixed
+        with ZarrReader.open(mixed_uri, cache_dir=mixed_cache, threads=2, memory_cache=None, read_mode='slab') as reader:
+            out = reader.read_many([np.s_[1:2, 2:3, 3:4], np.s_[1:2, 2:3, 67:68], np.s_[1:2, 2:3, 131:132]])
+            self.assertEqual(out[0][0, 0, 0], mixed_data[1, 2, 3])
+            self.assertEqual(out[1][0, 0, 0], mixed_data[1, 2, 67])
+            self.assertEqual(out[2][0, 0, 0], mixed_data[1, 2, 131])
+        # Chunk 0 was warm on disk; chunks 1 and 2 coalesced into one 512 KiB range!
+        self.assertEqual(len(ranges), 2)
+        self.assertIn('bytes=262144-786431', ranges)
 
     def test_remote_group_companions_offline(self):
         attrs = dict(multiscales=[dict(axes=['y', 'x'], datasets=[dict(path='0')])])

@@ -77,6 +77,31 @@ public:
     }
 
     using Entry = std::pair<std::uint64_t, std::uint64_t>;
+    enum class EntryState { Present, Missing, Invalid };
+    struct EntryProbe {
+        EntryState state = EntryState::Invalid;
+        Entry entry{0, 0};
+    };
+
+    EntryProbe probe_entry(const std::vector<std::uint8_t>& index, std::size_t position,
+                           std::uint64_t total) const noexcept
+    {
+        if (position >= indexBytes / 16 || index.size() != indexBytes)
+            return {EntryState::Invalid, {0, 0}};
+        const auto offset = little_uint(index.data() + 16 * position, 8);
+        const auto length = little_uint(index.data() + 16 * position + 8, 8);
+        constexpr auto missing = std::numeric_limits<std::uint64_t>::max();
+        if (offset == missing && length == missing)
+            return {EntryState::Missing, {0, 0}};
+        if (total < indexBytes)
+            return {EntryState::Invalid, {0, 0}};
+        const auto end = indexEnd ? total - indexBytes : total;
+        if (offset > end || length > end - offset || (!indexEnd && offset < indexBytes) ||
+            !length || length > maxPayload)
+            return {EntryState::Invalid, {0, 0}};
+        return {EntryState::Present, {offset, length}};
+    }
+
     std::optional<Entry> entry(const std::vector<std::uint8_t>& index, std::size_t position,
                                std::uint64_t total) const
     {
