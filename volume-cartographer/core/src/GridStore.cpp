@@ -139,6 +139,11 @@ public:
     void collect_query_results(const cv::Rect& query_rect, GridStore::QueryScratch& scratch) const {
         scratch.ids.clear();
         scratch.results.clear();
+        // Once read whole, that copy's bounds apply, not this file's.
+        if (const GridStore* whole = current_whole()) {
+            whole->pimpl_->collect_query_results(query_rect, scratch);
+            return;
+        }
         const QueryBucketRange range = queryBucketRange(query_rect);
         if (range.empty) {
             return;
@@ -249,7 +254,12 @@ public:
     }
 
     cv::Size size() const {
+        if (const GridStore* whole = current_whole()) return whole->size();
         return bounds_.size();
+    }
+
+    uint64_t generation() const {
+        return generation_.load(std::memory_order_acquire);
     }
 
     size_t remote_resident_bytes() const {
@@ -319,6 +329,7 @@ public:
     }
 
     size_t numNonEmptyBuckets() const {
+        if (const GridStore* whole = current_whole()) return whole->numNonEmptyBuckets();
         size_t count = 0;
         for (const auto& bucket : grid_) {
             if (!bucket.empty()) {
@@ -490,10 +501,12 @@ public:
     }
 
     void load_remote(std::shared_ptr<RemoteGridFile> remote,
-                     std::function<std::shared_ptr<const GridStore>()> whole_file) {
+                     std::function<std::shared_ptr<const GridStore>()> whole_file,
+                     std::function<void()> on_failure = {}) {
         read_only_ = true;
         remote_ = std::move(remote);
         whole_loader_ = std::move(whole_file);
+        on_failure_ = std::move(on_failure);
         mmapped_data_ = std::make_unique<MmappedData>();
         mmapped_data_->data = remote_->data();
         mmapped_data_->size = remote_->size();
@@ -927,9 +940,19 @@ private:
     // A remote store whose region could not be fetched switches, once, to the
     // file read whole (whole_loader_); whole_ then answers every query.
     std::function<std::shared_ptr<const GridStore>()> whole_loader_;
+    std::function<void()> on_failure_;
     mutable std::mutex whole_mutex_;
     mutable std::shared_ptr<const GridStore> whole_;
-    mutable bool whole_tried_ = false;
+    // After a failed whole read, the next is tried no sooner than this, so an
+    // outage does not turn every query into a download attempt.
+    mutable std::chrono::steady_clock::time_point whole_retry_at_{};
+    mutable std::atomic<uint64_t> generation_{0};
+
+    const GridStore* current_whole() const {
+        if (!remote_) return nullptr;
+        std::lock_guard<std::mutex> lock(whole_mutex_);
+        return whole_.get();
+    }
 
     // Runs `ensure` (fetch what a read needs) for a remote store. Returns the
     // store to read instead, when this one has switched to the whole file;
@@ -939,10 +962,7 @@ private:
     // treats a corrupt file as a whole-file store does).
     const GridStore* fetched_or_whole(const std::function<void()>& ensure, bool* failed) const {
         *failed = false;
-        {
-            std::lock_guard<std::mutex> lock(whole_mutex_);
-            if (whole_) return whole_.get();
-        }
+        if (const GridStore* whole = current_whole()) return whole;
         std::string why;
         bool changed = false;
         for (int attempt = 0; attempt < 2 && !changed; ++attempt) {
@@ -956,19 +976,29 @@ private:
                 why = e.what();
             }
         }
-        std::lock_guard<std::mutex> lock(whole_mutex_);
-        if (!whole_ && !whole_tried_ && whole_loader_) {
-            whole_tried_ = true;
-            try {
-                whole_ = whole_loader_();
-            } catch (const std::exception& e) {
-                why += std::string("; reading it whole: ") + e.what();
+        {
+            std::lock_guard<std::mutex> lock(whole_mutex_);
+            const auto now = std::chrono::steady_clock::now();
+            if (!whole_ && whole_loader_ && now >= whole_retry_at_) {
+                try {
+                    whole_ = whole_loader_();
+                    if (!whole_) why += "; reading it whole: not found";
+                } catch (const std::exception& e) {
+                    why += std::string("; reading it whole: ") + e.what();
+                }
+                if (whole_) {
+                    generation_.fetch_add(1, std::memory_order_acq_rel);
+                    std::cerr << "normal grid " << remote_->url() << ": range read failed (" << why
+                              << "), read it whole instead" << std::endl;
+                } else {
+                    whole_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                }
             }
-            if (whole_) std::cerr << "normal grid " << remote_->url() << ": range read failed (" << why
-                                  << "), read it whole instead" << std::endl;
+            if (whole_) return whole_.get();
         }
-        if (whole_) return whole_.get();
+        generation_.fetch_add(1, std::memory_order_acq_rel);
         RemoteGridFile::reportFailure(remote_->url() + ": " + why);
+        if (on_failure_) on_failure_();
         *failed = true;
         return nullptr;
     }
@@ -1011,9 +1041,14 @@ GridStore::GridStore(const std::string& path)
 }
 
 GridStore::GridStore(std::shared_ptr<RemoteGridFile> remote,
-                     std::function<std::shared_ptr<const GridStore>()> whole_file)
+                     std::function<std::shared_ptr<const GridStore>()> whole_file,
+                     std::function<void()> on_failure)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) {
-    pimpl_->load_remote(std::move(remote), std::move(whole_file));
+    pimpl_->load_remote(std::move(remote), std::move(whole_file), std::move(on_failure));
+}
+
+uint64_t GridStore::generation() const {
+    return pimpl_->generation();
 }
 
 GridStore::~GridStore() = default;

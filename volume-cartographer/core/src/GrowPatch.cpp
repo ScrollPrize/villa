@@ -1,3 +1,5 @@
+#include <atomic>
+#include <stdexcept>
 #include <utility>
 #include "vc/tracer/SheetGrowth.hpp"
 #include <opencv2/core.hpp>
@@ -2020,6 +2022,20 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
                   << ", output_spiral_step=" << ngv->outputSpiralStep()
                   << ")" << std::endl;
     }
+    // A slice read a part at a time whose region could not be read, nor the
+    // slice read whole, answers with no paths: its normals are missing, not
+    // absent. A patch grown on that is not saved: snapshots stop and the
+    // trace fails at the end instead of returning it.
+    auto normal_grid_read_failures = [&]() -> uint64_t { return ngv ? ngv->readFailures() : 0; };
+    std::atomic<bool> skipped_snapshot_reported{false};
+    auto snapshot_allowed = [&]() {
+        const uint64_t failures = normal_grid_read_failures();
+        if (failures == 0) return true;
+        if (!skipped_snapshot_reported.exchange(true))
+            std::cerr << "normal grid reads failed " << failures
+                      << " time(s): not saving snapshots of a patch missing normal constraints" << std::endl;
+        return false;
+    };
 
     // Determine step size with priority: explicit param > normal_grid > resume_surf > default
     float step;
@@ -2744,7 +2760,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
             //     delete surf;
             // }
 
-            if (!tgt_path.empty() && snapshot_interval > 0) {
+            if (!tgt_path.empty() && snapshot_interval > 0 && snapshot_allowed()) {
                 QuadSurface* surf = create_surface_from_state();
                 surf->save(tgt_path, true);
                 delete surf;
@@ -3058,7 +3074,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
     #pragma omp critical
                     {
-                        if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0) {
+                        if (snapshot_interval > 0 && !tgt_path.empty() && inpaint_count % snapshot_interval == 0 && snapshot_allowed()) {
                             QuadSurface* surf = create_surface_from_state();
                             surf->save(tgt_path, true);
                             delete surf;
@@ -3429,7 +3445,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         timer_gen.unit = succ_gen * vx_per_quad;
         timer_gen.unit_string = "vx^2";
 
-        if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0) {
+        if (!tgt_path.empty() && snapshot_interval > 0 && generation % snapshot_interval == 0 && snapshot_allowed()) {
             QuadSurface* surf = create_surface_from_state();
             surf->save(tgt_path, true);
             delete surf;
@@ -3438,6 +3454,12 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
     }  // end while fringe is non-empty
     delete timer;
+
+    if (const uint64_t failures = normal_grid_read_failures()) {
+        throw std::runtime_error("normal grid reads failed " + std::to_string(failures) +
+                                 " time(s) (see the messages above); the patch would be missing normal "
+                                 "constraints, so it is not saved");
+    }
 
     QuadSurface* surf = create_surface_from_state();
 

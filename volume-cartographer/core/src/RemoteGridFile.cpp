@@ -8,6 +8,10 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <optional>
+#include <mutex>
+#include <map>
 #include <random>
 
 namespace fs = std::filesystem;
@@ -226,7 +230,7 @@ void RemoteGridFile::reportFailure(const std::string& what)
 }
 
 RemoteGridFile::RemoteGridFile(std::string url, const std::string& local_path, RangeFetcher fetcher, const Options& options)
-    : url_(std::move(url)), pack_path_(local_path + ".ranges"), fetch_(std::move(fetcher)), charge_(options.charge),
+    : url_(std::move(url)), pack_path_(local_path + ".ranges"), fetch_(std::move(fetcher)), budgeted_(options.budgeted),
       min_free_bytes_(options.min_free_bytes)
 {
     ++g_opens;
@@ -271,36 +275,65 @@ RemoteGridFile::~RemoteGridFile()
     g_resident -= resident_.load();
 }
 
-// Charges what the pack occupies now (other processes may append to it too).
-// When the budget refuses it, or the disk is under its free-space floor, the
-// pack stops growing (it is still read as it is).
-void RemoteGridFile::chargePack()
+namespace {
+std::optional<uint64_t> fileSize(const std::string& path)
 {
-    if (in_memory_) return;
     struct stat st{};
-    if (::stat(pack_path_.c_str(), &st) != 0) return;  // evicted: nothing left to charge
-    bool fits = !belowFloor(fs::path(pack_path_).parent_path(), min_free_bytes_, 0);
-    try {
-        fits = fits && (!charge_ || charge_(pack_path_, uint64_t(st.st_size)));
-    } catch (const std::exception&) {
-        fits = false;
+    if (::stat(path.c_str(), &st) != 0) return std::nullopt;
+    return uint64_t(st.st_size);
+}
+}  // namespace
+
+void RemoteGridFile::withPack(const Options::Write& write)
+{
+    const fs::path dir = fs::path(pack_path_).parent_path();
+    const Options::Write floored = [&](const Options::Fits& budget) -> std::optional<uint64_t> {
+        const auto before = fileSize(pack_path_).value_or(0);
+        const Options::Fits fits = [&](uint64_t total) {
+            if (belowFloor(dir, min_free_bytes_, total > before ? total - before : 0)) return false;
+            return budget(total);
+        };
+        return write(fits);
+    };
+    if (!budgeted_) {
+        static std::mutex mutex;
+        static std::map<std::string, std::shared_ptr<std::mutex>> per_pack;
+        std::shared_ptr<std::mutex> one;
+        {
+            std::lock_guard lock(mutex);
+            auto& slot = per_pack[pack_path_];
+            if (!slot) slot = std::make_shared<std::mutex>();
+            one = slot;
+        }
+        std::lock_guard lock(*one);
+        (void)floored([](uint64_t) { return true; });
+        return;
     }
-    if (!fits) {
-        std::lock_guard lock(pack_mutex_);
-        pack_ino_ = 0;
+    try {
+        budgeted_(pack_path_, floored);
+    } catch (const std::exception&) {
+        // The budget could not be asked: write() did not run, or what it wrote
+        // was not recorded; the caller's flags say which, and the next start
+        // reconciles the budget with the disk.
     }
 }
 
-// Whether the pack may grow to `total` bytes on disk by writing `growth` more:
-// the free-space floor allows it and the budget accepts the new size. Checked
-// before every write, so the pack never holds more than it was charged for.
-bool RemoteGridFile::admit(uint64_t total, uint64_t growth)
+// Charges what the pack occupies now, as the newest in the budget (other
+// processes may have appended to it). When the budget would not take it, or
+// the disk is under its free-space floor, the pack stops growing (it is still
+// read as it is).
+void RemoteGridFile::chargePack()
 {
-    if (belowFloor(fs::path(pack_path_).parent_path(), min_free_bytes_, growth)) return false;
-    try {
-        return !charge_ || charge_(pack_path_, total);
-    } catch (const std::exception&) {
-        return false;  // the budget could not be asked: write nothing (the data stays in memory)
+    if (in_memory_) return;
+    bool fits_now = false;
+    withPack([&](const Options::Fits& fits) {
+        const auto size = fileSize(pack_path_);
+        if (size) fits_now = fits(*size);
+        return size;
+    });
+    if (!fits_now) {
+        std::lock_guard lock(pack_mutex_);
+        pack_ino_ = 0;
     }
 }
 
@@ -393,7 +426,7 @@ bool RemoteGridFile::reuse()
         map_ = nullptr;
         std::lock_guard lock(held_mutex_);
         held_.clear();
-        resident_ = 0;
+        g_resident -= resident_.exchange(0);  // what place() charged while replaying
         return false;
     }
     version_ = header.substr(sizeof(fixed), vlen);
@@ -435,21 +468,29 @@ bool RemoteGridFile::writePack(const std::string& records)
     out += version_;
     put(out, crc32(out.data(), out.size()), 4);
     out += records;
-    if (!admit(out.size(), out.size())) return false;
-    const std::string temporary = pack_path_ + ".tmp." + std::to_string(::getpid());
-    const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return false;
-    struct stat st{};
-    const bool ok = writeAll(fd, out) && ::fstat(fd, &st) == 0;
-    ::close(fd);
-    if (!ok || ::rename(temporary.c_str(), pack_path_.c_str()) != 0) {
-        ::unlink(temporary.c_str());
-        return false;
-    }
-    pack_dev_ = uint64_t(st.st_dev);
-    pack_ino_ = uint64_t(st.st_ino);
-    pack_identity_ = identity;
-    return true;
+    // Written, renamed into place and charged with the budget held, so no
+    // eviction comes between charging the pack and publishing it.
+    bool published = false;
+    withPack([&](const Options::Fits& fits) -> std::optional<uint64_t> {
+        if (!fits(out.size())) return fileSize(pack_path_);
+        const std::string temporary = pack_path_ + ".tmp." + std::to_string(::getpid());
+        const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return fileSize(pack_path_);
+        struct stat st{};
+        const bool ok = writeAll(fd, out) && ::fstat(fd, &st) == 0;
+        ::close(fd);
+        if (!ok || ::rename(temporary.c_str(), pack_path_.c_str()) != 0) {
+            ::unlink(temporary.c_str());
+            return fileSize(pack_path_);
+        }
+        pack_dev_ = uint64_t(st.st_dev);
+        pack_ino_ = uint64_t(st.st_ino);
+        pack_identity_ = identity;
+        published = true;
+        return uint64_t(st.st_size);
+    });
+    if (!published) pack_ino_ = 0;
+    return published;
 }
 
 // A new file: the header, and with the plane's layout the first region's
@@ -576,23 +617,29 @@ void RemoteGridFile::commit(const Pieces& pieces, const std::string& tail)
             putData(out, a, bytes.data() + (a - offset), b - a);
     out += tail;
     if (out.empty()) return;
-    const int fd = ::open(pack_path_.c_str(), O_RDWR | O_APPEND | O_CLOEXEC);
-    if (fd < 0) {
-        pack_ino_ = 0;  // evicted, or the disk is gone: nothing more to reuse
-        return;
-    }
-    struct stat st{};
+    // With the budget held, so appends of other readers of this pack, here or
+    // in another process, are made and charged one at a time, each fitted to
+    // the size the pack has when it is made.
     bool ok = false;
-    char identity[8];
-    if (::fstat(fd, &st) == 0 && uint64_t(st.st_dev) == pack_dev_ && uint64_t(st.st_ino) == pack_ino_ &&
-        preadAll(fd, identity, 8, 16) && get(identity, 8) == pack_identity_ &&
-        // Charged at its new size before it grows: refused, it stays as it is.
-        admit(uint64_t(st.st_size) + out.size(), out.size())) {
-        // One write: appends of other processes never land inside it.
-        const ssize_t n = ::write(fd, out.data(), out.size());
-        ok = n == ssize_t(out.size());
-    }
-    ::close(fd);
+    withPack([&](const Options::Fits& fits) -> std::optional<uint64_t> {
+        const int fd = ::open(pack_path_.c_str(), O_RDWR | O_APPEND | O_CLOEXEC);
+        if (fd < 0) return fileSize(pack_path_);  // evicted, or the disk is gone
+        struct stat st{};
+        char identity[8];
+        if (::fstat(fd, &st) == 0 && uint64_t(st.st_dev) == pack_dev_ && uint64_t(st.st_ino) == pack_ino_ &&
+            preadAll(fd, identity, 8, 16) && get(identity, 8) == pack_identity_ &&
+            fits(uint64_t(st.st_size) + out.size())) {
+            const ssize_t n = ::write(fd, out.data(), out.size());
+            ok = n == ssize_t(out.size());
+            // A short write is cut off again: the pack holds only what was charged.
+            if (!ok && n > 0 && ::ftruncate(fd, st.st_size) != 0) {}
+        }
+        struct stat after{};
+        const bool sized = ::fstat(fd, &after) == 0;
+        ::close(fd);
+        if (!sized) return fileSize(pack_path_);
+        return uint64_t(after.st_size);
+    });
     if (!ok) pack_ino_ = 0;  // nothing more is appended; the pack is read as it is
 }
 

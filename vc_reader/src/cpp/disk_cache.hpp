@@ -7,6 +7,8 @@
 #include "http.hpp"
 #include "vc_reader/zarr.hpp"
 
+#include <functional>
+#include <optional>
 #include <atomic>
 #include <iostream>
 #include <sqlite3.h>
@@ -319,6 +321,50 @@ public:
             charged = true;
         });
         return charged;
+    }
+
+    // Runs `write` for a file its owner writes in place under the root (as
+    // account_file's) inside one transaction of the index, so no eviction, no
+    // publication and no other with_file of this budget, in any process, comes
+    // between the write and its accounting. `write(fits)` writes only after
+    // fits(total) accepts what the file will occupy (the floor, and the budget
+    // less reservations); it returns what the file occupies once done (nullopt:
+    // none there), which is charged as the newest entry, older files evicted to
+    // make room. The file is never charged less than it holds.
+    void with_file(const std::string& path,
+                   const std::function<std::optional<std::int64_t>(const std::function<bool(std::int64_t)>&)>& write)
+    {
+        check_path(path);
+        std::lock_guard lock(mutex_);
+        if (!reconciled_) transaction([&] { reconcile(); });
+        transaction([&] {
+            std::int64_t before = 0;
+            {
+                Statement s(db_, "SELECT size FROM chunks WHERE path=?");
+                s.text(1, path);
+                if (s.step()) before = sqlite3_column_int64(s.get(), 0);
+            }
+            const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
+            const std::function<bool(std::int64_t)> fits = [&](std::int64_t total) {
+                if (total < 0 || total > available) return false;
+                return total <= before || leaves_free_space(static_cast<std::size_t>(total - before));
+            };
+            const auto after = write(fits);
+            if (after) {
+                record(path, *after);
+                Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                f.text(1, path);
+                f.step();
+                evict_to(available);
+            } else {
+                Statement s(db_, "DELETE FROM chunks WHERE path=?");
+                s.text(1, path);
+                s.step();
+                Statement f(db_, "DELETE FROM files WHERE path=?");
+                f.text(1, path);
+                f.step();
+            }
+        });
     }
 
 private:

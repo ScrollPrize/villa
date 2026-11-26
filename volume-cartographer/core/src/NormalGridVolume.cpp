@@ -213,6 +213,8 @@
          std::string remote_url;
          // Shared with the range fetchers of grids, which may outlive this object.
          mutable std::shared_ptr<vcr::sources::EncodedFiles> files;
+         // Shared with the range-read stores, which can outlive this volume.
+         std::shared_ptr<std::atomic<uint64_t>> read_failures = std::make_shared<std::atomic<uint64_t>>(0);
          mutable std::atomic<uint64_t> fetch_failures{0};
          mutable std::mutex fetch_error_mutex;
          mutable std::string last_fetch_error;
@@ -743,8 +745,12 @@
             const std::string location = remote_url + "/" + rel;
             RemoteGridFile::Options options;
             options.min_free_bytes = range_min_free_bytes;
-            options.charge = [files = files, location](const std::string& path, uint64_t bytes) {
-                return files->chargeFile(location, path, static_cast<std::int64_t>(bytes));
+            options.budgeted = [files = files, location](const std::string& path,
+                                                         const RemoteGridFile::Options::Write& write) {
+                files->writeFile(location, path, [&](const vcr::sources::EncodedFiles::Fits& fits) {
+                    const auto after = write([&](uint64_t total) { return fits(static_cast<std::int64_t>(total)); });
+                    return after ? std::optional<std::int64_t>(static_cast<std::int64_t>(*after)) : std::nullopt;
+                });
             };
             if (layout) {
                 options.layout = &*layout;
@@ -913,7 +919,8 @@
                             return nullptr;
                         }
                     };
-                    grid_store = std::make_shared<GridStore>(std::move(*opened), std::move(whole_file));
+                    auto on_failure = [failures = read_failures] { failures->fetch_add(1, std::memory_order_relaxed); };
+                    grid_store = std::make_shared<GridStore>(std::move(*opened), std::move(whole_file), std::move(on_failure));
                 }
             }
             if (!grid_store) {
@@ -1135,6 +1142,10 @@
 
     std::shared_ptr<const GridStore> NormalGridVolume::get_grid(int plane_idx, int slice_idx) const {
         return pimpl_->get_grid(plane_idx, slice_idx);
+    }
+
+    uint64_t NormalGridVolume::readFailures() const {
+        return pimpl_->read_failures->load(std::memory_order_relaxed);
     }
 
     NormalGridVolume::CacheStats NormalGridVolume::cacheStats() const {

@@ -308,11 +308,16 @@ struct NormalConstraintPlane {
          T payload_;
          const vc::core::util::NormalGridVolume* grid_source = nullptr;
          std::weak_ptr<const vc::core::util::GridStore> selected_grid_owner;
+         // The grid's generation() when the payload was read: a slice read a part
+         // at a time changes it when its answers may change (a failed read, or
+         // the switch to the slice read whole), so the payload is read again.
+         uint64_t grid_generation = 0;
  
          bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::NormalGridVolume* current_grid_source, const std::shared_ptr<const vc::core::util::GridStore>& current_grid) const {
              if (grid_source != current_grid_source) return false;
              const auto prior_grid = selected_grid_owner.lock();
              if (!prior_grid || prior_grid.get() != current_grid.get() || selected_grid_owner.owner_before(current_grid) || current_grid.owner_before(selected_grid_owner)) return false;
+             if (current_grid->generation() != grid_generation) return false;
              cv::Point2f d1 = p1 - p1_;
              cv::Point2f d2 = p2 - p2_;
              return (d1.dot(d1) + d2.dot(d2)) < th * th;
@@ -320,12 +325,14 @@ struct NormalConstraintPlane {
  
          const T& get() const { return payload_; }
  
-         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::NormalGridVolume* new_grid_source, const std::shared_ptr<const vc::core::util::GridStore>& current_grid) {
+         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::NormalGridVolume* new_grid_source, const std::shared_ptr<const vc::core::util::GridStore>& current_grid, uint64_t generation) {
+             // `generation`: current_grid->generation() read before the payload's query.
              p1_ = p1;
              p2_ = p2;
              payload_ = std::move(payload);
              grid_source = new_grid_source;
              selected_grid_owner = current_grid;
+             grid_generation = generation;
          }
      };
  
@@ -590,9 +597,10 @@ struct NormalConstraintPlane {
 
         if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume, current_grid)) {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
+            const uint64_t generation = normal_grid.generation();
             auto raw_paths = normal_grid.get(midpoint_cv, query_radius_);
             auto filtered_paths = filter_and_split_paths(raw_paths, p1_cv, p2_cv);
-            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume, current_grid);
+            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume, current_grid, generation);
             // Invalidate snapping cache whenever the path cache is updated
             snap_loss_caches_[grid_idx] = {};
         }
@@ -686,7 +694,7 @@ struct NormalConstraintPlane {
                      }
                  }
              }
-            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid_volume, current_grid);
+            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid_volume, current_grid, path_caches_[grid_idx].grid_generation);
         }
 
         const auto& snap_payload = snap_cache.get();

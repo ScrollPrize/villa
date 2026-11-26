@@ -40,12 +40,15 @@ public:
     // first fetches what its region needs (see RemoteGridFile). Its `meta` is
     // not read. When a region cannot be fetched (after a retry), or the
     // remote file changed version, `whole_file` loads the file whole
-    // the usual way, and this store answers every later query from that copy,
-    // so a slice is read from one version. Without it, or when it fails too,
-    // the failure is reported and the region reads as empty, as a whole-file
-    // store does when its download fails.
+    // the usual way, and this store answers every later query, and size(),
+    // from that copy, so a slice is read from one version. Without it, or
+    // when it fails too, the failure is reported (`on_failure` is called)
+    // and the region reads as empty; a later query tries both again.
+    // generation() changes whenever answers may have changed: on the switch
+    // to the whole copy and on each failed read.
     explicit GridStore(std::shared_ptr<RemoteGridFile> remote,
-                       std::function<std::shared_ptr<const GridStore>()> whole_file = {});
+                       std::function<std::shared_ptr<const GridStore>()> whole_file = {},
+                       std::function<void()> on_failure = {});
     ~GridStore();
 
     void add(const std::vector<cv::Point>& points);
@@ -68,6 +71,10 @@ public:
     size_t remoteResidentBytes() const;
     size_t numSegments() const;
     size_t numNonEmptyBuckets() const;
+    // Changes when what this store answers may have changed (see the remote
+    // constructor); constant for other stores. A caller that keeps results
+    // reads it before its query and keeps them only while it is unchanged.
+    uint64_t generation() const;
     CacheStats cacheStats() const;
     void resetCacheStats() const;
 

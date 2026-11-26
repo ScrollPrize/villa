@@ -24,6 +24,7 @@
 #include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <dlfcn.h>
@@ -378,6 +379,43 @@ TEST_CASE("Range reads: when a grid's regions stop arriving, the grid is read wh
     CHECK(failed > 0);
     CHECK(wholeGets == 1);  // read whole once, then every query answered from it
     CHECK(fs::is_regular_file(s.dir / "xy" / gridName(5)));
+}
+
+TEST_CASE("Range reads: in an outage a region that cannot be read is counted, not taken as empty, and reads after it")
+{
+    // As main's whole-file path serves a slice read before an outage, while a
+    // region never fetched cannot be: the volume counts that (GrowPatch then
+    // does not save), the grid's generation changes (GrowPatch's caches read
+    // it again), and once the store answers again the region is read.
+    Streamed s;
+    RangeReads on;
+    {
+        vc::core::util::GridStore big(cv::Rect(0, 0, 4000, 3000), 32);
+        for (int y = 5; y < 3000; y += 37)
+            for (int x = 5; x < 4000; x += 41) big.add({cv::Point(x, y), cv::Point(x + 6, y + 3), cv::Point(x + 12, y + 1)});
+        big.save((s.store / "xy" / gridName(5)).string());
+    }
+    std::atomic<bool> outage{false};
+    s.server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
+        if (request.path != "/ng/xy/" + gridName(5) || !outage) return std::nullopt;
+        return LoopbackHttpServer::Response{503, "down", {}, false};
+    });
+    vc::core::util::GridStore whole((s.store / "xy" / gridName(5)).string());
+    NormalGridVolume volume(s.dir.string());
+    const auto grid = volume.get_grid(0, 5);
+    REQUIRE(grid != nullptr);
+    const cv::Rect first(100, 100, 200, 200), second(3000, 2000, 300, 300);
+    CHECK(points(grid->get(first)) == points(whole.get(first)));
+    CHECK(volume.readFailures() == 0);
+    outage = true;
+    const auto generation = grid->generation();
+    CHECK(grid->get(second).empty());
+    CHECK(volume.readFailures() == 1);
+    CHECK(grid->generation() != generation);
+    outage = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    CHECK(points(grid->get(second)) == points(whole.get(second)));
+    CHECK(volume.readFailures() == 1);  // what failed stays counted: a patch grown meanwhile is not saved
 }
 
 // Runs `work` on its own thread; nullopt when it has not finished within `limit`

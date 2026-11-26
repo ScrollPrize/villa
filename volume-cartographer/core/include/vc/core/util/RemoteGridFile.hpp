@@ -73,11 +73,18 @@ public:
         std::optional<BucketRect> first;        // the region the first query reads
         uint64_t min_free_bytes = 0;            // below this much free disk, write no pack
         bool in_memory = false;                 // never write a pack to disk
-        // Charges the bytes the pack file occupies to the cache's disk budget
-        // (false: it does not fit). Called with the new size before every
-        // write (a write that does not fit is not made, and the pack stops
-        // growing), and again when a pack is reused.
-        std::function<bool(const std::string& path, uint64_t bytes)> charge;
+        // The cache's disk budget, holding it for each write to the pack (see
+        // vcr::sources::EncodedFiles::writeFile): `budgeted(path, write)` runs
+        // `write`, which writes only once fits(total) accepts what the pack
+        // will occupy, and returns what the pack occupies afterwards, written
+        // or not (nullopt: none there); the budget charges that. Used for every
+        // pack written, appended to or reused. Without it the pack is not
+        // limited, and writes to one pack in this process are still made one
+        // at a time. When the budget refuses a write, the pack stops growing
+        // (it is still read as it is).
+        using Fits = std::function<bool(uint64_t total)>;
+        using Write = std::function<std::optional<uint64_t>(const Fits& fits)>;
+        std::function<void(const std::string& path, const Write& write)> budgeted;
     };
 
     // Replays the pack at local_path + ".ranges", or creates it when there is
@@ -131,7 +138,9 @@ private:
     // Appends the pieces not in the pack yet and then `tail` (records) in one write.
     void commit(const Pieces& pieces, const std::string& tail);
     bool writePack(const std::string& records);  // a new pack, renamed into place
-    bool admit(uint64_t total, uint64_t growth);  // the pack may grow to `total` bytes
+    // Runs `write` with the pack's budget held, its fits() also keeping the
+    // free-space floor; a budget that throws writes nothing.
+    void withPack(const Options::Write& write);
     void chargePack();
 
     std::string url_;
@@ -139,7 +148,7 @@ private:
     RangeFetcher fetch_;
     std::string version_;
     bool in_memory_ = false;
-    std::function<bool(const std::string&, uint64_t)> charge_;
+    std::function<void(const std::string&, const Options::Write&)> budgeted_;
     void* map_ = nullptr;
     size_t size_ = 0;
 

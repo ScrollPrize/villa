@@ -426,6 +426,31 @@ bool EncodedFiles::chargeFile(const std::string& location, const std::string& pa
     return budget->account_file(utf8String(fs::weakly_canonical(utf8Path(path))), bytes);
 }
 
+void EncodedFiles::writeFile(const std::string& location, const std::string& path,
+                             const std::function<std::optional<std::int64_t>(const Fits& fits)>& write)
+{
+    std::vector<fs::path> roots;
+    std::optional<zarr::OpenOptions> options;
+    if (zarr::isRemote(location)) options = resolve(location, roots);
+    if (!options || roots.empty() || !options->cacheWrites) {
+        static std::mutex mutex;
+        static std::map<std::string, std::shared_ptr<std::mutex>> perPath;
+        std::shared_ptr<std::mutex> one;
+        {
+            std::lock_guard guard(mutex);
+            auto& slot = perPath[path];
+            if (!slot) slot = std::make_shared<std::mutex>();
+            one = slot;
+        }
+        std::lock_guard guard(*one);
+        (void)write([](std::int64_t) { return true; });
+        return;
+    }
+    auto budget = zarr::diskBudget(utf8String(roots.front()), options->cacheMaxBytes);
+    if (options->cacheMinFreeBytes) budget->set_min_free_bytes(*options->cacheMinFreeBytes);
+    budget->with_file(utf8String(fs::weakly_canonical(utf8Path(path))), write);
+}
+
 EncodedFiles::Opened EncodedFiles::open(const std::string& location)
 {
     if (!zarr::isRemote(location)) {

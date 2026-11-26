@@ -194,6 +194,19 @@ public:
     // root, or a local location).
     [[nodiscard]] bool chargeFile(const std::string& location, const std::string& path, std::int64_t bytes);
 
+    // Writes to such a file with its budget held: no eviction, no download's
+    // publication and no other writeFile of the budget, in this process or
+    // another, comes between the write and its accounting. `write(fits)` may
+    // write only after fits(total) accepts what the file will then occupy (the
+    // floor and the budget, as chargeFile); it returns what the file at `path`
+    // occupies once done, written or not (nullopt: no file there), and that is
+    // what the budget charges. `write` must not throw. Without a budget (no
+    // cache root, or a local location) fits() accepts anything, and writes to
+    // one path in this process are still made one at a time.
+    using Fits = std::function<bool(std::int64_t total)>;
+    void writeFile(const std::string& location, const std::string& path,
+                   const std::function<std::optional<std::int64_t>(const Fits& fits)>& write);
+
     [[nodiscard]] std::size_t bytesRead() const { return bytesRead_; }
     [[nodiscard]] std::size_t cacheHits() const { return cacheHits_; }
     // Where files live when nothing can be kept; empty until one is needed.

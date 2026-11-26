@@ -9,6 +9,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <optional>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -272,6 +274,71 @@ int main()
         sources::EncodedFiles again(limited);
         // Local locations have no budget.
         CHECK(again.chargeFile((root / "local.bin").string(), (root / "local.bin").string(), 1LL << 40));
+    }
+
+    // writeFile holds the budget across a write and its accounting: a writer
+    // paused between being admitted and publishing its file is not evicted
+    // from under it (the file it then publishes would be on disk unaccounted),
+    // and the files on disk stay within the limit.
+    {
+        const auto publishRoot = root / "publish";
+        fs::create_directories(publishRoot);
+        auto small = [publishRoot](const std::string& location) {
+            zarr::OpenOptions options;
+            options.access = zarr::resolveAccess(location, zarr::AuthMode::Anonymous);
+            options.cacheDirs = {publishRoot.string()};
+            options.cacheMaxBytes = 120;
+            return options;
+        };
+        sources::EncodedFiles files(small);
+        const auto base = zarr::decodedCachePath(publishRoot, server.url()).string();
+        const std::string a = base + ".a", b = base + ".b";
+        fs::create_directories(fs::path(a).parent_path());
+        const auto publish = [](const std::string& path, std::size_t n) {
+            const auto temporary = path + ".tmp";
+            { std::ofstream(temporary, std::ios::binary) << std::string(n, 'x'); }
+            fs::rename(temporary, path);
+            return static_cast<std::int64_t>(fs::file_size(path));
+        };
+        std::atomic<bool> admitted{false};
+        std::thread first([&] {
+            files.writeFile(server.url(), a, [&](const sources::EncodedFiles::Fits& fits) -> std::optional<std::int64_t> {
+                if (!fits(105)) return std::nullopt;
+                admitted = true;
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));  // paused before publishing
+                return publish(a, 105);
+            });
+        });
+        while (!admitted) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        bool secondFit = false;
+        files.writeFile(server.url(), b, [&](const sources::EncodedFiles::Fits& fits) -> std::optional<std::int64_t> {
+            CHECK(fs::exists(a));  // waited for the first to publish
+            secondFit = fits(105);
+            if (!secondFit) return std::nullopt;
+            return publish(b, 105);
+        });
+        first.join();
+        CHECK(secondFit);
+        std::uintmax_t onDisk = 0;
+        for (const auto& path : {a, b})
+            if (fs::exists(path)) onDisk += fs::file_size(path);
+        CHECK(onDisk <= 120);
+        CHECK(fs::exists(b));    // the newest stays
+        CHECK(!fs::exists(a));   // the older was evicted for it, after it was published
+        // What does not fit is not written; a refused write leaves the file charged as it is.
+        files.writeFile(server.url(), b, [&](const sources::EncodedFiles::Fits& fits) -> std::optional<std::int64_t> {
+            CHECK(!fits(121));
+            return static_cast<std::int64_t>(fs::file_size(b));
+        });
+        CHECK(fs::exists(b));
+        // Local locations have no budget: anything fits.
+        bool ran = false;
+        files.writeFile((root / "local.bin").string(), (root / "local.bin").string(),
+                        [&](const sources::EncodedFiles::Fits& fits) -> std::optional<std::int64_t> {
+                            ran = fits(1LL << 40);
+                            return std::nullopt;
+                        });
+        CHECK(ran);
     }
 
     fs::remove_all(root);
