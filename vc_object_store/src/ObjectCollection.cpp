@@ -1058,6 +1058,9 @@ void ObjectCollection::scanObjects(const CollectionTxn& t,const std::function<bo
         return visit(CollectionObject{key,std::move(row)});
     });
 }
+int64_t ObjectCollection::objectCount(const CollectionTxn& t,const std::string& kind)const{
+    return impl_->nodes[0].store->objectCount(impl_->txn(t,0),kind,false);
+}
 std::optional<GeometryRevision> ObjectCollection::currentGeometry(const CollectionTxn& t,const ObjectKey& key)const{
     return impl_->nodes[0].store->currentGeometry(impl_->txn(t,0),canonical(key).objectUuid);
 }

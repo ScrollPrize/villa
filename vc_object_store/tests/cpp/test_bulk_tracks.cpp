@@ -66,6 +66,7 @@ std::map<std::string, Snapshot> snapshot(const fs::path& root)
         result[object.record.name] = std::move(s);
         return true;
     }, std::string("track"));
+    require(store.objectCount(txn, "track") == static_cast<std::int64_t>(result.size()), "the count-only API agrees with the full scan (review of PR 2588)");
     return result;
 }
 void requireSame(const std::map<std::string, Snapshot>& a, const std::map<std::string, Snapshot>& b, const char* what)

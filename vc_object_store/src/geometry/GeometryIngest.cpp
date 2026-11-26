@@ -537,7 +537,7 @@ nlohmann::json bulkBaseIdentity(const fs::path& base)
     OpenOptions readOnly; readOnly.readOnly = true;
     auto root = ObjectCollection::open(base, readOnly);
     std::int64_t objects = 0;
-    { auto txn = root.read(); root.scanObjects(txn, [&](const CollectionObject&) { ++objects; return true; }); }          // the number of tracks the publication really holds
+    { auto txn = root.read(); objects = root.objectCount(txn, "track"); }          // the number of tracks the publication really holds: a count, not a scan that decodes every record (review of PR 2588)
     return {{"members", bulkMembersIdentity(root.members())}, {"objects", objects}};
 }
 bool bulkMarkerMatches(const nlohmann::json& marker, const std::string& packed, const std::string& fingerprint, const nlohmann::json& options, std::size_t shards, std::size_t rows)

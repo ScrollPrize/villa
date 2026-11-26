@@ -135,6 +135,8 @@ public:
     // reserved range as permission to allocate that ID in another partition.
     std::optional<CollectionObject> objectById(const CollectionTxn&, const std::string& owner, int64_t id) const;
     void scanObjects(const CollectionTxn&, const std::function<bool(const CollectionObject&)>&, const std::optional<std::string>& kind = {}) const;
+    /// Number of visible (active) objects of `kind`: a native COUNT(*) on a single store, a reference-only scan (no record decoding or hydration) on a composed collection.
+    int64_t objectCount(const CollectionTxn&, const std::string& kind) const;
     std::optional<GeometryRevision> currentGeometry(const CollectionTxn&, const ObjectKey&) const;
     std::vector<uint8_t> readGeometryArray(const CollectionTxn&, const ObjectKey&, const std::string& array) const;
     std::optional<uint64_t> artifactLength(const CollectionTxn&,const std::string& hash) const;
