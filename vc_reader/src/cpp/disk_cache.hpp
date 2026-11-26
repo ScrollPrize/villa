@@ -339,31 +339,50 @@ public:
         check_path(path);
         std::lock_guard lock(mutex_);
         if (!reconciled_) transaction([&] { reconcile(); });
-        transaction([&] {
-            std::int64_t before = 0;
-            {
-                Statement s(db_, "SELECT size FROM chunks WHERE path=?");
-                s.text(1, path);
-                if (s.step()) {
-                    before = sqlite3_column_int64(s.get(), 0);
-                    record(path, before);  // newest: room is made from older files
+        // Accepting a size charges it at once, in its own transaction, before
+        // anything is written: a writer interrupted after its bytes reach the
+        // disk leaves the file charged at least what it holds, so no other
+        // writer is admitted into that space. The charge is corrected to what
+        // the file holds once the write is done.
+        const std::function<bool(std::int64_t)> fits = [&](std::int64_t total) {
+            bool accepted = false;
+            transaction([&] {
+                std::int64_t before = 0;
+                {
+                    Statement s(db_, "SELECT size FROM chunks WHERE path=?");
+                    s.text(1, path);
+                    if (s.step()) before = sqlite3_column_int64(s.get(), 0);
                 }
-            }
-            const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
-            const std::function<bool(std::int64_t)> fits = [&](std::int64_t total) {
-                if (total < 0 || total > available) return false;
+                const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
+                if (total < 0 || total > available) return;
                 const auto growth = total - before;
-                if (growth > 0 && !leaves_free_space(static_cast<std::size_t>(growth))) return false;
-                if (growth > 0) evict_to(available - growth);
-                return true;
-            };
-            const auto after = write(fits);
+                if (growth > 0 && !leaves_free_space(static_cast<std::size_t>(growth))) return;
+                record(path, std::max(before, total));  // the newest: room is made from older files
+                Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                f.text(1, path);
+                f.step();
+                evict_to(available);
+                accepted = true;
+            });
+            return accepted;
+        };
+        std::optional<std::int64_t> after;
+        try {
+            after = write(fits);
+        } catch (...) {
+            after.reset();
+            std::error_code ec;
+            const auto there = utf8Path(path);
+            if (std::filesystem::is_regular_file(std::filesystem::symlink_status(there, ec)))
+                after = occupied_bytes(there);
+        }
+        transaction([&] {
             if (after) {
                 record(path, *after);
                 Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
                 f.text(1, path);
                 f.step();
-                evict_to(available);
+                evict_to(number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes());
             } else {
                 Statement s(db_, "DELETE FROM chunks WHERE path=?");
                 s.text(1, path);
@@ -564,7 +583,17 @@ private:
         }
         for (const auto& path : paths) {
             check_path(path);
-            if (remove_abandoned(path)) forget_download(path);
+            const bool missing = !std::filesystem::exists(std::filesystem::symlink_status(utf8Path(path)));
+            if (!remove_abandoned(path)) continue;
+            forget_download(path);
+            // Its temporary is gone: interrupted after the rename, the file it
+            // became is on disk, and is charged here (as it is when published).
+            const auto tmp = path.rfind(".tmp.");
+            if (!missing || tmp == std::string::npos) continue;
+            const auto published = path.substr(0, tmp);
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(std::filesystem::symlink_status(utf8Path(published), ec)))
+                record(published, occupied_bytes(utf8Path(published)));
         }
     }
 
@@ -739,7 +768,11 @@ private:
         std::sort(files.begin(), files.end());
         for (const auto& [time, file, size] : files)
             record(file, size);
-        exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM chunks);");
+        // A file whose publication is pending (its temporary, named after it,
+        // is reserved) stays registered though it is not there yet: renamed
+        // into place and then interrupted, it is still found (clean_downloads).
+        exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM chunks) AND NOT EXISTS "
+             "(SELECT 1 FROM downloads WHERE substr(downloads.path, 1, length(files.path) + 5) = files.path || '.tmp.');");
         evict();
         reconciled_ = true;
     }

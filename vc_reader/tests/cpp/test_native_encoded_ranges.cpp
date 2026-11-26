@@ -405,6 +405,121 @@ int main()
         CHECK(fs::file_size(pack) == 103);
     }
 
+    // An append interrupted after its bytes reach the disk, before its writer
+    // finishes: the space it took is already charged, so another writer is not
+    // admitted into it.
+    {
+        const auto appendRoot = root / "append";
+        fs::create_directories(appendRoot);
+        const auto make = [appendRoot](const std::string& location) {
+            zarr::OpenOptions options;
+            options.access = zarr::resolveAccess(location, zarr::AuthMode::Anonymous);
+            options.cacheDirs = {appendRoot.string()};
+            options.cacheMaxBytes = 150;
+            return options;
+        };
+        const auto base = zarr::decodedCachePath(appendRoot, server.url()).string();
+        const std::string a = base + ".a.ranges", b = base + ".b.ranges";
+        fs::create_directories(fs::path(a).parent_path());
+        const pid_t child = ::fork();
+        if (child == 0) {
+            sources::EncodedFiles files(make);
+            files.writeFile(server.url(), a, [&](const sources::EncodedFiles::Fits& fits) -> std::optional<std::int64_t> {
+                if (!fits(140)) ::_exit(2);
+                { std::ofstream(a, std::ios::binary) << std::string(140, 'a'); }
+                ::_exit(0);  // interrupted before the write is accounted
+            });
+            ::_exit(1);
+        }
+        int status = 0;
+        ::waitpid(child, &status, 0);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        sources::EncodedFiles files(make);
+        bool fit = true;
+        files.writeFile(server.url(), b, [&](const sources::EncodedFiles::Fits& fits) -> std::optional<std::int64_t> {
+            fit = fits(40);
+            if (fit) { std::ofstream(b, std::ios::binary) << std::string(40, 'b'); }
+            return fit ? std::optional<std::int64_t>(40) : std::nullopt;
+        });
+        std::uintmax_t onDisk = 0;
+        for (const auto& path : {a, b})
+            if (fs::exists(path)) onDisk += fs::file_size(path);
+        CHECK(onDisk <= 150);
+    }
+
+    // A publication pending while another process reconciles the index, then
+    // interrupted just after the rename: the published file is still counted
+    // when the cache is next opened.
+    {
+        const auto pendRoot = root / "pending";
+        fs::create_directories(pendRoot);
+        const auto make = [pendRoot](const std::string& location) {
+            zarr::OpenOptions options;
+            options.access = zarr::resolveAccess(location, zarr::AuthMode::Anonymous);
+            options.cacheDirs = {pendRoot.string()};
+            options.cacheMaxBytes = 200;
+            return options;
+        };
+        const auto base = zarr::decodedCachePath(pendRoot, server.url()).string();
+        const std::string pack = base + ".ranges", other = base + ".other.ranges", third = base + ".third.ranges";
+        const auto dir = fs::path(pack).parent_path();
+        fs::create_directories(dir);
+        int filled[2], reconciled[2];
+        CHECK(::pipe(filled) == 0);
+        CHECK(::pipe(reconciled) == 0);
+        const pid_t writer = ::fork();
+        if (writer == 0) {
+            sources::EncodedFiles files(make);
+            (void)files.publishFile(server.url(), pack, 103, [&](int fd) {
+                const std::string bytes(103, 'p');
+                (void)!::write(fd, bytes.data(), bytes.size());
+                char c = 1;
+                (void)!::write(filled[1], &c, 1);
+                (void)!::read(reconciled[0], &c, 1);  // another process reconciles meanwhile
+                for (const auto& entry : fs::directory_iterator(dir))  // the rename, then the interruption
+                    if (entry.path().filename().string().rfind(fs::path(pack).filename().string() + ".tmp.", 0) == 0)
+                        fs::rename(entry.path(), pack);
+                ::_exit(0);
+                return true;
+            });
+            ::_exit(1);
+        }
+        char c = 0;
+        CHECK(::read(filled[0], &c, 1) == 1);
+        const pid_t reconciler = ::fork();
+        if (reconciler == 0) {
+            sources::EncodedFiles files(make);  // a new process: reconciles while `pack` is not there yet
+            const bool ok = files.publishFile(server.url(), other, 10, [](int fd) {
+                const std::string bytes(10, 'o');
+                return ::write(fd, bytes.data(), bytes.size()) == 10;
+            });
+            ::_exit(ok ? 0 : 1);
+        }
+        int status = 0;
+        ::waitpid(reconciler, &status, 0);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        c = 1;
+        CHECK(::write(reconciled[1], &c, 1) == 1);
+        ::waitpid(writer, &status, 0);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(fs::file_size(pack) == 103);  // published, never accounted by its writer
+        bool published = false;
+        std::thread next([&] {  // its own thread: a temporary not named like the forked writer's
+            sources::EncodedFiles files(make);
+            published = files.publishFile(server.url(), third, 103, [](int fd) {
+                const std::string bytes(103, 't');
+                return ::write(fd, bytes.data(), bytes.size()) == 103;
+            });
+        });
+        next.join();
+        CHECK(published);
+        std::uintmax_t onDisk = 0;
+        for (const auto& entry : fs::directory_iterator(dir))
+            if (entry.is_regular_file()) onDisk += entry.file_size();
+        CHECK(onDisk <= 200);
+        for (int fd : {filled[0], filled[1], reconciled[0], reconciled[1]}) ::close(fd);
+    }
+
     fs::remove_all(root);
     std::puts("ok");
     return 0;

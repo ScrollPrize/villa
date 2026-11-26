@@ -136,7 +136,45 @@ public:
         return range;
     }
 
+    // A slice that switches to its whole copy while a query reads the mirror
+    // (an old range request finishing late, say) answers that query from the
+    // copy too: no answer from the mirror is given after the switch.
     void collect_query_results(const cv::Rect& query_rect, GridStore::QueryScratch& scratch) const {
+        const GridStore* before = current_whole();
+        collect_query_results_once(query_rect, scratch);
+        if (!before)
+            if (const GridStore* whole = answered_from_mirror()) whole->pimpl_->collect_query_results(query_rect, scratch);
+    }
+
+    std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const {
+        const GridStore* before = current_whole();
+        auto result = get_all_once();
+        if (!before)
+            if (const GridStore* whole = answered_from_mirror()) return whole->get_all();
+        return result;
+    }
+
+    size_t numSegments() const {
+        const GridStore* before = current_whole();
+        const size_t n = numSegments_once();
+        if (!before)
+            if (const GridStore* whole = answered_from_mirror()) return whole->numSegments();
+        return n;
+    }
+
+    // After reading the mirror: the whole copy, when the store switched to it
+    // meanwhile (the answer is then read from it), else nullptr, the answer
+    // stands and the mirror is marked as having answered. Under the switch's
+    // lock, so a switch sees every answer the mirror gave before it.
+    const GridStore* answered_from_mirror() const {
+        if (!remote_) return nullptr;
+        std::lock_guard<std::mutex> lock(whole_mutex_);
+        if (whole_) return whole_.get();
+        answered_ = true;
+        return nullptr;
+    }
+
+    void collect_query_results_once(const cv::Rect& query_rect, GridStore::QueryScratch& scratch) const {
         scratch.ids.clear();
         scratch.results.clear();
         // Once read whole, that copy's bounds apply, not this file's.
@@ -223,7 +261,7 @@ public:
         }
     }
 
-    std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const {
+    std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all_once() const {
         std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
         if (read_only_) {
             if (remote_) {
@@ -268,6 +306,11 @@ public:
 
     bool is_remote() const { return remote_ != nullptr; }
 
+    std::pair<const void*, size_t> raw_bytes() const {
+        if (!mmapped_data_) return {nullptr, 0};
+        return {mmapped_data_->data, mmapped_data_->size};
+    }
+
     size_t mapped_bytes() const {
         return mmapped_data_ ? mmapped_data_->size : 0;
     }
@@ -295,7 +338,7 @@ public:
         return grid_memory + storage_memory;
     }
 
-    size_t numSegments() const {
+    size_t numSegments_once() const {
         if (read_only_) {
             if (remote_) {
                 bool failed = false;
@@ -949,6 +992,7 @@ private:
     // outage does not turn every query into a download attempt.
     mutable std::chrono::steady_clock::time_point whole_retry_at_{};
     mutable std::atomic<uint64_t> generation_{0};
+    mutable bool answered_ = false;  // a query was answered from the mirror; under whole_mutex_
 
 public:
     const GridStore* current_whole() const {
@@ -995,6 +1039,19 @@ private:
                     if (events_.readWhole) events_.readWhole();
                     std::cerr << "normal grid " << remote_->url() << ": range read failed (" << why
                               << "), read it whole instead" << std::endl;
+                    // What was already answered from the mirror must be what
+                    // the copy answers: every byte the mirror holds is compared.
+                    // When the slice changed between them, the answers before
+                    // and after would mix two versions: reported as a failed
+                    // read, so a trace using them is not saved.
+                    const auto [bytes, size] = whole_->pimpl_->raw_bytes();
+                    if (answered_ && !remote_->sameBytesAs(bytes, size)) {
+                        generation_.fetch_add(1, std::memory_order_acq_rel);
+                        RemoteGridFile::reportFailure(remote_->url() +
+                                                      ": changed on the server after parts of it were read; "
+                                                      "answers given before were of the old version");
+                        if (events_.failed) events_.failed();
+                    }
                 } else {
                     whole_retry_at_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
                 }

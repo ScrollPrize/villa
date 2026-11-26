@@ -106,6 +106,10 @@ public:
 
     const char* data() const { return static_cast<const char*>(map_); }
     size_t size() const { return size_; }
+    // Whether every byte the mirror holds is the same in `data` (`size` bytes,
+    // the file read whole, say): answers read from the mirror are then what
+    // that copy answers. False when sizes differ and the mirror holds any byte.
+    bool sameBytesAs(const void* data, size_t size);
     bool inMemory() const { return in_memory_; }  // no pack on disk
     // Bytes of the file held in memory (fetched or replayed, each byte once).
     uint64_t residentBytes() const { return resident_.load(); }

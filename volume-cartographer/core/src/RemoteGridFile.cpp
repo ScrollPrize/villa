@@ -20,6 +20,7 @@ namespace fs = std::filesystem;
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -579,6 +580,16 @@ void RemoteGridFile::writeAt(uint64_t offset, std::string bytes, Pieces* log)
 // Copies in the bytes memory does not hold yet. Bytes already held are never
 // written again, so queries reading them race with nothing; and the copy is
 // made under the lock, so once any writer of a range returns, it is in place.
+bool RemoteGridFile::sameBytesAs(const void* data, size_t size)
+{
+    std::lock_guard lock(held_mutex_);
+    if (held_.empty()) return true;
+    if (size != size_) return false;
+    for (const auto& [a, b] : held_)
+        if (std::memcmp(static_cast<const char*>(map_) + a, static_cast<const char*>(data) + a, b - a) != 0) return false;
+    return true;
+}
+
 void RemoteGridFile::place(uint64_t offset, const char* bytes, uint64_t n)
 {
     std::lock_guard lock(held_mutex_);
@@ -636,6 +647,10 @@ void RemoteGridFile::commit(const Pieces& pieces, const std::string& tail)
     withPack([&](const Options::Fits& fits) -> std::optional<uint64_t> {
         const int fd = ::open(pack_path_.c_str(), O_RDWR | O_APPEND | O_CLOEXEC);
         if (fd < 0) return fileSize(pack_path_);  // evicted, or the disk is gone
+        // Readers of this pack in other processes take turns too: each append
+        // is sized, charged and written with the pack locked (the budget's
+        // charge commits before the write, so the lock spans both).
+        while (::flock(fd, LOCK_EX) != 0 && errno == EINTR) {}
         struct stat st{};
         char identity[8];
         if (::fstat(fd, &st) == 0 && uint64_t(st.st_dev) == pack_dev_ && uint64_t(st.st_ino) == pack_ino_ &&
@@ -928,6 +943,11 @@ RemoteGridFile::~RemoteGridFile() = default;
 void RemoteGridFile::ensureBuckets(int, int, int, int, bool)
 {
     throw std::logic_error("normal-grid range reads are not available on Windows");
+}
+
+bool RemoteGridFile::sameBytesAs(const void*, size_t)
+{
+    return false;
 }
 
 void RemoteGridFile::ensureAll()

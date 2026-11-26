@@ -65,28 +65,51 @@ struct Remote {
     std::atomic<uint64_t> requests{0}, served{0};
     std::atomic<int> failNext{0};
     bool missing = false;
+    // A query still in flight when the slice changes: requests from `spared`
+    // for bytes from `holdFrom` on (tile data, not the index) wait while
+    // `hold` is set (`held` says one does), and never fail; with `failOthers`
+    // every other thread's request fails.
+    std::thread::id spared;
+    uint64_t holdFrom = 0;
+    std::atomic<bool> hold{false}, held{false}, failOthers{false};
 
     RemoteGridFile::RangeFetcher fetcher()
     {
         return [this](const std::vector<std::pair<uint64_t, uint64_t>>& ranges, const std::string& wanted) {
-            std::lock_guard lock(mutex);
-            if (missing) throw RemoteGridFile::NotFound("no such grid");
-            if (failNext > 0) {
-                --failNext;
-                throw std::runtime_error("connection reset");
-            }
-            if (!wanted.empty() && wanted != version) throw RemoteGridFile::Changed("grid changed");
             RemoteGridFile::Fetched out;
-            out.version = version;
-            for (const auto& [offset, length] : ranges) {
-                ++requests;
-                served += length;
-                out.parts.push_back(bytes.substr(offset, length));
+            const bool isSpared = std::this_thread::get_id() == spared;
+            if (failOthers && !isSpared) throw std::runtime_error("connection reset");
+            bool tiles = false;
+            for (const auto& [offset, length] : ranges) tiles |= holdFrom && offset >= holdFrom;
+            if (isSpared && tiles && hold) {
+                held = true;
+                while (hold) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            {
+                std::lock_guard lock(mutex);
+                if (missing) throw RemoteGridFile::NotFound("no such grid");
+                if (failNext > 0) {
+                    --failNext;
+                    throw std::runtime_error("connection reset");
+                }
+                if (!wanted.empty() && wanted != version) throw RemoteGridFile::Changed("grid changed");
+                out.version = version;
+                for (const auto& [offset, length] : ranges) {
+                    ++requests;
+                    served += length;
+                    out.parts.push_back(bytes.substr(offset, length));
+                }
             }
             return out;
         };
     }
 };
+
+std::string readFile(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+}
 
 std::vector<std::vector<cv::Point>> points(const Paths& paths)
 {
@@ -639,13 +662,18 @@ TEST_CASE("Remote grid: a region that fails to arrive is recovered, never read a
 
     SUBCASE("persistent range failures fall back to reading the file whole")
     {
-        int wholeReads = 0;
-        GridStore store(open(remote, s.dir / "mirror" / "000000.grid"), [&]() -> std::shared_ptr<const GridStore> {
-            ++wholeReads;
-            return std::make_shared<GridStore>((s.dir / "whole.grid").string());
-        });
+        int wholeReads = 0, failures = 0;
+        GridStore store(
+            open(remote, s.dir / "mirror" / "000000.grid"),
+            [&]() -> std::shared_ptr<const GridStore> {
+                ++wholeReads;
+                return std::make_shared<GridStore>((s.dir / "whole.grid").string());
+            },
+            GridStore::RemoteEvents{[&] { ++failures; }, {}});
+        CHECK(points(store.get(rects[0])) == points(whole.get(rects[0])));  // answered from the mirror
         remote.failNext = 1 << 30;
         for (const auto& rect : rects) CHECK(points(store.get(rect)) == points(whole.get(rect)));
+        CHECK(failures == 0);  // the whole copy holds what the mirror answered from
         CHECK(store.numSegments() == whole.numSegments());
         CHECK(points(store.get_all()).size() == points(whole.get_all()).size());
         CHECK(wholeReads == 1);  // switched once, then every query reads the whole copy
@@ -665,6 +693,72 @@ TEST_CASE("Remote grid: a region that fails to arrive is recovered, never read a
             remote.version = "v2";
         }
         for (const auto& rect : rects) CHECK(points(store.get(rect)) == points(newer.get(rect)));
+    }
+
+    // The mirror answers, then the slice changes on the server: answers before
+    // and after would mix two versions, so it is reported (GrowPatch then does
+    // not save a trace that used both), and later answers are the new copy's.
+    const auto changedAfterAnswering = [&](const std::function<void()>& change) {
+        int failures = 0;
+        makeGrid(s.dir / "v2.grid", 15);
+        GridStore newer((s.dir / "v2.grid").string());
+        GridStore store(
+            open(remote, s.dir / "mirror" / "000000.grid"),
+            [&]() -> std::shared_ptr<const GridStore> { return std::make_shared<GridStore>((s.dir / "v2.grid").string()); },
+            GridStore::RemoteEvents{[&] { ++failures; }, {}});
+        CHECK(points(store.get(rects[0])) == points(whole.get(rects[0])));  // the old version
+        change();
+        const auto before = store.generation();
+        for (size_t i = 1; i < rects.size(); ++i) CHECK(points(store.get(rects[i])) == points(newer.get(rects[i])));
+        CHECK(failures == 1);
+        CHECK(store.generation() != before);
+    };
+
+    SUBCASE("a slice whose version changes after the mirror answered is reported")
+    {
+        changedAfterAnswering([&] {
+            std::lock_guard lock(remote.mutex);
+            remote.bytes = readFile(s.dir / "v2.grid");
+            remote.version = "v2";
+        });
+    }
+
+    SUBCASE("a slice whose range reads stop and that is read whole at a new version is reported")
+    {
+        changedAfterAnswering([&] { remote.failNext = 1 << 30; });
+    }
+
+    SUBCASE("a request still in flight when the slice changes is answered from the new copy")
+    {
+        int failures = 0;
+        makeGrid(s.dir / "v2.grid", 16);
+        GridStore newer((s.dir / "v2.grid").string());
+        GridStore store(
+            open(remote, s.dir / "mirror" / "000000.grid"),
+            [&]() -> std::shared_ptr<const GridStore> { return std::make_shared<GridStore>((s.dir / "v2.grid").string()); },
+            GridStore::RemoteEvents{[&] { ++failures; }, {}});
+        CHECK(points(store.get(rects[0])) == points(whole.get(rects[0])));
+        const cv::Rect late(5000, 3000, 300, 300), other(1000, 4000, 300, 300);
+        REQUIRE(points(whole.get(late)) != points(newer.get(late)));
+        {
+            const auto byte = [&](int i) { return uint64_t(uint8_t(remote.bytes[i])); };
+            remote.holdFrom = 52 + (byte(28) << 24 | byte(29) << 16 | byte(30) << 8 | byte(31)) * 4 + 4;
+        }
+        remote.hold = true;
+        std::vector<std::vector<cv::Point>> lateAnswer;
+        std::atomic<bool> started{false};
+        std::thread inFlight([&] {
+            remote.spared = std::this_thread::get_id();
+            started = true;
+            lateAnswer = points(store.get(late));  // its tiles arrive after the switch, of the old version
+        });
+        while (!remote.held) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        remote.failOthers = true;  // range reads stop for the rest; the slice is read whole, at its new version
+        CHECK(points(store.get(other)) == points(newer.get(other)));
+        remote.hold = false;
+        inFlight.join();
+        CHECK(lateAnswer == points(newer.get(late)));  // not the old bytes that arrived after the switch
+        CHECK(failures == 1);
     }
 
     SUBCASE("read whole at a new version, the store has that copy's dimensions and regions")
