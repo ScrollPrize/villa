@@ -186,16 +186,52 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
         if (!revisions[i]) throw std::runtime_error("scaffold graph: fiber revision disappeared: " + entry.record.uuid);
         const auto& revision = *revisions[i];
         const auto view = snapshot.viewTransformedAt(revision, graph.volume, graph.scale);
-        const auto controls = view.points("control_points", 0, entry.record.fiber->controlPointCount);
-        // Only the annotated line: a manual fiber's extrapolated tails past its
-        // end controls are not fiber, so arc 0 is its first control and no
-        // normal, crossing, anchor or enclosure ever sees a tail.
-        const auto raw = view.points("line_points", 0, entry.record.fiber->linePointCount);
-        const auto annotated = geometry::annotatedLine(controls, raw);
-        const std::vector<geometry::Point> lines(annotated.begin(), annotated.end());
+        // What this version of the fiber reads as. A version never changes,
+        // so a caller that keeps the reads of an earlier run gets them back;
+        // the mapping is asked again, since it is the frame's, not the
+        // fiber's.
+        const ScaffoldFiberReads::Key key{entry.record.uuid, revision.version,
+                                          revision.geometryRevision.value_or(std::string()), graph.volume, graph.scale};
+        std::shared_ptr<const ScaffoldFiberRead> read;
+        if (options.reads) {
+            read = options.reads->find(key);
+            if (read && read->mapping.values != view.mapping().values) read.reset();
+        }
+        if (!read) {
+            auto fresh = std::make_shared<ScaffoldFiberRead>();
+            fresh->mapping = view.mapping();
+            const auto controls = view.points("control_points", 0, entry.record.fiber->controlPointCount);
+            // Only the annotated line: a manual fiber's extrapolated tails past its
+            // end controls are not fiber, so arc 0 is its first control and no
+            // normal, crossing, anchor or enclosure ever sees a tail.
+            const auto raw = view.points("line_points", 0, entry.record.fiber->linePointCount);
+            const auto annotated = geometry::annotatedLine(controls, raw);
+            fresh->rawPoints = raw.size();
+            fresh->shift = std::size_t(annotated.data() - raw.data());
+            fresh->content.controlPoints = controls;
+            fresh->content.controlIds =
+                std::get<objects::FiberView>(view.canonical()).controlPointIds(0, entry.record.fiber->controlPointCount);
+            fresh->content.linePoints.assign(annotated.begin(), annotated.end());
+            Json annotations = Json::array();
+            if (revision.geometryRevision)
+                annotations = reader.geometryPointAnnotations(*revision.geometryRevision, "control_points");
+            fresh->content.annotations.assign(fresh->content.controlPoints.size(), Json::object());
+            if (annotations.is_array())
+                for (std::size_t k = 0; k < std::min(annotations.size(), fresh->content.annotations.size()); ++k)
+                    if (annotations[k].is_object()) fresh->content.annotations[k] = annotations[k];
+            fresh->content.resolveLineIndices();
+            // The fiber as the store holds it: the fingerprints and the
+            // approval layer are over its own frame, tails included.
+            const auto stored = objects::fiberPieceContent(snapshot.fiber(revision).load(), annotations);
+            for (std::size_t span = 0; span + 1 < stored.controlPoints.size(); ++span)
+                fresh->spanFingerprints.push_back(objects::fiberSpanFingerprint(stored, span));
+            fresh->storedLinePoints = stored.linePoints;
+            if (options.reads) options.reads->keep(key, fresh);
+            read = std::move(fresh);
+        }
         // Seam transport needs a segment: a fiber of one point carries no
         // winding relation of its own.
-        if (lines.size() < 2) { ++graph.report.shortFibers; continue; }
+        if (read->content.linePoints.size() < 2) { ++graph.report.shortFibers; continue; }
 
         ScaffoldFiber fiber;
         fiber.uuid = entry.record.uuid;
@@ -204,36 +240,21 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
         fiber.manualFamily = entry.manual;
         fiber.version = revision.version;
         fiber.pointFirst = graph.offsets.back();
-        fiber.pointCount = std::int64_t(lines.size());
-        fiber.content.controlPoints = controls;
-        fiber.content.controlIds =
-            std::get<objects::FiberView>(view.canonical()).controlPointIds(0, entry.record.fiber->controlPointCount);
-        fiber.content.linePoints = lines;
-        fiber.content.annotations.assign(fiber.content.controlPoints.size(), Json::object());
-        if (revision.geometryRevision) {
-            const auto annotations = reader.geometryPointAnnotations(*revision.geometryRevision, "control_points");
-            if (annotations.is_array())
-                for (std::size_t k = 0; k < std::min(annotations.size(), fiber.content.annotations.size()); ++k)
-                    if (annotations[k].is_object()) fiber.content.annotations[k] = annotations[k];
-        }
-        fiber.content.resolveLineIndices();
-        {
-            const auto stored = objects::fiberPieceContent(reader, revision);
-            for (std::size_t span = 0; span + 1 < stored.controlPoints.size(); ++span)
-                fiber.spanFingerprints.push_back(objects::fiberSpanFingerprint(stored, span));
-        }
-        mappingOf.insert_or_assign(fiber.uuid, view.mapping());
+        fiber.pointCount = std::int64_t(read->content.linePoints.size());
+        fiber.content = read->content;
+        fiber.spanFingerprints = read->spanFingerprints;
+        mappingOf.insert_or_assign(fiber.uuid, read->mapping);
         if (options.readApprovals) {
             if (const auto layer = objects::readFiberApproval(reader, fiber.uuid); layer && !layer->empty()) {
                 // The layer is over the stored line points, tails included and
                 // as stored; the run reads the annotated part, mapped.
-                const auto stored = snapshot.fiber(revision).load().linePoints;
-                if (stored.size() != raw.size())
+                const auto& stored = read->storedLinePoints;
+                if (stored.size() != read->rawPoints)
                     throw std::runtime_error("scaffold graph: fiber " + fiber.uuid + " reads " +
-                                             std::to_string(raw.size()) + " line points mapped and " +
+                                             std::to_string(read->rawPoints) + " line points mapped and " +
                                              std::to_string(stored.size()) + " stored");
                 const auto status = objects::fiberApprovalStatus(*layer, stored);
-                const double shift = double(annotated.data() - raw.data()), last = double(lines.size() - 1);
+                const double shift = double(read->shift), last = double(fiber.pointCount - 1);
                 const auto ranges = [&](objects::FiberApprovalAspect aspect, objects::FiberStretchState state) {
                     ScaffoldApproval::Ranges out;
                     for (auto [from, to] : objects::fiberStretchRanges(*layer, status, aspect, state)) {
@@ -256,8 +277,9 @@ ScaffoldGraph loadScaffoldGraph(const objects::StoreReader& reader, const Scaffo
                 approval.normalPoints = std::int64_t(layer->normalPoints.size()) - status.staleNormalPoints;
                 const auto normals = objects::approvedFiberLineNormals(*layer, status, stored.size());
                 if (!normals.empty())
-                    fiber.approvedLineNormals.assign(normals.begin() + std::ptrdiff_t(shift),
-                                                     normals.begin() + std::ptrdiff_t(shift) + std::ptrdiff_t(lines.size()));
+                    fiber.approvedLineNormals.assign(normals.begin() + std::ptrdiff_t(read->shift),
+                                                     normals.begin() + std::ptrdiff_t(read->shift) +
+                                                         std::ptrdiff_t(fiber.pointCount));
                 ++graph.report.approvalLayers;
                 graph.report.approvedStretches +=
                     std::int64_t(approval.approvedGeometry.size() + approval.approvedNormals.size());
@@ -437,6 +459,24 @@ double ScaffoldGeometry::controlArc(std::size_t fiber, std::size_t control) cons
     const auto index = entry.content.controlLineIndex.at(control);
     if (index < 0 || index >= entry.pointCount) return project(fiber, entry.content.controlPoints.at(control)).arc;
     return columns_.arc[std::size_t(entry.pointFirst + index)];
+}
+
+std::shared_ptr<const ScaffoldFiberRead> ScaffoldFiberReads::find(const Key& key) const
+{
+    const std::lock_guard<std::mutex> guard(mutex_);
+    const auto found = reads_.find(key);
+    return found == reads_.end() ? nullptr : found->second;
+}
+
+void ScaffoldFiberReads::keep(const Key& key, std::shared_ptr<const ScaffoldFiberRead> read)
+{
+    const std::lock_guard<std::mutex> guard(mutex_);
+    // One version per fiber and frame: an edited fiber's earlier read is not asked for again.
+    std::erase_if(reads_, [&](const auto& entry) {
+        return std::get<0>(entry.first) == std::get<0>(key) && std::get<3>(entry.first) == std::get<3>(key) &&
+               std::get<4>(entry.first) == std::get<4>(key);
+    });
+    reads_.insert_or_assign(key, std::move(read));
 }
 
 } // namespace vc::fiber_graph

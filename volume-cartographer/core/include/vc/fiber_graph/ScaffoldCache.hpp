@@ -37,6 +37,13 @@ public:
 
     [[nodiscard]] bool empty() const { return _normals.empty() && _crossings.empty(); }
 
+    // Rows a run computed and its caller has written to the store: a caller
+    // that keeps this cache between runs adds them here and does not read the
+    // store's rows again. A pair's rows are added whole (ScaffoldCacheSink
+    // holds every event of a pair it computed).
+    void add(std::span<const objects::FiberScaffoldNormalsRow> normals,
+             std::span<const objects::FiberScaffoldCrossingRow> crossings);
+
     // The cached normals of one fiber, or null.
     [[nodiscard]] const objects::FiberScaffoldNormalsRow* normals(const std::string& fiberUuid,
                                                                   std::int64_t fiberVersion,

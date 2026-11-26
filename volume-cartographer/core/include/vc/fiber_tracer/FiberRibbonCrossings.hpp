@@ -121,8 +121,8 @@ struct FiberCrossingFilterOptions {
     std::span<const FiberRibbonCrossing> crossings, std::span<const FiberRibbonEncounter> encounters,
     std::span<const FiberCrossingEventView> views, const FiberCrossingFilterOptions& options = {});
 
-// The crossings of one fiber with one other fiber's ribbon, without the grid
-// of the whole-volume pass: every span against every segment within reach.
+// The crossings of one fiber with one other fiber's ribbon: every span against
+// every segment within reach, in the ribbon's and then the fiber's order.
 // `ribbon` and `fiber` indices of the result are zero.
 [[nodiscard]] std::vector<FiberRibbonCrossing> fiberPairRibbonCrossings(
     std::span<const FiberStripSample> ribbon, std::span<const FiberStripSample> fiber,
@@ -143,5 +143,11 @@ struct FiberCrossingFindings {
 [[nodiscard]] FiberCrossingFindings fiberCrossingFindings(
     std::span<const FiberStripSample> a, std::span<const FiberStripSample> b, double arcA, double arcB,
     const FiberRibbonOptions& surface, const FiberCrossingFilterOptions& filter = {}, double encounterArcGap = 3000.0);
+// The same for several measured crossings of one pair, `arcs` their (arcA,
+// arcB): the two surfaces are intersected once for all of them.
+[[nodiscard]] std::vector<FiberCrossingFindings> fiberCrossingFindings(
+    std::span<const FiberStripSample> a, std::span<const FiberStripSample> b,
+    std::span<const std::pair<double, double>> arcs, const FiberRibbonOptions& surface,
+    const FiberCrossingFilterOptions& filter = {}, double encounterArcGap = 3000.0);
 
 }  // namespace vc::fiber_tracer

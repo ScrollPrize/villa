@@ -1,10 +1,14 @@
 #include "vc/fiber_tracer/FiberNeighbourNormals.hpp"
 
+#include "vc/core/util/SpatialBatches.hpp"
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <thread>
 
 namespace vc::fiber_tracer
 {
@@ -26,31 +30,63 @@ FiberStripSampleFile readFiberStripSampleFile(const std::filesystem::path& path)
 {
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("strip samples: cannot read " + path.string());
+    const auto truncated = [&] { return std::runtime_error("strip samples: truncated " + path.string()); };
     const auto get = [&](void* data, std::size_t bytes) {
-        if (!file.read(static_cast<char*>(data), std::streamsize(bytes))) throw std::runtime_error("strip samples: truncated " + path.string());
+        if (!file.read(static_cast<char*>(data), std::streamsize(bytes))) throw truncated();
     };
     char magic[8];
     get(magic, sizeof magic);
     if (std::memcmp(magic, kMagic, sizeof magic) != 0) throw std::runtime_error("strip samples: not a strip samples file " + path.string());
     std::uint64_t listed = 0;
     get(&listed, sizeof listed);
+    std::error_code sizeError;
+    const auto fileBytes = std::filesystem::file_size(path, sizeError);
+    if (sizeError) throw std::runtime_error("strip samples: cannot read " + path.string());
     FiberStripSampleFile out;
     out.ids.resize(listed);
     out.samples.resize(listed);
-    std::vector<double> buffer;
+    // The headers in file order - each fiber's id, its sample count and where
+    // its samples start - then the samples themselves on several threads.
+    std::vector<std::uint64_t> counts(listed), offsets(listed);
+    std::uint64_t at = sizeof magic + sizeof listed;
     for (std::uint64_t f = 0; f < listed; ++f) {
+        file.seekg(std::streamoff(at));
         get(out.ids[f].data(), out.ids[f].size());
-        std::uint64_t n = 0;
-        get(&n, sizeof n);
-        buffer.resize(n * kRecord);
-        get(buffer.data(), buffer.size() * sizeof(double));
-        auto& list = out.samples[f];
-        list.resize(n);
-        for (std::size_t j = 0; j < n; ++j) {
-            const double* v = &buffer[j * kRecord];
-            list[j] = {v[0], {v[1], v[2], v[3]}, {v[4], v[5], v[6]}, {v[7], v[8], v[9]}};
-        }
+        get(&counts[f], sizeof counts[f]);
+        offsets[f] = at + out.ids[f].size() + sizeof counts[f];
+        if (counts[f] > (fileBytes - std::min<std::uint64_t>(fileBytes, offsets[f])) / (kRecord * sizeof(double)))
+            throw truncated();
+        at = offsets[f] + counts[f] * kRecord * sizeof(double);
     }
+    const std::size_t threads = std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, 16);
+    std::atomic<std::uint64_t> next{0};
+    std::atomic<bool> failed{false};
+    const auto work = [&] {
+        std::ifstream own(path, std::ios::binary);
+        std::vector<double> buffer;
+        constexpr std::uint64_t block = 256;
+        for (std::uint64_t first; !failed && (first = next.fetch_add(block)) < listed;)
+            for (std::uint64_t f = first; f < std::min(first + block, listed); ++f) {
+                const auto n = counts[f];
+                buffer.resize(n * kRecord);
+                own.seekg(std::streamoff(offsets[f]));
+                if (!own.read(reinterpret_cast<char*>(buffer.data()), std::streamsize(buffer.size() * sizeof(double)))) {
+                    failed = true;
+                    return;
+                }
+                auto& list = out.samples[f];
+                list.resize(n);
+                for (std::size_t j = 0; j < n; ++j) {
+                    const double* v = &buffer[j * kRecord];
+                    list[j] = {v[0], {v[1], v[2], v[3]}, {v[4], v[5], v[6]}, {v[7], v[8], v[9]}};
+                }
+            }
+    };
+    std::vector<std::thread> pool;
+    for (std::size_t t = 1; t < threads; ++t) pool.emplace_back(work);
+    work();
+    for (auto& thread : pool) thread.join();
+    if (failed) throw truncated();
     return out;
 }
 
@@ -91,13 +127,32 @@ FiberNeighbourField::FiberNeighbourField(std::vector<std::vector<FiberStripSampl
     const std::size_t total = begin_.back();
     sample_.resize(total);
     owner_.resize(total);
-    for (std::size_t f = 0; f < listed; ++f)
-        for (std::size_t j = 0; j < samples_[f].size(); ++j) { sample_[begin_[f] + j] = &samples_[f][j]; owner_[begin_[f] + j] = std::uint32_t(f); }
-    // Uniform grid (cell = radius) over the signed samples.
-    keyed_.reserve(total);
-    for (std::size_t i = 0; i < total; ++i)
-        if (signs_[owner_[i]] != 0) keyed_.emplace_back(key(sample_[i]->point), std::uint32_t(i));
-    std::sort(keyed_.begin(), keyed_.end());
+    // Uniform grid (cell = radius) over the signed samples, in the order of
+    // their cell and then of the samples.
+    std::vector<std::size_t> keyedBegin(listed + 1, 0);
+    for (std::size_t f = 0; f < listed; ++f) keyedBegin[f + 1] = keyedBegin[f] + (signs_[f] != 0 ? samples_[f].size() : 0);
+    keyed_.resize(keyedBegin.back());
+    const int threads = int(std::clamp<unsigned>(std::thread::hardware_concurrency(), 1, 16));
+    {
+        std::atomic<std::size_t> next{0};
+        constexpr std::size_t block = 1024;
+        const auto work = [&] {
+            for (std::size_t first; (first = next.fetch_add(block)) < listed;)
+                for (std::size_t f = first; f < std::min(first + block, listed); ++f)
+                    for (std::size_t j = 0; j < samples_[f].size(); ++j) {
+                        const std::size_t i = begin_[f] + j;
+                        sample_[i] = &samples_[f][j];
+                        owner_[i] = std::uint32_t(f);
+                        if (signs_[f] != 0) keyed_[keyedBegin[f] + j] = {key(samples_[f][j].point), std::uint32_t(i)};
+                    }
+        };
+        std::vector<std::thread> pool;
+        for (int t = 1; t < threads; ++t) pool.emplace_back(work);
+        work();
+        for (auto& thread : pool) thread.join();
+    }
+    // The pairs are all different, so the order is the same on any number of threads.
+    core::util::parallelSort(keyed_, std::less<>{}, threads);
     for (std::size_t a = 0; a < keyed_.size();) {
         std::size_t b = a;
         while (b < keyed_.size() && keyed_[b].first == keyed_[a].first) ++b;

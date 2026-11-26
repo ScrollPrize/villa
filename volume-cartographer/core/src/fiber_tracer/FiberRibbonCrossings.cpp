@@ -323,16 +323,67 @@ std::vector<FiberRibbonCrossing> fiberPairRibbonCrossings(const std::span<const 
         !(options.maxTangentCosine > 0.0 && options.maxTangentCosine <= 1.0))
         throw std::invalid_argument("ribbon crossings need a positive height and segment length and a cosine in (0, 1]");
     std::vector<FiberRibbonCrossing> crossings;
+    if (ribbon.size() < 2 || fiber.size() < 2) return crossings;
     // A segment can only reach a span whose middle lies within the ribbon's
     // half diagonal plus both half lengths of it.
     const double reach = options.halfHeight + 2.0 * options.maxSegmentLength;
+    // The fiber's segments in a grid of that reach over their middles, so a
+    // span asks only the cells around its own middle. The candidates are
+    // then taken in the fiber's order and pass the same distance test, so
+    // the crossings and their order are those of every span against every
+    // segment.
+    const auto middleOf = [&](const std::size_t f) { return 0.5 * (fiber[f].point + fiber[f + 1].point); };
+    // A segment that is not finite fails the length test below either way.
+    const auto finite = [](const cv::Vec3d& m) { return std::isfinite(m[0] + m[1] + m[2]); };
+    cv::Vec3d lo{0.0, 0.0, 0.0};
+    bool any = false;
+    for (std::size_t f = 0; f + 1 < fiber.size(); ++f) {
+        const cv::Vec3d m = middleOf(f);
+        if (!finite(m)) continue;
+        for (int d = 0; d < 3; ++d) lo[d] = any ? std::min(lo[d], m[d]) : m[d];
+        any = true;
+    }
+    if (!any) return crossings;
+    const auto cellAxis = [&](const double v, const int d) { return std::int64_t(std::floor((v - lo[d]) / reach)) + 2; };
+    std::vector<std::pair<std::int64_t, std::uint32_t>> cells;
+    cells.reserve(fiber.size() - 1);
+    for (std::size_t f = 0; f + 1 < fiber.size(); ++f) {
+        const cv::Vec3d m = middleOf(f);
+        if (!finite(m)) continue;
+        const std::int64_t x = cellAxis(m[0], 0), y = cellAxis(m[1], 1), z = cellAxis(m[2], 2);
+        if (std::max({x, y, z}) + 4 > kAxisMask)
+            throw std::invalid_argument("ribbon crossings: the samples span too large a volume");
+        cells.emplace_back(packCell(x, y, z), std::uint32_t(f));
+    }
+    std::sort(cells.begin(), cells.end());
+    std::vector<std::uint32_t> candidates;
     for (std::size_t r = 0; r + 1 < ribbon.size(); ++r) {
         const double length = cv::norm(ribbon[r + 1].point - ribbon[r].point);
         if (!(length > 0.0) || length > options.maxSegmentLength) continue;
         const auto span = ribbonSpan(ribbon[r], ribbon[r + 1], options.halfHeight);
         if (!span.valid) continue;
         const cv::Vec3d middle = 0.5 * (ribbon[r].point + ribbon[r + 1].point);
-        for (std::size_t f = 0; f + 1 < fiber.size(); ++f) {
+        std::int64_t low[3], high[3];
+        bool inside = true;
+        for (int d = 0; d < 3; ++d) {
+            // Beyond the grid on either side nothing is within reach.
+            const double below = (middle[d] - reach - lo[d]) / reach, above = (middle[d] + reach - lo[d]) / reach;
+            if (!(above >= 0.0) || !(below <= double(kAxisMask - 8))) { inside = false; break; }
+            low[d] = std::max<std::int64_t>(0, std::int64_t(std::floor(std::max(below, -2.0))) + 2);
+            high[d] = std::int64_t(std::floor(std::min(above, double(kAxisMask - 8)))) + 2;
+        }
+        if (!inside) continue;
+        candidates.clear();
+        for (std::int64_t x = low[0]; x <= high[0]; ++x)
+            for (std::int64_t y = low[1]; y <= high[1]; ++y) {
+                const std::int64_t last = packCell(x, y, high[2]);
+                for (auto k = std::lower_bound(cells.begin(), cells.end(),
+                                               std::pair{packCell(x, y, low[2]), std::uint32_t(0)});
+                     k != cells.end() && k->first <= last; ++k)
+                    candidates.push_back(k->second);
+            }
+        std::sort(candidates.begin(), candidates.end());
+        for (const std::size_t f : candidates) {
             const cv::Vec3d offset = 0.5 * (fiber[f].point + fiber[f + 1].point) - middle;
             if (offset.dot(offset) > reach * reach) continue;
             const double segment = cv::norm(fiber[f + 1].point - fiber[f].point);
@@ -344,34 +395,52 @@ std::vector<FiberRibbonCrossing> fiberPairRibbonCrossings(const std::span<const 
     return crossings;
 }
 
-FiberCrossingFindings fiberCrossingFindings(const std::span<const FiberStripSample> a,
-                                            const std::span<const FiberStripSample> b, const double arcA,
-                                            const double arcB, const FiberRibbonOptions& surface,
-                                            const FiberCrossingFilterOptions& filter, const double encounterArcGap)
+std::vector<FiberCrossingFindings> fiberCrossingFindings(const std::span<const FiberStripSample> a,
+                                                        const std::span<const FiberStripSample> b,
+                                                        const std::span<const std::pair<double, double>> arcs,
+                                                        const FiberRibbonOptions& surface,
+                                                        const FiberCrossingFilterOptions& filter,
+                                                        const double encounterArcGap)
 {
     namespace finding = vc::geometry::crossing_finding;
-    FiberCrossingFindings out;
-    double alternativeHeight = 0.0;
+    std::vector<FiberCrossingFindings> out(arcs.size());
+    if (arcs.empty()) return out;
+    std::vector<double> alternativeHeight(arcs.size(), 0.0);
+    std::vector<FiberCrossingEventView> events(arcs.size());
     // Each fiber's surface is asked about the other fiber; a finding holds
     // when either states it, and of two alternatives the one nearer its fiber.
     for (int view = 0; view < 2; ++view) {
         auto crossings = fiberPairRibbonCrossings(view == 0 ? a : b, view == 0 ? b : a, surface);
         if (crossings.empty()) continue;
         const auto encounters = fiberRibbonEncounters(crossings, encounterArcGap);
-        const FiberCrossingEventView event{0, 0, view == 0 ? arcA : arcB, view == 0 ? arcB : arcA};
-        const auto verdict = fiberCrossingVerdicts(crossings, encounters, std::span(&event, 1), filter)[0];
-        if (verdict.matched) out.findings |= finding::Matched;
-        if (verdict.multiple) out.findings |= finding::Multiple;
-        if (verdict.nothingLeft) out.findings |= finding::NothingLeft;
-        if (verdict.mixed) out.findings |= finding::Mixed;
-        if (verdict.mixedNear) out.findings |= finding::MixedNear;
-        if (verdict.severalLeft) out.findings |= finding::SeveralLeft;
-        if (verdict.alternativeDot != 0.0 && (out.alternative == 0.0 || verdict.alternativeHeight < alternativeHeight)) {
-            out.alternative = verdict.alternativeDot;
-            alternativeHeight = verdict.alternativeHeight;
+        for (std::size_t i = 0; i < arcs.size(); ++i)
+            events[i] = {0, 0, view == 0 ? arcs[i].first : arcs[i].second, view == 0 ? arcs[i].second : arcs[i].first};
+        const auto verdicts = fiberCrossingVerdicts(crossings, encounters, events, filter);
+        for (std::size_t i = 0; i < arcs.size(); ++i) {
+            const auto& verdict = verdicts[i];
+            if (verdict.matched) out[i].findings |= finding::Matched;
+            if (verdict.multiple) out[i].findings |= finding::Multiple;
+            if (verdict.nothingLeft) out[i].findings |= finding::NothingLeft;
+            if (verdict.mixed) out[i].findings |= finding::Mixed;
+            if (verdict.mixedNear) out[i].findings |= finding::MixedNear;
+            if (verdict.severalLeft) out[i].findings |= finding::SeveralLeft;
+            if (verdict.alternativeDot != 0.0 &&
+                (out[i].alternative == 0.0 || verdict.alternativeHeight < alternativeHeight[i])) {
+                out[i].alternative = verdict.alternativeDot;
+                alternativeHeight[i] = verdict.alternativeHeight;
+            }
         }
     }
     return out;
+}
+
+FiberCrossingFindings fiberCrossingFindings(const std::span<const FiberStripSample> a,
+                                            const std::span<const FiberStripSample> b, const double arcA,
+                                            const double arcB, const FiberRibbonOptions& surface,
+                                            const FiberCrossingFilterOptions& filter, const double encounterArcGap)
+{
+    const std::pair<double, double> arcs{arcA, arcB};
+    return fiberCrossingFindings(a, b, std::span(&arcs, 1), surface, filter, encounterArcGap)[0];
 }
 
 }  // namespace vc::fiber_tracer

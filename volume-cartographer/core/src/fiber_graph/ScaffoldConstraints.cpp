@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <map>
 #include <stdexcept>
+#include <tuple>
 
 namespace vc::fiber_graph {
 namespace {
@@ -30,24 +31,46 @@ std::int64_t familyIndex(ScaffoldFamily family) { return std::int64_t(family); }
 namespace {
 // Each perpendicular crossing followed through its two fibers' normal
 // surfaces. Computed on every run: the findings depend on the run's normals,
-// not only on the geometry the cache keys the crossings by.
+// not only on the geometry the cache keys the crossings by. With `changed`
+// (one flag per fiber) only the crossings of those fibers are followed again
+// and the others keep the findings they carry.
 void crossingFindings(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
                       const std::function<std::optional<geometry::Point>(std::size_t, double)>& normalOf,
                       const ScaffoldEventOptions& options, std::vector<ScaffoldEvent>& events,
-                      ScaffoldEventReport& report)
+                      ScaffoldEventReport& report, const std::vector<char>* changed = nullptr)
 {
     if (!options.crossingFindings) return;
-    // The strip normals of every fiber at a regular arc spacing, then each
-    // perpendicular crossing through its two fibers' surfaces. Computed on
-    // every run: the findings depend on the run's normals, not only on the
-    // geometry the cache keys the crossings by.
     if (!(options.crossingSampleSpacing > 0))
         throw std::invalid_argument("scaffold constraints: the crossing sample spacing must be positive");
+    const auto asks = [](const ScaffoldEvent& event) {
+        return !event.parallel && event.validA && event.validB && event.a != event.b;
+    };
+    // The crossings of one ordered pair of fibers share the intersection of
+    // the two surfaces.
+    std::vector<std::size_t> order;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        const auto& event = events[i];
+        if (!asks(event)) continue;
+        if (changed && !(*changed)[std::size_t(event.a)] && !(*changed)[std::size_t(event.b)]) continue;
+        order.push_back(i);
+    }
+    std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+        return std::tuple(events[x].a, events[x].b, x) < std::tuple(events[y].a, events[y].b, y);
+    });
+    std::vector<std::pair<std::size_t, std::size_t>> pairs; // [first, end) in `order`
+    for (std::size_t first = 0; first < order.size();) {
+        std::size_t end = first + 1;
+        while (end < order.size() && events[order[end]].a == events[order[first]].a &&
+               events[order[end]].b == events[order[first]].b)
+            ++end;
+        pairs.emplace_back(first, end);
+        first = end;
+    }
+    // The strip normals of every fiber in such a pair at a regular arc spacing.
     std::vector<std::vector<fiber_tracer::FiberStripSample>> samples(graph.fibers.size());
     std::vector<char> needed(graph.fibers.size(), 0);
-    for (const auto& event : events)
-        if (!event.parallel && event.validA && event.validB && event.a != event.b)
-            needed[std::size_t(event.a)] = needed[std::size_t(event.b)] = 1;
+    for (const auto index : order)
+        needed[std::size_t(events[index].a)] = needed[std::size_t(events[index].b)] = 1;
     const auto threads = std::max<std::size_t>(1, options.workers ? options.workers : std::thread::hardware_concurrency());
     const auto parallel = [&](std::size_t count, const auto& body) {
         std::atomic<std::size_t> next{0};
@@ -67,20 +90,26 @@ void crossingFindings(const ScaffoldGraph& graph, const ScaffoldGeometry& geomet
             samples[fiber].push_back({arc, {point[0], point[1], point[2]}, {(*normal)[0], (*normal)[1], (*normal)[2]}, {0, 0, 0}});
         }
     });
-    std::atomic<std::int64_t> asked{0}, found{0};
-    parallel(events.size(), [&](std::size_t index) {
-        auto& event = events[index];
-        if (event.parallel || !event.validA || !event.validB || event.a == event.b) return;
+    parallel(pairs.size(), [&](std::size_t pair) {
+        const auto [first, end] = pairs[pair];
+        std::vector<std::pair<double, double>> arcs;
+        arcs.reserve(end - first);
+        for (std::size_t k = first; k < end; ++k) arcs.emplace_back(events[order[k]].arcA, events[order[k]].arcB);
+        const auto& head = events[order[first]];
         const auto findings = fiber_tracer::fiberCrossingFindings(
-            samples[std::size_t(event.a)], samples[std::size_t(event.b)], event.arcA, event.arcB,
-            options.crossingSurface, options.crossingFilter, options.crossingEncounterArcGap);
-        event.crossingFindings = findings.findings;
-        event.crossingAlternative = findings.alternative;
-        ++asked;
-        found += (findings.findings & ~geometry::crossing_finding::Matched) != 0;
+            samples[std::size_t(head.a)], samples[std::size_t(head.b)], arcs, options.crossingSurface,
+            options.crossingFilter, options.crossingEncounterArcGap);
+        for (std::size_t k = first; k < end; ++k) {
+            events[order[k]].crossingFindings = findings[k - first].findings;
+            events[order[k]].crossingAlternative = findings[k - first].alternative;
+        }
     });
-    report.crossingsAsked = asked.load();
-    report.crossingsWithFindings = found.load();
+    report.crossingsAsked = report.crossingsWithFindings = 0;
+    for (const auto& event : events) {
+        if (!asks(event)) continue;
+        ++report.crossingsAsked;
+        report.crossingsWithFindings += (event.crossingFindings & ~geometry::crossing_finding::Matched) != 0;
+    }
 }
 } // namespace
 
@@ -389,25 +418,31 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
 
 void scaffoldRefreshEventNormals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
                                  const ScaffoldNormals& normals, const ScaffoldEventOptions& options,
-                                 std::vector<ScaffoldEvent>& events, ScaffoldEventReport& report)
+                                 std::vector<ScaffoldEvent>& events, ScaffoldEventReport& report,
+                                 const std::vector<char>* changed)
 {
+    if (changed && changed->size() != graph.fibers.size())
+        throw std::invalid_argument("scaffold constraints: the changed fibers cover a different fiber set");
     const std::function<std::optional<geometry::Point>(std::size_t, double)> normalOf =
         [&](std::size_t fiber, double arc) {
             return options.normalAt ? options.normalAt(fiber, arc) : normals.at(fiber, arc);
         };
     report.withoutNormals = 0;
     for (auto& event : events) {
-        const auto normalA = normalOf(std::size_t(event.a), event.arcA);
-        const auto normalB = normalOf(std::size_t(event.b), event.arcB);
-        event.validA = normalA.has_value();
-        event.validB = normalB.has_value();
-        event.normalA = normalA.value_or(geometry::Point{});
-        event.normalB = normalB.value_or(geometry::Point{});
+        const bool touched = !changed || (*changed)[std::size_t(event.a)] || (*changed)[std::size_t(event.b)];
+        if (touched) {
+            const auto normalA = normalOf(std::size_t(event.a), event.arcA);
+            const auto normalB = normalOf(std::size_t(event.b), event.arcB);
+            event.validA = normalA.has_value();
+            event.validB = normalB.has_value();
+            event.normalA = normalA.value_or(geometry::Point{});
+            event.normalB = normalB.value_or(geometry::Point{});
+            event.crossingFindings = 0;
+            event.crossingAlternative = 0;
+        }
         if (!event.validA || !event.validB) ++report.withoutNormals;
-        event.crossingFindings = 0;
-        event.crossingAlternative = 0;
     }
-    crossingFindings(graph, geometry, normalOf, options, events, report);
+    crossingFindings(graph, geometry, normalOf, options, events, report, changed);
 }
 
 std::vector<ScaffoldApprovedFacing> scaffoldApprovedFacing(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
@@ -562,7 +597,12 @@ ScaffoldFacingReport scaffoldFaceApprovedNormals(const ScaffoldGraph& graph, con
         normalOptions.monitor->checkpoint();
     }
     normals.face(facing, normalOptions);
-    scaffoldRefreshEventNormals(graph, geometry, normals, eventOptions, events, eventReport);
+    // Facing a stretch the way it already faces changes nothing: only the
+    // fibers with a turned stretch have new normals.
+    std::vector<char> changed(graph.fibers.size(), 0);
+    for (const auto& entry : facing)
+        if (entry.sign < 0) changed[std::size_t(entry.fiber)] = 1;
+    scaffoldRefreshEventNormals(graph, geometry, normals, eventOptions, events, eventReport, &changed);
     return report;
 }
 

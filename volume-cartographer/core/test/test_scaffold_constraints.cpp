@@ -266,7 +266,10 @@ TEST_CASE("the cache reuses unchanged fibers and pairs, and nothing else")
 
     // Second run, same inputs: everything comes from the cache, and the
     // events are the ones the first run found.
-    const ScaffoldCache cache(sink.normals, sink.crossings);
+    // A cache a caller keeps and adds a run's rows to answers like one read whole.
+    ScaffoldCache cache;
+    cache.add(sink.normals, sink.crossings);
+    CHECK_FALSE(cache.empty());
     ScaffoldNormalOptions reuseNormals = scaffold.facing();
     reuseNormals.cache = &cache;
     const ScaffoldNormals second(scaffold.graph, geometry, reuseNormals);
@@ -515,6 +518,20 @@ TEST_CASE("approved normals are faced together before anything is solved")
     // The events carry the faced normals.
     for (const auto& event : events)
         if (!event.parallel) CHECK(dot(event.normalA, event.normalB) > 0.7);
+    // Only the turned fibers' events were refreshed; refreshing all of them says the same.
+    auto all = events;
+    ScaffoldEventReport allReport = eventReport;
+    scaffoldRefreshEventNormals(scaffold.graph, geometry, normals, eventOptions, all, allReport);
+    REQUIRE(all.size() == events.size());
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        CHECK(all[i].normalA == events[i].normalA);
+        CHECK(all[i].normalB == events[i].normalB);
+        CHECK(all[i].crossingFindings == events[i].crossingFindings);
+        CHECK(all[i].crossingAlternative == events[i].crossingAlternative);
+    }
+    CHECK(allReport.crossingsAsked == eventReport.crossingsAsked);
+    CHECK(allReport.crossingsWithFindings == eventReport.crossingsWithFindings);
+    CHECK(allReport.withoutNormals == eventReport.withoutNormals);
 }
 
 TEST_CASE("two stretches of one fiber that face opposite ways are joined by an even half turn")

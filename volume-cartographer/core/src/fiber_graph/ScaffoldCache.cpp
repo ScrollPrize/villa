@@ -120,6 +120,18 @@ ScaffoldCache::ScaffoldCache(const objects::StoreReader& reader)
     sortPairs();
 }
 
+void ScaffoldCache::add(std::span<const objects::FiberScaffoldNormalsRow> normals,
+                        std::span<const objects::FiberScaffoldCrossingRow> crossings)
+{
+    for (const auto& row : normals) _normals.insert_or_assign(NormalKey{row.fiberUuid, row.fiberVersion, row.inputs}, row);
+    // A pair computed again replaces what was held for it.
+    std::map<PairKey, std::vector<objects::FiberScaffoldCrossingRow>> fresh;
+    for (const auto& row : crossings)
+        fresh[PairKey{row.fiberA, row.fiberB, row.versionA, row.versionB, row.normalsA, row.normalsB, row.inputs}].push_back(row);
+    for (auto& [key, rows] : fresh) _crossings.insert_or_assign(key, std::move(rows));
+    sortPairs();
+}
+
 void ScaffoldCache::sortPairs()
 {
     for (auto& [key, rows] : _crossings) {

@@ -203,6 +203,12 @@ public:
         vc::fiber_graph::ScaffoldNeighbourSource source;
     };
 
+    // What earlier runs read from the fiber store, kept for the next one: the
+    // fibers (a version is read once) and the derived rows (read once, then
+    // added to by what each run computes and saves). For one store; another
+    // store starts empty.
+    struct KeptReads;
+
     // Approval of a *measured* constraint (a crossing). A link's approval is
     // its edge record's review state and is not touched here.
     void reloadConstraintApprovals();
@@ -271,6 +277,7 @@ private:
     WindingSamplerResolver _windingSampler;
     AxisSamplerResolver _axisSampler;
     std::shared_ptr<NeighbourNormals> _neighbours;
+    std::shared_ptr<KeptReads> _kept;
 };
 
 // The solver dock: what a run uses, and the Run button.

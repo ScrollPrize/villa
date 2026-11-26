@@ -21,10 +21,13 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <numbers>
 #include <optional>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -133,6 +136,37 @@ struct ScaffoldGraph {
     std::optional<std::size_t> indexOf(const std::string& fiberUuid) const;
 };
 
+// One version of one fiber as a run reads it in one frame: everything
+// loadScaffoldGraph takes from the store for it but its approval layer.
+struct ScaffoldFiberRead {
+    // Control points and the annotated line, mapped; ScaffoldFiber::content
+    // with its line points still in place.
+    objects::FiberPieceContent content;
+    std::vector<objects::FiberSpanFingerprint> spanFingerprints;
+    // The line points as stored (own frame, tails included), which an
+    // approval layer is over; `shift` of them precede the annotated line and
+    // `rawPoints` is their number as read mapped.
+    std::vector<geometry::Point> storedLinePoints;
+    std::size_t shift = 0, rawPoints = 0;
+    vcr::catalog::Affine mapping;
+};
+
+// The fiber reads of earlier runs, kept by a caller that solves the same
+// store again and again (ScaffoldLoadOptions::reads). A read is keyed by the
+// fiber's version and geometry revision and by the frame, so an edited fiber
+// is read again and everything else is not. Safe to share between threads.
+class ScaffoldFiberReads {
+public:
+    // uuid, object version, geometry revision, volume, scale.
+    using Key = std::tuple<std::string, std::int64_t, std::string, std::string, double>;
+    [[nodiscard]] std::shared_ptr<const ScaffoldFiberRead> find(const Key&) const;
+    void keep(const Key&, std::shared_ptr<const ScaffoldFiberRead>);
+
+private:
+    mutable std::mutex mutex_;
+    std::map<Key, std::shared_ptr<const ScaffoldFiberRead>> reads_;
+};
+
 struct ScaffoldLoadOptions {
     // Target frame. Empty reads the frame the fibers declare
     // (meta.coordinates.volume_uuid); fibers declaring different volumes are
@@ -162,6 +196,9 @@ struct ScaffoldLoadOptions {
     // Progress and cancellation of the read itself, which is a stage of its
     // own: a scaffold's line points are the run's first long wait.
     ScaffoldRunMonitor* monitor = nullptr;
+    // Fiber reads kept from earlier loads and added to by this one; null
+    // reads every fiber from the store.
+    ScaffoldFiberReads* reads = nullptr;
 };
 
 // The store commit that last changed anything a scaffold run reads: a fiber

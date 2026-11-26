@@ -38,6 +38,9 @@
 #include <QtConcurrent>
 
 #include <algorithm>
+#include <chrono>
+#include <format>
+#include <future>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -163,6 +166,10 @@ struct ScaffoldSolveController::SolveJob {
     std::filesystem::path neighbourPath;
     std::shared_ptr<ScaffoldSolveController::NeighbourNormals> neighbours;
     vc::fiber_graph::ScaffoldNeighbourSource neighbourSource;
+    // The controller's reads of this store (only one job runs at a time).
+    std::shared_ptr<ScaffoldSolveController::KeptReads> kept;
+    // Seconds per part of the run, for the log.
+    std::vector<std::pair<const char*, double>> timings;
     // Outputs.
     QString error;
     bool cancelled = false;
@@ -170,6 +177,13 @@ struct ScaffoldSolveController::SolveJob {
     std::string runUuid;
     ScaffoldRunRows rows;
     QThreadPool pool;
+};
+
+struct ScaffoldSolveController::KeptReads {
+    std::filesystem::path store;
+    vc::fiber_graph::ScaffoldFiberReads fibers;
+    // Unset until the first run of this store read the rows.
+    std::optional<vc::fiber_graph::ScaffoldCache> cache;
 };
 
 ScaffoldSolveController::ScaffoldSolveController(CState* state, QObject* parent)
@@ -600,6 +614,11 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
         _job->neighbourPath = neighbourNormalsPath(session->path(*store));
         _job->neighbours = _neighbours;
     }
+    if (const auto path = session->path(*store); !_kept || _kept->store != path) {
+        _kept = std::make_shared<KeptReads>();
+        _kept->store = path;
+    }
+    _job->kept = _kept;
     _job->request = request;
     _job->attachment = store;
     _job->session = session;
@@ -616,7 +635,15 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
     auto job = _job;
     _watcher->setFuture(QtConcurrent::run(&job->pool, [job]() {
         try {
+            std::future<vc::fiber_graph::ScaffoldNeighbourSource> neighbourOpening;
+            auto lapStarted = std::chrono::steady_clock::now();
+            const auto lap = [&](const char* name) {
+                const auto now = std::chrono::steady_clock::now();
+                job->timings.emplace_back(name, std::chrono::duration<double>(now - lapStarted).count());
+                lapStarted = now;
+            };
             ScaffoldLoadOptions load;
+            load.reads = &job->kept->fibers;
             load.volume = job->request.volume;
             load.fallbackHandedness = job->request.fallbackHandedness;
             load.fiberSubset = job->request.fiberSubset;
@@ -661,15 +688,18 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     if (missing)
                         throw std::runtime_error("No full-volume normals next to the fiber store: " +
                                                  job->neighbourPath.string() + " is missing.");
-                    const std::lock_guard<std::mutex> guard(job->neighbours->mutex);
-                    if (!job->neighbours->source.field || job->neighbours->path != job->neighbourPath ||
-                        job->neighbours->written != written) {
-                        job->neighbours->source = {};
-                        job->neighbours->source = vc::fiber_graph::openScaffoldNeighbourSource(job->neighbourPath);
-                        job->neighbours->path = job->neighbourPath;
-                        job->neighbours->written = written;
-                    }
-                    job->neighbourSource = job->neighbours->source;
+                    // Beside the read of the fibers: neither needs the other.
+                    neighbourOpening = std::async(std::launch::async, [job, written] {
+                        const std::lock_guard<std::mutex> guard(job->neighbours->mutex);
+                        if (!job->neighbours->source.field || job->neighbours->path != job->neighbourPath ||
+                            job->neighbours->written != written) {
+                            job->neighbours->source = {};
+                            job->neighbours->source = vc::fiber_graph::openScaffoldNeighbourSource(job->neighbourPath);
+                            job->neighbours->path = job->neighbourPath;
+                            job->neighbours->written = written;
+                        }
+                        return job->neighbours->source;
+                    });
                 }
                 job->monitor.checkpoint();
             }
@@ -692,11 +722,16 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             ScaffoldRunRecord record;
             record.runUuid = vc::objects::util::newUuid();
             record.createdAtUnix = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+            lap("datasets");
             job->session->readStore(*job->attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
                 const auto graph = loadScaffoldGraph(reader, load);
+                lap("fibers");
                 // What earlier runs computed from the same geometry with the
-                // same parameters: read once, before anything is solved.
-                const vc::fiber_graph::ScaffoldCache cache(reader);
+                // same parameters: read once per store, then added to by
+                // what each run saves.
+                if (!job->kept->cache) job->kept->cache.emplace(reader);
+                const vc::fiber_graph::ScaffoldCache& cache = *job->kept->cache;
+                lap("derived rows");
                 const ScaffoldGeometry geometry(graph);
                 // The measured stages, when the run asked for them. They run
                 // on this worker, in the frame the map was built in.
@@ -715,6 +750,8 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                 std::vector<ScaffoldCrossing> crossings;
                 ScaffoldRunStages stages;
                 if (job->request.measureCrossings) {
+                    if (neighbourOpening.valid()) job->neighbourSource = neighbourOpening.get();
+                    lap("full-volume normals");
                     normalOptions.cache = &cache;
                     normalOptions.sink = &job->cacheSink;
                     normalOptions.predictionIdentity = job->predictionIdentity;
@@ -750,14 +787,19 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                               double step, int workers) {
                             return sampler->normalAlignedWindingDistancesBatch(connectors, step, workers);
                         };
+                    lap("geometry");
                     normals.emplace(graph, geometry, normalOptions, job->axes);
+                    lap("normals");
                     events = scaffoldEvents(graph, geometry, *normals, eventOptions, distances, eventReport);
+                    lap("crossings");
                     // The approved normals are faced first, as one object per
                     // connected set of stretches; contradictions fail the run.
                     facing = vc::fiber_graph::scaffoldFaceApprovedNormals(graph, geometry, *normals, events,
                                                                           normalOptions, eventOptions, signOptions,
                                                                           eventReport);
+                    lap("approved normals");
                     signs = scaffoldNormalSigns(graph, *normals, events, signOptions);
+                    lap("signs");
                     const auto stated = scaffoldCrossingApprovals(
                         graph, geometry, events, vc::objects::readFiberConstraintApprovals(reader), approvals);
                     measured = scaffoldMeasuredConstraints(graph, geometry, events, signs.sign, measuredOptions,
@@ -775,7 +817,9 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     stages.approvals = &approvals;
                     stages.facing = &facing;
                 }
+                lap("constraints");
                 const auto result = solveScaffoldWinding(graph, geometry, options, measured);
+                lap("winding solve");
                 // Where the map links and the solved normals disagree about
                 // which fiber is inside: the stretches to review first.
                 std::vector<ScaffoldNormalFlip> flips;
@@ -788,6 +832,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                 record.input = {graph.source.storeUuid, graph.source.generation, graph.source.commitSequence};
                 job->rows = scaffoldSolveRunRows(graph, result, options, record, stages);
                 job->runUuid = record.runUuid;
+                lap("run rows");
                 job->summary = QObject::tr("%1 fibers in %2 components, %3 turns of residual, %4 violated of %5 \n"
                                            "constraints, %6 of %7 continuation links broken, %8 s")
                                    .arg(graph.fibers.size())
@@ -868,6 +913,7 @@ void ScaffoldSolveController::finishSolve()
     }
     // The rows are written from the GUI thread, like every other store edit
     // this workspace makes.
+    auto finishStarted = std::chrono::steady_clock::now();
     try {
         auto request = job->session->newRequest(*job->attachment);
         for (const auto& table : job->rows.tables)
@@ -897,15 +943,36 @@ void ScaffoldSolveController::finishSolve()
                 vc::objects::AppendExtensionRowsOp{vc::objects::kFiberScaffoldCrossingsTable, std::move(values)});
         }
         job->session->submitDurably(*job->attachment, request);
+        // Saved: the next run of this store finds them without reading.
+        if (job->kept && job->kept->cache) job->kept->cache->add(job->cacheSink.normals, job->cacheSink.crossings);
     } catch (const std::exception& problem) {
         _lastError = tr("The solve could not be saved: %1").arg(QString::fromUtf8(problem.what()));
         emit statusMessage(_lastError);
         return;
     }
+    const auto since = [](std::chrono::steady_clock::time_point& from) {
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - from).count();
+        from = now;
+        return seconds;
+    };
+    job->timings.emplace_back("save", since(finishStarted));
     reloadRuns();
+    job->timings.emplace_back("reload runs", since(finishStarted));
     selectRun(job->runUuid);
+    job->timings.emplace_back("select run", since(finishStarted));
     reloadConstraintApprovals();
     if (_approvalsLoaded) loadApprovals();
+    job->timings.emplace_back("reload approvals", since(finishStarted));
+    {
+        double total = 0;
+        std::string line;
+        for (const auto& [name, seconds] : job->timings) {
+            total += seconds;
+            line += std::format(" {} {:.2f}", name, seconds);
+        }
+        Logger()->info("scaffold solve: {:.2f} s -{}", total, line);
+    }
     emit statusMessage(job->summary);
 }
 

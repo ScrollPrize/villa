@@ -465,7 +465,7 @@ vc_scaffold_solve config.json
 | `weights.reviewed` | `10` | weight of a separation a reviewer stated |
 | `weights.crossing_confidence` | `true` | scale a crossing's perpendicular, parallel and sign weight by the sign stage's term, dot² × min(1, 1/d²) |
 | `constraints.crossing_filter` | `true` | follow every perpendicular crossing through its two fibers' normal surfaces and apply the shared crossing rule (vc_object_store `geometry/FiberCrossingFilter.hpp`, the one the traced volume's sign and winding stages use): the sign solve drops crossings with nothing left or mixed relations, the constraints drop crossings with nothing left and those that disagree under the solved signs but have an agreeing crossing in the same encounter |
-| `winding.manifest`, `winding.remote_cache` | — | the Lasagna normal dataset the separations are measured on |
+| `winding.manifest`, `winding.remote_cache` | — | the Lasagna normal dataset the separations are measured on; opened when the first separation has to be measured, so a run whose crossings are all cached does not open it |
 | `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `300`, `1`, `64`, `64` | the strip solve, at the whole-volume pipeline's settings |
 | `normals.manual_display_normals`, `.approved_pieces` | `true` | which annotated normals are held as axes |
 | `normals.adjacent_links` | `true` | whether adjacent links fix a fiber's facing |
@@ -589,6 +589,28 @@ whole sampling time, which is where a measured run's minutes go.
 
 A run records what it reused: `normal_fibers_reused`, `normal_fibers_cached`,
 `events_reused_pairs`, `events_reused`, `events_cached_pairs`.
+
+The crossing filter is not cached: its findings depend on the run's normals,
+so each run follows the perpendicular crossings through the two fibers'
+normal surfaces again. The two surfaces of a pair are intersected once for all
+of the pair's crossings (`fiberCrossingFindings` over a list of crossings),
+each span asks only the other fiber's segments near it, and after the approved
+normals were faced only the crossings of a fiber with a turned stretch are
+followed again.
+
+The fiber map also keeps, for the store it is solving, what it read: each
+fiber as its version reads (`ScaffoldFiberReads`, `ScaffoldLoadOptions::reads`:
+an edited fiber is read again, the approval layers always are) and the cache
+rows (read on the first run, then added to by what each run saved). Rows
+another process wrote meanwhile are not seen until the store is opened again;
+they would only have saved work. Each run logs its seconds per part
+(`scaffold solve: ...`), and `vc_scaffold_solve` reports them under `timings`.
+
+Measured on PHerc0332 (`objects-v22.vcobj`, 292 fibers, 16 workers,
+`vc_scaffold_solve`, everything cached, QuickBuild): the crossing filter took
+4.0 s and again 4.2 s after the facing before these changes, 0.35 s and 0.21 s
+after, with an identical result; reading the fibers went from 1.4 s to 1.05 s,
+and to 0.14 s with the reads of an earlier run kept.
 
 ## Stages, progress and cancellation
 

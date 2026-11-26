@@ -15,6 +15,8 @@
 // enclosures only.
 #include "vc/fiber_graph/ScaffoldCache.hpp"
 #include "vc/fiber_graph/ScaffoldConstraints.hpp"
+#include <future>
+#include <mutex>
 #include <vc_object_store/objects/ObjectCollection.hpp>
 #include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
 #include <vc_object_store/objects/FiberConstraintGraph.hpp>
@@ -307,14 +309,45 @@ int run(const std::string& configPath)
     // When the annotation itself last changed, so a log says whether a later
     // run read the same fibers (the Solves dock's stale verdict).
     std::int64_t annotationCommit = 0;
+    double datasetSeconds = 0, openSeconds = 0, graphSeconds = 0, approvalSeconds = 0, cacheSeconds = 0, neighbourSeconds = 0,
+           windingSeconds = 0, persistSeconds = 0;
+    // The three reads that need nothing of each other run side by side: the
+    // fibers (below), the derived rows through a reader of their own, and the
+    // full volume's normals.
+    auto cacheReading = std::async(std::launch::async, [&] {
+        const auto started = Clock::now();
+        vc::objects::OpenOptions readOnly;
+        readOnly.readOnly = true;
+        auto second = vc::objects::ObjectStore::open(cfg.at("store").get<std::string>(), readOnly);
+        const auto txn = second.read();
+        ScaffoldCache cache{vc::objects::LocalStoreReader(second, txn)};
+        cacheSeconds = seconds(started);
+        return cache;
+    });
+    std::future<vc::fiber_graph::ScaffoldNeighbourSource> neighbourOpening;
+    if (cfg.value("constraints", Json::object()).value("enabled", false) &&
+        cfg.value("normals", Json::object()).value("source", std::string{"geometry"}) == "neighbours" &&
+        cfg.value("neighbours", Json::object()).contains("samples"))
+        neighbourOpening = std::async(std::launch::async, [&] {
+            const auto started = Clock::now();
+            auto source = vc::fiber_graph::openScaffoldNeighbourSource(
+                cfg.at("neighbours").at("samples").get<std::string>(), ScaffoldNormalOptions{}.neighbours.variant.radius);
+            neighbourSeconds = seconds(started);
+            return source;
+        });
     {
+        openSeconds = seconds(readStarted);
         const auto txn = store.read();
         const vc::objects::LocalStoreReader reader(store, txn);
+        auto started = Clock::now();
         graph = loadScaffoldGraph(reader, loadOptionsFrom(cfg));
+        graphSeconds = seconds(started);
+        started = Clock::now();
         if (cfg.value("approvals", true)) constraintApprovals = vc::objects::readFiberConstraintApprovals(reader);
         annotationCommit = scaffoldAnnotationCommit(reader);
-        derivedCache = ScaffoldCache(reader);
+        approvalSeconds = seconds(started);
     }
+    derivedCache = cacheReading.get();
     const double readSeconds = seconds(readStarted);
 
     const auto geometryStarted = Clock::now();
@@ -338,6 +371,7 @@ int run(const std::string& configPath)
     std::vector<ScaffoldConstraint> measured;
     double normalSeconds = 0, eventSeconds = 0, signSeconds = 0, measuredSeconds = 0;
     std::unique_ptr<vc::lasagna::LasagnaNormalSampler> sampler;
+    std::mutex samplerMutex;
     ScaffoldWindingDistances distances;
     if (measure) {
         normalOptions = normalOptionsFrom(cfg);
@@ -362,19 +396,30 @@ int run(const std::string& configPath)
             vc::lasagna::LasagnaDatasetOpenOptions open;
             open.workingToBaseScale = 1.;
             if (section.contains("remote_cache")) open.remoteCacheRoot = section.at("remote_cache").get<std::string>();
-            auto dataset = vc::lasagna::LasagnaDataset::openLocation(section.at("manifest"), open);
             vc::lasagna::LasagnaNormalSamplerOptions samplerOptions;
             samplerOptions.maxCachedBytes = section.value("cache_bytes", samplerOptions.maxCachedBytes);
             samplerOptions.readerThreads = section.value("reader_threads", std::size_t{0});
             samplerOptions.windingRegionBaseVoxels =
                 section.value("region_base_voxels", samplerOptions.windingRegionBaseVoxels);
             samplerOptions.windingBatchPoints = section.value("batch_points", samplerOptions.windingBatchPoints);
-            sampler = std::make_unique<vc::lasagna::LasagnaNormalSampler>(dataset, samplerOptions);
-            if (!sampler->hasWindingDensity())
-                throw std::invalid_argument("winding.manifest states no grad_mag winding density: it cannot measure a "
-                                            "winding separation");
-            distances = [&sampler](const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors, double step,
-                                   int workers) {
+            // Opened when the first separation has to be measured: a run whose
+            // crossings are all cached reads nothing from the dataset.
+            distances = [&sampler, &datasetSeconds, &samplerMutex, open, samplerOptions,
+                         manifest = section.at("manifest")](
+                            const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors, double step, int workers) {
+                {
+                    const std::lock_guard<std::mutex> guard(samplerMutex);
+                    if (!sampler) {
+                        const auto opened = Clock::now();
+                        auto dataset = vc::lasagna::LasagnaDataset::openLocation(manifest, open);
+                        auto fresh = std::make_unique<vc::lasagna::LasagnaNormalSampler>(dataset, samplerOptions);
+                        if (!fresh->hasWindingDensity())
+                            throw std::invalid_argument("winding.manifest states no grad_mag winding density: it "
+                                                        "cannot measure a winding separation");
+                        sampler = std::move(fresh);
+                        datasetSeconds = seconds(opened);
+                    }
+                }
                 return sampler->normalAlignedWindingDistancesBatch(connectors, step, workers);
             };
         }
@@ -441,8 +486,7 @@ int run(const std::string& configPath)
             neighbour.fieldCrossings = section.value("field_crossings", neighbour.fieldCrossings);
             neighbour.scaffoldCrossings = section.value("scaffold_crossings", neighbour.scaffoldCrossings);
             neighbour.crossing.weight = section.value("crossing_weight", neighbour.crossing.weight);
-            neighbourSource = vc::fiber_graph::openScaffoldNeighbourSource(section.at("samples").get<std::string>(),
-                                                                           neighbour.variant.radius);
+            neighbourSource = neighbourOpening.get();
             neighbour.field = neighbourSource.field.get();
             neighbour.identity = neighbourSource.identity;
             neighbour.volume = neighbourSource.volume;
@@ -466,7 +510,9 @@ int run(const std::string& configPath)
                                                stated, &crossings);
         measuredSeconds = seconds(started);
     }
+    const auto windingStarted = Clock::now();
     const auto result = solveScaffoldWinding(graph, geometry, options, measured);
+    windingSeconds = seconds(windingStarted);
     // field_comparison: this scaffold solve against the winding solve of a resolved fiber volume,
     // through the crossings between the two (vc/fiber_graph/ScaffoldFieldComparison.hpp).
     //   samples       the volume's signed strip samples (its fibers and their signed normals)
@@ -577,11 +623,16 @@ int run(const std::string& configPath)
     }
     std::vector<ScaffoldNormalFlip> flips;
     ScaffoldNormalFlipReport flipReport;
+    const auto flipsStarted = Clock::now();
     if (normals) flips = scaffoldLinkNormalFlips(graph, geometry, *normals, signs.sign, result.constraints, flipReport);
+    const double flipSeconds = seconds(flipsStarted);
     // The stretches to approve, for the report: derived from this solve and the approvals read
     // with the graph. They are not stored with the run.
     ScaffoldStretchReport stretchReport;
+    const auto stretchesStarted = Clock::now();
     const auto stretches = scaffoldStretches(graph, geometry, result, {}, stretchReport);
+    const double stretchSeconds = seconds(stretchesStarted);
+    const auto reportStarted = Clock::now();
 
     Json summary{
         {"store", cfg.at("store")},
@@ -636,6 +687,13 @@ int run(const std::string& configPath)
                                   {"sign_at_most",
                                    result.constraintsByKind[std::size_t(ScaffoldConstraintKind::SignAtMost)]}}},
         {"timings", Json{{"store_read_seconds", readSeconds},
+                         {"store_open_seconds", openSeconds},
+                         {"graph_read_seconds", graphSeconds},
+                         {"approvals_read_seconds", approvalSeconds},
+                         {"cache_read_seconds", cacheSeconds},
+                         {"neighbour_open_seconds", neighbourSeconds},
+                         {"winding_dataset_open_seconds", datasetSeconds},
+                         {"winding_seconds", windingSeconds},
                          {"geometry_seconds", geometrySeconds},
                          {"normals_seconds", normalSeconds},
                          {"events_seconds", eventSeconds},
@@ -763,6 +821,7 @@ int run(const std::string& configPath)
     }
 
     if (persist) {
+        const auto persistStarted = Clock::now();
         ScaffoldRunRecord record;
         record.runUuid = vc::objects::util::newUuid();
         record.createdAtUnix = unixSecondsNow();
@@ -802,6 +861,7 @@ int run(const std::string& configPath)
         }
         txn.commit();
         summary["run_uuid"] = record.runUuid;
+        persistSeconds = seconds(persistStarted);
     }
 
     Json residuals = Json::array();
@@ -885,6 +945,8 @@ int run(const std::string& configPath)
         }
         summary["approval_stretches"] = std::move(rows);
     }
+    const double reportSeconds = seconds(reportStarted) - persistSeconds;
+    const auto filesStarted = Clock::now();
     if (cfg.contains("windings_output")) {
         Json windings{{"ids", Json::array()}, {"family", Json::array()}, {"selected_winding", Json::array()},
                       {"component", Json::array()}};
@@ -930,6 +992,12 @@ int run(const std::string& configPath)
         }
         writeJson(cfg.at("layout_output").get<std::string>(), Json{{"parts", std::move(rows)}});
     }
+    summary["timings"]["normal_flips_seconds"] = flipSeconds;
+    summary["timings"]["stretches_seconds"] = stretchSeconds;
+    summary["timings"]["report_seconds"] = reportSeconds;
+    summary["timings"]["extra_outputs_seconds"] = seconds(filesStarted);
+    summary["timings"]["persist_seconds"] = persistSeconds;
+    summary["timings"]["total_seconds"] = seconds(readStarted);
     if (cfg.contains("output")) writeJson(cfg.at("output").get<std::string>(), summary);
 
     Json line = summary;

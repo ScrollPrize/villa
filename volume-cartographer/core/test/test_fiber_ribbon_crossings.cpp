@@ -4,6 +4,7 @@
 #include "vc/fiber_tracer/FiberRibbonCrossings.hpp"
 
 #include <cmath>
+#include <random>
 #include <vector>
 
 using namespace vc::fiber_tracer;
@@ -180,4 +181,54 @@ TEST_CASE("findings of one measured crossing, from both fibers' surfaces")
     CHECK(disagreeing.used);
     CHECK(disagreeing.replaced);
     CHECK(disagreeing.dot == doctest::Approx(-1.0));
+}
+
+TEST_CASE("the pair pass finds exactly what every span against every segment finds, in that order")
+{
+    // Two long wandering fibers through the same box, far longer than the reach of a span.
+    std::mt19937 random(7);
+    std::uniform_real_distribution<double> turn(-0.35, 0.35);
+    const auto wander = [&](cv::Vec3d at, cv::Vec3d heading) {
+        std::vector<FiberStripSample> samples;
+        for (int i = 0; i < 1500; ++i) {
+            const cv::Vec3d side = cv::normalize(heading.cross(cv::Vec3d(0.3, 0.5, 0.8)));
+            samples.push_back({16.0 * i, at, side, {0.0, 0.0, 0.0}});
+            heading = cv::normalize(heading + cv::Vec3d(turn(random), turn(random), turn(random)));
+            for (int d = 0; d < 3; ++d)
+                if (at[d] < 0.0 || at[d] > 1500.0) heading[d] = at[d] < 0.0 ? std::abs(heading[d]) : -std::abs(heading[d]);
+            at += 16.0 * heading;
+        }
+        return samples;
+    };
+    const auto a = wander({200.0, 300.0, 400.0}, {1.0, 0.0, 0.0}), b = wander({900.0, 700.0, 500.0}, {0.0, 1.0, 0.0});
+    FiberRibbonOptions surface;
+    surface.maxTangentCosine = 1.0;
+    const std::span<const FiberStripSample> ribbon(a), fiber(b);
+    std::vector<FiberRibbonCrossing> every;
+    for (std::size_t r = 0; r + 1 < ribbon.size(); ++r)
+        for (std::size_t f = 0; f + 1 < fiber.size(); ++f)
+            for (const auto& crossing : fiberPairRibbonCrossings(ribbon.subspan(r, 2), fiber.subspan(f, 2), surface))
+                every.push_back(crossing);
+    const auto found = fiberPairRibbonCrossings(ribbon, fiber, surface);
+    REQUIRE(every.size() > 20);
+    REQUIRE(found.size() == every.size());
+    for (std::size_t i = 0; i < found.size(); ++i) {
+        CHECK(found[i].ribbonArc == every[i].ribbonArc);
+        CHECK(found[i].fiberArc == every[i].fiberArc);
+        CHECK(found[i].height == every[i].height);
+        CHECK(found[i].normalDot == every[i].normalDot);
+        CHECK(found[i].direction == every[i].direction);
+    }
+
+    // Several measured crossings of the pair at once come out as each alone.
+    std::vector<std::pair<double, double>> arcs;
+    for (std::size_t i = 0; i < found.size(); i += 3) arcs.emplace_back(found[i].ribbonArc, found[i].fiberArc);
+    arcs.emplace_back(5.0, 7.0);
+    const auto together = fiberCrossingFindings(ribbon, fiber, arcs, surface);
+    REQUIRE(together.size() == arcs.size());
+    for (std::size_t i = 0; i < arcs.size(); ++i) {
+        const auto alone = fiberCrossingFindings(ribbon, fiber, arcs[i].first, arcs[i].second, surface);
+        CHECK(together[i].findings == alone.findings);
+        CHECK(together[i].alternative == alone.alternative);
+    }
 }

@@ -139,9 +139,12 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph&, const ScaffoldGe
 
 // The normals of `events` looked up again and their crossing findings
 // followed again: after the normals changed (ScaffoldNormals::face), the
-// crossings themselves being a matter of the geometry alone.
+// crossings themselves being a matter of the geometry alone. With `changed`
+// (one flag per fiber: its normals changed) only the events of those fibers
+// are refreshed; the others keep what they carry.
 void scaffoldRefreshEventNormals(const ScaffoldGraph&, const ScaffoldGeometry&, const ScaffoldNormals&,
-                                 const ScaffoldEventOptions&, std::vector<ScaffoldEvent>&, ScaffoldEventReport&);
+                                 const ScaffoldEventOptions&, std::vector<ScaffoldEvent>&, ScaffoldEventReport&,
+                                 const std::vector<char>* changed = nullptr);
 
 struct ScaffoldSignOptions {
     fiber_tracer::FiberSignOptions sign;
