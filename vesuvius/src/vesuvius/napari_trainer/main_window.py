@@ -44,7 +44,7 @@ def filespicker(filenames: Sequence[Path] = str(DEFAULT_CONFIG_PATH)) -> Sequenc
     patch_size_y={'widget_type': 'SpinBox', 'label': 'Patch Size Y', 'min': 0, 'max': 4096, 'value': 128},
     min_labeled_percentage={'widget_type': 'FloatSpinBox', 'label': 'Min Labeled Percentage', 'min': 0.0, 'max': 100.0, 'step': 1.0, 'value': 10.0},
     max_epochs={'widget_type': 'SpinBox', 'label': 'Max Epochs', 'min': 1, 'max': 1000, 'value': 5},
-    # Losses for the default target: two output channels, one label channel, ignore label kept.
+    # The loss for targets the config gives no loss: two output channels, one label channel, ignore label kept.
     loss_function={'widget_type': 'ComboBox', 'choices': ["nnUNet_DC_and_CE_loss"], 'value': "nnUNet_DC_and_CE_loss"}
 )
 def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: int = 128,
@@ -136,15 +136,13 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
         min_bbox_percent=0.0
     )
 
-    targets = _run_targets(mgr, pairs)
+    targets = _run_targets(mgr, pairs, loss_function)
     _check_patch_selection_rule(targets)
+    _check_losses_fit_the_labels(targets, pairs)
 
     run_dir = Path(tempfile.mkdtemp(prefix="napari_trainer_"))
     try:
         _export_viewer_layers(mgr, pairs, run_dir / "data", targets)
-        for target_name in mgr.targets:
-            mgr.targets[target_name]['losses'] = [{"name": loss_function, "weight": 1.0, "kwargs": {}}]
-            print(f"  - Set loss function for target '{target_name}' to {loss_function}")
         selected = _write_patch_cache(mgr, min_labeled_percentage)
 
         from vesuvius.models.training.train import BaseTrainer
@@ -274,14 +272,68 @@ def _write_layer_zarr(path, data):
     ZarrWriter.create(path, shape=data.shape, chunks=chunks, dtype=data.dtype, overwrite=True)[...] = data
 
 
-def _run_targets(mgr, pairs):
+def _run_targets(mgr, pairs, loss_function):
     """The run's targets, one per label-layer suffix. A target the loaded config defines
-    keeps its settings (losses, ignore label, ...)."""
+    keeps its settings (losses, ignore label, ...); the widget's loss is used only for
+    targets without configured losses."""
     targets = {}
     for _, labels in pairs:
         for target, _ in labels:
             targets.setdefault(target, deepcopy(mgr.targets.get(target) or {}))
+    for name, info in targets.items():
+        if info.get("losses"):
+            print(f"  - Target '{name}' keeps its configured losses: "
+                  f"{', '.join(str(loss.get('name')) for loss in info['losses'])}")
+        else:
+            info["losses"] = [{"name": loss_function, "weight": 1.0, "kwargs": {}}]
+            print(f"  - Target '{name}' has no configured loss; using {loss_function}")
     return targets
+
+
+# Losses whose label requirements are checked before training: a class-index label for
+# cross-entropy over out_channels >= 2 channels, a 0/1 label for one-channel BCE. Other
+# configured losses are kept as configured, without a check.
+_CLASS_INDEX_LOSSES = {"nnUNet_DC_and_CE_loss"}
+_ONE_CHANNEL_BINARY_LOSSES = {"BCEWithLogitsLoss"}
+
+
+def _check_losses_fit_the_labels(targets, pairs):
+    """Refuse a target whose losses cannot take its labels (e.g. cross-entropy on one output
+    channel, or label values a loss cannot index), which would otherwise fail on the first batch."""
+    layers = {}
+    for _, labels in pairs:
+        for target, lbl_layer in labels:
+            layers.setdefault(target, []).append(lbl_layer)
+    for name, info in targets.items():
+        if name not in layers:
+            continue
+        out_channels = info.get("out_channels") or info.get("channels") or 2  # set_targets_and_data's default
+        ignore = _ignore_value(info)
+        values = set()
+        for lbl_layer in layers[name]:
+            values.update(np.unique(np.asarray(lbl_layer.data)).tolist())
+        values.discard(ignore)
+        for loss in info["losses"]:
+            loss_name = loss.get("name")
+            if loss_name in _CLASS_INDEX_LOSSES:
+                allowed, need = set(range(int(out_channels))), "out_channels of at least 2"
+                fits = int(out_channels) >= 2
+            elif loss_name in _ONE_CHANNEL_BINARY_LOSSES:
+                allowed, need = {0, 1}, "out_channels 1"
+                fits = int(out_channels) == 1
+            else:
+                continue
+            if not fits:
+                raise ValueError(
+                    f"Target '{name}' has out_channels {out_channels}, but its loss {loss_name} needs {need}. "
+                    "Fix the target's out_channels or losses in the config.")
+            bad = sorted(v for v in values if v not in allowed)
+            if bad:
+                raise ValueError(
+                    f"The label layers of target '{name}' contain the values {bad}, but its loss {loss_name} "
+                    f"with out_channels {out_channels} accepts only {sorted(allowed)}"
+                    + (f" and the ignore label {ignore}" if ignore is not None else "")
+                    + ". Repaint those voxels or change the target's settings.")
 
 
 def _ignore_value(target_info):

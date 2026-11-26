@@ -505,3 +505,59 @@ def test_the_trainer_stops_if_its_dataset_is_not_the_selection(main_window, tmp_
     with pytest.raises(RuntimeError, match="not the 2 selected"):
         _train(main_window, percent=1.0)
     assert _files(tmp_path / "checkpoints") == before
+
+
+_DAMAGE_TARGET = """
+    damage:
+      out_channels: 1
+      activation: "sigmoid"
+      losses:
+        - name: "BCEWithLogitsLoss"
+          weight: 1.0
+"""
+
+
+def test_configured_losses_are_kept_and_train(main_window, tmp_path, monkeypatch):
+    # the documented multi-task config (docs/data_formatting.md): two-channel ink + one-channel BCE damage
+    import torch
+    import vesuvius.models.training.train as train
+
+    main_window._config_manager = _tiny_manager(tmp_path, _DAMAGE_TARGET)
+    image, ink = _pair()
+    damage = _Labels(ink.data.copy(), "vol01_damage")
+    damage_maxima = []
+    real_step = train.BaseTrainer._train_step
+
+    def train_step(self, model, data_dict, *args, **kwargs):
+        damage_maxima.append(float(data_dict["damage"].max()))
+        return real_step(self, model, data_dict, *args, **kwargs)
+
+    monkeypatch.setattr(train.BaseTrainer, "_train_step", train_step)
+    _viewer(image, ink, damage)
+    _train(main_window)
+
+    assert damage_maxima and max(damage_maxima) == 1.0  # trained on batches with damage foreground
+    saved = torch.load(tmp_path / "checkpoints" / "tiny2d" / "tiny2d_final.pth", weights_only=False)
+    targets = saved["model_config"]["targets"]
+    assert [loss["name"] for loss in targets["ink"]["losses"]] == ["nnUNet_DC_and_CE_loss"]
+    assert [loss["name"] for loss in targets["damage"]["losses"]] == ["BCEWithLogitsLoss"]
+    assert targets["damage"]["out_channels"] == 1
+
+
+@pytest.mark.parametrize("target, value, message", [
+    ({"out_channels": 1}, 1, "needs out_channels of at least 2"),  # gets the widget's loss
+    (None, 3, r"contain the values \[3\]"),  # the default ink target: classes 0 and 1, ignore label 2
+    ({"out_channels": 1, "losses": [{"name": "BCEWithLogitsLoss", "weight": 1.0}]}, 2, r"contain the values \[2\]"),
+], ids=["widget-loss-on-one-channel", "class-out-of-range", "bce-non-binary"])
+def test_losses_that_cannot_take_the_labels_are_rejected(main_window, recorded, target, value, message):
+    name = "ink"
+    if target is not None:
+        name = "damage"
+        main_window._config_manager.targets[name] = target
+    image, label = _pair(target=name)
+    label.data[8:12, 8:12] = value
+
+    _viewer(image, label)
+    with pytest.raises(ValueError, match=message):
+        _train(main_window)
+    assert recorded == []
