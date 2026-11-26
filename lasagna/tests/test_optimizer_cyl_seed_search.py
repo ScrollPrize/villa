@@ -192,6 +192,8 @@ class _FakeShellModel(torch.nn.Module):
 		self.refine_calls: list[int] = []
 		self.resample_calls: list[int] = []
 		self.step_resample_calls: list[float] = []
+		self.count_resample_calls: list[tuple[int, float | None]] = []
+		self._grid_width = 3
 		self.radius_checks: list[tuple[int, int, float]] = []
 		self.forward_width_steps: list[float] = []
 		self.measure_calls = 0
@@ -209,6 +211,9 @@ class _FakeShellModel(torch.nn.Module):
 		return None
 
 	def begin_cylinder_shell(self, idx: int, data: _FakeData, *, direction: int = 1) -> None:
+		if int(idx) == 0:
+			self.cyl_grow_reference_width_count = int(self.current_cylinder_shell_xyz().shape[1])
+			self.cyl_grow_reference_circumference = float(self.cyl_grow_reference_width_count * self.cyl_shell_current_width_step)
 		self.begin_calls.append((int(idx), int(direction)))
 		self.cyl_shell_search_direction = int(direction)
 		self._active_idx = int(idx)
@@ -230,8 +235,17 @@ class _FakeShellModel(torch.nn.Module):
 		if self._reset_width_on_resample:
 			self._width_step_avg = float(target_step)
 
+	def resample_current_cylinder_shell_width_to_count(self, data: _FakeData, target_w: int, *, target_step: float | None = None) -> None:
+		self._grid_width = max(3, int(target_w))
+		self.count_resample_calls.append((self._grid_width, target_step))
+		if target_step is not None:
+			self.cyl_shell_width_target_step = float(target_step)
+			self.cyl_shell_current_width_step = float(target_step)
+			if self._reset_width_on_resample:
+				self._width_step_avg = float(target_step)
+
 	def complete_current_cylinder_shell(self, data: _FakeData) -> None:
-		shell = torch.zeros(2, 3, 3)
+		shell = torch.zeros(2, self._grid_width, 3)
 		idx = self._active_idx
 		if len(self.cyl_shell_completed) > idx:
 			self.cyl_shell_completed[idx] = shell
@@ -276,11 +290,11 @@ class _FakeShellModel(torch.nn.Module):
 		return (avg, 0.9 * avg, 1.1 * avg)
 
 	def current_cylinder_shell_xyz(self) -> torch.Tensor:
-		return torch.zeros(2, 3, 3)
+		return torch.zeros(2, self._grid_width, 3)
 
 	def forward(self, data: _FakeData, *, needs=None) -> fit_model.FitResult3D:
 		self.forward_width_steps.append(float(self.cyl_shell_current_width_step))
-		xyz = self.param.view(1, 1, 1, 1).expand(1, 2, 3, 3)
+		xyz = self.param.view(1, 1, 1, 1).expand(1, 2, self._grid_width, 3)
 		return fit_model.FitResult3D(
 			xyz_lr=xyz,
 			xyz_hr=None,
@@ -289,8 +303,8 @@ class _FakeShellModel(torch.nn.Module):
 			data_lr=None,
 			target_plain=None,
 			target_mod=None,
-			amp_lr=torch.zeros(1, 1, 2, 3),
-			bias_lr=torch.zeros(1, 1, 2, 3),
+			amp_lr=torch.zeros(1, 1, 2, self._grid_width),
+			bias_lr=torch.zeros(1, 1, 2, self._grid_width),
 			mask_hr=None,
 			mask_lr=None,
 			normals=None,
@@ -317,7 +331,7 @@ class _FakeShellModel(torch.nn.Module):
 			cyl_count=1,
 			cyl_shell_mode=True,
 			cyl_shell_width_step=float(self.cyl_shell_current_width_step),
-			cyl_shell_delta_xyz=torch.zeros(2, 3, 3),
+			cyl_shell_delta_xyz=torch.zeros(2, self._grid_width, 3),
 			cyl_shell_index=self._active_idx,
 		)
 
@@ -410,7 +424,9 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 		self.assertEqual(mdl.begin_calls, [(0, 1), (1, 1), (2, 1), (3, 1), (4, 1)])
 		self.assertEqual(mdl.measure_calls, 0)
 		self.assertEqual(mdl.bracket_calls, 0)
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0])
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertTrue(mdl.cyl_shell_search_done)
 		self.assertFalse(mdl.cyl_shell_search_crossed)
 		self.assertEqual(len(mdl.cyl_shell_completed), 1)
@@ -422,10 +438,9 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 		)
 
 		self.assertEqual(mdl.begin_calls, [(0, 1), (1, -1), (2, -1), (3, -1), (4, -1)])
-		self.assertEqual(
-			mdl.radius_checks,
-			[(1, -1, 900.0), (2, -1, 800.0), (3, -1, 700.0), (4, -1, 600.0)],
-		)
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(3, 100.0/1.5), (3, 100.0/2.25), (3, 100.0/3.375), (3, 100.0/5.0625)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(3, 100.0/1.5), (3, 100.0/2.25), (3, 100.0/3.375), (3, 100.0/5.0625)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertTrue(mdl.cyl_shell_search_done)
 		self.assertEqual(len(mdl.cyl_shell_completed), 1)
 
@@ -587,7 +602,10 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 		self.assertNotIn("ERROR", stdout)
 		self.assertIn(1, mdl.refine_calls)
 		self.assertIn(4, mdl.refine_calls)
-		self.assertIn(150.0, mdl.forward_width_steps)
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)], strict=True):
+			self.assertAlmostEqual(actual, target)
+		self.assertIn(90.0, mdl.forward_width_steps)
 		self.assertIn(100.0, mdl.forward_width_steps)
 
 	def test_grow_refine_runs_without_seed_detection(self) -> None:
@@ -675,7 +693,9 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			grow_steps=3,
 		)
 
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0])
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertTrue(mdl.cyl_shell_search_done)
 
 	def test_linear_grow_uses_model_step_without_compounding_from_actual_avg(self) -> None:
@@ -686,8 +706,10 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			width_step_avg=50.0,
 		)
 
-		self.assertIn(150.0, mdl.forward_width_steps)
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0])
+		self.assertIn(90.0, mdl.forward_width_steps)
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertTrue(mdl.cyl_shell_search_done)
 
 	def test_grow_target_linearly_expands_to_default_factor(self) -> None:
@@ -702,9 +724,11 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			post_steps=0,
 		)
 
-		self.assertIn(125.0, mdl.forward_width_steps)
-		self.assertIn(150.0, mdl.forward_width_steps)
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0])
+		self.assertIn(95.0, mdl.forward_width_steps)
+		self.assertIn(90.0, mdl.forward_width_steps)
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertTrue(mdl.cyl_shell_search_done)
 
 	def test_grow_target_linearly_shrinks_to_inverse_default_factor(self) -> None:
@@ -722,7 +746,9 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 
 		self.assertIn(100.0 + 0.5 * ((100.0 / 1.5) - 100.0), mdl.forward_width_steps)
 		self.assertIn(100.0 / 1.5, mdl.forward_width_steps)
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0])
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(3, 100.0/1.5), (3, 100.0/2.25), (3, 100.0/3.375), (3, 100.0/5.0625)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(3, 100.0/1.5), (3, 100.0/2.25), (3, 100.0/3.375), (3, 100.0/5.0625)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertTrue(mdl.cyl_shell_search_done)
 
 	def test_grow_factor_arg_changes_linear_target_end(self) -> None:
@@ -738,9 +764,11 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			grow_args={"cyl_grow_factor": 1.2},
 		)
 
-		self.assertIn(110.0, mdl.forward_width_steps)
-		self.assertIn(120.0, mdl.forward_width_steps)
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0])
+		self.assertIn(95.0, mdl.forward_width_steps)
+		self.assertIn(90.0, mdl.forward_width_steps)
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(4, 90.0), (4, 108.0), (5, 103.68), (6, 103.68)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(4, 90.0), (4, 108.0), (5, 103.68), (6, 103.68)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertTrue(mdl.cyl_shell_search_done)
 
 	def test_growth_resamples_each_shell_back_to_model_step(self) -> None:
@@ -755,7 +783,9 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			width_step_avg=150.0,
 		)
 
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0])
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertTrue(mdl.cyl_shell_search_done)
 
 	def test_post_cylinder_stages_track_current_avg_wtarget(self) -> None:
@@ -771,7 +801,9 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			width_step_avg=150.0,
 		)
 
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0])
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)], strict=True):
+			self.assertAlmostEqual(actual, target)
 		self.assertEqual(len(mdl.cyl_shell_completed), 1)
 		self.assertTrue(mdl.cyl_shell_search_done)
 
@@ -804,7 +836,10 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			width_step_avg=150.0,
 		)
 
-		self.assertEqual(mdl.step_resample_calls, [100.0, 100.0, 100.0, 100.0, 50.0])
+		self.assertEqual([n for n, _ in mdl.count_resample_calls], [n for n, _ in [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)]])
+		for (_, actual), (_, target) in zip(mdl.count_resample_calls, [(5, 90.0), (7, 675.0/7), (10, 101.25), (15, 101.25)], strict=True):
+			self.assertAlmostEqual(actual, target)
+		self.assertEqual(mdl.step_resample_calls, [50.0])
 		self.assertIn(50.0, mdl.forward_width_steps)
 
 	def test_cyl_outside_field_builds_for_grow_reuses_for_refine_and_replaces_next_shell(self) -> None:
@@ -827,6 +862,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 		mdl = _FakeShellModel(["outside"])
 		build_calls: list[torch.Tensor] = []
 		chunk_sizes: list[int] = []
+		barrier_modes: list[str] = []
 		deep_interp_values: list[float] = []
 		deep_blend_values: list[float] = []
 
@@ -834,6 +870,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 			shell,
 			*,
 			grid_step,
+			mode,
 			device,
 			bbox=None,
 			chunk_size=8,
@@ -843,6 +880,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 		):
 			build_calls.append(shell.detach().clone())
 			chunk_sizes.append(int(chunk_size))
+			barrier_modes.append(mode)
 			deep_interp_values.append(float(deep_interp_chunks))
 			deep_blend_values.append(float(deep_blend_chunks))
 			return optimizer.cyl_sdf_volume.CylOutsideVolume(
@@ -855,7 +893,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 
 		with mock.patch.object(optimizer.opt_loss_cyl, "cyl_normal_loss", _zero_cyl_loss):
 			with mock.patch.object(optimizer.opt_loss_cyl, "cyl_outside_loss", _zero_cyl_loss):
-				with mock.patch.object(optimizer.cyl_sdf_volume, "build_previous_shell_inside_depth_volume", side_effect=_fake_build):
+				with mock.patch.object(optimizer.cyl_sdf_volume, "build_previous_shell_violation_depth_volume", side_effect=_fake_build):
 					with contextlib.redirect_stdout(io.StringIO()):
 						optimizer.optimize(
 							model=mdl,
@@ -868,6 +906,7 @@ class CylinderSeedDynamicSearchSmokeTest(unittest.TestCase):
 
 		self.assertEqual(len(build_calls), 2)
 		self.assertEqual(chunk_sizes, [4, 4])
+		self.assertEqual(barrier_modes, ["inside", "inside"])
 		self.assertEqual(deep_interp_values, [1.5, 1.5])
 		self.assertEqual(deep_blend_values, [0.5, 0.5])
 		self.assertEqual(float(mdl.cyl_outside_depth_max), 2.0)

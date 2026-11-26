@@ -145,9 +145,9 @@ class OptimizerStageWeightsTest(unittest.TestCase):
 		self.assertEqual(opt.eff["atlas_line_other"], 0.0)
 		gate = opt.args["pred_dt_flow_gate"]
 		self.assertTrue(gate["enabled"])
-		self.assertTrue(gate["debug"])
+		self.assertFalse(gate["debug"])
 		self.assertEqual(gate["debug_layer_interval"], 0)
-		self.assertEqual(gate["debug_vis_interval"], 10)
+		self.assertEqual(gate["debug_vis_interval"], 1)
 		self.assertTrue(gate["atlas_snap_seed_enabled"])
 		self.assertFalse(gate["corr_seed_enabled"])
 		self.assertTrue(gate["anticipatory_pull"]["enabled"])
