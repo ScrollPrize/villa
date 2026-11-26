@@ -79,17 +79,7 @@ def generate_patch_caches(
     # Load config
     mgr = ConfigManager(verbose=True)
     mgr.load_config(config_path)
-    return generate_patch_caches_for_config(mgr, input_path=input_path, cache_dir=cache_dir, force=force)
 
-
-def generate_patch_caches_for_config(
-    mgr: ConfigManager,
-    *,
-    input_path: Optional[Path] = None,
-    cache_dir: Optional[Path] = None,
-    force: bool = False,
-) -> PatchCacheResult:
-    """generate_patch_caches for a config that is already loaded (e.g. one changed in memory)."""
     if input_path is not None:
         mgr.data_path = Path(input_path)
 

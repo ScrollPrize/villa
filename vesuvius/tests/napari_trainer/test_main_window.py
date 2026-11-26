@@ -5,6 +5,7 @@ config manager, the layer export and the trainer's ZarrDataset are the real ones
 """
 import importlib
 import inspect
+import json
 import sys
 import tomllib
 import tempfile
@@ -135,12 +136,12 @@ def test_loss_choices_are_losses_the_trainer_knows(main_window):
         _create_loss(name, {}, None, -100, None)
 
 
-def _default_manager():
+def _default_manager(name="ps128_dicece.yaml"):
     import vesuvius
     from vesuvius.models.configuration.config_manager import ConfigManager
 
     mgr = ConfigManager(verbose=False)
-    mgr.load_config(Path(vesuvius.__file__).parent / "models/configuration/single_task/ps128_dicece.yaml")
+    mgr.load_config(Path(vesuvius.__file__).parent / "models/configuration/single_task" / name)
     return mgr
 
 
@@ -161,8 +162,11 @@ def recorded(main_window, monkeypatch):
             arrays = [(np.asarray(v.image_array[:]),
                        {t: np.asarray(a[:]) for t, a in v.label_arrays.items() if a is not None})
                       for v in dataset._volumes]  # read now: the export is removed when the run ends
+            caches = list((Path(self.mgr.data_path) / ".patches_cache").glob("*.json"))
+            selected = [[(p["vol_name"], tuple(p["pos"])) for p in json.loads(c.read_text())["fg_patches"]]
+                        for c in caches]
             runs.append(SimpleNamespace(mgr=self.mgr, data_path=Path(self.mgr.data_path), dataset=dataset,
-                                        arrays=arrays, targets=deepcopy(self.mgr.targets)))
+                                        arrays=arrays, targets=deepcopy(self.mgr.targets), selected=selected))
 
     monkeypatch.setattr(train, "BaseTrainer", RecordingTrainer)
     main_window._config_manager = _default_manager()
@@ -404,4 +408,100 @@ def test_a_split_without_training_patches_stops_before_saving(main_window, tmp_p
         _train(main_window, percent=1.0)
 
     assert final.read_bytes() == b"an earlier run's checkpoint"
+    assert _files(tmp_path / "checkpoints") == before
+
+
+def _patches(run):
+    return [(p.volume_name, tuple(p.position)) for p in run.dataset._patches]
+
+
+def test_ignored_voxels_do_not_count_toward_the_labeled_percentage(main_window, recorded):
+    # the guided ink preset: ignore_label 2 and no valid_patch_value
+    main_window._config_manager = _default_manager("ps128_guided_dinovol_ink.yaml")
+    image, label = _pair()
+    label.data = np.full_like(label.data, 2)  # nothing but the ignore label
+    _viewer(image, label)
+
+    with pytest.raises(ValueError, match="Min Labeled Percentage"):
+        _train(main_window, percent=1.0)
+    assert recorded == []
+
+    label.data[4:8, 4:8] = 1  # 16 labeled pixels in patch (0, 0), everything else ignored
+    _train(main_window, percent=1.0)
+    assert _patches(recorded[0]) == [("image0", (0, 0))]
+
+
+def test_training_reads_exactly_the_selected_patches(main_window, recorded):
+    image1, ink1 = _pair("vol01")
+    image2, ink2 = _pair("vol02")
+    ink2.data = np.zeros_like(ink2.data)
+    ink2.data[0:32, 0:32] = 1
+    surface1 = _Labels(np.ones_like(ink1.data), "vol01_surface")
+    surface2 = _Labels(np.ones_like(ink2.data), "vol02_surface")
+
+    _viewer(image1, ink1, surface1, image2, ink2, surface2)
+    _train(main_window)
+
+    run = recorded[0]
+    assert list(run.targets) == ["ink", "surface"]
+    assert len(run.selected) == 1
+    assert _patches(run) == run.selected[0] == [("image0", (0, 0)), ("image0", (0, 32)), ("image0", (32, 0)),
+                                                ("image0", (32, 32)), ("image1", (0, 0))]
+
+
+def test_targets_with_different_valid_patch_values_are_rejected(main_window, recorded):
+    mgr = main_window._config_manager
+    mgr.targets["ink"]["valid_patch_value"] = None
+    mgr.targets["surface"] = {"out_channels": 2, "valid_patch_value": 2,
+                              "losses": [{"name": "nnUNet_DC_and_CE_loss", "weight": 1.0}]}
+    image, ink = _pair()
+    surface = _Labels(ink.data.copy(), "vol01_surface")
+    ink.data[0:4] = 2
+
+    _viewer(image, ink, surface)
+    with pytest.raises(ValueError, match="valid_patch_value"):
+        _train(main_window)
+    assert recorded == []
+
+
+@pytest.mark.parametrize("allow_unlabeled_data", [True, False])
+def test_images_without_a_label_for_every_target_are_rejected(main_window, recorded, allow_unlabeled_data):
+    mgr = main_window._config_manager
+    mgr.allow_unlabeled_data = allow_unlabeled_data
+    mgr.dataset_config["allow_unlabeled_data"] = allow_unlabeled_data
+    image1, ink1 = _pair("vol01", "ink")
+    image2, surface2 = _pair("vol02", "surface")
+
+    _viewer(image1, ink1, image2, surface2)
+    with pytest.raises(ValueError, match="no label layer for target"):
+        _train(main_window)
+    assert recorded == []
+
+
+def test_unlabeled_foreground_configs_are_rejected(main_window, recorded):
+    mgr = main_window._config_manager
+    mgr.unlabeled_foreground_enabled = True
+    mgr.dataset_config["unlabeled_foreground_enabled"] = True
+
+    _viewer(*_pair())
+    with pytest.raises(ValueError, match="unlabeled_foreground_enabled"):
+        _train(main_window)
+    assert recorded == []
+
+
+def test_the_trainer_stops_if_its_dataset_is_not_the_selection(main_window, tmp_path, monkeypatch):
+    from vesuvius.models.datasets.zarr_dataset import ZarrDataset
+
+    main_window._config_manager = _tiny_manager(tmp_path)
+    image, label = _pair()
+    label.data = np.zeros_like(label.data)
+    label.data[4:8, 4:8] = 1  # at 1% only patch (0, 0) is selected
+    label.data[40:44, 40:44] = 1  # and (32, 32), so the split keeps one for training
+    _viewer(image, label)
+    # a dataset that misses the patch cache enumerates every patch
+    monkeypatch.setattr(ZarrDataset, "_try_load_cache", lambda self: None)
+    before = _files(tmp_path / "checkpoints")
+
+    with pytest.raises(RuntimeError, match="not the 2 selected"):
+        _train(main_window, percent=1.0)
     assert _files(tmp_path / "checkpoints") == before

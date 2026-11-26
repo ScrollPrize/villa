@@ -136,17 +136,20 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
         min_bbox_percent=0.0
     )
 
+    targets = _run_targets(mgr, pairs)
+    _check_patch_selection_rule(targets)
+
     run_dir = Path(tempfile.mkdtemp(prefix="napari_trainer_"))
     try:
-        _export_viewer_layers(mgr, pairs, run_dir / "data")
+        _export_viewer_layers(mgr, pairs, run_dir / "data", targets)
         for target_name in mgr.targets:
             mgr.targets[target_name]['losses'] = [{"name": loss_function, "weight": 1.0, "kwargs": {}}]
             print(f"  - Set loss function for target '{target_name}' to {loss_function}")
-        _write_patch_cache(mgr, min_labeled_percentage)
+        selected = _write_patch_cache(mgr, min_labeled_percentage)
 
         from vesuvius.models.training.train import BaseTrainer
 
-        trainer = _viewer_layer_trainer(BaseTrainer)(mgr=mgr, verbose=True)
+        trainer = _viewer_layer_trainer(BaseTrainer, selected)(mgr=mgr, verbose=True)
         print("\nStarting training...")
         trainer.train()
 
@@ -160,13 +163,24 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
         print(f"Removed the exported layers ({run_dir})")
 
 
-def _viewer_layer_trainer(base):
+def _viewer_layer_trainer(base, selected):
     """The trainer class for a run on the viewer's layers: `base` (BaseTrainer), stopping
-    before the model directory or any checkpoint is written when the train/validation
-    split leaves no training patch (a run without an optimizer step would still save a
-    final checkpoint and could overwrite an earlier one)."""
+    before the model directory or any checkpoint is written when its datasets would not
+    read exactly the `selected` patches [(volume id, position), ...], or when the
+    train/validation split leaves no training patch (a run without an optimizer step
+    would still save a final checkpoint and could overwrite an earlier one)."""
 
     class ViewerLayerTrainer(base):
+        def _build_dataset_for_mgr(self, mgr, *, is_training):
+            dataset = super()._build_dataset_for_mgr(mgr, is_training=is_training)
+            patches = [(p.volume_name, tuple(p.position)) for p in dataset.valid_patches]
+            if patches != selected:
+                raise RuntimeError(
+                    f"The trainer's {'training' if is_training else 'validation'} dataset has "
+                    f"{len(patches)} patches, not the {len(selected)} selected ones; not training on "
+                    "patches the labeled-percentage check did not select.")
+            return dataset
+
         def _configure_dataloaders(self, train_dataset, val_dataset=None):
             loaders = super()._configure_dataloaders(train_dataset, val_dataset)
             train_indices, val_indices = loaders[2], loaders[3]
@@ -199,8 +213,9 @@ def _pair_layers(image_layers, label_layers):
 
 
 def _check_trains_on_viewer_layers(mgr, pairs):
-    """Refuse configs that would train on other data, targets that are not plain names,
-    and labels that do not cover their image voxel for voxel."""
+    """Refuse configs that would train on other data or on unlabeled patches, images without
+    a label for every target, targets that are not plain names, and labels that do not
+    cover their image voxel for voxel."""
     dataset_config = getattr(mgr, 'dataset_config', None) or {}
     if dataset_config.get("volumes"):
         raise ValueError(
@@ -211,6 +226,20 @@ def _check_trains_on_viewer_layers(mgr, pairs):
         raise ValueError(
             f"The selected config uses dataset_type '{dataset_type}', which reads its own image and "
             "label data instead of the viewer's layers. Choose a config with the default 'zarr' dataset.")
+
+    if getattr(mgr, 'unlabeled_foreground_enabled', False):
+        raise ValueError(
+            "The selected config sets unlabeled_foreground_enabled; the napari trainer trains only on "
+            "labeled patches of the viewer's layers. Choose a config without it.")
+    all_targets = list(dict.fromkeys(target for _, labels in pairs for target, _ in labels))
+    for img_layer, labels in pairs:
+        missing = [t for t in all_targets if t not in {target for target, _ in labels}]
+        if missing:
+            raise ValueError(
+                f"Image layer '{img_layer.name}' has no label layer for target(s) {', '.join(missing)} "
+                f"(e.g. '{img_layer.name}_{missing[0]}'). Every paired image needs a label layer for each "
+                "target, since a missing label would be trained as background; add the label layers or "
+                "train the targets separately.")
 
     for img_layer, labels in pairs:
         for target, lbl_layer in labels:
@@ -245,18 +274,47 @@ def _write_layer_zarr(path, data):
     ZarrWriter.create(path, shape=data.shape, chunks=chunks, dtype=data.dtype, overwrite=True)[...] = data
 
 
-def _export_viewer_layers(mgr, pairs, data_path):
+def _run_targets(mgr, pairs):
+    """The run's targets, one per label-layer suffix. A target the loaded config defines
+    keeps its settings (losses, ignore label, ...)."""
+    targets = {}
+    for _, labels in pairs:
+        for target, _ in labels:
+            targets.setdefault(target, deepcopy(mgr.targets.get(target) or {}))
+    return targets
+
+
+def _ignore_value(target_info):
+    """The target's ignore label, under any of the names the trainer reads."""
+    for alias in ("ignore_index", "ignore_label", "ignore_value"):
+        if target_info.get(alias) is not None:
+            return target_info[alias]
+    return None
+
+
+def _check_patch_selection_rule(targets):
+    """Patches are selected, and the patch cache is keyed, with one valid_patch_value; the
+    trainer's dataset would look the cache up with another value than the one it was written
+    with if the targets set different ones, and would then train on every patch."""
+    values = {name: info.get("valid_patch_value") for name, info in targets.items()
+              if not info.get("auxiliary_task", False)}
+    if len(set(values.values())) > 1:
+        raise ValueError(
+            "The targets set different valid_patch_value ("
+            + ", ".join(f"{name}: {value}" for name, value in values.items())
+            + "); patches are selected with one value for all targets. Give every target the same "
+            "valid_patch_value (or none), or train the targets separately.")
+
+
+def _export_viewer_layers(mgr, pairs, data_path, targets):
     """Write the paired layers to data_path in the images/ + labels/ layout the trainer's
     ZarrDataset reads (file names are indexes, not layer names), and set the run's
     data_path and targets to them."""
-    targets = {}
     for index, (img_layer, labels) in enumerate(pairs):
         volume_id = f"image{index}"
         _write_layer_zarr(data_path / "images" / f"{volume_id}.zarr", img_layer.data)
         for target, lbl_layer in labels:
             _write_layer_zarr(data_path / "labels" / f"{volume_id}_{target}.zarr", lbl_layer.data)
-            # A target the loaded config defines keeps its settings (losses, ignore label, ...).
-            targets.setdefault(target, deepcopy(mgr.targets.get(target, {})))
             print(f"Exported '{img_layer.name}' + '{lbl_layer.name}' as {volume_id}, target '{target}'")
 
     mgr.data_path = data_path
@@ -265,16 +323,64 @@ def _export_viewer_layers(mgr, pairs, data_path):
 
 
 def _write_patch_cache(mgr, min_labeled_percentage):
-    """Select the training patches with at least the widget's labeled percentage, with
-    vesuvius.find_patches' generator; ZarrDataset reads the cache it writes to data_path."""
-    from vesuvius.models.preprocessing.patches.generate import generate_patch_caches_for_config
+    """Select the training patches and write them as the patch cache ZarrDataset loads.
 
-    result = generate_patch_caches_for_config(mgr, force=True)
-    if result.total_fg_patches == 0:
+    As in vesuvius.find_patches, the first target's labels decide: a patch qualifies when at
+    least the widget's percentage of its voxels equal valid_patch_value (any non-zero value
+    when none is set). Voxels with the target's ignore label never count. The cache key uses
+    the parameters ZarrDataset looks the cache up with. Returns the selected patches as
+    [(volume id, position), ...] in the order the dataset reads them."""
+    from vc_reader.reader import open_node
+    from vesuvius.models.datasets.find_valid_patches import find_valid_patches
+    from vesuvius.models.preprocessing.patches.cache import (
+        PatchCacheData, PatchEntry, build_cache_params, save_patch_cache)
+
+    data_path = Path(mgr.data_path)
+    patch_size = tuple(int(v) for v in mgr.train_patch_size)
+    target = next(name for name, info in mgr.targets.items() if not info.get("auxiliary_task", False))
+    info = mgr.targets[target]
+    valid_patch_value = info.get("valid_patch_value")  # the same on every target (_check_patch_selection_rule)
+    if valid_patch_value is None:
+        valid_patch_value = (getattr(mgr, "dataset_config", None) or {}).get("valid_patch_value")
+    ignore = _ignore_value(info)
+    volume_ids = sorted(p.stem for p in (data_path / "images").iterdir() if p.suffix == ".zarr")
+
+    params = build_cache_params(
+        data_path=data_path,
+        volume_ids=volume_ids,
+        patch_size=patch_size,
+        min_labeled_ratio=float(getattr(mgr, "min_labeled_ratio", 0.10)),
+        bbox_threshold=float(getattr(mgr, "min_bbox_percent", 0.95)),
+        valid_patch_find_resolution=int(getattr(mgr, "valid_patch_find_resolution", 1)),
+        valid_patch_value=valid_patch_value,
+        unlabeled_fg_enabled=bool(getattr(mgr, "unlabeled_foreground_enabled", False)),
+        unlabeled_fg_threshold=float(getattr(mgr, "unlabeled_foreground_threshold", 0.05)),
+        unlabeled_fg_bbox_threshold=float(getattr(mgr, "unlabeled_foreground_bbox_threshold", 0.15)),
+    )
+    found = find_valid_patches(
+        label_arrays=[open_node(data_path / "labels" / f"{v}_{target}.zarr") for v in volume_ids],
+        label_names=volume_ids,
+        patch_size=patch_size,
+        bbox_threshold=params.bbox_threshold,
+        label_threshold=params.min_labeled_ratio,
+        valid_patch_find_resolution=params.valid_patch_find_resolution,
+        ignore_labels=[ignore] * len(volume_ids),
+        valid_patch_values=[valid_patch_value] * len(volume_ids) if valid_patch_value is not None else None,
+        collect_unlabeled_fg=False,
+    )
+    fg = [PatchEntry(volume_idx=p["volume_idx"], volume_name=p["volume_name"], position=tuple(p["start_pos"]))
+          for p in found["fg_patches"]]
+    if not fg:
         raise ValueError(
-            f"No {'x'.join(map(str, mgr.train_patch_size))} patch of the paired layers has at least "
-            f"{min_labeled_percentage}% labeled voxels; lower Min Labeled Percentage, the patch size, or label more.")
-    print(f"{result.total_fg_patches} patches have at least {min_labeled_percentage}% labeled voxels")
+            f"No {'x'.join(map(str, patch_size))} patch of the paired layers has at least "
+            f"{min_labeled_percentage}% voxels labeled for target '{target}'"
+            + (f" (ignore label {ignore} not counted)" if ignore is not None else "")
+            + "; lower Min Labeled Percentage, the patch size, or label more.")
+    save_patch_cache(data_path / ".patches_cache", params, PatchCacheData(fg_patches=fg, bg_patches=[],
+                                                                           unlabeled_fg_patches=[]))
+    print(f"{len(fg)} patches have at least {min_labeled_percentage}% voxels labeled for target '{target}'"
+          + (f" (ignore label {ignore} not counted)" if ignore is not None else ""))
+    return [(entry.volume_name, entry.position) for entry in fg]
 
 
 def main():
