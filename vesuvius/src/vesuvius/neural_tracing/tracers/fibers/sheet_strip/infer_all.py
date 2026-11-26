@@ -23,13 +23,13 @@ voxels of ``--base-voxel-um``.
 Fiber by fiber, this process prepares the next batch of decisions (crops, frames) while the device runs the current
 one, and writes each strip as its fiber completes; a record's seconds is the time since the shard's previous record.
 Each fiber's decisions run in batches of ``--batch`` of their own, so on the CPU the strips are those of infer.py.
-``--across-fibers`` fills every strip-model batch with the next ``--batch`` decisions, from the next fibers when one
-ends, so batches stay full (faster on a GPU; heights then move by the batch's rounding).
+``--across-fibers`` fills every batch (crops, frame model and strip model) with the next ``--batch`` decisions, from
+the next fibers when one ends, so batches stay full (faster on a GPU; heights then move by the batch's rounding).
 
 ``--workers N`` (CUDA or the CPU) runs the shard through sheet_strip/batched.py instead of fiber by fiber: N CPU worker processes build
 the decisions' geometry and write the strips, and this process runs the crops (``--crops gpu``: on the GPU) and both
 models over the decisions of many fibers at once. Strips and index records are written as above, in the order fibers
-finish; a record's seconds is the time since the shard's previous record, since fibers overlap. The strip model runs
+finish; a record's seconds is the time since the shard's previous record, since fibers overlap. Both models run
 each fiber's decisions in batches of ``--batch`` as the per-fiber loop does (on the CPU, the same heights), or with
 ``--across-fibers`` in batches of ``--batch`` decisions from any fibers (faster at a large batch; bf16 heights move by
 the batch size's rounding). ``--compile MODE`` compiles the strip model (torch.compile, with ``--across-fibers``),
@@ -241,7 +241,7 @@ def main(argv=None):
                     help='batched mode (sheet_strip/batched.py): CPU worker processes building the geometry while this '
                          'process runs crops and models over many fibers (default 0: fiber by fiber)')
     ap.add_argument('--across-fibers', action='store_true',
-                    help="strip-model batches of --batch decisions from any fibers (default: each fiber's own)")
+                    help="batches of --batch decisions from any fibers, for the frame and strip models (default: each fiber's own)")
     ap.add_argument('--compile', metavar='MODE',
                     help='with --workers and --across-fibers on CUDA: torch.compile the strip model in this mode (e.g. '
                          'max-autotune-no-cudagraphs), with inductor emulating eager precision casts')

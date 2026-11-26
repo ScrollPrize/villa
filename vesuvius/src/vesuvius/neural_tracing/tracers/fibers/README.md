@@ -300,7 +300,7 @@ device and the frame model where the per-fiber loop runs it (the GPU with `--cro
 files and index records as fiber by fiber. Records are appended in the order fibers finish, and a record's `seconds`
 is the time since the shard's previous record, because fibers overlap. Without `--across-fibers` both models run each
 fiber's decisions in batches of `--batch`, as the per-fiber loop does, and on the CPU the strips are identical to the
-per-fiber loop's. `--across-fibers` fills each strip-model batch with `--batch` decisions from any fibers, and
+per-fiber loop's. `--across-fibers` fills each batch of both models with `--batch` decisions from any fibers, and
 `--compile MODE` compiles the strip model with `torch.compile` (CUDA only; it needs `--across-fibers`, so every batch
 has one shape). Compiling turns on inductor's `emulate_precision_casts`.
 
@@ -329,7 +329,7 @@ compiled batch 64. Compiling without emulated casts was measurably worse (strip_
 On Apple GPUs, `--device mps --crops gpu --batch 16 --across-fibers` samples the crops with vc_reader's Metal reader
 and runs the frame model and the strip model on the GPU, with the CropCNN, the cell-token gather, the crop z-score and
 the masked attention as Metal kernels (`models/mps*.py`, same weights). Without `--workers`, `--across-fibers` fills
-the strip-model batches across fiber ends inside the shard's process (`StripPredictor.predict_many`); batched mode
+the batches across fiber ends inside the shard's process (`StripPredictor.predict_many`); batched mode
 (`--workers`) does not run on MPS. On an M4 Pro Mac
 mini one such process wrote strips at 58.8 decisions/s over 21,153 PHerc0211 decisions, in a 6.8 GiB peak, against
 15.5 decisions/s for `--device mps --batch 4` and 8.0 for the CPU path (`--batch 4`, 12 threads); its nodes match the
