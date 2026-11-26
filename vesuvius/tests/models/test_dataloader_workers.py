@@ -24,10 +24,15 @@ class _Items(Dataset):
 def test_spawned_workers_shut_down_without_waiting_for_the_join_timeout() -> None:
     loader = DataLoader(_Items(), num_workers=2, multiprocessing_context="spawn",
                         worker_init_fn=keep_worker_descriptors_private)
+    batches = iter(loader)
+    assert len([next(batches) for _ in range(8)]) == 8
+    # The next call finds the pass finished and joins both workers before raising StopIteration.
+    # Only that shutdown is timed, so a slow worker start cannot fail the test.
     started = time.perf_counter()
-    assert len(list(loader)) == 8  # the pass ends by joining both workers
-    # Without the worker_init_fn each join waits its full 5 s timeout: about 11 s for this pass, 1 s with it.
-    assert time.perf_counter() - started < 5.0
+    with pytest.raises(StopIteration):
+        next(batches)
+    # Without the worker_init_fn each join waits its full 5 s timeout, about 10 s here.
+    assert time.perf_counter() - started < 3.0
 
 
 def test_base_trainer_loaders_use_the_worker_init_fn(monkeypatch) -> None:
