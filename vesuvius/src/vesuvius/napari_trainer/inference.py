@@ -9,9 +9,53 @@ from tqdm.auto import tqdm
 import contextlib
 from typing import Optional, List, Tuple, Dict, Any, Union, Callable
 import itertools
+from copy import deepcopy
 
 from vesuvius.models.run.blending import generate_gaussian_map
 from vesuvius.utils.models.helpers import compute_steps_for_sliding_window
+
+def _checkpoint_model_config(checkpoint_data):
+    """The network config a train.py checkpoint was saved with: its 'model_config', or the
+    nested legacy 'config' unwrapped (as vesuvius.predict reads it). Primus saves its patch
+    as 'input_shape'; it is also returned as 'patch_size', which inference tiles with."""
+    if checkpoint_data.get('model_config'):
+        model_config = deepcopy(checkpoint_data['model_config'])
+    else:
+        legacy = checkpoint_data['config']
+        model_config = deepcopy(legacy.get('model_config') or {})
+        if 'patch_size' in legacy:
+            model_config.setdefault('patch_size', list(legacy['patch_size']))
+        for key in ('batch_size', 'in_channels', 'targets'):
+            if key in legacy:
+                model_config.setdefault(key, deepcopy(legacy[key]))
+    if 'patch_size' not in model_config and 'train_patch_size' not in model_config and 'input_shape' in model_config:
+        model_config['patch_size'] = list(model_config['input_shape'])
+    return model_config
+
+
+def _apply_saved_decoder_layout(model_config, state_dict):
+    """Rebuild each target with the decoder its weights were saved with. The saved
+    'separate_decoders' is True as soon as one target has its own decoder, so a target
+    that used the shared decoder would otherwise get a separate, untrained one."""
+    for name, info in (model_config.get('targets') or {}).items():
+        if any(k.startswith(f"task_decoders.{name}.") for k in state_dict):
+            info['separate_decoder'] = True
+        elif any(k.startswith(f"task_heads.{name}.") for k in state_dict):
+            info['separate_decoder'] = False
+
+
+def _strip_wrapper_prefixes(state_dict):
+    """Drop DDP ('module.') and torch.compile ('_orig_mod.') key prefixes."""
+    def strip(key):
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ('module.', '_orig_mod.'):
+                if key.startswith(prefix):
+                    key, changed = key[len(prefix):], True
+        return key
+    return {strip(k): v for k, v in state_dict.items()}
+
 
 # Model loader class
 class ModelLoader:
@@ -28,20 +72,18 @@ class ModelLoader:
             raise FileNotFoundError(f"Checkpoint not found: {self.checkpoint_path}")
             
         checkpoint_data = torch.load(self.checkpoint_path, map_location='cpu', weights_only=False)
-        
-        # Try to extract model configuration
-        model_config = {}
-        if 'model_config' in checkpoint_data:
-            model_config = checkpoint_data['model_config']
-        elif 'config' in checkpoint_data:
-            model_config = checkpoint_data['config']
-        elif self.config_manager is not None:
-            # Use config from config manager
-            model_config = self.config_manager.model_config
-            print(f"Using model configuration from config manager")
+
+        if 'model' in checkpoint_data:
+            print("Loading weights from 'model' key in checkpoint")
+            model_state_dict = checkpoint_data['model']
+        elif 'model_state_dict' in checkpoint_data:
+            model_state_dict = checkpoint_data['model_state_dict']
+        elif 'state_dict' in checkpoint_data:
+            model_state_dict = checkpoint_data['state_dict']
         else:
-            print(f"Warning: No model configuration found in checkpoint. Using empty config.")
-        
+            model_state_dict = checkpoint_data
+        model_state_dict = _strip_wrapper_prefixes(model_state_dict)
+
         from vesuvius.models.build.build_network_from_config import NetworkFromConfig
         
         class MinimalConfigManager:
@@ -56,46 +98,43 @@ class ModelLoader:
                 
                 self.spacing = [1] * len(self.train_patch_size)
                 self.model_name = "Loaded_Model"
-                
+
         # The checkpoint's own config describes the network its weights belong to;
         # the GUI's config manager is only a fallback for checkpoints without one.
-        checkpoint_has_config = 'model_config' in checkpoint_data or 'config' in checkpoint_data
-        if self.config_manager is not None and not checkpoint_has_config:
+        if checkpoint_data.get('model_config') or isinstance(checkpoint_data.get('config'), dict):
+            model_config = _checkpoint_model_config(checkpoint_data)
+            _apply_saved_decoder_layout(model_config, model_state_dict)
+            mgr = MinimalConfigManager(model_config)
+        elif self.config_manager is not None:
+            # Use config from config manager
+            model_config = self.config_manager.model_config
             mgr = self.config_manager
+            print(f"Using model configuration from config manager")
         else:
+            print(f"Warning: No model configuration found in checkpoint. Using empty config.")
+            model_config = {}
             mgr = MinimalConfigManager(model_config)
             
         model = NetworkFromConfig(mgr)
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = model.to(device)
-        
-        model_state_dict = None
-        if 'model' in checkpoint_data:
-            print("Loading weights from 'model' key in checkpoint")
-            model_state_dict = checkpoint_data['model']
-        elif 'model_state_dict' in checkpoint_data:
-            model_state_dict = checkpoint_data['model_state_dict']
-        elif 'state_dict' in checkpoint_data:
-            model_state_dict = checkpoint_data['state_dict']
-        else:
-            model_state_dict = checkpoint_data
-        
-        # Check if this is a compiled model state dict (keys will have "_orig_mod." prefix)
-        is_compiled_state_dict = any("_orig_mod." in key for key in model_state_dict.keys())
-        
-        # If we're on CUDA and the state dict is from a compiled model,
-        # compile our model before loading weights
-        if device.type == 'cuda' and is_compiled_state_dict:
-            print("On CUDA with compiled model checkpoint - compiling model before loading weights")
-            model = torch.compile(model)
-            
-        # Load the state dict
+
+        # Every tensor of the network must come from the checkpoint; checkpoint tensors the
+        # network does not use (e.g. deep-supervision or old shared-decoder heads) are skipped.
         try:
-            model.load_state_dict(model_state_dict, strict=False)
-            print("Model weights loaded successfully")
-        except Exception as e:
-            print(f"Warning: Error loading state dict: {str(e)}")
-            print("Attempting to continue with partially loaded weights")
+            missing, unexpected = model.load_state_dict(model_state_dict, strict=False)
+        except RuntimeError as e:
+            raise RuntimeError(f"The weights in {self.checkpoint_path} do not fit the network built "
+                               f"from its config: {e}") from e
+        if missing:
+            raise RuntimeError(
+                f"{self.checkpoint_path} has no weights for {len(missing)} of the network's "
+                f"{len(model.state_dict())} tensors ({', '.join(missing[:5])}{', ...' if len(missing) > 5 else ''}); "
+                "not running inference with untrained weights.")
+        if unexpected:
+            print(f"Skipped {len(unexpected)} checkpoint tensors the inference network does not use "
+                  f"({', '.join(unexpected[:5])}{', ...' if len(unexpected) > 5 else ''})")
+        print("Model weights loaded successfully")
                 
         return model, model_config
 
