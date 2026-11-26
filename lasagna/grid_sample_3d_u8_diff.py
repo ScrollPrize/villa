@@ -1,6 +1,7 @@
 """Differentiable uint8 3D grid_sample with gradients w.r.t. sample positions.
 
-CUDA runs the JIT-built kernel, MPS the Metal port (``u8_sample_metal``), and the CPU ``F.grid_sample``.
+CUDA runs the JIT-built kernel, MPS the Metal port (``u8_sample_metal``; with ``LASAGNA_METAL=0``, the PyTorch
+version in ``u8_sample_torch``), and the CPU ``F.grid_sample``.
 """
 
 import os
