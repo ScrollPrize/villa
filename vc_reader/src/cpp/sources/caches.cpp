@@ -451,6 +451,27 @@ void EncodedFiles::writeFile(const std::string& location, const std::string& pat
     budget->with_file(utf8String(fs::weakly_canonical(utf8Path(path))), write);
 }
 
+bool EncodedFiles::publishFile(const std::string& location, const std::string& path, std::size_t size,
+                               const std::function<bool(int fd)>& fill)
+{
+    std::vector<fs::path> roots;
+    std::optional<zarr::OpenOptions> options;
+    if (zarr::isRemote(location)) options = resolve(location, roots);
+    if (!options || roots.empty() || !options->cacheWrites) {
+        AtomicFile output(path);
+        try {
+            if (!fill(output.fd())) return false;
+            output.publish();
+        } catch (const std::exception&) {
+            return false;
+        }
+        return true;
+    }
+    auto budget = zarr::diskBudget(utf8String(roots.front()), options->cacheMaxBytes);
+    if (options->cacheMinFreeBytes) budget->set_min_free_bytes(*options->cacheMinFreeBytes);
+    return budget->publish_file(utf8String(fs::weakly_canonical(utf8Path(path))), size, fill);
+}
+
 EncodedFiles::Opened EncodedFiles::open(const std::string& location)
 {
     if (!zarr::isRemote(location)) {

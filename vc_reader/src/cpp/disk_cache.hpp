@@ -327,10 +327,12 @@ public:
     // account_file's) inside one transaction of the index, so no eviction, no
     // publication and no other with_file of this budget, in any process, comes
     // between the write and its accounting. `write(fits)` writes only after
-    // fits(total) accepts what the file will occupy (the floor, and the budget
-    // less reservations); it returns what the file occupies once done (nullopt:
-    // none there), which is charged as the newest entry, older files evicted to
-    // make room. The file is never charged less than it holds.
+    // fits(total) accepts what the file will occupy: the floor and the budget
+    // less reservations, older files evicted to make room before it returns
+    // true, so the disk never holds more than the budget while it writes. It
+    // returns what the file occupies once done (nullopt: none there), which is
+    // charged as the newest entry. The file is registered, so a write cut off
+    // by an interruption is measured when the index is next reconciled.
     void with_file(const std::string& path,
                    const std::function<std::optional<std::int64_t>(const std::function<bool(std::int64_t)>&)>& write)
     {
@@ -342,12 +344,18 @@ public:
             {
                 Statement s(db_, "SELECT size FROM chunks WHERE path=?");
                 s.text(1, path);
-                if (s.step()) before = sqlite3_column_int64(s.get(), 0);
+                if (s.step()) {
+                    before = sqlite3_column_int64(s.get(), 0);
+                    record(path, before);  // newest: room is made from older files
+                }
             }
             const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
             const std::function<bool(std::int64_t)> fits = [&](std::int64_t total) {
                 if (total < 0 || total > available) return false;
-                return total <= before || leaves_free_space(static_cast<std::size_t>(total - before));
+                const auto growth = total - before;
+                if (growth > 0 && !leaves_free_space(static_cast<std::size_t>(growth))) return false;
+                if (growth > 0) evict_to(available - growth);
+                return true;
             };
             const auto after = write(fits);
             if (after) {
@@ -365,6 +373,76 @@ public:
                 f.step();
             }
         });
+    }
+
+    // Writes `size` bytes as `path`, a file its owner rewrites whole under the
+    // root, the way open_file publishes a download: the bytes are reserved
+    // first (older files evicted to make room; the old file, if any, stays
+    // charged while both are on disk) and the free-space floor kept for all
+    // of them; `fill(fd)` writes them to a temporary that holds its lifetime
+    // lock, so an interrupted write is removed at the next start; `path` is
+    // registered before the temporary is renamed over it, so a file published
+    // just before an interruption is measured when the index is reconciled.
+    // False when it does not fit or `fill` fails (nothing is published).
+    bool publish_file(const std::string& path, std::size_t size, const std::function<bool(int fd)>& fill)
+    {
+        check_path(path);
+        std::unique_ptr<AtomicFile> output;
+        std::string temporary;
+        {
+            std::lock_guard lock(mutex_);
+            if (!reconciled_) transaction([&] { reconcile(); });
+            bool admitted = false;
+            transaction([&] {
+                const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
+                if (size > static_cast<std::uint64_t>(limit) || !leaves_free_space(size)) return;
+                auto reserved = reserved_bytes();
+                if (size > static_cast<std::uint64_t>(limit - reserved)) {
+                    clean_downloads();
+                    reserved = reserved_bytes();
+                    if (size > static_cast<std::uint64_t>(limit - reserved)) return;
+                }
+                evict_to(limit - reserved - static_cast<std::int64_t>(size));
+                output = std::make_unique<AtomicFile>(path);
+                temporary = output->temporary_path();
+                lock_file(output->fd());
+                record_download(temporary, size);
+                Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                f.text(1, path);
+                f.step();
+                admitted = true;
+            });
+            if (!admitted) return false;
+        }
+        bool filled = false;
+        try {
+            filled = fill(output->fd());
+        } catch (...) {
+            filled = false;
+        }
+        std::lock_guard lock(mutex_);
+        bool published = false;
+        try {
+            transaction([&] {
+                if (filled) {
+                    output->publish();
+                    record(path, occupied_bytes(utf8Path(path)));
+                    Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                    f.text(1, path);
+                    f.step();
+                    published = true;
+                }
+                output.reset();
+                forget_download(temporary);
+                evict_to(number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes());
+            });
+        } catch (...) {
+            try {
+                transaction([&] { output.reset(); forget_download(temporary); });
+            } catch (...) {}  // startup reclaims abandoned reservations
+            return false;
+        }
+        return published;
     }
 
 private:

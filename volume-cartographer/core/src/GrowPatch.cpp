@@ -1824,7 +1824,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     return sqrt(summary.final_cost/summary.num_residual_blocks);
 }
-QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlohmann::json &params, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
+static QuadSurface *tracer_body(vcr::Array& volume, float scale, cv::Vec3f origin, const nlohmann::json &params, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask, uint64_t& normal_read_failures)
 {
     if (volume.itemsize() != 1)
         throw std::runtime_error("the tracer reads uint8 volumes");
@@ -2027,6 +2027,13 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     // absent. A patch grown on that is not saved: snapshots stop and the
     // trace fails at the end instead of returning it.
     auto normal_grid_read_failures = [&]() -> uint64_t { return ngv ? ngv->readFailures() : 0; };
+    // However this returns (a grown patch, --inpaint, any later path), the
+    // count is reported to tracer(), which refuses the patch.
+    struct ReportReadFailures {
+        const vc::core::util::NormalGridVolume* volume;
+        uint64_t& out;
+        ~ReportReadFailures() { out = volume ? volume->readFailures() : 0; }
+    } report_read_failures{ngv.get(), normal_read_failures};
     std::atomic<bool> skipped_snapshot_reported{false};
     auto snapshot_allowed = [&]() {
         const uint64_t failures = normal_grid_read_failures();
@@ -2200,6 +2207,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         constexpr int margin = 4;
 
         for (int i = 0; i < static_cast<int>(contours.size()); ++i) {
+            if (normal_grid_read_failures()) break;  // not saved anyway (see tracer())
             if (hierarchy[i][3] == -1) {
                 ++inpaint_skip;
                 continue;
@@ -2986,6 +2994,7 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
     #pragma omp parallel for schedule(dynamic)
             for (int i = 0; i < contours.size(); i++) {
+                if (normal_grid_read_failures()) continue;  // not saved anyway (see tracer())
                 if (hierarchy[i][3] != -1) { // It's a hole
                     cv::Rect roi = cv::boundingRect(contours[i]);
 
@@ -3124,6 +3133,11 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         generation++;
         if (stop_gen && generation >= stop_gen)
             break;
+        if (const uint64_t failures = normal_grid_read_failures()) {
+            std::cerr << "normal grid reads failed " << failures << " time(s): stopping at generation " << generation
+                      << "; the patch will not be saved" << std::endl;
+            break;
+        }
 
         auto is_loc_valid = [&](const cv::Vec2i& p) {
             return bounds.contains(cv::Point(p[1], p[0])) &&
@@ -3455,11 +3469,6 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
     }  // end while fringe is non-empty
     delete timer;
 
-    if (const uint64_t failures = normal_grid_read_failures()) {
-        throw std::runtime_error("normal grid reads failed " + std::to_string(failures) +
-                                 " time(s) (see the messages above); the patch would be missing normal "
-                                 "constraints, so it is not saved");
-    }
 
     QuadSurface* surf = create_surface_from_state();
 
@@ -3475,5 +3484,22 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
                area_est_vx2);
     }
 
+    return surf;
+}
+
+QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlohmann::json &params, float voxelsize, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const nlohmann::json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
+{
+    uint64_t normal_read_failures = 0;
+    QuadSurface* surf = tracer_body(volume, scale, origin, params, voxelsize, resume_surf, tgt_path, meta_params,
+                                    corrections, allowed_growth_mask, normal_read_failures);
+    // A slice read a part at a time that could not be read (nor read whole)
+    // answered with no paths: its normals are missing, not absent. Callers
+    // save what tracer returns, so such a patch is not returned at all.
+    if (normal_read_failures) {
+        delete surf;
+        throw std::runtime_error("normal grid reads failed " + std::to_string(normal_read_failures) +
+                                 " time(s) (see the messages above); the patch would be missing normal "
+                                 "constraints, so it is not saved");
+    }
     return surf;
 }

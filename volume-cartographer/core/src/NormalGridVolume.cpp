@@ -215,6 +215,9 @@
          mutable std::shared_ptr<vcr::sources::EncodedFiles> files;
          // Shared with the range-read stores, which can outlive this volume.
          std::shared_ptr<std::atomic<uint64_t>> read_failures = std::make_shared<std::atomic<uint64_t>>(0);
+         // Set when a cached store's memory grew outside the cache's view (a
+         // range-read slice switched to its whole copy): resync at next lookup.
+         std::shared_ptr<std::atomic<bool>> resync_pending = std::make_shared<std::atomic<bool>>(false);
          mutable std::atomic<uint64_t> fetch_failures{0};
          mutable std::mutex fetch_error_mutex;
          mutable std::string last_fetch_error;
@@ -752,6 +755,10 @@
                     return after ? std::optional<std::int64_t>(static_cast<std::int64_t>(*after)) : std::nullopt;
                 });
             };
+            options.publish = [files = files, location](const std::string& path, uint64_t size,
+                                                        const std::function<bool(int)>& fill) {
+                return files->publishFile(location, path, static_cast<std::size_t>(size), fill);
+            };
             if (layout) {
                 options.layout = &*layout;
                 if (first_px && layout->cell) options.first = bucket_rect(*layout, *first_px);
@@ -883,8 +890,9 @@
                 }
                 if (found) {
                     if (byte_budget &&
-                        hits_since_resync.fetch_add(1, std::memory_order_relaxed)
-                            % kResyncEveryHits == kResyncEveryHits - 1) {
+                        (resync_pending->exchange(false, std::memory_order_acq_rel) ||
+                         hits_since_resync.fetch_add(1, std::memory_order_relaxed)
+                             % kResyncEveryHits == kResyncEveryHits - 1)) {
                         std::unique_lock<std::shared_mutex> lock(mutex);
                         resync_bytes_locked();
                         evict_to_budget_locked();
@@ -919,8 +927,11 @@
                             return nullptr;
                         }
                     };
-                    auto on_failure = [failures = read_failures] { failures->fetch_add(1, std::memory_order_relaxed); };
-                    grid_store = std::make_shared<GridStore>(std::move(*opened), std::move(whole_file), std::move(on_failure));
+                    GridStore::RemoteEvents events;
+                    events.failed = [failures = read_failures] { failures->fetch_add(1, std::memory_order_relaxed); };
+                    // Its memory now includes the whole copy: charged at the next lookup.
+                    events.readWhole = [pending = resync_pending] { pending->store(true, std::memory_order_release); };
+                    grid_store = std::make_shared<GridStore>(std::move(*opened), std::move(whole_file), std::move(events));
                 }
             }
             if (!grid_store) {
@@ -958,7 +969,8 @@
  
                 insert_locked(key, grid_store);
 
-                if (byte_budget && ++inserts_since_resync >= kResyncEveryInserts) {
+                if (byte_budget && (resync_pending->exchange(false, std::memory_order_acq_rel) ||
+                                    ++inserts_since_resync >= kResyncEveryInserts)) {
                     resync_bytes_locked();
                 }
                 evict_to_budget_locked();

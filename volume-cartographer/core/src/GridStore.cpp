@@ -266,6 +266,8 @@ public:
         return remote_ ? remote_->residentBytes() : 0;
     }
 
+    bool is_remote() const { return remote_ != nullptr; }
+
     size_t mapped_bytes() const {
         return mmapped_data_ ? mmapped_data_->size : 0;
     }
@@ -502,11 +504,11 @@ public:
 
     void load_remote(std::shared_ptr<RemoteGridFile> remote,
                      std::function<std::shared_ptr<const GridStore>()> whole_file,
-                     std::function<void()> on_failure = {}) {
+                     GridStore::RemoteEvents events = {}) {
         read_only_ = true;
         remote_ = std::move(remote);
         whole_loader_ = std::move(whole_file);
-        on_failure_ = std::move(on_failure);
+        events_ = std::move(events);
         mmapped_data_ = std::make_unique<MmappedData>();
         mmapped_data_->data = remote_->data();
         mmapped_data_->size = remote_->size();
@@ -940,7 +942,7 @@ private:
     // A remote store whose region could not be fetched switches, once, to the
     // file read whole (whole_loader_); whole_ then answers every query.
     std::function<std::shared_ptr<const GridStore>()> whole_loader_;
-    std::function<void()> on_failure_;
+    GridStore::RemoteEvents events_;
     mutable std::mutex whole_mutex_;
     mutable std::shared_ptr<const GridStore> whole_;
     // After a failed whole read, the next is tried no sooner than this, so an
@@ -948,11 +950,13 @@ private:
     mutable std::chrono::steady_clock::time_point whole_retry_at_{};
     mutable std::atomic<uint64_t> generation_{0};
 
+public:
     const GridStore* current_whole() const {
         if (!remote_) return nullptr;
         std::lock_guard<std::mutex> lock(whole_mutex_);
         return whole_.get();
     }
+private:
 
     // Runs `ensure` (fetch what a read needs) for a remote store. Returns the
     // store to read instead, when this one has switched to the whole file;
@@ -988,6 +992,7 @@ private:
                 }
                 if (whole_) {
                     generation_.fetch_add(1, std::memory_order_acq_rel);
+                    if (events_.readWhole) events_.readWhole();
                     std::cerr << "normal grid " << remote_->url() << ": range read failed (" << why
                               << "), read it whole instead" << std::endl;
                 } else {
@@ -998,7 +1003,7 @@ private:
         }
         generation_.fetch_add(1, std::memory_order_acq_rel);
         RemoteGridFile::reportFailure(remote_->url() + ": " + why);
-        if (on_failure_) on_failure_();
+        if (events_.failed) events_.failed();
         *failed = true;
         return nullptr;
     }
@@ -1042,9 +1047,9 @@ GridStore::GridStore(const std::string& path)
 
 GridStore::GridStore(std::shared_ptr<RemoteGridFile> remote,
                      std::function<std::shared_ptr<const GridStore>()> whole_file,
-                     std::function<void()> on_failure)
+                     RemoteEvents events)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) {
-    pimpl_->load_remote(std::move(remote), std::move(whole_file), std::move(on_failure));
+    pimpl_->load_remote(std::move(remote), std::move(whole_file), std::move(events));
 }
 
 uint64_t GridStore::generation() const {
@@ -1084,12 +1089,19 @@ cv::Size GridStore::size() const {
     return pimpl_->size();
 }
 
+// A store read a part at a time that switched to its slice read whole keeps
+// that copy, and is charged for it too.
 size_t GridStore::get_memory_usage() const {
-    return pimpl_->get_memory_usage();
+    const GridStore* whole = pimpl_->current_whole();
+    return pimpl_->get_memory_usage() + (whole ? whole->get_memory_usage() : 0);
 }
 
 size_t GridStore::residentBytes() const {
-    return pimpl_->mapped_bytes() + pimpl_->get_memory_usage();
+    const GridStore* whole = pimpl_->current_whole();
+    // A store read a part at a time holds what its mirror has been filled
+    // with, not the whole mapping it reserves.
+    const size_t mapped = pimpl_->is_remote() ? pimpl_->remote_resident_bytes() : pimpl_->mapped_bytes();
+    return mapped + pimpl_->get_memory_usage() + (whole ? whole->residentBytes() : 0);
 }
 
 size_t GridStore::remoteResidentBytes() const {

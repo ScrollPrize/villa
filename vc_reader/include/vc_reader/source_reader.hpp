@@ -207,6 +207,15 @@ public:
     void writeFile(const std::string& location, const std::string& path,
                    const std::function<std::optional<std::int64_t>(const Fits& fits)>& write);
 
+    // Writes such a file whole: `size` bytes, reserved in the budget before
+    // `fill(fd)` writes them to a temporary that is renamed over `path` (see
+    // DiskCache::publish_file: an interrupted write is reclaimed at the next
+    // start, and one published just before an interruption is still counted).
+    // Without a budget, a plain temporary-and-rename. False when it does not
+    // fit, or `fill` fails; then nothing is published.
+    [[nodiscard]] bool publishFile(const std::string& location, const std::string& path, std::size_t size,
+                                   const std::function<bool(int fd)>& fill);
+
     [[nodiscard]] std::size_t bytesRead() const { return bytesRead_; }
     [[nodiscard]] std::size_t cacheHits() const { return cacheHits_; }
     // Where files live when nothing can be kept; empty until one is needed.

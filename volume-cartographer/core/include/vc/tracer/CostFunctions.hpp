@@ -452,6 +452,10 @@ struct NormalConstraintPlane {
 
         if (z_min != -1 && query_point.z < z_min) return true;
         if (z_max != -1 && query_point.z > z_max) return true;
+        // Once a read has failed for good the patch is not saved (tracer() refuses
+        // it), so no more grids are read for it: in an outage, retrying every
+        // evaluation would only delay that answer.
+        if (normal_grid_volume.readFailures()) return true;
 
         // auto grid_query = normal_grid_volume.query(query_point, plane_idx);
         // if (!grid_query) {

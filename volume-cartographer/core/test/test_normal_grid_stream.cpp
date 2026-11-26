@@ -381,6 +381,43 @@ TEST_CASE("Range reads: when a grid's regions stop arriving, the grid is read wh
     CHECK(fs::is_regular_file(s.dir / "xy" / gridName(5)));
 }
 
+TEST_CASE("Range reads: a slice read whole after its regions stop arriving is charged to the grid cache")
+{
+    // The whole copy a slice keeps after the fallback counts against
+    // VC_GRID_CACHE_BYTES like any slice read whole: here it alone exceeds
+    // the budget, so the next lookup evicts down to one entry.
+    Streamed s;
+    RangeReads on;
+    {
+        vc::core::util::GridStore big(cv::Rect(0, 0, 4000, 3000), 32);
+        for (int y = 5; y < 3000; y += 37)
+            for (int x = 5; x < 4000; x += 41) big.add({cv::Point(x, y), cv::Point(x + 6, y + 3), cv::Point(x + 12, y + 1)});
+        big.save((s.store / "xy" / gridName(5)).string());
+    }
+    const auto budget = fs::file_size(s.store / "xy" / gridName(5)) / 2;
+    setenv("VC_GRID_CACHE_BYTES", std::to_string(budget).c_str(), 1);
+    std::atomic<bool> failRanges{false};
+    s.server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
+        if (request.path == "/ng/xy/" + gridName(5) && failRanges && !request.header("range").empty())
+            return LoopbackHttpServer::Response{500, "range reads are down", {}, false};
+        return std::nullopt;
+    });
+    {
+        NormalGridVolume volume(s.dir.string());
+        const auto grid = volume.get_grid(0, 5);
+        REQUIRE(grid != nullptr);
+        (void)grid->get(cv::Rect(100, 100, 200, 200));
+        const auto partial = grid->residentBytes();
+        CHECK(partial < budget);
+        failRanges = true;
+        CHECK(grid->get_all().size() == vc::core::util::GridStore((s.store / "xy" / gridName(5)).string()).get_all().size());
+        CHECK(grid->residentBytes() > budget);  // the whole copy is counted
+        REQUIRE(volume.get_grid(0, 4) != nullptr);   // the next lookup charges it
+        CHECK(volume.cacheStats().liveGridEntries == 1);
+    }
+    unsetenv("VC_GRID_CACHE_BYTES");
+}
+
 TEST_CASE("Range reads: in an outage a region that cannot be read is counted, not taken as empty, and reads after it")
 {
     // As main's whole-file path serves a slice read before an outage, while a

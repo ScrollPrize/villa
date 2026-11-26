@@ -85,6 +85,12 @@ public:
         using Fits = std::function<bool(uint64_t total)>;
         using Write = std::function<std::optional<uint64_t>(const Fits& fits)>;
         std::function<void(const std::string& path, const Write& write)> budgeted;
+        // Writes the pack whole (a new pack, or one rewritten to repair it):
+        // `publish(path, size, fill)` reserves `size` bytes in the budget,
+        // runs fill(fd) to write a temporary and renames it over `path`; an
+        // interrupted write is reclaimed (see EncodedFiles::publishFile).
+        // False: not published. Without it, a temporary and a rename here.
+        std::function<bool(const std::string& path, uint64_t size, const std::function<bool(int fd)>& fill)> publish;
     };
 
     // Replays the pack at local_path + ".ranges", or creates it when there is
@@ -149,6 +155,7 @@ private:
     std::string version_;
     bool in_memory_ = false;
     std::function<void(const std::string&, const Options::Write&)> budgeted_;
+    std::function<bool(const std::string&, uint64_t, const std::function<bool(int)>&)> publish_;
     void* map_ = nullptr;
     size_t size_ = 0;
 

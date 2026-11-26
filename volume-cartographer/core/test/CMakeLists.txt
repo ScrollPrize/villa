@@ -423,7 +423,11 @@ vc_add_test(NAME test_gridstore_branches)
 
 vc_add_test(NAME test_gridstore_malformed)
 
-vc_add_test(NAME test_remote_grid_file)
+# Range reads are POSIX-only (RemoteGridFile throws on Windows, where slices
+# are read whole).
+if(NOT WIN32)
+    vc_add_test(NAME test_remote_grid_file)
+endif()
 
 vc_add_test(NAME test_normalgridtools)
 

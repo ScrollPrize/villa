@@ -41,14 +41,19 @@ public:
     // not read. When a region cannot be fetched (after a retry), or the
     // remote file changed version, `whole_file` loads the file whole
     // the usual way, and this store answers every later query, and size(),
-    // from that copy, so a slice is read from one version. Without it, or
-    // when it fails too, the failure is reported (`on_failure` is called)
-    // and the region reads as empty; a later query tries both again.
-    // generation() changes whenever answers may have changed: on the switch
-    // to the whole copy and on each failed read.
+    // from that copy, so a slice is read from one version (and its memory
+    // counts that copy's). Without it, or when it fails too, the failure is
+    // reported (`events.failed` is called) and the region reads as empty; a
+    // later query tries both again. generation() changes whenever answers
+    // may have changed: on the switch to the whole copy (`events.readWhole`
+    // is called) and on each failed read.
+    struct RemoteEvents {
+        std::function<void()> failed;
+        std::function<void()> readWhole;
+    };
     explicit GridStore(std::shared_ptr<RemoteGridFile> remote,
                        std::function<std::shared_ptr<const GridStore>()> whole_file = {},
-                       std::function<void()> on_failure = {});
+                       RemoteEvents events = {});
     ~GridStore();
 
     void add(const std::vector<cv::Point>& points);

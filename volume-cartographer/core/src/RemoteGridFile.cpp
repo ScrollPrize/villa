@@ -231,6 +231,7 @@ void RemoteGridFile::reportFailure(const std::string& what)
 
 RemoteGridFile::RemoteGridFile(std::string url, const std::string& local_path, RangeFetcher fetcher, const Options& options)
     : url_(std::move(url)), pack_path_(local_path + ".ranges"), fetch_(std::move(fetcher)), budgeted_(options.budgeted),
+      publish_(options.publish),
       min_free_bytes_(options.min_free_bytes)
 {
     ++g_opens;
@@ -468,29 +469,40 @@ bool RemoteGridFile::writePack(const std::string& records)
     out += version_;
     put(out, crc32(out.data(), out.size()), 4);
     out += records;
-    // Written, renamed into place and charged with the budget held, so no
-    // eviction comes between charging the pack and publishing it.
+    // Old and new pack are both on disk until the rename: the floor is kept
+    // for all of the new one.
+    if (belowFloor(fs::path(pack_path_).parent_path(), min_free_bytes_, out.size())) {
+        pack_ino_ = 0;
+        return false;
+    }
+    struct stat st{};
+    const auto fill = [&](int fd) { return writeAll(fd, out) && ::fstat(fd, &st) == 0; };
     bool published = false;
-    withPack([&](const Options::Fits& fits) -> std::optional<uint64_t> {
-        if (!fits(out.size())) return fileSize(pack_path_);
+    if (publish_) {
+        // Reserved before it is written, reclaimed if interrupted, counted once published.
+        try {
+            published = publish_(pack_path_, out.size(), fill);
+        } catch (const std::exception&) {
+            published = false;
+        }
+    } else {
         const std::string temporary = pack_path_ + ".tmp." + std::to_string(::getpid());
         const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-        if (fd < 0) return fileSize(pack_path_);
-        struct stat st{};
-        const bool ok = writeAll(fd, out) && ::fstat(fd, &st) == 0;
-        ::close(fd);
-        if (!ok || ::rename(temporary.c_str(), pack_path_.c_str()) != 0) {
-            ::unlink(temporary.c_str());
-            return fileSize(pack_path_);
+        if (fd >= 0) {
+            const bool ok = fill(fd);
+            ::close(fd);
+            published = ok && ::rename(temporary.c_str(), pack_path_.c_str()) == 0;
+            if (!published) ::unlink(temporary.c_str());
         }
-        pack_dev_ = uint64_t(st.st_dev);
-        pack_ino_ = uint64_t(st.st_ino);
-        pack_identity_ = identity;
-        published = true;
-        return uint64_t(st.st_size);
-    });
-    if (!published) pack_ino_ = 0;
-    return published;
+    }
+    if (!published) {
+        pack_ino_ = 0;
+        return false;
+    }
+    pack_dev_ = uint64_t(st.st_dev);  // the temporary's inode, now the pack's
+    pack_ino_ = uint64_t(st.st_ino);
+    pack_identity_ = identity;
+    return true;
 }
 
 // A new file: the header, and with the plane's layout the first region's

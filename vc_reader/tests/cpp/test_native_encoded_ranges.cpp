@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <sys/wait.h>
 #include <chrono>
 #include <optional>
 #include <cstdio>
@@ -339,6 +340,69 @@ int main()
                             return std::nullopt;
                         });
         CHECK(ran);
+    }
+
+    // publishFile reserves before it writes, and an interrupted write is
+    // reclaimed: two writers that die just before the rename (as a killed
+    // process does) leave nothing a third cannot reclaim, and the disk stays
+    // within the limit. Each runs in its own process.
+    {
+        const auto crashRoot = root / "crash";
+        fs::create_directories(crashRoot);
+        const auto make = [crashRoot](const std::string& location) {
+            zarr::OpenOptions options;
+            options.access = zarr::resolveAccess(location, zarr::AuthMode::Anonymous);
+            options.cacheDirs = {crashRoot.string()};
+            options.cacheMaxBytes = 200;
+            return options;
+        };
+        const auto pack = zarr::decodedCachePath(crashRoot, server.url()).string() + ".ranges";
+        fs::create_directories(fs::path(pack).parent_path());
+        const auto write103 = [](int fd) {
+            const std::string bytes(103, 'p');
+            return ::write(fd, bytes.data(), bytes.size()) == 103;
+        };
+        for (int writer = 0; writer < 2; ++writer) {
+            const pid_t child = ::fork();
+            if (child == 0) {
+                sources::EncodedFiles files(make);
+                (void)files.publishFile(server.url(), pack, 103, [&](int fd) {
+                    write103(fd);
+                    ::_exit(0);  // interrupted after writing, before the rename
+                    return true;
+                });
+                ::_exit(1);
+            }
+            int status = 0;
+            ::waitpid(child, &status, 0);
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+        std::uintmax_t left = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(fs::path(pack).parent_path()))
+            if (entry.is_regular_file()) left += entry.file_size();
+        CHECK(left > 0);  // the interrupted temporaries are still there
+        {
+            // A new process's budget reclaims them. On a thread of its own, so
+            // its temporary is not named like the forked writers' (they share
+            // this process's naming), which would replace theirs by accident.
+            bool published = false;
+            std::thread third([&] {
+                sources::EncodedFiles files(make);
+                published = files.publishFile(server.url(), pack, 103, write103);
+            });
+            third.join();
+            CHECK(published);
+        }
+        std::uintmax_t onDisk = 0;
+        int temporaries = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(fs::path(pack).parent_path())) {
+            if (!entry.is_regular_file()) continue;
+            onDisk += entry.file_size();
+            if (entry.path().filename().string().find(".tmp.") != std::string::npos) ++temporaries;
+        }
+        CHECK(temporaries == 0);
+        CHECK(onDisk <= 200);
+        CHECK(fs::file_size(pack) == 103);
     }
 
     fs::remove_all(root);
