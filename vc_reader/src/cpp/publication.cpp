@@ -96,9 +96,10 @@ void renameNewDirectory(const fs::path& source, const fs::path& destination, con
         else fs::rename(source, destination);
     } catch (const fs::filesystem_error& error) {
         // NFS can report a rename that took effect as failed. The staging directory is
-        // gone only if it was renamed, so that counts as published.
+        // gone only if it was renamed, so that counts as published. A failed lookup does not.
         std::error_code ignored;
-        if (!fs::exists(fs::symlink_status(source, ignored)) && fs::is_directory(fs::symlink_status(destination, ignored)))
+        if (fs::symlink_status(source, ignored).type() == fs::file_type::not_found &&
+            fs::is_directory(fs::symlink_status(destination, ignored)))
             return;
         if (error.code() == std::errc::directory_not_empty || error.code() == std::errc::file_exists)
             throw destinationExists(source, destination);

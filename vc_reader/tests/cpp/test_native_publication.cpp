@@ -136,12 +136,17 @@ int main(int argc, char** argv)
     CHECK(fs::is_empty(root / "empty") && holds(root / "c.tmp", "c"));
 
     // A competitor that publishes at the destination just before the rename wins, and
-    // this save fails.
+    // this save fails. Windows reports access denied rather than EEXIST.
     const auto competitor = [&](const fs::path& from, const fs::path& to) {
         stage(to, "winner");
         fs::rename(from, to);
     };
-    CHECK(failure([&] { renameNewDirectory(root / "c.tmp", root / "d", competitor); }) == std::errc::file_exists);
+    const auto lost = failure([&] { renameNewDirectory(root / "c.tmp", root / "d", competitor); });
+#ifdef _WIN32
+    CHECK(lost);
+#else
+    CHECK(lost == std::errc::file_exists);
+#endif
     CHECK(holds(root / "d", "winner") && holds(root / "c.tmp", "c"));
 
     // A rename reported as failed after it took effect (NFS) counts as published.
