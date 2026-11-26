@@ -13,9 +13,16 @@ run-name: VC3D macOS ${{ github.event_name }} ${{ inputs.request_id || github.sh
 # feature first needs its Python environment. Those files go out with the app,
 # as the VC3D-macos-python-tools artifact, to every release the app goes to.
 #
-# No Developer ID signing / notarization: downloads are Gatekeeper-quarantined,
-# so the first launch is right-click -> Open (or
-# `xattr -dr com.apple.quarantine VC3D.app`).
+# With the Apple secrets below, the app and the DMG are signed with a Developer
+# ID and notarized (.github/mac-app/sign-macos.sh). Without them the app stays
+# ad-hoc signed: downloads are Gatekeeper-quarantined, so the first launch is
+# right-click -> Open (or `xattr -dr com.apple.quarantine VC3D.app`).
+#   MACOS_CERTIFICATE_P12        base64 of a .p12 with the Developer ID
+#                                Application certificate and its key
+#   MACOS_CERTIFICATE_PASSWORD   that .p12's password
+#   NOTARY_API_KEY               an App Store Connect API key (.p8 contents)
+#   NOTARY_API_KEY_ID            its key ID
+#   NOTARY_API_ISSUER_ID         its issuer ID
 #
 # Binaries link Homebrew bottles built for the runner's macOS release, so the
 # package effectively requires that macOS major version or newer (recorded as
@@ -249,6 +256,64 @@ jobs:
           trap - EXIT
 
           ls -la VC3D-*-macos-*.dmg VC3D-*-macos-*.zip
+
+      # a temporary keychain with the Developer ID certificate and the notary key
+      # in a file, both removed after signing; nothing happens without the secrets
+      - name: Set up Developer ID signing
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_API_KEY: ${{ secrets.NOTARY_API_KEY }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+        run: |
+          given=0
+          for name in MACOS_CERTIFICATE_P12 MACOS_CERTIFICATE_PASSWORD NOTARY_API_KEY NOTARY_API_KEY_ID NOTARY_API_ISSUER_ID; do
+            [[ -n ${!name} ]] && given=$((given + 1))
+          done
+          if [[ $given -eq 0 ]]; then
+            echo "::notice::No Apple signing secrets: the app stays ad-hoc signed and is not notarized"
+            exit 0
+          fi
+          [[ $given -eq 5 ]] || { echo "::error::set all five Apple signing secrets, or none"; exit 1; }
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(uuidgen)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          # keep the user's keychains in the search list after this one
+          read -r -a keychains <<< "$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')"
+          security list-keychains -d user -s "$keychain" "${keychains[@]}"
+          identity=$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          [[ -n $identity ]] || { echo "::error::no Developer ID Application identity in MACOS_CERTIFICATE_P12"; exit 1; }
+          printf '%s\n' "$NOTARY_API_KEY" > "$RUNNER_TEMP/notary-key.p8"
+          {
+            echo "SIGN_IDENTITY=$identity"
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/notary-key.p8"
+            echo "NOTARY_KEY_ID=$NOTARY_API_KEY_ID"
+            echo "NOTARY_ISSUER_ID=$NOTARY_API_ISSUER_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Sign and notarize (DMG + ZIP)
+        if: env.SIGN_IDENTITY != ''
+        working-directory: volume-cartographer/build-macos
+        run: |
+          dmg=$(echo VC3D-*-macos-*.dmg)
+          ../../.github/mac-app/sign-macos.sh "$dmg" "${dmg%.dmg}.zip"
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/notary-key.p8"
+          if [[ -f "$RUNNER_TEMP/signing.keychain-db" ]]; then
+            security delete-keychain "$RUNNER_TEMP/signing.keychain-db"
+          fi
 
       - name: Upload app artifact
         uses: actions/upload-artifact@v4

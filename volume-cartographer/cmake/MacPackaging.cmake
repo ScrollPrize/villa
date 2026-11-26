@@ -10,8 +10,10 @@
 #
 # Everything is ad-hoc signed (codesign -s -): arm64 macOS refuses to load
 # binaries whose linker signature was invalidated by install-name rewriting.
-# There is no Developer ID / notarization, so downloads stay quarantined —
-# first launch of the app is right-click -> Open.
+# A Developer ID signature and notarization are added afterwards when the
+# release workflow has the Apple secrets (.github/mac-app/sign-macos.sh);
+# without them downloads stay quarantined, and the first launch of the app is
+# right-click -> Open.
 
 if(NOT APPLE OR NOT VC_BUILD_APPS)
     return()
