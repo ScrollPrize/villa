@@ -1,6 +1,7 @@
 #include "SpiralServiceManager.hpp"
 
 #include "PythonExecutable.hpp"
+#include "PythonToolsInstaller.hpp"
 #include "SpiralArtifactCache.hpp"
 #include "SpiralArtifactPins.hpp"
 #include "SpiralPreviewProvenance.hpp"
@@ -27,6 +28,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProcessEnvironment>
 #include <QPushButton>
 #include <QRandomGenerator>
@@ -178,14 +180,26 @@ bool SpiralServiceManager::ownsProcess() const
     return _process && _process->state() != QProcess::NotRunning;
 }
 
-QString SpiralServiceManager::findPython() const
+QString SpiralServiceManager::chosenPython() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString condaPrefix = qEnvironmentVariable("CONDA_PREFIX");
     const QStringList candidates{
         settings.value(QStringLiteral("spiral/python")).toString(),
         qEnvironmentVariable("SPIRAL_PYTHON"),
         qEnvironmentVariable("PYTHON_EXECUTABLE"),
-        QDir(qEnvironmentVariable("CONDA_PREFIX")).filePath(QStringLiteral("bin/python")),
+        condaPrefix.isEmpty() ? QString() : QDir(condaPrefix).filePath(QStringLiteral("bin/python")),
+    };
+    for (const QString& candidate : candidates)
+        if (!candidate.isEmpty() && QFileInfo(candidate).isExecutable()) return QFileInfo(candidate).absoluteFilePath();
+    return {};
+}
+
+QString SpiralServiceManager::findPython() const
+{
+    const QString chosen = chosenPython();
+    if (!chosen.isEmpty()) return chosen;
+    const QStringList candidates{
         vc3d::installedPythonEnvironment(QStringLiteral("spiral")),
         QStandardPaths::findExecutable(QStringLiteral("python3")),
         QStandardPaths::findExecutable(QStringLiteral("python")),
@@ -331,6 +345,16 @@ void SpiralServiceManager::startLocalProcess()
         return;
     }
     _waitingForLocalStore = false;
+    // after an install from the prompt, start the service this connection was waiting for, unless the user moved on
+    const auto retry = [self = QPointer<SpiralServiceManager>(this)] {
+        if (self && self->_connectionState == ConnectionState::Failed) {
+            self->connectToService(self->_profile);
+        }
+    };
+    if (!vc3d::requirePythonTools(tr("Spiral"), QStringLiteral("spiral"), chosenPython(), nullptr, retry)) {
+        setConnectionState(ConnectionState::Failed, vc3d::pythonToolsMissingMessage(tr("Spiral")));
+        return;
+    }
     QString outputRoot = _profile.outputRoot.trimmed();
     if (outputRoot.isEmpty())
         outputRoot = defaultLocalOutputRoot(_localStorePath);

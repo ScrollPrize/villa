@@ -115,6 +115,9 @@ public:
     /** Locate a config beside the Lasagna service checkout. */
     static QString findConfigFile(const QString& fileName);
 
+    /** The interpreter the user chose for Lasagna (PYTHON_EXECUTABLE or the active conda env), or empty. */
+    static QString chosenPython();
+
     /** Fetch available datasets from the connected service (GET /datasets). */
     void fetchDatasets();
 

@@ -74,6 +74,14 @@ namespace project {
 }
 
 // -----------------------------------------------------------------------------
+// Python Tools Settings
+// -----------------------------------------------------------------------------
+namespace python_tools {
+    // Set by "Don't ask again" when a feature offers to install the bundled Python tools
+    constexpr auto SKIP_INSTALL_PROMPT = "python_tools/skip_install_prompt";
+}
+
+// -----------------------------------------------------------------------------
 // Object Store Settings
 // -----------------------------------------------------------------------------
 namespace object_store {

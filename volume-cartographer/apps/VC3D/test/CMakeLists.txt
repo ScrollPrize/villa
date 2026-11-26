@@ -667,6 +667,7 @@ add_executable(test_spiral_service_protocol
     ../SpiralServiceManager.cpp ../SpiralServiceManager.hpp
     ../SpiralServiceManagerInputs.cpp
     ../PythonExecutable.cpp ../PythonExecutable.hpp
+    ../PythonToolsInstaller.cpp ../PythonToolsInstaller.hpp
     ../SpiralArtifactCache.cpp ../SpiralArtifactCache.hpp
     ../SpiralSshTunnel.cpp ../SpiralSshTunnel.hpp
     ../SpiralStoreInputs.cpp ../SpiralStoreInputs.hpp

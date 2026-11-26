@@ -28,6 +28,24 @@ bool isExecutableFile(const QString& path)
     return info.isFile() && info.isExecutable();
 }
 
+// the python of the active virtualenv, else of the active conda env
+QString activeEnvironmentPython()
+{
+    for (const char* variable : {"VIRTUAL_ENV", "CONDA_PREFIX"}) {
+        const QString prefix = qEnvironmentVariable(variable);
+        if (prefix.isEmpty()) {
+            continue;
+        }
+        for (const char* name : {"bin/python", "bin/python3"}) {
+            const QString candidate = QDir(prefix).filePath(QString::fromLatin1(name));
+            if (isExecutableFile(candidate)) {
+                return candidate;
+            }
+        }
+    }
+    return {};
+}
+
 }  // namespace
 
 QString installedPythonToolsRoot()
@@ -77,17 +95,9 @@ QString pythonExecutableForServices(const QString& preferred)
     if (!preferred.trimmed().isEmpty()) {
         return QDir::cleanPath(QFileInfo(preferred.trimmed()).absoluteFilePath());
     }
-    for (const char* variable : {"VIRTUAL_ENV", "CONDA_PREFIX"}) {
-        const QString prefix = qEnvironmentVariable(variable);
-        if (prefix.isEmpty()) {
-            continue;
-        }
-        for (const char* name : {"bin/python", "bin/python3"}) {
-            const QString candidate = QDir(prefix).filePath(QString::fromLatin1(name));
-            if (isExecutableFile(candidate)) {
-                return candidate;
-            }
-        }
+    const QString active = activeEnvironmentPython();
+    if (!active.isEmpty()) {
+        return active;
     }
     // the neural tracer and fibre follow run from the vesuvius package
     const QString installed = installedPythonEnvironment(QStringLiteral("vesuvius"));
@@ -101,6 +111,16 @@ QString pythonExecutableForServices(const QString& preferred)
         }
     }
     return QStringLiteral("python3");
+}
+
+QString chosenPythonForServices(const QString& preferred)
+{
+    const QString trimmed = preferred.trimmed();
+    if (trimmed.isEmpty()) {
+        return activeEnvironmentPython();
+    }
+    const QString path = QDir::cleanPath(QFileInfo(trimmed).absoluteFilePath());
+    return isExecutableFile(path) ? path : QString();
 }
 
 void rememberLaunchEnvironmentValue(const char* name)

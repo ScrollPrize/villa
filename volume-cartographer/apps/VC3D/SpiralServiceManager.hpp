@@ -330,6 +330,9 @@ private:
                                                const QJsonObject& body)>;
 
     QString findPython() const;
+    // The interpreter the user chose for Spiral (VC3D's [spiral] python, SPIRAL_PYTHON, PYTHON_EXECUTABLE or the
+    // active conda env), or empty
+    QString chosenPython() const;
     void setConnectionState(ConnectionState state, const QString& message = {});
     void startLocalProcess();
     void startTunnel();

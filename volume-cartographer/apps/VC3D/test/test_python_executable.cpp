@@ -87,6 +87,26 @@ private slots:
         QCOMPARE(pythonExecutableForServices("/opt/chosen/bin/python"), QString("/opt/chosen/bin/python"));
     }
 
+    // what the install prompt checks before asking: only a Python the user set up counts, never the installed
+    // tools or a python3 on PATH
+    void chosenPythonIsOnlyOneTheUserSetUp()
+    {
+        makeExecutable(_root.filePath("envs/vesuvius/bin/python"));
+        QVERIFY(markInstalled(_root.filePath("envs/vesuvius")));
+        QVERIFY(chosenPythonForServices().isEmpty());
+        QVERIFY(!pythonExecutableForServices().isEmpty());
+
+        QTemporaryDir own;
+        QVERIFY(chosenPythonForServices(own.filePath("missing/bin/python")).isEmpty());
+        const QString preferred = makeExecutable(own.filePath("tools/bin/python"));
+        QCOMPARE(chosenPythonForServices(preferred), preferred);
+
+        const QString conda = makeExecutable(own.filePath("conda/bin/python"));
+        qputenv("CONDA_PREFIX", own.filePath("conda").toUtf8());
+        QCOMPARE(chosenPythonForServices(), conda);
+        QCOMPARE(chosenPythonForServices(preferred), preferred);
+    }
+
     void pythonServicesGetTheLaunchValuesBack()
     {
         qputenv("VC3D_TEST_THREADS", "8");

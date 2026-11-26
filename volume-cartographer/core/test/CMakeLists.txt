@@ -191,6 +191,7 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/LasagnaBatchWindow.cpp
             test_lasagna_service_manager_stub.cpp
+            test_python_tools_stub.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/OpenedVolumes.cpp

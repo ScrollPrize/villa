@@ -32,6 +32,13 @@ QString installedPythonToolsSource(const QString& relative);
 // site-packages stay in effect.
 QString pythonExecutableForServices(const QString& preferred = {});
 
+// The interpreter the user chose for the services VC3D starts, or empty:
+// `preferred` when it is an executable file, else the python of the active
+// virtualenv or conda env. Unlike pythonExecutableForServices it never falls
+// back to the installed Python tools or to PATH, so a feature can tell
+// whether the user set up a Python of their own.
+QString chosenPythonForServices(const QString& preferred = {});
+
 // Records `name` as VC3D was launched with it (set or unset), before VC3D
 // overrides it for its own process, such as the OMP_NUM_THREADS=1 cap at
 // startup. Only the first call for a name counts. Safe to call before static

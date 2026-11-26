@@ -224,6 +224,8 @@ private:
     QAction* _exitAct{nullptr};
     QAction* _keybindsAct{nullptr};
     QAction* _aboutAct{nullptr};
+    QAction* _installPythonToolsAct{nullptr};
+    QAction* _removePythonToolsAct{nullptr};
     QAction* _resetViewsAct{nullptr};
     QAction* _showConsoleAct{nullptr};
     QAction* _drawBBoxAct{nullptr};

@@ -91,7 +91,8 @@ bool isTransportError(const QNetworkReply* reply)
         && !reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).isValid();
 }
 
-QString findPythonExecutable()
+// interpreters the user named, before the ones VC3D looks for on its own
+QStringList chosenPythonCandidates()
 {
     QStringList candidates;
 
@@ -105,6 +106,12 @@ QString findPythonExecutable()
         candidates.append(QDir(condaPrefix).filePath("bin/python"));
         candidates.append(QDir(condaPrefix).filePath("bin/python3"));
     }
+    return candidates;
+}
+
+QString findPythonExecutable()
+{
+    QStringList candidates = chosenPythonCandidates();
 
     const QString installed = vc3d::installedPythonEnvironment(QStringLiteral("lasagna"));
     if (!installed.isEmpty()) {
@@ -573,6 +580,16 @@ bool LasagnaServiceManager::isRunning() const
         return _serviceReady;
     }
     return _process && _process->state() == QProcess::Running && _serviceReady;
+}
+
+QString LasagnaServiceManager::chosenPython()
+{
+    for (const QString& candidate : chosenPythonCandidates()) {
+        if (QFileInfo(candidate).isExecutable()) {
+            return QFileInfo(candidate).absoluteFilePath();
+        }
+    }
+    return {};
 }
 
 QString LasagnaServiceManager::findConfigFile(const QString& fileName)
