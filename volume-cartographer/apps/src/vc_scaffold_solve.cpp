@@ -148,6 +148,8 @@ ScaffoldMeasuredOptions measuredOptionsFrom(const Json& cfg)
     options.parallelWeight = weights.value("parallel", options.parallelWeight);
     options.enclosureWeight = weights.value("enclosure", options.enclosureWeight);
     options.signWeight = weights.value("sign", options.signWeight);
+    options.approvedSignFactor = weights.value("sign_approved_factor", options.approvedSignFactor);
+    options.reviewedWeight = weights.value("reviewed", options.reviewedWeight);
     options.crossingConfidence = weights.value("crossing_confidence", options.crossingConfidence);
     options.perpendicularOffset = section.value("perpendicular_offset", options.perpendicularOffset);
     options.windingScale = section.value("winding_scale", options.windingScale);
@@ -219,7 +221,10 @@ ScaffoldSolveOptions solveOptionsFrom(const Json& cfg)
     const auto lemon = cfg.value("lemon", Json::object());
     options.flow.backend = vc::geometry::parseWindingFlowBackend(lemon.value("backend", std::string{"network_simplex"}));
     options.flow.capacityScale = lemon.value("capacity_scale", std::int64_t{1000});
-    options.fixApprovedSubgraphs = cfg.value("fix_approved_subgraphs", true);
+    const auto continuation = cfg.value("continuation", Json::object());
+    options.continuation.enabled = continuation.value("enabled", options.continuation.enabled);
+    options.continuation.weight = continuation.value("weight", options.continuation.weight);
+    options.continuation.intervalVx = continuation.value("interval_vx", options.continuation.intervalVx);
     options.maxAlternativePaths = cfg.value("max_alternative_paths", std::int64_t{4});
     options.workers = cfg.value("workers", std::size_t{1});
     return options;
@@ -272,8 +277,7 @@ Json constraintJson(const ScaffoldGraph& graph, const ScaffoldConstraint& constr
                {"arc_b_vx", constraint.arcB},
                {"step", constraint.step},
                {"target", constraint.target},
-               {"weight", constraint.weight},
-               {"approved", constraint.approved}};
+               {"weight", constraint.weight}};
     if (constraint.link >= 0) value["link"] = graph.links[std::size_t(constraint.link)].uuid;
     return value;
 }
@@ -327,6 +331,7 @@ int run(const std::string& configPath)
     ScaffoldMeasuredReport measuredReport;
     ScaffoldSignResult signs;
     ScaffoldApprovalReport approvalReport;
+    vc::fiber_graph::ScaffoldFacingReport facingReport;
     std::vector<ScaffoldCrossing> crossings;
     std::vector<ScaffoldConstraint> measured;
     double normalSeconds = 0, eventSeconds = 0, signSeconds = 0, measuredSeconds = 0;
@@ -449,6 +454,8 @@ int run(const std::string& configPath)
         events = scaffoldEvents(graph, geometry, *normals, *eventOptions, distances, eventReport);
         eventSeconds = seconds(started);
         started = Clock::now();
+        facingReport = vc::fiber_graph::scaffoldFaceApprovedNormals(graph, geometry, *normals, events, *normalOptions,
+                                                                    *eventOptions, *signOptions, eventReport);
         signs = scaffoldNormalSigns(graph, *normals, events, *signOptions);
         signSeconds = seconds(started);
         started = Clock::now();
@@ -464,7 +471,7 @@ int run(const std::string& configPath)
     //   winding_store the volume's winding result store (families and solved windings)
     //   winding_run   optional run UUID when the store holds several
     //   weights       optional perpendicular / parallel / sign weights of the cross constraints
-    //                 (default 1 / 0 / 100)
+    //                 (default 1 / 0 / 3)
     //   output        the constraints as doubles, 11 per row: scaffold fiber, volume fiber, kind,
     //                 target, weight, winding distance, placed, step, residual, arc on the scaffold
     //                 fiber, arc on the volume fiber; `<output>.json` names the fibers
@@ -512,7 +519,7 @@ int run(const std::string& configPath)
         comparisonOptions.events = *eventOptions;
         // The cross constraints are weighed on their own, whatever the scaffold solve itself used
         // (a links-only solve has no measured weights): the measured defaults, perpendicular 1 and
-        // sign 100, or field_comparison.weights; the crossing evidence and filter are the run's.
+        // sign 3, or field_comparison.weights; the crossing evidence and filter are the run's.
         comparisonOptions.measured = *measuredOptions;
         {
             const ScaffoldMeasuredOptions defaults;
@@ -569,7 +576,8 @@ int run(const std::string& configPath)
     std::vector<ScaffoldNormalFlip> flips;
     ScaffoldNormalFlipReport flipReport;
     if (normals) flips = scaffoldLinkNormalFlips(graph, geometry, *normals, signs.sign, result.constraints, flipReport);
-    // The stretches to look at for the violated sign constraints.
+    // The stretches to approve, for the report: derived from this solve and the approvals read
+    // with the graph. They are not stored with the run.
     ScaffoldStretchReport stretchReport;
     const auto stretches = scaffoldStretches(graph, geometry, result, {}, stretchReport);
 
@@ -599,8 +607,8 @@ int run(const std::string& configPath)
                        {"arcs", std::int64_t(result.arcs.size())},
                        {"components", result.components},
                        {"isolated_fibers", result.isolatedFibers},
-                       {"approved_subgraphs", result.approvedSubgraphs},
-                       {"contracted_fibers", result.contractedFibers},
+                       {"continuation_links", result.continuationLinks},
+                       {"continuation_links_broken", result.brokenContinuations},
                        {"weighted_l1_turns", result.objective},
                        {"max_residual_turns", result.maxResidual},
                        {"split_fibers", result.splitFibers},
@@ -638,7 +646,9 @@ int run(const std::string& configPath)
                           {"manual_weight", options.links.weight},
                           {"lemon_backend", vc::geometry::windingFlowBackendName(options.flow.backend)},
                           {"lemon_capacity_scale", options.flow.capacityScale},
-                          {"fix_approved_subgraphs", options.fixApprovedSubgraphs},
+                          {"continuation_links", options.continuation.enabled},
+                          {"continuation_weight", options.continuation.weight},
+                          {"continuation_interval_vx", options.continuation.intervalVx},
                           {"max_alternative_paths", options.maxAlternativePaths},
                           {"constraints_enabled", measure}}}};
 
@@ -737,9 +747,17 @@ int run(const std::string& configPath)
                                                {"direct", measuredReport.statedDirect},
                                                {"distant_kept", measuredReport.statedDistantKept},
                                                {"distant_dropped", measuredReport.statedDistantDropped},
-                                               {"without_sign", measuredReport.statedWithoutSign},
-                                               {"rigid", measuredReport.statedRigid},
-                                               {"without_pieces", measuredReport.statedWithoutPieces}};
+                                               {"without_sign", measuredReport.statedWithoutSign}};
+        summary["approved_normals"] = Json{{"stretches", facingReport.stretches},
+                                           {"objects", facingReport.objects},
+                                           {"crossings", facingReport.crossings},
+                                           {"objects_faced_by_neighbours", facingReport.facedByNeighbours},
+                                           {"neighbour_samples", facingReport.samples},
+                                           {"weakest_agreement_share", facingReport.weakestAgreement},
+                                           {"faced_fibers", normals->report().facedFibers},
+                                           {"gaps_unrolled", normals->report().unrolledGaps},
+                                           {"sign_constraints_on_approved_normals",
+                                            measuredReport.signOnApprovedNormals}};
     }
 
     if (persist) {
@@ -759,11 +777,10 @@ int run(const std::string& configPath)
             stages.signOptions = &*signOptions;
             stages.signs = &signs;
             stages.approvals = &approvalReport;
+            stages.facing = &facingReport;
             stages.crossings = &crossings;
             stages.flips = &flips;
             stages.flipReport = &flipReport;
-            stages.stretches = &stretches;
-            stages.stretchReport = &stretchReport;
         }
         const auto rows = scaffoldSolveRunRows(graph, result, options, record, stages);
         auto txn = store.write();

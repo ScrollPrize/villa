@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <stdexcept>
 
@@ -24,6 +25,63 @@ double length(const geometry::Point& value)
 
 std::int64_t familyIndex(ScaffoldFamily family) { return std::int64_t(family); }
 
+} // namespace
+
+namespace {
+// Each perpendicular crossing followed through its two fibers' normal
+// surfaces. Computed on every run: the findings depend on the run's normals,
+// not only on the geometry the cache keys the crossings by.
+void crossingFindings(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                      const std::function<std::optional<geometry::Point>(std::size_t, double)>& normalOf,
+                      const ScaffoldEventOptions& options, std::vector<ScaffoldEvent>& events,
+                      ScaffoldEventReport& report)
+{
+    if (!options.crossingFindings) return;
+    // The strip normals of every fiber at a regular arc spacing, then each
+    // perpendicular crossing through its two fibers' surfaces. Computed on
+    // every run: the findings depend on the run's normals, not only on the
+    // geometry the cache keys the crossings by.
+    if (!(options.crossingSampleSpacing > 0))
+        throw std::invalid_argument("scaffold constraints: the crossing sample spacing must be positive");
+    std::vector<std::vector<fiber_tracer::FiberStripSample>> samples(graph.fibers.size());
+    std::vector<char> needed(graph.fibers.size(), 0);
+    for (const auto& event : events)
+        if (!event.parallel && event.validA && event.validB && event.a != event.b)
+            needed[std::size_t(event.a)] = needed[std::size_t(event.b)] = 1;
+    const auto threads = std::max<std::size_t>(1, options.workers ? options.workers : std::thread::hardware_concurrency());
+    const auto parallel = [&](std::size_t count, const auto& body) {
+        std::atomic<std::size_t> next{0};
+        std::vector<std::thread> pool;
+        const auto work = [&] { for (std::size_t i; (i = next.fetch_add(1)) < count;) body(i); };
+        for (std::size_t t = 1; t < std::min(threads, count); ++t) pool.emplace_back(work);
+        work();
+        for (auto& thread : pool) thread.join();
+    };
+    parallel(graph.fibers.size(), [&](std::size_t fiber) {
+        if (!needed[fiber]) return;
+        const double length = geometry.arcLength(fiber);
+        for (double arc = 0; arc <= length; arc += options.crossingSampleSpacing) {
+            const auto normal = normalOf(fiber, arc);
+            if (!normal) continue;
+            const auto point = geometry.packed().sample(std::int64_t(fiber), arc).point;
+            samples[fiber].push_back({arc, {point[0], point[1], point[2]}, {(*normal)[0], (*normal)[1], (*normal)[2]}, {0, 0, 0}});
+        }
+    });
+    std::atomic<std::int64_t> asked{0}, found{0};
+    parallel(events.size(), [&](std::size_t index) {
+        auto& event = events[index];
+        if (event.parallel || !event.validA || !event.validB || event.a == event.b) return;
+        const auto findings = fiber_tracer::fiberCrossingFindings(
+            samples[std::size_t(event.a)], samples[std::size_t(event.b)], event.arcA, event.arcB,
+            options.crossingSurface, options.crossingFilter, options.crossingEncounterArcGap);
+        event.crossingFindings = findings.findings;
+        event.crossingAlternative = findings.alternative;
+        ++asked;
+        found += (findings.findings & ~geometry::crossing_finding::Matched) != 0;
+    });
+    report.crossingsAsked = asked.load();
+    report.crossingsWithFindings = found.load();
+}
 } // namespace
 
 std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
@@ -323,55 +381,189 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph& graph, const Scaf
         ++report.rejectedGap;
         return true;
     });
-    if (options.crossingFindings) {
-        // The strip normals of every fiber at a regular arc spacing, then each
-        // perpendicular crossing through its two fibers' surfaces. Computed on
-        // every run: the findings depend on the run's normals, not only on the
-        // geometry the cache keys the crossings by.
-        if (!(options.crossingSampleSpacing > 0))
-            throw std::invalid_argument("scaffold constraints: the crossing sample spacing must be positive");
-        std::vector<std::vector<fiber_tracer::FiberStripSample>> samples(graph.fibers.size());
-        std::vector<char> needed(graph.fibers.size(), 0);
-        for (const auto& event : events)
-            if (!event.parallel && event.validA && event.validB && event.a != event.b)
-                needed[std::size_t(event.a)] = needed[std::size_t(event.b)] = 1;
-        const auto threads = std::max<std::size_t>(1, options.workers ? options.workers : std::thread::hardware_concurrency());
-        const auto parallel = [&](std::size_t count, const auto& body) {
-            std::atomic<std::size_t> next{0};
-            std::vector<std::thread> pool;
-            const auto work = [&] { for (std::size_t i; (i = next.fetch_add(1)) < count;) body(i); };
-            for (std::size_t t = 1; t < std::min(threads, count); ++t) pool.emplace_back(work);
-            work();
-            for (auto& thread : pool) thread.join();
-        };
-        parallel(graph.fibers.size(), [&](std::size_t fiber) {
-            if (!needed[fiber]) return;
-            const double length = geometry.arcLength(fiber);
-            for (double arc = 0; arc <= length; arc += options.crossingSampleSpacing) {
-                const auto normal = normalOf(fiber, arc);
-                if (!normal) continue;
-                const auto point = geometry.packed().sample(std::int64_t(fiber), arc).point;
-                samples[fiber].push_back({arc, {point[0], point[1], point[2]}, {(*normal)[0], (*normal)[1], (*normal)[2]}, {0, 0, 0}});
-            }
-        });
-        std::atomic<std::int64_t> asked{0}, found{0};
-        parallel(events.size(), [&](std::size_t index) {
-            auto& event = events[index];
-            if (event.parallel || !event.validA || !event.validB || event.a == event.b) return;
-            const auto findings = fiber_tracer::fiberCrossingFindings(
-                samples[std::size_t(event.a)], samples[std::size_t(event.b)], event.arcA, event.arcB,
-                options.crossingSurface, options.crossingFilter, options.crossingEncounterArcGap);
-            event.crossingFindings = findings.findings;
-            event.crossingAlternative = findings.alternative;
-            ++asked;
-            found += (findings.findings & ~geometry::crossing_finding::Matched) != 0;
-        });
-        report.crossingsAsked = asked.load();
-        report.crossingsWithFindings = found.load();
-    }
+    crossingFindings(graph, geometry, normalOf, options, events, report);
     report.events = std::int64_t(events.size());
     report.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return events;
+}
+
+void scaffoldRefreshEventNormals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                 const ScaffoldNormals& normals, const ScaffoldEventOptions& options,
+                                 std::vector<ScaffoldEvent>& events, ScaffoldEventReport& report)
+{
+    const std::function<std::optional<geometry::Point>(std::size_t, double)> normalOf =
+        [&](std::size_t fiber, double arc) {
+            return options.normalAt ? options.normalAt(fiber, arc) : normals.at(fiber, arc);
+        };
+    report.withoutNormals = 0;
+    for (auto& event : events) {
+        const auto normalA = normalOf(std::size_t(event.a), event.arcA);
+        const auto normalB = normalOf(std::size_t(event.b), event.arcB);
+        event.validA = normalA.has_value();
+        event.validB = normalB.has_value();
+        event.normalA = normalA.value_or(geometry::Point{});
+        event.normalB = normalB.value_or(geometry::Point{});
+        if (!event.validA || !event.validB) ++report.withoutNormals;
+        event.crossingFindings = 0;
+        event.crossingAlternative = 0;
+    }
+    crossingFindings(graph, geometry, normalOf, options, events, report);
+}
+
+std::vector<ScaffoldApprovedFacing> scaffoldApprovedFacing(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                                           const ScaffoldNormals& normals,
+                                                           std::span<const ScaffoldEvent> events,
+                                                           const ScaffoldNormalOptions& normalOptions,
+                                                           const ScaffoldSignOptions& signs,
+                                                           ScaffoldFacingReport& report)
+{
+    report = ScaffoldFacingReport{};
+    // The stretches approved for normals, per fiber in arc order.
+    std::vector<ScaffoldApprovedFacing> stretches;
+    std::vector<std::pair<std::size_t, std::size_t>> ofFiber(graph.fibers.size(), {0, 0});
+    for (std::size_t i = 0; i < graph.fibers.size(); ++i) {
+        ofFiber[i].first = stretches.size();
+        if (normals.solved(i)) {
+            std::vector<std::pair<double, double>> ranges;
+            for (const auto& [from, to] : graph.fibers[i].approval.approvedNormals)
+                ranges.emplace_back(geometry.arcAtLineIndex(i, from), geometry.arcAtLineIndex(i, to));
+            for (const auto& [from, to] : scaffoldMergeApprovedRanges(std::move(ranges)))
+                stretches.push_back({std::int64_t(i), from, to, 1});
+        }
+        ofFiber[i].second = stretches.size();
+    }
+    report.stretches = std::int64_t(stretches.size());
+    if (stretches.empty()) return stretches;
+    const auto stretchAt = [&](std::int64_t fiber, double arc) -> std::int64_t {
+        for (auto at = ofFiber[std::size_t(fiber)].first; at < ofFiber[std::size_t(fiber)].second; ++at)
+            if (arc >= stretches[at].arcFrom && arc <= stretches[at].arcTo) return std::int64_t(at);
+        return -1;
+    };
+    // Union-find with the facing of each stretch relative to its root.
+    std::vector<std::size_t> parent(stretches.size());
+    std::vector<int> flip(stretches.size(), 1);
+    for (std::size_t i = 0; i < parent.size(); ++i) parent[i] = i;
+    const auto facingOf = [&](std::size_t x) {
+        int sign = 1;
+        while (parent[x] != x) {
+            sign *= flip[x];
+            x = parent[x];
+        }
+        return std::pair{x, sign};
+    };
+    const auto place = [&](std::int64_t fiber, double arc) {
+        const auto& entry = graph.fibers[std::size_t(fiber)];
+        char buffer[64];
+        std::snprintf(buffer, sizeof buffer, " at %.0f vx", arc);
+        return "'" + (entry.name.empty() ? entry.uuid : entry.name) + "'" + buffer;
+    };
+    for (const auto& event : events) {
+        if (event.parallel || !event.validA || !event.validB || event.a == event.b) continue;
+        const auto a = stretchAt(event.a, event.arcA), b = stretchAt(event.b, event.arcB);
+        if (a < 0 || b < 0) continue;
+        const double dot = event.normalA[0] * event.normalB[0] + event.normalA[1] * event.normalB[1] +
+                           event.normalA[2] * event.normalB[2];
+        if (dot == 0.) continue;
+        if (signs.crossingFilter &&
+            !geometry::fiberCrossingUse(event.crossingFindings, event.crossingAlternative, dot, 0).used)
+            continue;
+        ++report.crossings;
+        const int relation = dot > 0 ? 1 : -1;
+        const auto [rootA, signA] = facingOf(std::size_t(a));
+        const auto [rootB, signB] = facingOf(std::size_t(b));
+        if (rootA == rootB) {
+            if (signA * signB != relation)
+                throw std::runtime_error(
+                    "Approved normals contradict each other: at the crossing of " + place(event.a, event.arcA) +
+                    " and " + place(event.b, event.arcB) + " the two normals face " +
+                    (relation > 0 ? "the same way" : "opposite ways") +
+                    ", the other crossings of the approved stretches say the reverse. One normals approval on that "
+                    "loop is wrong: correct it or revoke it.");
+            continue;
+        }
+        parent[rootB] = rootA;
+        flip[rootB] = signA * signB * relation;
+    }
+    // The sign of each object: against the signed normals around it.
+    struct Score { double agree = 0, against = 0; bool neighbours = false; };
+    std::map<std::size_t, Score> scores;
+    const auto* field = normalOptions.neighbours.field;
+    const double spacing = normalOptions.neighbours.sampleSpacing > 0 ? normalOptions.neighbours.sampleSpacing : 16.;
+    for (const bool radial : {false, true}) {
+        for (std::size_t at = 0; at < stretches.size(); ++at) {
+            const auto [root, sign] = facingOf(at);
+            auto& score = scores[root];
+            if (radial ? score.neighbours : field == nullptr) continue;
+            const auto fiber = std::size_t(stretches[at].fiber);
+            std::vector<fiber_tracer::FiberStripSample> query;
+            std::vector<geometry::Point> gauge;
+            for (double arc = stretches[at].arcFrom; arc <= stretches[at].arcTo; arc += spacing) {
+                const auto normal = normals.at(fiber, arc);
+                if (!normal) continue;
+                const auto point = geometry.packed().sample(std::int64_t(fiber), arc).point;
+                fiber_tracer::FiberStripSample sample;
+                sample.arc = arc;
+                sample.point = {point[0], point[1], point[2]};
+                query.push_back(sample);
+                gauge.push_back(*normal);
+            }
+            if (query.empty()) continue;
+            const auto vote = [&](double cosine) {
+                // Cosine times its magnitude: a cos^2 weight with the side it takes.
+                (cosine * double(sign) >= 0 ? score.agree : score.against) += cosine * cosine;
+            };
+            if (radial) {
+                for (std::size_t k = 0; k < query.size(); ++k) {
+                    const auto relative = geometry.seam().relative(
+                        geometry::Point{query[k].point[0], query[k].point[1], query[k].point[2]});
+                    const double radius = std::sqrt(relative[0] * relative[0] + relative[1] * relative[1]);
+                    if (radius > 0) vote((gauge[k][0] * relative[0] + gauge[k][1] * relative[1]) / radius);
+                }
+                continue;
+            }
+            const auto estimates = field->infer(
+                query, std::span<const fiber_tracer::FiberNeighbourVariant>(&normalOptions.neighbours.variant, 1));
+            for (std::size_t k = 0; k < query.size(); ++k) {
+                if (!(estimates[k].count > 0)) continue;
+                ++report.samples;
+                vote(gauge[k][0] * estimates[k].axis[0] + gauge[k][1] * estimates[k].axis[1] +
+                     gauge[k][2] * estimates[k].axis[2]);
+            }
+        }
+        if (!radial)
+            for (auto& [root, score] : scores) score.neighbours = score.agree + score.against > 0;
+    }
+    report.objects = std::int64_t(scores.size());
+    for (const auto& [root, score] : scores) {
+        if (score.neighbours) ++report.facedByNeighbours;
+        const double total = score.agree + score.against;
+        if (total > 0) report.weakestAgreement = std::min(report.weakestAgreement, std::max(score.agree, score.against) / total);
+    }
+    for (std::size_t at = 0; at < stretches.size(); ++at) {
+        const auto [root, sign] = facingOf(at);
+        const auto& score = scores[root];
+        stretches[at].sign = sign * (score.agree >= score.against ? 1 : -1);
+    }
+    return stretches;
+}
+
+ScaffoldFacingReport scaffoldFaceApprovedNormals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                                 ScaffoldNormals& normals, std::vector<ScaffoldEvent>& events,
+                                                 const ScaffoldNormalOptions& normalOptions,
+                                                 const ScaffoldEventOptions& eventOptions,
+                                                 const ScaffoldSignOptions& signs, ScaffoldEventReport& eventReport)
+{
+    ScaffoldFacingReport report;
+    if (!normalOptions.approvedNormalPieces) return report;
+    const auto facing = scaffoldApprovedFacing(graph, geometry, normals, events, normalOptions, signs, report);
+    if (facing.empty()) return report;
+    if (normalOptions.monitor) {
+        normalOptions.monitor->enter("approved normals");
+        normalOptions.monitor->checkpoint();
+    }
+    normals.face(facing, normalOptions);
+    scaffoldRefreshEventNormals(graph, geometry, normals, eventOptions, events, eventReport);
+    return report;
 }
 
 ScaffoldSignResult scaffoldNormalSigns(const ScaffoldGraph& graph, const ScaffoldNormals& normals,
@@ -598,7 +790,8 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
         throw std::invalid_argument("scaffold constraints: the reviewed crossings cover a different event set");
     if (crossings) crossings->clear();
     for (const auto weight :
-         {options.perpendicularWeight, options.parallelWeight, options.enclosureWeight, options.signWeight})
+         {options.perpendicularWeight, options.parallelWeight, options.enclosureWeight, options.signWeight,
+          options.approvedSignFactor, options.reviewedWeight})
         if (!std::isfinite(weight) || weight < 0)
             throw std::invalid_argument("scaffold constraints: a measured weight is negative or nonfinite");
     if (!std::isfinite(options.perpendicularOffset) || !std::isfinite(options.windingScale) || options.windingScale < 0)
@@ -622,6 +815,11 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
     std::vector<Bound> bounds;
 
     const auto shared = sharedConstraintOptions(options);
+    const auto normalsApproved = [&](std::int64_t fiber, double arc) {
+        const auto line = geometry.lineIndexAt(std::size_t(fiber), arc);
+        return line >= 0 &&
+               ScaffoldApproval::touches(graph.fibers[std::size_t(fiber)].approval.approvedNormals, double(line));
+    };
     for (std::size_t index = 0; index < events.size(); ++index) {
         auto event = events[index];
         if (!eventStatesRelation(graph, event, &report)) continue;
@@ -650,20 +848,18 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
             ++report.statedDirect;
             if (built.relation.sign == 0) ++report.statedWithoutSign;
         }
+        if (built.hasSign && (normalsApproved(event.a, event.arcA) || normalsApproved(event.b, event.arcB))) {
+            built.sign.weight *= options.approvedSignFactor;
+            ++report.signOnApprovedNormals;
+        }
         if (built.relation.hasEnclosure && shared.enclosures)
             bounds.push_back({built.relation.enclosure, std::int64_t(index), built.relation.transport});
         const auto first = constraints.size();
         appendEventConstraints(constraints, built, event, std::int64_t(index), options, &report);
         if (review != ScaffoldNeighbour::Undecided) {
-            // A reviewed separation counts in full, and is held rigid where
-            // both pieces it lies on are approved geometry.
-            for (auto at = first; at < constraints.size(); ++at) {
-                auto& constraint = constraints[at];
-                if (scaffoldConstraintSide(constraint.kind) != 0) continue;
-                constraint.weight = options.perpendicularWeight;
-                constraint.approved = scaffoldConstraintPiecesApproved(graph, geometry, constraint);
-                ++(constraint.approved ? report.statedRigid : report.statedWithoutPieces);
-            }
+            // A reviewed separation is heavy, whatever the crossing's confidence.
+            for (auto at = first; at < constraints.size(); ++at)
+                if (scaffoldConstraintSide(constraints[at].kind) == 0) constraints[at].weight = options.reviewedWeight;
         }
         if (crossings && !event.parallel) {
             ScaffoldCrossing crossing;
@@ -715,6 +911,8 @@ objects::FiberConstraintKind scaffoldConstraintStoreKind(ScaffoldConstraintKind 
         case ScaffoldConstraintKind::SignAtLeast:
         case ScaffoldConstraintKind::SignAtMost:
             throw std::invalid_argument("scaffold constraints: a sign constraint has no approval");
+        case ScaffoldConstraintKind::Continuation:
+            throw std::invalid_argument("scaffold constraints: a continuation link has no approval");
     }
     throw std::invalid_argument("scaffold constraints: unknown constraint kind");
 }
@@ -769,20 +967,6 @@ objects::FiberConstraintApproval approveScaffoldConstraint(const ScaffoldGraph& 
     return objects::approveFiberConstraint(identity, contentA, ordered ? spans->spanA : spans->spanB, *versionA,
                                            contentB, ordered ? spans->spanB : spans->spanA, *versionB, distance,
                                            author, approvedAt, host);
-}
-
-bool scaffoldConstraintPiecesApproved(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
-                                      const ScaffoldConstraint& constraint)
-{
-    // Approved geometry at the anchor itself: the stretch of the fiber's
-    // approval layer that covers it.
-    const auto approved = [&](std::int64_t fiber, double arc) {
-        if (fiber < 0 || std::size_t(fiber) >= graph.fibers.size()) return false;
-        const auto line = geometry.lineIndexAt(std::size_t(fiber), arc);
-        return line >= 0 &&
-               ScaffoldApproval::touches(graph.fibers[std::size_t(fiber)].approval.approvedGeometry, double(line));
-    };
-    return approved(constraint.a, constraint.arcA) && approved(constraint.b, constraint.arcB);
 }
 
 std::vector<ScaffoldNeighbour> scaffoldCrossingApprovals(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
@@ -854,74 +1038,96 @@ std::vector<ScaffoldNeighbour> scaffoldCrossingApprovals(const ScaffoldGraph& gr
     return stated;
 }
 
-std::vector<ScaffoldStretch> scaffoldStretches(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
-                                                      const ScaffoldSolveResult& result,
-                                                      const ScaffoldStretchOptions& options,
-                                                      ScaffoldStretchReport& report)
+std::vector<ScaffoldStretch> scaffoldStretches(std::span<const ScaffoldStretchFiber> fibers,
+                                               std::span<const ScaffoldStretchPlace> places,
+                                               std::span<const ScaffoldStretchViolation> violations,
+                                               const ScaffoldStretchOptions& options, ScaffoldStretchReport& report)
 {
-    const auto fibers = graph.fibers.size();
-    if (!(options.joinVx >= 0) || !(options.marginVx >= 0) || !(options.minStretchVx >= 0) || !(options.maxStretchVx >= options.minStretchVx) ||
-        !(options.maxStretchVx > 0))
+    if (!(options.joinVx >= 0) || !(options.marginVx >= 0) || !(options.minStretchVx >= 0) ||
+        !(options.maxStretchVx >= options.minStretchVx) || !(options.maxStretchVx > 0))
         throw std::invalid_argument("scaffold stretches: invalid stretch lengths");
     report = ScaffoldStretchReport{};
+    const auto known = [&](std::int64_t fiber) { return fiber >= 0 && std::size_t(fiber) < fibers.size(); };
     // A fiber is a row of zones, and a stretch stays in one: its parts
     // between broken geometry, and within a part every stretch that is
-    // already approved (for geometry or normals) as it stands. An approved
-    // stretch is never cut up or offset: it is offered whole, and new
-    // stretches lie in the fiber between the approved ones.
+    // already approved as it stands. An approved stretch is never cut up or
+    // offset: it is offered whole, and new stretches lie in the fiber between
+    // the approved ones.
     struct Zone {
         double from = 0, to = 0;
-        bool fixed = false;
+        bool fixed = false, broken = false;
     };
-    std::vector<std::vector<Zone>> zones(fibers);
-    for (std::size_t i = 0; i < fibers; ++i) {
-        const double length = geometry.arcAtLineIndex(i, double(graph.fibers[i].pointCount - 1));
-        std::vector<std::pair<double, double>> approved;
-        for (const auto* ranges : {&graph.fibers[i].approval.approvedGeometry, &graph.fibers[i].approval.approvedNormals})
-            for (const auto& [from, to] : *ranges)
-                approved.emplace_back(geometry.arcAtLineIndex(i, from), geometry.arcAtLineIndex(i, to));
-        std::sort(approved.begin(), approved.end());
+    std::vector<std::vector<Zone>> zones(fibers.size());
+    for (std::size_t i = 0; i < fibers.size(); ++i) {
         // Ranges that overlap are one stretch; ranges that only touch stay two.
-        std::vector<std::pair<double, double>> fixed;
-        for (const auto& range : approved) {
-            if (!(range.second > range.first)) continue;
-            if (!fixed.empty() && range.first < fixed.back().second - 1.)
-                fixed.back().second = std::max(fixed.back().second, range.second);
-            else
-                fixed.push_back(range);
-        }
-        auto bounds = geometry.splitArcs(i);
-        bounds.insert(bounds.begin(), 0.);
-        bounds.push_back(length);
-        for (std::size_t part = 0; part + 1 < bounds.size(); ++part) {
-            double at = bounds[part];
-            for (const auto& range : fixed) {
-                const double from = std::max(range.first, bounds[part]), to = std::min(range.second, bounds[part + 1]);
-                if (!(to > from)) continue;
-                if (from > at) zones[i].push_back({at, from, false});
-                zones[i].push_back({from, to, true});
-                at = to;
+        const auto fixed = scaffoldMergeApprovedRanges(fibers[i].approved);
+        const auto broken = scaffoldMergeApprovedRanges(fibers[i].broken);
+        const double length = fibers[i].length;
+        // Every place the fiber's kind can change at, then one zone per run
+        // of the same kind: broken, one approved range, or free fiber. A cut
+        // always ends a zone.
+        std::vector<double> bounds{0., length};
+        for (const double cut : fibers[i].cuts) bounds.push_back(cut);
+        for (const auto* ranges : {&fixed, &broken})
+            for (const auto& [from, to] : *ranges) {
+                bounds.push_back(from);
+                bounds.push_back(to);
             }
-            if (bounds[part + 1] > at || zones[i].empty()) zones[i].push_back({at, bounds[part + 1], false});
+        for (auto& bound : bounds) bound = std::clamp(bound, 0., length);
+        std::sort(bounds.begin(), bounds.end());
+        bounds.erase(std::unique(bounds.begin(), bounds.end()), bounds.end());
+        const auto rangeAt = [](const std::vector<std::pair<double, double>>& ranges, double arc) {
+            for (std::size_t at = 0; at < ranges.size(); ++at)
+                if (arc > ranges[at].first && arc < ranges[at].second) return std::int64_t(at);
+            return std::int64_t(-1);
+        };
+        const auto isCut = [&](double arc) {
+            return std::find(fibers[i].cuts.begin(), fibers[i].cuts.end(), arc) != fibers[i].cuts.end();
+        };
+        std::int64_t lastKind = -3;
+        for (std::size_t at = 0; at + 1 < bounds.size(); ++at) {
+            const double middle = (bounds[at] + bounds[at + 1]) / 2.;
+            const bool isBroken = rangeAt(broken, middle) >= 0;
+            const auto approvedRange = isBroken ? -1 : rangeAt(fixed, middle);
+            // -2 broken, -1 free, otherwise the approved range.
+            const std::int64_t kind = isBroken ? -2 : approvedRange;
+            if (!zones[i].empty() && kind == lastKind && !isCut(bounds[at]))
+                zones[i].back().to = bounds[at + 1];
+            else
+                zones[i].push_back({bounds[at], bounds[at + 1], approvedRange >= 0, isBroken});
+            lastKind = kind;
         }
+        if (zones[i].empty()) zones[i].push_back({0., length, false, false});
     }
-    const auto partAt = [&](std::int64_t fiber, double arc) {
+    const auto zoneAt = [&](std::int64_t fiber, double arc) {
         const auto& list = zones[std::size_t(fiber)];
         // The last zone starting at or before the arc.
         std::int64_t at = 0;
         while (at + 1 < std::int64_t(list.size()) && list[std::size_t(at) + 1].from <= arc) ++at;
         return at;
     };
-    // Every crossing of every fiber part: the anchors of the solve's constraints.
-    std::map<std::pair<std::int64_t, std::int64_t>, std::vector<double>> crossings;
-    for (const auto& constraint : result.constraints) {
-        crossings[{constraint.a, partAt(constraint.a, constraint.arcA)}].push_back(constraint.arcA);
-        crossings[{constraint.b, partAt(constraint.b, constraint.arcB)}].push_back(constraint.arcB);
+    using Key = std::pair<std::int64_t, std::int64_t>;  // fiber, zone
+    // Every place of every zone where a constraint is anchored, and the
+    // constraints anchored there.
+    std::map<Key, std::vector<double>> crossings;
+    std::map<Key, std::vector<std::pair<double, std::int64_t>>> anchored;
+    const auto onBroken = [&](std::int64_t fiber, double arc) {
+        return zones[std::size_t(fiber)][std::size_t(zoneAt(fiber, arc))].broken;
+    };
+    for (const auto& place : places) {
+        if (!known(place.fiber) || onBroken(place.fiber, place.arc)) continue;
+        const Key key{place.fiber, zoneAt(place.fiber, place.arc)};
+        crossings[key].push_back(place.arc);
+        anchored[key].emplace_back(place.arc, place.constraints);
     }
-    // Every constraint's anchor, before they are reduced to places.
-    const auto anchors = crossings;
-    // One crossing states several constraints at one arc; crossings less than
-    // a voxel apart are one place of the fiber.
+    std::map<Key, std::vector<const ScaffoldStretchViolation*>> violated;
+    for (const auto& violation : violations) {
+        if (!known(violation.fiber) || onBroken(violation.fiber, violation.arc)) continue;
+        const Key key{violation.fiber, zoneAt(violation.fiber, violation.arc)};
+        crossings[key].push_back(violation.arc);
+        violated[key].push_back(&violation);
+    }
+    // Places less than a voxel apart are one place of the fiber.
     for (auto& [key, arcs] : crossings) {
         std::sort(arcs.begin(), arcs.end());
         std::vector<double> distinct;
@@ -930,170 +1136,167 @@ std::vector<ScaffoldStretch> scaffoldStretches(const ScaffoldGraph& graph, const
         arcs = std::move(distinct);
     }
     struct Stretch {
-        std::size_t from = 0, to = 0;  // indices into the part's crossings
-        double cost = 0, arc = 0, otherArc = 0;
-        std::int64_t other = 0, violations = 0;
+        std::size_t from = 0, to = 0;  // indices into the zone's places
     };
-    // Per fiber part: every violated constraint anchored on it.
-    struct Violation {
-        double arc = 0, cost = 0, otherArc = 0;
-        std::int64_t other = 0;
-    };
-    std::map<std::pair<std::int64_t, std::int64_t>, std::vector<Violation>> violated;
-    std::map<std::pair<std::int64_t, std::int64_t>, std::vector<Stretch>> stretches;
-    for (const auto& residual : result.residuals) {
-        const auto& constraint = result.constraints.at(std::size_t(residual.constraint));
+    std::map<Key, std::vector<Stretch>> stretches;
+    for (const auto& violation : violations) {
         ++report.violations;
-        for (int side = 0; side < 2; ++side) {
-            const auto fiber = side == 0 ? constraint.a : constraint.b;
-            const double arc = side == 0 ? constraint.arcA : constraint.arcB;
-            const std::pair<std::int64_t, std::int64_t> key{fiber, partAt(fiber, arc)};
-            const auto& arcs = crossings[key];
-            violated[key].push_back({arc, residual.cost, side == 0 ? constraint.arcB : constraint.arcA,
-                                     side == 0 ? constraint.b : constraint.a});
-            const auto& zoneList = zones[std::size_t(fiber)];
-            const auto zone = std::size_t(key.second);
-            if (arcs.empty()) { ++report.withoutCrossing; continue; }
-            if (zoneList[zone].fixed) {
-                // An approved stretch is the stretch, whole.
-                Stretch whole;
-                whole.to = arcs.size() - 1;
-                stretches[key].push_back(whole);
-                continue;
-            }
-            // The crossing's own place among the zone's crossings.
-            auto at = std::size_t(std::lower_bound(arcs.begin(), arcs.end(), arc) - arcs.begin());
-            if (at >= arcs.size() || (at > 0 && arc - arcs[at - 1] < arcs[at] - arc)) --at;
-            if (arcs.size() < 2) {
-                // Alone between approved stretches, it is tied by them.
-                const bool beside = (zone > 0 && zoneList[zone - 1].fixed) ||
-                                    (zone + 1 < zoneList.size() && zoneList[zone + 1].fixed);
-                if (!beside) { ++report.withoutCrossing; continue; }
-                Stretch single;
-                single.from = single.to = at;
-                stretches[key].push_back(single);
-                continue;
-            }
-            // Another crossing is mandatory: the nearer neighbour, whatever
-            // its distance. Further ones join while they are close.
-            std::size_t from = at, to = at;
-            if (at == 0) to = 1;
-            else if (at + 1 == arcs.size()) from = at - 1;
-            else if (arcs[at] - arcs[at - 1] <= arcs[at + 1] - arcs[at]) from = at - 1;
-            else to = at + 1;
-            // Up to the minimum length: the nearer next crossing on either
-            // side, whatever its distance (the minimum outranks the maximum).
-            while (arcs[to] - arcs[from] < options.minStretchVx) {
-                const double before = from > 0 ? arcs[from] - arcs[from - 1] : -1.;
-                const double after = to + 1 < arcs.size() ? arcs[to + 1] - arcs[to] : -1.;
-                const bool takeBefore = before >= 0 && (after < 0 || before <= after);
-                const double added = takeBefore ? before : after;
-                if (added < 0) break;
-                if (takeBefore) --from; else ++to;
-            }
-            for (bool grown = true; grown;) {
-                grown = false;
-                if (from > 0 && arcs[from] - arcs[from - 1] <= options.joinVx &&
-                    arcs[to] - arcs[from - 1] <= options.maxStretchVx) { --from; grown = true; }
-                if (to + 1 < arcs.size() && arcs[to + 1] - arcs[to] <= options.joinVx &&
-                    arcs[to + 1] - arcs[from] <= options.maxStretchVx) { ++to; grown = true; }
-            }
-            Stretch stretch;
-            stretch.from = from;
-            stretch.to = to;
-            stretch.cost = residual.cost;
-            stretch.arc = arc;
-            stretch.other = side == 0 ? constraint.b : constraint.a;
-            stretch.otherArc = side == 0 ? constraint.arcB : constraint.arcA;
-            stretch.violations = 1;
-            stretches[key].push_back(stretch);
+        if (!known(violation.fiber)) { ++report.withoutCrossing; continue; }
+        // Nothing on a broken range is listed.
+        if (onBroken(violation.fiber, violation.arc)) continue;
+        const double arc = violation.arc;
+        const Key key{violation.fiber, zoneAt(violation.fiber, arc)};
+        const auto& arcs = crossings[key];
+        const auto& zoneList = zones[std::size_t(violation.fiber)];
+        const auto zone = std::size_t(key.second);
+        if (zoneList[zone].fixed) {
+            // An approved stretch is the stretch, whole.
+            stretches[key].push_back({0, arcs.size() - 1});
+            continue;
         }
+        // The violation's own place among the zone's places.
+        auto at = std::size_t(std::lower_bound(arcs.begin(), arcs.end(), arc) - arcs.begin());
+        if (at >= arcs.size() || (at > 0 && arc - arcs[at - 1] < arcs[at] - arc)) --at;
+        if (arcs.size() < 2) {
+            // Alone between approved stretches, it is tied by them.
+            const bool beside = (zone > 0 && zoneList[zone - 1].fixed) ||
+                                (zone + 1 < zoneList.size() && zoneList[zone + 1].fixed);
+            if (!beside) { ++report.withoutCrossing; continue; }
+            stretches[key].push_back({at, at});
+            continue;
+        }
+        // Another place is mandatory: the nearer neighbour, whatever its
+        // distance.
+        std::size_t from = at, to = at;
+        if (at == 0) to = 1;
+        else if (at + 1 == arcs.size()) from = at - 1;
+        else if (arcs[at] - arcs[at - 1] <= arcs[at + 1] - arcs[at]) from = at - 1;
+        else to = at + 1;
+        // Up to the minimum length: the nearer next place on either side,
+        // whatever its distance (the minimum outranks the maximum).
+        while (arcs[to] - arcs[from] < options.minStretchVx) {
+            const double before = from > 0 ? arcs[from] - arcs[from - 1] : -1.;
+            const double after = to + 1 < arcs.size() ? arcs[to + 1] - arcs[to] : -1.;
+            const bool takeBefore = before >= 0 && (after < 0 || before <= after);
+            if ((takeBefore ? before : after) < 0) break;
+            if (takeBefore) --from; else ++to;
+        }
+        // Further ones join while they are close.
+        for (bool grown = true; grown;) {
+            grown = false;
+            if (from > 0 && arcs[from] - arcs[from - 1] <= options.joinVx &&
+                arcs[to] - arcs[from - 1] <= options.maxStretchVx) { --from; grown = true; }
+            if (to + 1 < arcs.size() && arcs[to + 1] - arcs[to] <= options.joinVx &&
+                arcs[to + 1] - arcs[from] <= options.maxStretchVx) { ++to; grown = true; }
+        }
+        stretches[key].push_back({from, to});
     }
     std::vector<ScaffoldStretch> out;
     for (auto& [key, list] : stretches) {
         const auto fiber = std::size_t(key.first);
         const auto& arcs = crossings[key];
-        // Overlapping stretches are one; the first (worst) names the row.
+        const auto& zoneList = zones[fiber];
+        const auto zone = std::size_t(key.second);
+        // Overlapping stretches are one while that stays within the maximum
+        // length; a stretch inside the last one is that one.
         std::stable_sort(list.begin(), list.end(), [](const Stretch& x, const Stretch& y) {
             return x.from != y.from ? x.from < y.from : x.to > y.to;
         });
         std::vector<Stretch> merged;
         for (const auto& stretch : list) {
-            // ... while the result stays within the maximum length.
-            // A stretch inside the last one is that one.
             if (!merged.empty() && stretch.from <= merged.back().to &&
                 (stretch.to <= merged.back().to ||
-                 arcs[stretch.to] - arcs[merged.back().from] <= options.maxStretchVx)) {
-                auto& last = merged.back();
-                last.to = std::max(last.to, stretch.to);
-            } else {
+                 arcs[stretch.to] - arcs[merged.back().from] <= options.maxStretchVx))
+                merged.back().to = std::max(merged.back().to, stretch.to);
+            else
                 merged.push_back(stretch);
-            }
         }
-        for (auto& stretch : merged) {
+        for (const auto& stretch : merged) {
+            ScaffoldStretch entry;
+            entry.fiber = key.first;
+            // An approved stretch stands exactly as it was approved. A new
+            // one reaches past its outer places by the margin and is at
+            // least the minimum length, within its zone - the margin into an
+            // approved neighbour, never farther.
+            double arcFrom = zoneList[zone].from, arcTo = zoneList[zone].to;
+            double holdFrom = arcFrom, holdTo = arcTo;  // what counts as "on the stretch"
+            if (!zoneList[zone].fixed) {
+                const double lower =
+                    zoneList[zone].from - (zone > 0 && zoneList[zone - 1].fixed ? options.marginVx : 0.);
+                const double upper = zoneList[zone].to +
+                                     (zone + 1 < zoneList.size() && zoneList[zone + 1].fixed ? options.marginVx : 0.);
+                arcFrom = arcs[stretch.from] - options.marginVx;
+                arcTo = arcs[stretch.to] + options.marginVx;
+                if (arcTo - arcFrom < options.minStretchVx) {
+                    const double pad = (options.minStretchVx - (arcTo - arcFrom)) / 2.;
+                    arcFrom -= pad;
+                    arcTo += pad;
+                }
+                // What one end cannot take, the other does.
+                if (arcFrom < lower) { arcTo += lower - arcFrom; arcFrom = lower; }
+                if (arcTo > upper) { arcFrom -= arcTo - upper; arcTo = upper; }
+                arcFrom = std::max(arcFrom, lower);
+                holdFrom = arcs[stretch.from] - 1.;
+                holdTo = arcs[stretch.to] + 1.;
+            }
             // The cost: every violated constraint anchored on the stretch,
             // each once; the worst of them names the row.
-            stretch.cost = 0;
-            stretch.violations = 0;
             double worst = -1;
-            for (const auto& violation : violated[key]) {
-                if (violation.arc < arcs[stretch.from] - 1. || violation.arc > arcs[stretch.to] + 1.) continue;
-                stretch.cost += violation.cost;
-                ++stretch.violations;
-                if (violation.cost > worst) {
-                    worst = violation.cost;
-                    stretch.arc = violation.arc;
-                    stretch.other = violation.other;
-                    stretch.otherArc = violation.otherArc;
+            for (const auto* violation : violated[key]) {
+                if (violation->arc < holdFrom || violation->arc > holdTo) continue;
+                entry.cost += violation->cost;
+                ++entry.violations;
+                if (violation->cost > worst) {
+                    worst = violation->cost;
+                    entry.arc = violation->arc;
+                    entry.other = violation->other;
+                    entry.otherArc = violation->otherArc;
                 }
             }
-            // The stretch itself: past its outer crossings by the margin and
-            // at least the minimum length, within its zone - reaching the
-            // margin into an approved neighbour, never farther.
-            const auto& zoneList = zones[fiber];
-            const auto zone = std::size_t(key.second);
-            const double partFrom = zoneList[zone].from -
-                                    (zone > 0 && zoneList[zone - 1].fixed ? options.marginVx : 0.);
-            const double partTo = zoneList[zone].to +
-                                  (zone + 1 < zoneList.size() && zoneList[zone + 1].fixed ? options.marginVx : 0.);
-            double arcFrom = arcs[stretch.from] - options.marginVx, arcTo = arcs[stretch.to] + options.marginVx;
-            if (arcTo - arcFrom < options.minStretchVx) {
-                const double pad = (options.minStretchVx - (arcTo - arcFrom)) / 2.;
-                arcFrom -= pad;
-                arcTo += pad;
-            }
-            // What one end cannot take, the other does.
-            if (arcFrom < partFrom) { arcTo += partFrom - arcFrom; arcFrom = partFrom; }
-            if (arcTo > partTo) { arcFrom -= arcTo - partTo; arcTo = partTo; }
-            arcFrom = std::max(arcFrom, partFrom);
-            // An approved stretch stands exactly as it was approved.
-            if (zoneList[zone].fixed) {
-                arcFrom = zoneList[zone].from;
-                arcTo = zoneList[zone].to;
-            }
-            // Every constraint anchored on it, violated or not.
-            std::int64_t anchored = 0;
-            for (const double arc : anchors.at(key))
-                if (arc >= arcs[stretch.from] - 1. && arc <= arcs[stretch.to] + 1.) ++anchored;
-            ScaffoldStretch suspect;
-            suspect.fiber = key.first;
-            suspect.violations = stretch.violations;
-            suspect.constraints = anchored;
-            suspect.cost = stretch.cost;
-            suspect.arc = stretch.arc;
-            suspect.other = stretch.other;
-            suspect.otherArc = stretch.otherArc;
-            suspect.crossings = std::int64_t(stretch.to - stretch.from + 1);
-            suspect.piece.fiber = key.first;
-            suspect.piece.arcFrom = arcFrom;
-            suspect.piece.arcTo = arcTo;
-            scaffoldPieceControls(graph, geometry, suspect.piece);
-            out.push_back(suspect);
+            for (const auto& [arc, count] : anchored[key])
+                if (arc >= holdFrom && arc <= holdTo) entry.constraints += count;
+            entry.constraints = std::max(entry.constraints, entry.violations);
+            for (const double arc : arcs)
+                if (arc >= holdFrom && arc <= holdTo) ++entry.crossings;
+            entry.piece.fiber = key.first;
+            entry.piece.arcFrom = arcFrom;
+            entry.piece.arcTo = arcTo;
+            out.push_back(entry);
         }
     }
     std::stable_sort(out.begin(), out.end(),
                      [](const ScaffoldStretch& x, const ScaffoldStretch& y) { return x.cost > y.cost; });
     report.suspects = std::int64_t(out.size());
+    return out;
+}
+
+std::vector<ScaffoldStretch> scaffoldStretches(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                               const ScaffoldSolveResult& result,
+                                               const ScaffoldStretchOptions& options, ScaffoldStretchReport& report)
+{
+    std::vector<ScaffoldStretchFiber> fibers(graph.fibers.size());
+    for (std::size_t i = 0; i < fibers.size(); ++i) {
+        fibers[i].length = geometry.arcAtLineIndex(i, double(graph.fibers[i].pointCount - 1));
+        fibers[i].cuts = geometry.splitArcs(i);
+        fibers[i].approved = scaffoldApprovedArcRanges(graph, geometry, i);
+        for (const auto* ranges : {&graph.fibers[i].approval.brokenGeometry, &graph.fibers[i].approval.brokenNormals})
+            for (const auto& [from, to] : *ranges)
+                fibers[i].broken.emplace_back(geometry.arcAtLineIndex(i, from), geometry.arcAtLineIndex(i, to));
+    }
+    std::vector<ScaffoldStretchPlace> places;
+    for (const auto& constraint : result.constraints) {
+        places.push_back({constraint.a, constraint.arcA, 1});
+        places.push_back({constraint.b, constraint.arcB, 1});
+    }
+    std::vector<ScaffoldStretchViolation> violations;
+    for (const auto& residual : result.residuals) {
+        const auto& constraint = result.constraints.at(std::size_t(residual.constraint));
+        violations.push_back({constraint.a, constraint.arcA, residual.cost, constraint.b, constraint.arcB});
+        violations.push_back({constraint.b, constraint.arcB, residual.cost, constraint.a, constraint.arcA});
+    }
+    auto out = scaffoldStretches(fibers, places, violations, options, report);
+    report.violations = std::int64_t(result.residuals.size());
+    for (auto& stretch : out) scaffoldPieceControls(graph, geometry, stretch.piece);
     return out;
 }
 

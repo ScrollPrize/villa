@@ -271,6 +271,7 @@ const char* scaffoldConstraintKindName(ScaffoldConstraintKind kind)
         case ScaffoldConstraintKind::Enclosure: return "enclosure";
         case ScaffoldConstraintKind::SignAtLeast: return "sign_at_least";
         case ScaffoldConstraintKind::SignAtMost: return "sign_at_most";
+        case ScaffoldConstraintKind::Continuation: return "continuation";
     }
     throw std::invalid_argument("scaffold winding: unknown constraint kind");
 }
@@ -429,13 +430,6 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
         constraint.arcB = refined.arcB;
         constraint.step = step;
         constraint.weight = options.weight;
-        // An approved record is not enough: a link is held rigid only when
-        // the two pieces its anchors lie on are approved geometry.
-        constraint.approved = link.approvalState == "approved";
-        if (constraint.approved && !scaffoldConstraintPiecesApproved(graph, geometry, constraint)) {
-            constraint.approved = false;
-            ++report.approvedWithoutPieces;
-        }
         constraints.push_back(constraint);
         ++report.used;
     }
@@ -460,6 +454,80 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
     return constraints;
 }
 
+std::vector<std::pair<double, double>> scaffoldMergeApprovedRanges(std::vector<std::pair<double, double>> approved)
+{
+    std::sort(approved.begin(), approved.end());
+    std::vector<std::pair<double, double>> merged;
+    for (const auto& range : approved) {
+        if (!(range.second > range.first)) continue;
+        if (!merged.empty() && range.first < merged.back().second - 1.)
+            merged.back().second = std::max(merged.back().second, range.second);
+        else
+            merged.push_back(range);
+    }
+    return merged;
+}
+
+std::vector<std::pair<double, double>> scaffoldApprovedArcRanges(const ScaffoldGraph& graph,
+                                                                 const ScaffoldGeometry& geometry, std::size_t fiber)
+{
+    std::vector<std::pair<double, double>> ranges;
+    const auto& approval = graph.fibers.at(fiber).approval;
+    for (const auto* list : {&approval.approvedGeometry, &approval.approvedNormals})
+        for (const auto& [from, to] : *list)
+            ranges.emplace_back(geometry.arcAtLineIndex(fiber, from), geometry.arcAtLineIndex(fiber, to));
+    return scaffoldMergeApprovedRanges(std::move(ranges));
+}
+
+std::vector<double> scaffoldContinuationArcs(double length, std::span<const double> hardCuts,
+                                             std::span<const std::pair<double, double>> approved,
+                                             std::span<const double> anchors, double intervalVx)
+{
+    if (!(intervalVx > 0)) throw std::invalid_argument("scaffold winding: the continuation interval must be positive");
+    std::vector<double> cuts;
+    // A link lies strictly inside the fiber and is not a hard cut.
+    const auto add = [&](double arc) {
+        if (!(arc > 1.) || !(arc < length - 1.)) return;
+        for (const double hard : hardCuts)
+            if (std::abs(hard - arc) < 1.) return;
+        cuts.push_back(arc);
+    };
+    // The fiber between the approved ranges and the hard cuts, piece by piece.
+    std::vector<double> bounds{0., length};
+    for (const double hard : hardCuts) bounds.push_back(hard);
+    for (const auto& [from, to] : approved) {
+        add(from);
+        add(to);
+        bounds.push_back(std::clamp(from, 0., length));
+        bounds.push_back(std::clamp(to, 0., length));
+    }
+    std::sort(bounds.begin(), bounds.end());
+    const auto inApproved = [&](double arc) {
+        for (const auto& [from, to] : approved)
+            if (arc > from && arc < to) return true;
+        return false;
+    };
+    for (std::size_t at = 0; at + 1 < bounds.size(); ++at) {
+        const double from = bounds[at], to = bounds[at + 1], span = to - from;
+        if (!(span > intervalVx) || inApproved((from + to) / 2.)) continue;
+        const auto pieces = std::int64_t(std::ceil(span / intervalVx));
+        for (std::int64_t piece = 1; piece < pieces; ++piece) {
+            double arc = from + span * double(piece) / double(pieces);
+            // Between the two constraints around it, so none sits on the cut.
+            const auto next = std::upper_bound(anchors.begin(), anchors.end(), arc);
+            if (next != anchors.end() && next != anchors.begin() && *std::prev(next) > from && *next < to)
+                arc = (*std::prev(next) + *next) / 2.;
+            add(arc);
+        }
+    }
+    std::sort(cuts.begin(), cuts.end());
+    // Two links less than a voxel apart are one.
+    std::vector<double> distinct;
+    for (const double arc : cuts)
+        if (distinct.empty() || arc - distinct.back() >= 1.) distinct.push_back(arc);
+    return distinct;
+}
+
 ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
                                          const ScaffoldSolveOptions& options,
                                          std::span<const ScaffoldConstraint> measured)
@@ -469,40 +537,15 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
     if (options.maxAlternativePaths < 0)
         throw std::invalid_argument("scaffold winding: the alternative path cap must be non-negative");
     const auto started = std::chrono::steady_clock::now();
-    // A fiber whose geometry is broken somewhere is not one fiber there: each
-    // part between the broken stretches takes its own winding. The longest
-    // part is the fiber's node; the others are extra nodes after the fibers.
-    const auto fibers = graph.fibers.size();
-    std::vector<std::vector<double>> cuts(fibers);
-    std::vector<std::size_t> mainPart(fibers, 0), extraFirst(fibers, 0);
-    std::size_t nodes = fibers;
-    for (std::size_t i = 0; i < fibers; ++i) {
-        cuts[i] = geometry.splitArcs(i);
-        if (cuts[i].empty()) continue;
-        double best = -1;
-        for (std::size_t part = 0; part <= cuts[i].size(); ++part) {
-            const double from = part == 0 ? 0. : cuts[i][part - 1];
-            const double to = part == cuts[i].size() ? geometry.arcLength(i) : cuts[i][part];
-            if (to - from > best) { best = to - from; mainPart[i] = part; }
-        }
-        extraFirst[i] = nodes;
-        nodes += cuts[i].size();
-    }
-    const auto partOf = [&](std::int64_t fiber, double arc) {
-        const auto& list = cuts[std::size_t(fiber)];
-        return std::size_t(std::upper_bound(list.begin(), list.end(), arc) - list.begin());
-    };
-    const auto nodeOfPart = [&](std::size_t fiber, std::size_t part) {
-        if (part == mainPart[fiber]) return std::int64_t(fiber);
-        return std::int64_t(extraFirst[fiber] + (part < mainPart[fiber] ? part : part - 1));
-    };
-    const auto nodeOf = [&](std::int64_t fiber, double arc) {
-        return nodeOfPart(std::size_t(fiber), partOf(fiber, arc));
-    };
+    if (options.continuation.enabled &&
+        (!(options.continuation.weight > 0) || !std::isfinite(options.continuation.weight) ||
+         !(options.continuation.intervalVx > 0)))
+        throw std::invalid_argument("scaffold winding: the continuation weight and interval must be positive");
     if (options.monitor) {
         options.monitor->enter("constraints");
         options.monitor->checkpoint();
     }
+    const auto fibers = graph.fibers.size();
 
     ScaffoldSolveResult result;
     // A run with the links switched off reads none of them: the report stays
@@ -542,19 +585,89 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
         result.linkReport.deduplicatedCrossings = std::int64_t(droppedEvents.size());
         result.linkReport.linksWithCrossing = std::count(hasCrossing.begin(), hasCrossing.end(), char(1));
     }
+    for (const auto& constraint : result.constraints)
+        if (constraint.kind == ScaffoldConstraintKind::Continuation)
+            throw std::invalid_argument("scaffold winding: continuation links are the solve's own");
+
+    // A fiber is solved as its parts. Broken geometry splits it: the parts
+    // have nothing to do with each other. A continuation link splits it too,
+    // and ties the two parts to the same winding at a weight, so the fiber
+    // can break there when the evidence asks for it. The longest part is the
+    // fiber's node; the others are extra nodes after the fibers.
+    std::vector<std::vector<double>> cuts(fibers);
+    // Per cut: whether a continuation link bridges it.
+    std::vector<std::vector<char>> linked(fibers);
+    std::vector<std::size_t> mainPart(fibers, 0), extraFirst(fibers, 0);
+    std::size_t nodes = fibers;
+    std::vector<std::vector<double>> anchors(fibers);
+    if (options.continuation.enabled)
+        for (const auto& constraint : result.constraints) {
+            anchors.at(std::size_t(constraint.a)).push_back(constraint.arcA);
+            anchors.at(std::size_t(constraint.b)).push_back(constraint.arcB);
+        }
+    for (std::size_t i = 0; i < fibers; ++i) {
+        const auto hard = geometry.splitArcs(i);
+        std::vector<double> soft;
+        if (options.continuation.enabled) {
+            std::sort(anchors[i].begin(), anchors[i].end());
+            soft = scaffoldContinuationArcs(geometry.arcLength(i), hard, scaffoldApprovedArcRanges(graph, geometry, i),
+                                            anchors[i], options.continuation.intervalVx);
+        }
+        if (!hard.empty()) ++result.splitFibers;
+        std::vector<std::pair<double, char>> all;
+        for (const double arc : hard) all.emplace_back(arc, char(0));
+        for (const double arc : soft) all.emplace_back(arc, char(1));
+        std::sort(all.begin(), all.end());
+        for (const auto& [arc, bridged] : all) {
+            cuts[i].push_back(arc);
+            linked[i].push_back(bridged);
+        }
+        if (cuts[i].empty()) continue;
+        double best = -1;
+        for (std::size_t part = 0; part <= cuts[i].size(); ++part) {
+            const double from = part == 0 ? 0. : cuts[i][part - 1];
+            const double to = part == cuts[i].size() ? geometry.arcLength(i) : cuts[i][part];
+            if (to - from > best) { best = to - from; mainPart[i] = part; }
+        }
+        extraFirst[i] = nodes;
+        nodes += cuts[i].size();
+    }
+    const auto partOf = [&](std::int64_t fiber, double arc) {
+        const auto& list = cuts[std::size_t(fiber)];
+        return std::size_t(std::upper_bound(list.begin(), list.end(), arc) - list.begin());
+    };
+    const auto nodeOfPart = [&](std::size_t fiber, std::size_t part) {
+        if (part == mainPart[fiber]) return std::int64_t(fiber);
+        return std::int64_t(extraFirst[fiber] + (part < mainPart[fiber] ? part : part - 1));
+    };
+    const auto nodeOf = [&](std::int64_t fiber, double arc) {
+        return nodeOfPart(std::size_t(fiber), partOf(fiber, arc));
+    };
+    // The continuation links, after everything else: one per bridged cut,
+    // anchored just below it and at it, so each end lies on its own part.
+    for (std::size_t i = 0; i < fibers; ++i)
+        for (std::size_t cut = 0; cut < cuts[i].size(); ++cut) {
+            if (!linked[i][cut]) continue;
+            ScaffoldConstraint link;
+            link.kind = ScaffoldConstraintKind::Continuation;
+            link.a = link.b = std::int64_t(i);
+            link.arcA = std::nextafter(cuts[i][cut], 0.);
+            link.arcB = cuts[i][cut];
+            link.weight = options.continuation.weight;
+            result.constraints.push_back(link);
+            ++result.continuationLinks;
+        }
     for (const auto& constraint : result.constraints) {
         const auto kind = std::size_t(constraint.kind);
         if (kind >= result.constraintsByKind.size())
             throw std::invalid_argument("scaffold winding: unknown constraint kind");
         ++result.constraintsByKind[kind];
         if (constraint.a < 0 || constraint.b < 0 || std::size_t(constraint.a) >= fibers ||
-            std::size_t(constraint.b) >= fibers || constraint.a == constraint.b)
+            std::size_t(constraint.b) >= fibers ||
+            (constraint.a == constraint.b) != (constraint.kind == ScaffoldConstraintKind::Continuation))
             throw std::invalid_argument("scaffold winding: a constraint names an unknown fiber pair");
         if (!std::isfinite(constraint.weight) || constraint.weight < 0)
             throw std::invalid_argument("scaffold winding: a constraint weight is negative or nonfinite");
-        // A bound is not a relation an approval can hold rigid.
-        if (constraint.approved && scaffoldConstraintSide(constraint.kind) != 0)
-            throw std::invalid_argument("scaffold winding: a sign constraint cannot be approved");
     }
     // The same constraints between the nodes they relate: `a` and `b` are
     // node indices here, fiber indices in result.constraints.
@@ -574,63 +687,8 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
     result.arcs = aggregateWindingArcs(arcs);
     if (result.arcs.empty()) throw std::invalid_argument("scaffold winding: no usable winding constraints");
 
-    // Approved subgraphs: solved alone, then held rigid. Each contributes one
-    // node to the global problem, with its members' offsets.
-    std::vector<std::int64_t> offset(nodes, 0), representative(nodes);
-    std::iota(representative.begin(), representative.end(), 0);
-    if (options.fixApprovedSubgraphs) {
-        UnionFind approved(nodes);
-        std::vector<WindingArc> approvedArcs;
-        for (const auto& constraint : noded)
-            if (constraint.approved && constraint.weight > 0) {
-                approved.join(constraint.a, constraint.b);
-                approvedArcs.push_back(constraint.a < constraint.b
-                    ? WindingArc{constraint.a, constraint.b, constraint.target, constraint.weight}
-                    : WindingArc{constraint.b, constraint.a, -constraint.target, constraint.weight});
-            }
-        if (!approvedArcs.empty()) {
-            offset = solveComponents(nodes, aggregateWindingArcs(approvedArcs), options.flow);
-            std::vector<std::string> violated;
-            for (std::size_t index = 0; index < noded.size(); ++index) {
-                const auto& constraint = noded[index];
-                if (!constraint.approved || constraint.weight <= 0) continue;
-                if (offset[std::size_t(constraint.b)] - offset[std::size_t(constraint.a)] == constraint.target) continue;
-                violated.push_back(graph.fibers[std::size_t(result.constraints[index].a)].uuid + " - " +
-                                   graph.fibers[std::size_t(result.constraints[index].b)].uuid);
-            }
-            if (!violated.empty()) {
-                std::string message = "scaffold winding: approved constraints contradict each other and cannot all be "
-                                      "satisfied; revoke one of ";
-                for (std::size_t i = 0; i < violated.size(); ++i) message += (i ? ", " : "") + violated[i];
-                throw std::invalid_argument(message);
-            }
-            std::set<std::int64_t> subgraphs;
-            for (std::size_t i = 0; i < nodes; ++i) {
-                representative[i] = approved.find(std::int64_t(i));
-                if (representative[i] != std::int64_t(i)) {
-                    ++result.contractedFibers;
-                    subgraphs.insert(representative[i]);
-                }
-            }
-            result.approvedSubgraphs = std::int64_t(subgraphs.size());
-        }
-    }
-
-    // Contracted arcs: k_S(b) - k_S(a) = target + offset_a - offset_b. Arcs
-    // inside one approved subgraph are already decided and carry no freedom.
-    std::vector<WindingArc> contracted;
-    for (const auto& arc : result.arcs) {
-        const auto a = representative[std::size_t(arc.a)], b = representative[std::size_t(arc.b)];
-        if (a == b) continue;
-        const auto target = arc.target + offset[std::size_t(arc.a)] - offset[std::size_t(arc.b)];
-        contracted.push_back(a < b ? WindingArc{a, b, target, arc.weight, arc.side}
-                                   : WindingArc{b, a, -target, arc.weight, -arc.side});
-    }
-    const auto solved =
-        solveComponents(nodes, aggregateWindingArcs(contracted), options.flow, &result.quantization, options.monitor);
-    result.winding.resize(nodes);
-    for (std::size_t i = 0; i < nodes; ++i)
-        result.winding[i] = solved[std::size_t(representative[i])] + offset[i];
+    result.winding =
+        solveComponents(nodes, result.arcs, options.flow, &result.quantization, options.monitor);
 
     // Components of the solved relation, and the gauge per component.
     UnionFind sets(nodes);
@@ -742,14 +800,17 @@ ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph& graph, const Scaff
     // columns hold each fiber's longest part.
     for (std::size_t i = 0; i < fibers; ++i) {
         if (cuts[i].empty()) continue;
-        ++result.splitFibers;
         for (std::size_t part = 0; part <= cuts[i].size(); ++part) {
             const auto node = std::size_t(nodeOfPart(i, part));
             result.parts.push_back({std::int64_t(i), part == 0 ? 0. : cuts[i][part - 1],
                                     part == cuts[i].size() ? geometry.arcLength(i) : cuts[i][part],
-                                    result.winding[node], result.component[node], part == mainPart[i]});
+                                    result.winding[node], result.component[node], part == mainPart[i],
+                                    part > 0 && linked[i][part - 1] != 0});
         }
     }
+    for (const auto& entry : result.residuals)
+        if (result.constraints[std::size_t(entry.constraint)].kind == ScaffoldConstraintKind::Continuation)
+            ++result.brokenContinuations;
     result.winding.resize(fibers);
     result.component.resize(fibers);
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

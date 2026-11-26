@@ -205,7 +205,8 @@ library states those exactly as the automatic pipeline does
   sides that agree fixes its step exactly: the *enclosure* relation. Weights
   are `weights.perpendicular`, `weights.parallel` and `weights.enclosure`.
 
-- **sign** (`weights.sign`, 100 by default). The signed order of one
+- **sign** (`weights.sign`, 3 by default; times `weights.sign_approved_factor`,
+  10, where one of the two anchors lies on a stretch approved for normals). The signed order of one
   perpendicular crossing is a bound on its own: the V fiber lies outside the H
   fiber there, so the pair's H->V step is at least the crossing's transport,
   or inside, so it is at most that minus one. An enclosure needs a pair
@@ -218,8 +219,7 @@ library states those exactly as the automatic pipeline does
   The bounds are those of the Python min-flow experiment's `sign_only` graph
   (`fiber_min_flow_benchmark.graph`) for perpendicular crossings; that
   experiment also states one for signed parallel crossings, which this
-  does not. A sign constraint is never approved, and it counts as part of a
-  residual cycle only where it holds with equality.
+  does not. It counts as part of a residual cycle only where it holds with equality.
 
 - **crossing confidence.** A crossing's perpendicular, parallel and sign
   weight is its type's weight times the confidence the sign stage gives the
@@ -229,15 +229,14 @@ library states those exactly as the automatic pipeline does
   their weight.
 
 The defaults are the scaffold workflow's run: no parallel and no enclosure
-relations, perpendicular weight 1, sign weight 100, crossing confidence on;
+relations, perpendicular weight 1, sign weight 3, crossing confidence on;
 the dock starts with no link state ticked and the crossings measured.
 
-Every kind lands in the same constraint list, so the solve, the contraction of
-approved constraints and the residual analysis treat a crossing exactly like a
-link.
+Every kind lands in the same constraint list, so the solve and the residual
+analysis treat a crossing exactly like a link.
 
-Measured on the PHerc0332 scaffold with neighbour normals, no links and
-perpendicular weight 1 (1,423 perpendicular constraints, 1,423 sign
+Measured, before continuation links existed, on the PHerc0332 scaffold with
+neighbour normals, no links and perpendicular weight 1 (1,423 perpendicular constraints, 1,423 sign
 constraints), against the links-only solution (216 fibers comparable):
 
 | sign weight | fibers placed differently from the links | violated perpendicular | violated sign |
@@ -335,12 +334,61 @@ sign run and sample count and the inference parameters.
 connected component at a time, each gauged to minimum winding 0. Fibers
 without a constraint keep their own component and winding 0.
 
-With `fix_approved_subgraphs` (default on) the approved constraints are solved
-alone first. If they contradict each other the run stops and names the pairs,
-so one of them can be revoked; otherwise each approved subgraph is contracted
-into one node with per-member offsets, and the remaining arcs are rewritten
-`k_S(b) - k_S(a) = target + offset_a - offset_b`. Approved relations are
-therefore held exactly, whatever the rest of the evidence says.
+Nothing is held rigid. An approval makes a constraint heavier, never exact:
+whether two statements contradict each other can only be said around a whole
+cycle, and a cycle is rarely approved end to end.
+
+### Approved normals are faced first
+
+Before any winding is solved the stretches approved for normals are faced
+(`scaffoldFaceApprovedNormals`). A normals approval states an axis along a
+stretch, not which of its two sides is outward. Every perpendicular crossing
+whose two anchors lie on approved stretches carries the facing across (the two
+normals point the same way through the sheets), so the stretches the crossings
+connect are one object with one free sign. That sign is the one that agrees
+best with the signed normals of the resolved fiber volume around the object's
+stretches, each sample counting with cos^2 of its angle; a run without
+neighbour normals takes the radial prior of the sign solve instead.
+
+Crossings that contradict each other inside one object are an annotation
+error - every part of that loop was approved - and fail the run, naming the
+crossing that closed the contradiction. No winding is solved in this step.
+
+The fiber normals are then traced out from the approved stretches
+(`ScaffoldNormals::face`): each stretch takes its facing, the fiber before the
+first and after the last follows the nearest one, and between two stretches
+the solved normal is kept where the two agree. Where they do not, the solved
+normals hold a half turn between them: it is taken out evenly over the gap, in
+the direction that leaves the least turning. Whatever error this hides shows up
+as violated constraints of the solve. A faced fiber's sign is held by the sign
+solve (`ScaffoldSignSource::ApprovedPiece`); its faced normals are a cache row
+of their own, keyed by the fiber's inputs and the facing, and that is the row
+the run references. The run records `approved_normal_stretches`, `_objects`,
+`_crossings`, `_objects_faced_by_neighbours`, `_weakest_agreement` (the share
+of the weighted samples that agree, for the object where it is lowest) and
+`_gaps_unrolled`.
+
+### Continuation links
+
+A fiber is not one node of the solve. It is cut at both ends of every approved
+stretch (geometry or normals; an approved stretch is one node and never cut)
+and, in the fiber between them, into pieces of at most `continuation.interval_vx`
+(2,000 voxels), each of those cuts moved to the middle between the two
+constraints around it (`scaffoldContinuationArcs`). Every cut is a
+*continuation link*: a constraint of kind `continuation` that puts the two
+parts on the same winding at `continuation.weight` (10). So a fiber can break
+where the evidence asks for it, at a cost, and a break shows where to look.
+Broken geometry still cuts a fiber without a link.
+
+The per-fiber winding of a run is that of the fiber's longest part. A run
+stores every link (residual row kind 19: the place, the weight, and by how
+many windings the solve broke it), and a broken one is also a violated
+constraint.
+
+On the PHerc0332 scaffold (292 fibers, 10 stretches approved for normals in 7
+objects, all faced by the neighbour normals with every sample agreeing): 1,798
+continuation links, 1 broken; 412 of 4,570 constraints violated, 223.9
+weighted turns; 17.7 s for the whole run with 16 workers.
 
 ### Scope
 
@@ -412,7 +460,9 @@ vc_scaffold_solve config.json
 | `constraints.maximum_winding_distance`, `.enforce_maximum_winding` | `1.5`, `false` | turns, and whether to reject beyond it |
 | `constraints.perpendicular_offset`, `.winding_scale`, `.enclosures` | `0.5`, `1`, `true` | relation conventions |
 | `weights.perpendicular`, `.parallel`, `.enclosure` | `1`, `0`, `0` | weight per measured arc |
-| `weights.sign` | `100` | weight per sign constraint (one per signed perpendicular crossing) |
+| `weights.sign` | `3` | weight per sign constraint (one per signed perpendicular crossing) |
+| `weights.sign_approved_factor` | `10` | factor on a sign constraint with an anchor on a stretch approved for normals |
+| `weights.reviewed` | `10` | weight of a separation a reviewer stated |
 | `weights.crossing_confidence` | `true` | scale a crossing's perpendicular, parallel and sign weight by the sign stage's term, dot² × min(1, 1/d²) |
 | `constraints.crossing_filter` | `true` | follow every perpendicular crossing through its two fibers' normal surfaces and apply the shared crossing rule (vc_object_store `geometry/FiberCrossingFilter.hpp`, the one the traced volume's sign and winding stages use): the sign solve drops crossings with nothing left or mixed relations, the constraints drop crossings with nothing left and those that disagree under the solved signs but have an agreeing crossing in the same encounter |
 | `winding.manifest`, `winding.remote_cache` | — | the Lasagna normal dataset the separations are measured on |
@@ -429,7 +479,7 @@ vc_scaffold_solve config.json
 | `include_untagged` | `false` | load the fibers without an H/V tag too |
 | `fibers` | all of them | restrict the run to these fiber UUIDs (the dock's scope) |
 | `lemon.backend`, `lemon.capacity_scale` | `network_simplex`, `1000` | flow backend |
-| `fix_approved_subgraphs` | `true` | contract approved subgraphs |
+| `continuation.enabled`, `.weight`, `.interval_vx` | `true`, `10`, `2000` | continuation links: a fiber may break at the ends of its approved stretches and about every interval between them |
 | `max_alternative_paths` | `4` | redundancy cap |
 | `workers` | `1` | geometry packing threads |
 | `output`, `windings_output` | — | JSON summary / per-fiber windings |
@@ -561,18 +611,8 @@ publishes nothing and leaves the previous layout and its cache in place.
 
 ## Approving a measured constraint
 
-An approved constraint is held rigid: the next run solves the approved
-constraints alone first and contracts each approved subgraph into one node, so
-an approved relation is never traded away (and approved relations that
-contradict each other stop the run instead of being averaged).
-
-Nothing is held rigid over geometry nobody reviewed. Whatever states the
-approval, a constraint only counts as approved when the two pieces its anchors
-lie on are *currently* approved for geometry
-(`scaffoldConstraintPiecesApproved`). A link whose record says approved but
-whose pieces are not counts as an ordinary link and is reported as
-`link_approved_without_pieces`. A link's approval is otherwise its record's
-review state.
+An approval is never exact: a link's review state does not change its
+weight, and a reviewed crossing is a heavy constraint.
 
 A measured crossing has no record, so what a reviewer states about it is a row
 of `ext_fiber_constraint_approval`, keyed by the two fibers, the kind and the
@@ -589,9 +629,8 @@ applies it:
 - distant, measurement direct or missing: the separation is dropped;
 - distant, always: the sign bound moves one winding out.
 
-A reviewed separation takes the full perpendicular weight and is held rigid
-where both pieces are approved geometry (`crossings_stated_rigid`, otherwise
-`crossings_stated_without_pieces`). Re-running the extraction does not lose a
+A reviewed separation takes `weights.reviewed` (10), whatever the crossing's
+confidence. Re-running the extraction does not lose a
 row - the crossing lands in the same quantum - but editing either fiber's
 covering span does. The run stores its perpendicular crossings (residual row
 kind 18: the measured separation and whether the side is known), which is
@@ -646,52 +685,36 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   are those that moved against the neighbours they share a component with in
   both runs; a pure gauge shift or a renumbered component counts as no
   difference.
-- **Fiber and piece approval.** The selected run's violated constraints and the
-  stretches they accuse, in one table. Columns: what, fiber (the pair for a
-  constraint), where (the control spans the anchors lie on), *off* (turns the
-  solve could not satisfy), *state*, *cost* (weight times residual, weighted
-  turns), *joint* (cost per constraint of the shortest cycle), *cycle*
-  (constraints on that cycle), *loop* (which cycle, numbered from 1 in rank
-  order - rows sharing a number are about the same loop, and a stretch lists
-  every loop running along it), *length* (the stretch, or the cycle's total
-  stretch length, voxels) and *paths* (edge-disjoint alternatives for a
-  constraint, accusing constraints for a stretch). The Order combo applies
-  the three documented orders with their tie-breaks - *smallest cycle* (then
-  the shorter stretch), *highest cost* (then the shorter cycle and stretch),
-  *cost per hop* - and a header click sorts by that column's own number.
-  The component filter restricts the table to one component of the run; a
-  component was solved on its own, so its violations can only be explained by
-  its own annotation.
+- **Fiber and piece approval.** The stretches to approve, and nothing else.
+  A stretch is not part of a solve: the list is derived here
+  (`scaffoldStretches`) from what the selected run left violated (its
+  residual rows and its stored crossings) and from the approval layers as
+  they are now. An approval therefore changes the list at once; a new solve
+  only changes the costs.
 
-  A stretch says something to a solve only where it reaches from one
-  constraint to another, so the stretch rows run from constraint to
-  constraint; their ends are not control points.
+  An annotation states a normal without a facing and a crossing's distance
+  without a side, so a stretch always ties constraints together: from a
+  violated constraint's anchor to the nearest other constraint of that fiber
+  (however far), over the next ones until it is 500 voxels long, and over
+  further ones within 300 voxels while it stays within 2,000 voxels. It
+  reaches 100 voxels past its outer constraints. One row per fiber of the
+  violated constraint; overlapping rows of a fiber are one. *cost* is the
+  summed cost of every violated constraint anchored on the stretch.
 
-  **Geometry** rows are the stretches the cycles of the violated constraints
-  run along. A violated constraint's cost is split over its cycle's stretches
-  in proportion to 1 / length, among those whose geometry is not approved
-  from end to end: an approved stretch cannot be the error, so the cost
-  gathers on what is left. Stretches of one fiber that overlap or lie within
-  300 voxels of each other are one row (their shares add up) while the whole
-  stays within 2,000 voxels, so one look covers several constraints. *cost*
-  is the summed share, *cost/kvx* that cost per 1000 voxels; *cost per voxel*
-  is the default order. The rows are computed from the run's rows and the
-  current approvals, so an approval moves the cost without a new solve. A
-  fiber nothing accuses has no row.
+  A stretch that is already approved (geometry or normals) is fixed: it is
+  listed exactly as approved, with the violated constraints on it, and is
+  never cut up or shifted. New stretches lie between approved ones and reach
+  at most 100 voxels into one.
 
-  **Normals** rows come from the violated sign constraints
-  (`scaffoldStretches`). A sign constraint the solve had to break says a
-  normal is wrong at that crossing, on one of its two fibers. An annotation
-  states a normal without a facing, so the row always reaches from that
-  crossing to at least one other crossing of the same fiber (the nearest,
-  however far), and over further crossings within 300 voxels (at most 2,000
-  voxels): approving the normals there ties those crossings to one facing.
-  One row per fiber of the constraint; overlapping rows of a fiber are one.
-  *cost* is the summed cost of the violated sign constraints on the row,
-  *state* their number and *paths* the fiber's crossings on it. A row whose
-  stretch is approved for normals from end to end is not offered, which
-  leaves the other fiber. A fiber with no other crossing has no row; the run
-  counts those (`stretches_without_crossing`).
+  Columns: *geo* and *nrm* (a check when the stretch is approved for that
+  aspect), *approved w.* (crossings with an approved winding distance - direct or distant - of all on the stretch),
+  *winding* (violated winding constraints - separations and links - of all
+  on it, as X/Y), *sign* (violated sign constraints, of the crossings whose
+  side is known, as X/Y), *cont* (continuation links on the stretch the
+  solve broke, of all on it, as X/Y), *where*, *cost*,
+  *cost/kvx*, *length* and *fiber*. The Order combo offers *highest cost*
+  (the default) and *cost per voxel*; a header click sorts by that column.
+  The component filter restricts the table to one component of the run.
 
   What a run accuses outside a fiber's present control points stays a row
   without a control range, and selecting it is an error that says the run is
@@ -729,10 +752,10 @@ Three docks (`FiberMapScaffoldSolve.hpp`, with the Qt-free ranking in
   in the approval window), `sign` or `link`. A link is never approved here: a
   link's approval is its review state in the annotation.
 
-A run records what its approvals actually fixed:
+A run records what its approvals stated:
 `constraint_approval_rows` (live rows), `constraint_approvals_applied`,
-`constraint_approvals_stale` (the covering spans were edited),
-the `crossings_stated_*` counts above and `link_approved_without_pieces`.
+`constraint_approvals_stale` (the covering spans were edited) and
+the `crossings_stated_*` counts above.
 
 Halos are reserved for the selection - the fiber list's and the approval
 dock's - so what the map says about a fiber's own geometry stays what it always
@@ -851,7 +874,7 @@ dock is for.
 |---|---|
 | `field_comparison.samples` | the volume's signed strip samples: its fibers as polylines with their signed normals |
 | `field_comparison.winding_store` | the volume's winding result store (families and solved windings); `winding_run` selects a run when it holds several |
-| `field_comparison.weights` | optional `perpendicular` / `parallel` / `sign` weights of the cross constraints (default 1 / 0 / 100), independent of the scaffold solve's own weights, so a links-only solve can be compared too |
+| `field_comparison.weights` | optional `perpendicular` / `parallel` / `sign` weights of the cross constraints (default 1 / 0 / 3), independent of the scaffold solve's own weights, so a links-only solve can be compared too |
 | `field_comparison.output` | the cross constraints as doubles, 11 per row (scaffold fiber, volume fiber, kind, target, weight, winding distance, scored, step, residual, the two arcs), and `<output>.json` with the fiber ids and the summary |
 
 - The crossings are extracted between the two sets only (the extractor's bipartite mode), with the run's event options, and turned into constraints by the shared assembly, with rounded separations so that every crossing is one statement. The crossing findings and the crossing filter apply as in the solve.

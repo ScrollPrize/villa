@@ -208,6 +208,15 @@ struct ScaffoldNormalOptions {
     ScaffoldRunMonitor* monitor = nullptr;
 };
 
+// The facing of one stretch approved for normals: `sign` times the solved
+// (gauge) normal is the outward normal on it. Decided for all approved
+// stretches together (scaffoldApprovedFacing, ScaffoldConstraints.hpp).
+struct ScaffoldApprovedFacing {
+    std::int64_t fiber = 0;
+    double arcFrom = 0, arcTo = 0;
+    int sign = 1;
+};
+
 struct ScaffoldNormalReport {
     // Fibers whose normals came from the cache, and those this run solved
     // and wrote back.
@@ -238,6 +247,10 @@ struct ScaffoldNormalReport {
     std::int64_t fieldCrossings = 0, scaffoldCrossings = 0, crossedNodes = 0;
     double neighbourSeconds = 0;
     double seconds = 0;
+    // face(): the fibers and approved stretches that were faced, and the
+    // gaps between two stretches of one fiber that face opposite ways in the
+    // solved normals, where the half turn was spread over the gap.
+    std::int64_t facedFibers = 0, facedStretches = 0, unrolledGaps = 0;
 };
 
 class ScaffoldNormals {
@@ -267,6 +280,17 @@ public:
     // a fiber whose sign the sign solve decides.
     const std::vector<int>& fixedSigns() const { return fixedSigns_; }
     const ScaffoldNormalReport& report() const { return report_; }
+    // Turns the normals of every fiber with a faced stretch into outward
+    // normals, traced out from its approved stretches: each stretch takes its
+    // facing, the fiber before the first and after the last follows the
+    // nearest one, and between two stretches the solved normal is kept where
+    // they agree. Where they do not, the solved normals hold a half turn
+    // between them that the facings do not have: it is taken out evenly over
+    // the gap, in the direction that leaves the least turning. Such a fiber
+    // is faced (sign source ApprovedPiece) and the sign solve holds it. The
+    // result is cached under the fiber's inputs plus the facing; `options`
+    // are the ones the normals were solved with.
+    void face(std::span<const ScaffoldApprovedFacing>, const ScaffoldNormalOptions& options);
     // Per fiber: the identity of the cache row its normals are (read from it,
     // or written by this run), which the crossings extracted with them name.
     // Empty for a fiber whose normals cannot be cached.
@@ -282,6 +306,9 @@ private:
     std::vector<double> radialAgreement_;
     std::vector<int> fixedSigns_;
     std::vector<std::string> cacheRows_;
+    // Per fiber: what its normals were solved from (the cache key), empty for
+    // a fiber that is not cached.
+    std::vector<std::string> inputs_;
     ScaffoldNormalReport report_;
 };
 

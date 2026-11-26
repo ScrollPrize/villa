@@ -99,7 +99,9 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         {"link_state_rejected", usesState("rejected")},
         {"link_state_count", std::int64_t(states.size())},
         {"lemon_capacity_scale", options.flow.capacityScale},
-        {"fix_approved_subgraphs", options.fixApprovedSubgraphs},
+        {"continuation_links", options.continuation.enabled},
+        {"weight_continuation", options.continuation.weight},
+        {"continuation_interval", options.continuation.intervalVx},
         {"max_alternative_paths", options.maxAlternativePaths},
         // A restricted run says so: the fibers its scope left out.
         {"scope_excluded_fibers", graph.report.filteredSubset},
@@ -136,6 +138,8 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         settings.emplace("weight_parallel", stages.measuredOptions->parallelWeight);
         settings.emplace("weight_enclosure", stages.measuredOptions->enclosureWeight);
         settings.emplace("weight_sign", stages.measuredOptions->signWeight);
+        settings.emplace("weight_sign_approved_factor", stages.measuredOptions->approvedSignFactor);
+        settings.emplace("weight_reviewed", stages.measuredOptions->reviewedWeight);
         settings.emplace("weight_crossing_confidence", stages.measuredOptions->crossingConfidence);
         settings.emplace("crossing_filter", stages.measuredOptions->crossingFilter);
         settings.emplace("perpendicular_offset", stages.measuredOptions->perpendicularOffset);
@@ -226,20 +230,14 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("isolated_fibers", result.isolatedFibers, "fibers");
     count("violated_arcs", result.violatedArcs, "arcs");
     count("violated_constraints", result.violatedConstraints, "constraints");
-    count("approved_subgraphs", result.approvedSubgraphs, "subgraphs");
+    count("continuation_links", result.continuationLinks, "links");
+    count("continuation_links_broken", result.brokenContinuations, "links");
     count("approval_layers", graph.report.approvalLayers, "fibers");
     count("approved_stretches", graph.report.approvedStretches, "stretches");
     count("broken_stretches", graph.report.brokenStretches, "stretches");
     count("stale_approval_items", graph.report.staleApprovalItems, "items");
     count("split_fibers", result.splitFibers, "fibers");
     count("split_parts", std::int64_t(result.parts.size()), "parts");
-    std::int64_t approvedConstraints = 0;
-    for (const auto& constraint : result.constraints) approvedConstraints += constraint.approved ? 1 : 0;
-    count("approved_constraints", approvedConstraints, "constraints");
-    // Approved by their record, not held rigid: the pieces they lie on are
-    // not approved geometry.
-    count("link_approved_without_pieces", result.linkReport.approvedWithoutPieces, "links");
-    count("contracted_fibers", result.contractedFibers, "fibers");
     // The map links, refined onto their encounters: how many assert a
     // relation, how many the refinement rejected and why, and how many
     // measured crossings they replaced.
@@ -254,11 +252,6 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     count("links_with_crossing", result.linkReport.linksWithCrossing, "links");
     count("crossings_replaced_by_links", result.linkReport.deduplicatedCrossings, "crossings");
     metric("link_refinement_max_shift", result.linkReport.maxRefinementShift, "voxels");
-    if (stages.stretchReport) {
-        count("stretch_violations", stages.stretchReport->violations, "constraints");
-        count("stretches", stages.stretchReport->suspects, "stretches");
-        count("stretches_without_crossing", stages.stretchReport->withoutCrossing, "fiber sides");
-    }
     if (stages.flipReport) {
         count("normal_order_links_checked", stages.flipReport->checked, "links");
         count("normal_order_links_agreed", stages.flipReport->agreed, "links");
@@ -328,8 +321,7 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
         count("crossings_stated_distant_kept", stages.measured->statedDistantKept, "crossings");
         count("crossings_stated_distant_dropped", stages.measured->statedDistantDropped, "crossings");
         count("crossings_stated_without_sign", stages.measured->statedWithoutSign, "crossings");
-        count("crossings_stated_rigid", stages.measured->statedRigid, "constraints");
-        count("crossings_stated_without_pieces", stages.measured->statedWithoutPieces, "constraints");
+        count("sign_constraints_on_approved_normals", stages.measured->signOnApprovedNormals, "constraints");
     }
     if (stages.signs) {
         count("sign_events", stages.signs->events, "events");
@@ -347,6 +339,14 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
             metric("sign_strict_disagreement_percent", stages.signs->solve.metrics.strictDisagreementPercent,
                    "percent");
         }
+    }
+    if (stages.facing) {
+        count("approved_normal_stretches", stages.facing->stretches, "stretches");
+        count("approved_normal_objects", stages.facing->objects, "objects");
+        count("approved_normal_crossings", stages.facing->crossings, "crossings");
+        count("approved_normal_objects_faced_by_neighbours", stages.facing->facedByNeighbours, "objects");
+        metric("approved_normal_weakest_agreement", stages.facing->weakestAgreement, "share");
+        if (stages.normals) count("approved_normal_gaps_unrolled", stages.normals->unrolledGaps, "gaps");
     }
     if (stages.approvals) {
         count("constraint_approval_rows", stages.approvals->live, "rows");
@@ -436,42 +436,8 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
                  {"score", nullValue()}}).values);
         }
     }
-    if (stages.stretches) {
-        const auto first = std::int64_t(result.residuals.size() + (stages.flips ? stages.flips->size() : 0));
-        for (std::size_t at = 0; at < stages.stretches->size(); ++at) {
-            const auto& suspect = (*stages.stretches)[at];
-            const auto rank = first + std::int64_t(at);
-            const auto fiber = uuidValue(graph.fibers[std::size_t(suspect.fiber)].uuid);
-            residuals.push_back(objects::fiberGraphSolveRow(FiberGraphTable::Residuals,
-                {{"run_uuid", uuidValue(record.runUuid)},
-                 {"residual_index", rank},
-                 {"kind", kScaffoldStretchRowKind},
-                 {"fiber_a", fiber},
-                 {"fiber_b", uuidValue(graph.fibers[std::size_t(suspect.other)].uuid)},
-                 {"target", suspect.violations},
-                 {"weight", double(suspect.constraints)},
-                 {"residual", suspect.cost},
-                 {"edge_uuid", nullValue()},
-                 {"arc_a", suspect.arc},
-                 {"arc_b", suspect.otherArc},
-                 {"cycle_hops", nullValue()},
-                 {"cycle_piece_length", nullValue()},
-                 {"redundancy", nullValue()}}).values);
-            pieces.push_back(objects::fiberGraphSolveRow(FiberGraphTable::ResidualPieces,
-                {{"run_uuid", uuidValue(record.runUuid)},
-                 {"residual_index", rank},
-                 {"member_index", std::int64_t{0}},
-                 {"fiber_uuid", fiber},
-                 {"arc_from", std::min(suspect.piece.arcFrom, suspect.piece.arcTo)},
-                 {"arc_to", std::max(suspect.piece.arcFrom, suspect.piece.arcTo)},
-                 {"control_from", suspect.piece.controlFrom >= 0 ? ExtensionValue{suspect.piece.controlFrom} : nullValue()},
-                 {"control_to", suspect.piece.controlTo >= 0 ? ExtensionValue{suspect.piece.controlTo} : nullValue()},
-                 {"score", nullValue()}}).values);
-        }
-    }
     if (stages.crossings) {
-        const auto first = std::int64_t(result.residuals.size() + (stages.flips ? stages.flips->size() : 0) +
-                                        (stages.stretches ? stages.stretches->size() : 0));
+        const auto first = std::int64_t(result.residuals.size() + (stages.flips ? stages.flips->size() : 0));
         for (std::size_t at = 0; at < stages.crossings->size(); ++at) {
             const auto& crossing = (*stages.crossings)[at];
             residuals.push_back(objects::fiberGraphSolveRow(FiberGraphTable::Residuals,
@@ -481,11 +447,40 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
                  {"fiber_a", uuidValue(graph.fibers[std::size_t(crossing.a)].uuid)},
                  {"fiber_b", uuidValue(graph.fibers[std::size_t(crossing.b)].uuid)},
                  {"target", crossing.estimateHalves},
-                 {"weight", crossing.signKnown ? 1. : 0.},
+                 {"weight", double((crossing.signKnown ? 1 : 0) + (crossing.separation ? 2 : 0))},
                  {"residual", std::isfinite(crossing.distance) ? crossing.distance : -1.},
                  {"edge_uuid", nullValue()},
                  {"arc_a", crossing.arcA},
                  {"arc_b", crossing.arcB},
+                 {"cycle_hops", nullValue()},
+                 {"cycle_piece_length", nullValue()},
+                 {"redundancy", nullValue()}}).values);
+        }
+    }
+    {
+        // Every continuation link with what the solve made of it.
+        std::map<std::pair<std::int64_t, double>, double> broken;
+        for (const auto& entry : result.residuals) {
+            const auto& constraint = result.constraints[std::size_t(entry.constraint)];
+            if (constraint.kind == ScaffoldConstraintKind::Continuation)
+                broken[{constraint.a, constraint.arcB}] = entry.residual;
+        }
+        auto index = std::int64_t(residuals.size());
+        for (const auto& constraint : result.constraints) {
+            if (constraint.kind != ScaffoldConstraintKind::Continuation) continue;
+            const auto found = broken.find({constraint.a, constraint.arcB});
+            residuals.push_back(objects::fiberGraphSolveRow(FiberGraphTable::Residuals,
+                {{"run_uuid", uuidValue(record.runUuid)},
+                 {"residual_index", index++},
+                 {"kind", kScaffoldContinuationRowKind},
+                 {"fiber_a", uuidValue(graph.fibers[std::size_t(constraint.a)].uuid)},
+                 {"fiber_b", uuidValue(graph.fibers[std::size_t(constraint.b)].uuid)},
+                 {"target", std::int64_t{0}},
+                 {"weight", constraint.weight},
+                 {"residual", found == broken.end() ? 0. : found->second},
+                 {"edge_uuid", nullValue()},
+                 {"arc_a", constraint.arcB},
+                 {"arc_b", constraint.arcB},
                  {"cycle_hops", nullValue()},
                  {"cycle_piece_length", nullValue()},
                  {"redundancy", nullValue()}}).values);
@@ -550,9 +545,7 @@ std::vector<ScaffoldStoredRun> readScaffoldRuns(const objects::StoreReader& read
         const Columns residuals(FiberGraphTable::Residuals);
         scanRun(reader, FiberGraphTable::Residuals, entry.runUuid, [&](const ExtensionRow& row) {
             const auto kind = residuals.integer(row, "kind");
-            if (kind != kScaffoldNormalFlipRowKind && kind != kScaffoldStretchRowKind &&
-                kind != kScaffoldCrossingRowKind)
-                ++entry.residuals;
+            if (kind < kScaffoldNormalFlipRowKind) ++entry.residuals;
         });
     }
     return out;
@@ -576,12 +569,6 @@ std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::Store
     return readResidualRows(reader, runUuid, kScaffoldNormalFlipRowKind);
 }
 
-std::vector<ScaffoldStoredResidual> readScaffoldStretches(const objects::StoreReader& reader,
-                                                            const std::string& runUuid)
-{
-    return readResidualRows(reader, runUuid, kScaffoldStretchRowKind);
-}
-
 std::vector<ScaffoldStoredCrossing> readScaffoldCrossings(const objects::StoreReader& reader,
                                                           const std::string& runUuid)
 {
@@ -593,10 +580,21 @@ std::vector<ScaffoldStoredCrossing> readScaffoldCrossings(const objects::StoreRe
         crossing.arcA = row.arcA;
         crossing.arcB = row.arcB;
         crossing.estimateHalves = row.target;
-        crossing.signKnown = row.weight > 0;
+        const auto flags = std::int64_t(std::llround(row.weight));
+        crossing.signKnown = (flags & 1) != 0;
+        crossing.separation = (flags & 2) != 0;
         crossing.distance = row.residual < 0 ? std::numeric_limits<double>::quiet_NaN() : row.residual;
         out.push_back(std::move(crossing));
     }
+    return out;
+}
+
+std::vector<ScaffoldStoredContinuation> readScaffoldContinuations(const objects::StoreReader& reader,
+                                                                  const std::string& runUuid)
+{
+    std::vector<ScaffoldStoredContinuation> out;
+    for (const auto& row : readResidualRows(reader, runUuid, kScaffoldContinuationRowKind))
+        out.push_back({row.fiberA, row.arcA, row.weight, row.residual});
     return out;
 }
 
@@ -612,8 +610,8 @@ std::vector<ScaffoldStoredResidual> readResidualRows(const objects::StoreReader&
         ScaffoldStoredResidual entry;
         entry.index = columns.integer(row, "residual_index");
         entry.kind = columns.integer(row, "kind");
-        const bool suspect = entry.kind == kScaffoldNormalFlipRowKind || entry.kind == kScaffoldStretchRowKind ||
-                             entry.kind == kScaffoldCrossingRowKind;
+        // Kinds from the flip kind on are not violated constraints.
+        const bool suspect = entry.kind >= kScaffoldNormalFlipRowKind;
         if (suspects == 0 ? suspect : entry.kind != suspects) return;
         entry.target = columns.integer(row, "target");
         entry.fiberA = columns.uuid(row, "fiber_a");

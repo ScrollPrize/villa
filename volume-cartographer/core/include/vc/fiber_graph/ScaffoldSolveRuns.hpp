@@ -57,14 +57,12 @@ struct ScaffoldRunStages {
     const ScaffoldSignOptions* signOptions = nullptr;
     const ScaffoldSignResult* signs = nullptr;
     const ScaffoldApprovalReport* approvals = nullptr;
+    // The facing of the stretches approved for normals (scaffoldFaceApprovedNormals).
+    const ScaffoldFacingReport* facing = nullptr;
     // The normal flips the map links accuse (scaffoldLinkNormalFlips), over
     // the solve's own constraints.
     const std::vector<ScaffoldNormalFlip>* flips = nullptr;
     const ScaffoldNormalFlipReport* flipReport = nullptr;
-    // The stretches to look at for the violated sign constraints
-    // (scaffoldStretches).
-    const std::vector<ScaffoldStretch>* stretches = nullptr;
-    const ScaffoldStretchReport* stretchReport = nullptr;
     // The perpendicular crossings the run assembled (scaffoldMeasuredConstraints).
     const std::vector<ScaffoldCrossing>* crossings = nullptr;
 };
@@ -75,20 +73,19 @@ struct ScaffoldRunStages {
 // `residual` and `weight` the suspected fiber's disagreeing and agreeing
 // links, and one piece row for the stretch to look at.
 inline constexpr std::int64_t kScaffoldNormalFlipRowKind = 16;
-// A stretch to approve (scaffoldStretches), stored the same way after the
-// flips: fiber_a the stretch's fiber and arc_a its anchor of the worst
-// violated constraint, fiber_b / arc_b that constraint's other fiber,
-// `residual` the summed cost of the violated constraints on the stretch,
-// `target` their number, `weight` the number of all constraints anchored on
-// it, and one piece row for the stretch itself.
-inline constexpr std::int64_t kScaffoldStretchRowKind = 17;
-// A perpendicular crossing of the run, stored after the suspects: the two
+// A perpendicular crossing of the run, stored after the flips: the two
 // fibers and anchors, `target` the separation the measurement rounds to in
 // half windings (0 for none), `residual` the measured separation in turns
-// (-1 for none), and `weight` 1 when the normals state which fiber lies
-// outside. It is what the approval window lists; the state a reviewer gave it
+// (-1 for none), and `weight` two flags: 1 when the normals state which fiber
+// lies outside (a sign constraint), 2 when the crossing states a separation. It is what the approval window lists; the state a reviewer gave it
 // is the constraint approval row, not this.
 inline constexpr std::int64_t kScaffoldCrossingRowKind = 18;
+// A continuation link of the run, stored after the crossings: fiber_a and
+// fiber_b the fiber, arc_a and arc_b the place it may break at, `weight` the
+// link's weight and `residual` the windings the solve broke it by (0: held).
+// A broken one is also among the violated constraints, as kind
+// ScaffoldConstraintKind::Continuation.
+inline constexpr std::int64_t kScaffoldContinuationRowKind = 19;
 
 // The rows of one solve. `method` names the backend the result came from.
 ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph&, const ScaffoldSolveResult&, const ScaffoldSolveOptions&,
@@ -133,16 +130,22 @@ struct ScaffoldStoredResidual {
 std::vector<ScaffoldStoredResidual> readScaffoldResiduals(const objects::StoreReader&, const std::string& runUuid);
 // The run's normal flip suspects (kScaffoldNormalFlipRowKind), in stored order.
 std::vector<ScaffoldStoredResidual> readScaffoldNormalFlips(const objects::StoreReader&, const std::string& runUuid);
-// The run's sign suspects (kScaffoldStretchRowKind), highest cost first.
-std::vector<ScaffoldStoredResidual> readScaffoldStretches(const objects::StoreReader&, const std::string& runUuid);
-
+// The run's continuation links (kScaffoldContinuationRowKind).
+struct ScaffoldStoredContinuation {
+    std::string fiber;
+    double arc = 0, weight = 0;
+    // Windings the solve broke the link by; 0 where it held.
+    double residual = 0;
+};
+std::vector<ScaffoldStoredContinuation> readScaffoldContinuations(const objects::StoreReader&,
+                                                                  const std::string& runUuid);
 // The run's perpendicular crossings (kScaffoldCrossingRowKind).
 struct ScaffoldStoredCrossing {
     std::string fiberA, fiberB;
     double arcA = 0, arcB = 0;
     double distance = 0; // turns; NaN when none was measured
     std::int64_t estimateHalves = 0;
-    bool signKnown = false;
+    bool signKnown = false, separation = false;
 };
 std::vector<ScaffoldStoredCrossing> readScaffoldCrossings(const objects::StoreReader&, const std::string& runUuid);
 

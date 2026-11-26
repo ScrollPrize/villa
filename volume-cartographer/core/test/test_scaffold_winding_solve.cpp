@@ -193,7 +193,6 @@ TEST_CASE("a frustrated triangle names the cycle its violation lies on")
     builder.link(h, v, true, "approved", 5., 5.); // contradicts the two above
     const ScaffoldGeometry geometry(builder.graph);
     ScaffoldSolveOptions options;
-    options.fixApprovedSubgraphs = false;
     const auto result = solveScaffoldWinding(builder.graph, geometry, options);
     CHECK(result.linkReport.used == 3);
     CHECK(result.objective == doctest::Approx(1.));
@@ -242,7 +241,6 @@ TEST_CASE("a monitor reports the solve's stages and takes the run back")
     const ScaffoldGeometry geometry(builder.graph);
     ScaffoldRunMonitor monitor;
     ScaffoldSolveOptions options;
-    options.fixApprovedSubgraphs = false;
     options.monitor = &monitor;
     const auto result = solveScaffoldWinding(builder.graph, geometry, options);
     CHECK(result.violatedConstraints == 1);
@@ -279,7 +277,6 @@ TEST_CASE("the shortest cycle wins over a longer one")
     builder.link(a, b, true);
     const ScaffoldGeometry geometry(builder.graph);
     ScaffoldSolveOptions options;
-    options.fixApprovedSubgraphs = false;
     const auto result = solveScaffoldWinding(builder.graph, geometry, options);
     REQUIRE(result.residuals.size() == 1);
     const auto& residual = result.residuals.front();
@@ -290,29 +287,7 @@ TEST_CASE("the shortest cycle wins over a longer one")
     CHECK(residual.redundancy == 2);
 }
 
-TEST_CASE("approved subgraphs are held rigid")
-{
-    Builder builder;
-    const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
-    const auto b = builder.fiber(ScaffoldFamily::Horizontal, 110.);
-    const auto c = builder.fiber(ScaffoldFamily::Vertical, 120.);
-    builder.link(a, b, false, "approved");
-    builder.link(b, c, false, "approved");
-    builder.link(a, c, true, "pending"); // contradicts the approved pair
-    for (const auto fiber : {a, b, c}) builder.approveGeometry(fiber);
-    const ScaffoldGeometry geometry(builder.graph);
-    const auto result = solveScaffoldWinding(builder.graph, geometry, pendingAndApproved());
-    CHECK(result.approvedSubgraphs == 1);
-    CHECK(result.contractedFibers == 2);
-    CHECK(result.objective == doctest::Approx(1.));
-    REQUIRE(result.residuals.size() == 1);
-    // The pending link is the one left violated, never an approved one.
-    CHECK(result.constraints[std::size_t(result.residuals.front().constraint)].approved == false);
-    CHECK(result.winding[a] == result.winding[b]);
-    CHECK(result.winding[c] == result.winding[a]);
-}
-
-TEST_CASE("contradicting approved constraints stop the run")
+TEST_CASE("nothing is held rigid: approved links are ordinary constraints")
 {
     Builder builder;
     const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
@@ -322,30 +297,83 @@ TEST_CASE("contradicting approved constraints stop the run")
     builder.approveGeometry(a);
     builder.approveGeometry(b);
     const ScaffoldGeometry geometry(builder.graph);
-    CHECK_THROWS_AS(solveScaffoldWinding(builder.graph, geometry), std::invalid_argument);
+    // Two approved links that contradict each other cost one winding; the
+    // run does not stop.
+    const auto result = solveScaffoldWinding(builder.graph, geometry);
+    CHECK(result.objective == doctest::Approx(1.));
+    CHECK(result.residuals.size() == 1);
 }
 
-TEST_CASE("an approved link over unapproved geometry is not held rigid")
+TEST_CASE("continuation links: a fiber may break between its approved stretches and at regular intervals")
 {
+    // The cuts: both ends of an approved range, and the rest about every
+    // interval, each moved to the middle between the constraints around it.
+    const std::vector<std::pair<double, double>> approved{{1000., 1500.}};
+    const std::vector<double> anchors{100., 3400., 3700., 5200.};
+    const auto cuts = scaffoldContinuationArcs(6000., {}, approved, anchors, 2000.);
+    // 0-1000 is one piece; 1500-6000 (4500 vx) is three of 1500: nominal
+    // 3000 has no constraint after 1500 before it and stays, nominal 4500
+    // moves between the constraints at 3700 and 5200.
+    REQUIRE(cuts.size() == 4);
+    CHECK(cuts[0] == doctest::Approx(1000.));
+    CHECK(cuts[1] == doctest::Approx(1500.));
+    CHECK(cuts[2] == doctest::Approx(3000.));
+    CHECK(cuts[3] == doctest::Approx(4450.));
+    // An approved range is never cut, however long.
+    CHECK(scaffoldContinuationArcs(6000., {}, std::vector<std::pair<double, double>>{{0., 6000.}}, {}, 2000.).empty());
+
     Builder builder;
     const auto a = builder.fiber(ScaffoldFamily::Horizontal, 100.);
-    const auto b = builder.fiber(ScaffoldFamily::Horizontal, 110.);
-    const auto c = builder.fiber(ScaffoldFamily::Vertical, 120.);
-    builder.link(a, b, false, "approved");
-    builder.link(b, c, false, "approved");
-    builder.link(a, c, true, "pending"); // contradicts the approved pair
-    // Only one side of the approved pair has approved pieces, so neither
-    // approved link is rigid and the pending link is free to be satisfied.
-    builder.approveGeometry(a);
+    const auto b = builder.fiber(ScaffoldFamily::Vertical, 110.);
+    // Crossings of one pair that disagree by one winding, three against one
+    // at each end of `a`, with an approved stretch of `a` between them.
+    std::vector<ScaffoldConstraint> measured;
+    for (std::size_t i = 0; i < 2; ++i)
+        for (std::size_t copy = 0; copy < 3; ++copy) {
+            ScaffoldConstraint constraint;
+            constraint.kind = ScaffoldConstraintKind::Perpendicular;
+            constraint.a = std::int64_t(a);
+            constraint.b = std::int64_t(b);
+            constraint.arcA = i == 0 ? 50. : 350.;
+            constraint.arcB = 200.;
+            constraint.target = std::int64_t(i);
+            constraint.weight = 1.;
+            measured.push_back(constraint);
+        }
+    builder.graph.fibers[a].approval.approvedGeometry = {{30., 50.}}; // arc 150 to 250
     const ScaffoldGeometry geometry(builder.graph);
-    const auto result = solveScaffoldWinding(builder.graph, geometry, pendingAndApproved());
-    CHECK(result.linkReport.approvedWithoutPieces == 2);
-    CHECK(result.approvedSubgraphs == 0);
-    CHECK(result.contractedFibers == 0);
-    for (const auto& constraint : result.constraints) CHECK_FALSE(constraint.approved);
-    // Three links, one of which must give: the solve is free to choose, and
-    // the cheapest answer is one winding of residual somewhere.
-    CHECK(result.objective == doctest::Approx(1.));
+    ScaffoldSolveOptions options;
+    options.links.useLinks = false;
+    {
+        // Weak links: `a` breaks at one end of its approved stretch rather
+        // than leave three crossings violated.
+        options.continuation.weight = 1.;
+        const auto result = solveScaffoldWinding(builder.graph, geometry, options, measured);
+        CHECK(result.continuationLinks == 2);
+        CHECK(result.brokenContinuations == 1);
+        CHECK(result.objective == doctest::Approx(1.));
+        REQUIRE(result.parts.size() == 3);
+        CHECK(result.parts[1].continues);
+        CHECK(std::abs(result.parts[2].winding - result.parts[0].winding) == 1);
+        REQUIRE(result.residuals.size() == 1);
+        const auto& broken = result.constraints[std::size_t(result.residuals.front().constraint)];
+        CHECK(broken.kind == ScaffoldConstraintKind::Continuation);
+        CHECK(broken.a == broken.b);
+    }
+    {
+        // Strong links: the fiber stays whole and the crossings pay.
+        options.continuation.weight = 10.;
+        const auto result = solveScaffoldWinding(builder.graph, geometry, options, measured);
+        CHECK(result.brokenContinuations == 0);
+        CHECK(result.objective == doctest::Approx(3.));
+        for (const auto& part : result.parts) CHECK(part.winding == result.parts.front().winding);
+    }
+    {
+        options.continuation.enabled = false;
+        const auto result = solveScaffoldWinding(builder.graph, geometry, options, measured);
+        CHECK(result.continuationLinks == 0);
+        CHECK(result.parts.empty());
+    }
 }
 
 TEST_CASE("links are filtered by approval state, automation and family")
@@ -518,10 +546,6 @@ TEST_CASE("a sign constraint bounds the step from one side and costs only when b
         CHECK(result.components == 1);
         CHECK(result.violatedConstraints == 0);
         CHECK(result.winding[b] - result.winding[a] <= 4);
-        // An approved bound is refused: a bound is not a relation to hold rigid.
-        auto approved = constraints;
-        approved.front().approved = true;
-        CHECK_THROWS(solveScaffoldWinding(builder.graph, geometry, options, approved));
     }
 }
 
@@ -680,7 +704,6 @@ TEST_CASE("a solve round-trips through the store's extension tables")
     builder.link(h, v, true, "approved", 5., 5.);
     const ScaffoldGeometry geometry(builder.graph);
     ScaffoldSolveOptions options;
-    options.fixApprovedSubgraphs = false;
     const auto result = solveScaffoldWinding(builder.graph, geometry, options);
     REQUIRE(result.residuals.size() == 1);
 
@@ -717,7 +740,7 @@ TEST_CASE("a solve round-trips through the store's extension tables")
     CHECK(runs.front().counts.at("violated_constraints") == 1);
     CHECK(runs.front().metrics.at("weighted_l1") == doctest::Approx(result.objective));
     CHECK(runs.front().residuals == 1);
-    CHECK(runs.front().settingsJson.find("\"fix_approved_subgraphs\":false") != std::string::npos);
+    CHECK(runs.front().settingsJson.find("\"continuation_links\":true") != std::string::npos);
     // The store state the run read comes back, so a dock can tell a run that
     // is behind the store from a current one.
     CHECK(runs.front().input == record.input);

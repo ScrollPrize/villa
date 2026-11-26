@@ -474,6 +474,111 @@ TEST_CASE("an approved stretch comes out with its stored normals, and the fiber'
     for (std::size_t j = 0; j + 1 < std::size_t(fiber.pointCount); ++j) CHECK(dot(at(j), at(j + 1)) > 0.8);
 }
 
+TEST_CASE("approved normals are faced together before anything is solved")
+{
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    const auto vertical = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 45., -150., 150., 30));
+    // Both approved around their crossing; what was stored faces outward on
+    // one and inward on the other, which an approval does not state.
+    scaffold.approveNormals(horizontal, 5, 35, [](std::size_t, const Point& at) { return outward(at); });
+    scaffold.approveNormals(vertical, 5, 25, [](std::size_t, const Point& at) {
+        const auto normal = outward(at);
+        return Point{-normal[0], -normal[1], -normal[2]};
+    });
+    const ScaffoldGeometry geometry(scaffold.graph);
+    const ScaffoldNormalOptions normalOptions;
+    ScaffoldNormals normals(scaffold.graph, geometry, normalOptions);
+    CHECK(normals.fixedSigns()[horizontal] == 0);
+    ScaffoldEventReport eventReport;
+    ScaffoldEventOptions eventOptions;
+    auto events = scaffoldEvents(scaffold.graph, geometry, normals, eventOptions, constantDistance(0.5), eventReport);
+    REQUIRE_FALSE(events.empty());
+    const auto report = scaffoldFaceApprovedNormals(scaffold.graph, geometry, normals, events, normalOptions,
+                                                    eventOptions, {}, eventReport);
+    CHECK(report.stretches == 2);
+    // The crossing ties the two stretches into one object with one sign.
+    CHECK(report.crossings >= 1);
+    CHECK(report.objects == 1);
+    CHECK(report.facedByNeighbours == 0);
+    for (const auto fiber : {horizontal, vertical}) {
+        CHECK(normals.signSources()[fiber] == ScaffoldSignSource::ApprovedPiece);
+        CHECK(normals.fixedSigns()[fiber] == 1);
+        const auto& entry = scaffold.graph.fibers[fiber];
+        for (std::int64_t j = 0; j < entry.pointCount; ++j) {
+            const auto at = std::size_t(3 * (entry.pointFirst + j));
+            const Point point{scaffold.graph.linePoints[at], scaffold.graph.linePoints[at + 1], scaffold.graph.linePoints[at + 2]};
+            const Point normal{normals.normals()[at], normals.normals()[at + 1], normals.normals()[at + 2]};
+            CHECK(dot(normal, outward(point)) > 0.7);
+        }
+    }
+    // The events carry the faced normals.
+    for (const auto& event : events)
+        if (!event.parallel) CHECK(dot(event.normalA, event.normalB) > 0.7);
+}
+
+TEST_CASE("two stretches of one fiber that face opposite ways are joined by an even half turn")
+{
+    Scaffold scaffold;
+    const auto horizontal = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    const ScaffoldGeometry geometry(scaffold.graph);
+    const ScaffoldNormalOptions options;
+    ScaffoldNormals normals(scaffold.graph, geometry, options);
+    const std::vector<double> gauge(normals.normals().begin(), normals.normals().end());
+    const double length = geometry.arcLength(horizontal);
+    const std::vector<ScaffoldApprovedFacing> facing{{std::int64_t(horizontal), 0., 0.25 * length, 1},
+                                                     {std::int64_t(horizontal), 0.75 * length, length, -1}};
+    normals.face(facing, options);
+    CHECK(normals.report().unrolledGaps == 1);
+    CHECK(normals.report().facedStretches == 2);
+    const auto& entry = scaffold.graph.fibers[horizontal];
+    const auto at = [&](std::span<const double> values, std::int64_t j) {
+        const auto first = std::size_t(3 * (entry.pointFirst + j));
+        return Point{values[first], values[first + 1], values[first + 2]};
+    };
+    CHECK(dot(at(normals.normals(), 2), at(gauge, 2)) == doctest::Approx(1.));
+    CHECK(dot(at(normals.normals(), 38), at(gauge, 38)) == doctest::Approx(-1.));
+    // Half a turn over 20 line points: about 9 degrees a step, nowhere a jump.
+    for (std::int64_t j = 0; j + 1 < entry.pointCount; ++j)
+        CHECK(dot(at(normals.normals(), j), at(normals.normals(), j + 1)) > 0.95);
+}
+
+TEST_CASE("approved normals that contradict each other around a loop stop the run")
+{
+    Scaffold scaffold;
+    const auto h1 = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 0., 40));
+    const auto h2 = scaffold.fiber(ScaffoldFamily::Horizontal, arcLine(300., 20., 70., 120., 40));
+    const auto v1 = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 30., -150., 270., 42));
+    const auto v2 = scaffold.fiber(ScaffoldFamily::Vertical, verticalLine(260., 60., -150., 270., 42));
+    const auto whole = [&](std::size_t fiber) { return std::size_t(scaffold.graph.fibers[fiber].pointCount - 1); };
+    for (const auto fiber : {h2, v1, v2})
+        scaffold.approveNormals(fiber, 0, whole(fiber), [](std::size_t, const Point& at) { return outward(at); });
+    // The first fiber's approved normal turns half a turn along it: a strip
+    // cannot do that between two crossings of sheets that face one way.
+    const auto twisted = [&](bool twist) {
+        scaffold.approveNormals(h1, 0, whole(h1), [&](std::size_t point, const Point& at) {
+            const double angle = twist ? std::numbers::pi * double(point) / 40. : 0.;
+            const auto normal = outward(at);
+            return Point{std::cos(angle) * normal[0], std::cos(angle) * normal[1], std::sin(angle)};
+        });
+        const ScaffoldGeometry geometry(scaffold.graph);
+        const ScaffoldNormalOptions normalOptions;
+        ScaffoldNormals normals(scaffold.graph, geometry, normalOptions);
+        ScaffoldEventReport eventReport;
+        ScaffoldEventOptions eventOptions;
+        auto events = scaffoldEvents(scaffold.graph, geometry, normals, eventOptions, constantDistance(0.5), eventReport);
+        ScaffoldSignOptions signs;
+        signs.crossingFilter = false;
+        return scaffoldFaceApprovedNormals(scaffold.graph, geometry, normals, events, normalOptions, eventOptions,
+                                           signs, eventReport);
+    };
+    const auto plain = twisted(false);
+    CHECK(plain.stretches == 4);
+    CHECK(plain.crossings == 4);
+    CHECK(plain.objects == 1);
+    CHECK_THROWS_AS(twisted(true), std::runtime_error);
+}
+
 TEST_CASE("an unanchored fiber keeps no sign of its own")
 {
     Scaffold scaffold;
@@ -1027,7 +1132,6 @@ TEST_CASE("a reviewed crossing states its distance, never its side")
     REQUIRE_FALSE(measured.crossings.empty());
     CHECK(measured.crossings.front().estimateHalves == 3);
     CHECK(measured.crossings.front().signKnown);
-    CHECK_FALSE(measured.separation->approved);
     const auto side = scaffoldConstraintSide(measured.sign->kind);
 
     // Direct: the separation sits on the sign bound, whatever was measured.
@@ -1038,9 +1142,8 @@ TEST_CASE("a reviewed crossing states its distance, never its side")
     CHECK(direct.sign->target == measured.sign->target);
     CHECK(direct.sign->kind == measured.sign->kind);
     CHECK(direct.report.statedDirect >= 1);
-    // Used, but not held rigid over geometry nobody approved.
-    CHECK_FALSE(direct.separation->approved);
-    CHECK(direct.report.statedWithoutPieces >= 1);
+    // A reviewed separation is heavy, not exact.
+    CHECK(direct.separation->weight == doctest::Approx(10.));
 
     // Distant, and the measurement says so too: the measurement is kept and
     // the bound moves one winding out.
@@ -1063,12 +1166,16 @@ TEST_CASE("a reviewed crossing states its distance, never its side")
     CHECK(dropped.report.statedDistantDropped >= 1);
     CHECK_FALSE(dropped.crossings.front().separation);
 
-    // With the geometry approved at both anchors the reviewed separation is held.
-    for (const auto fiber : {measured.separation->a, measured.separation->b}) {
-        auto& entry = scaffold.graph.fibers[std::size_t(fiber)];
-        entry.approval.approvedGeometry = {{0., double(entry.pointCount - 1)}};
+    // A sign constraint on a stretch approved for normals counts ten times.
+    {
+        auto& entry = scaffold.graph.fibers[std::size_t(measured.sign->a)];
+        entry.approval.approvedNormals = {{0., double(entry.pointCount - 1)}};
+        const auto heavy = state(1.6, ScaffoldNeighbour::Undecided);
+        REQUIRE(heavy.sign);
+        CHECK(heavy.sign->weight == doctest::Approx(10. * measured.sign->weight));
+        CHECK(heavy.report.signOnApprovedNormals >= 1);
+        entry.approval.approvedNormals.clear();
     }
-    CHECK(state(1.6, ScaffoldNeighbour::Direct).separation->approved);
 
     // The store row: what it states per event, a revocation, and an edit of
     // a covering span.
@@ -1188,6 +1295,87 @@ TEST_CASE("the neighbour normals face a fiber whose normals are approved, and an
         REQUIRE(solved);
         CHECK(dot(*solved, tilted(polar(300., 45., 0.))) > 0.999);
     }
+}
+
+TEST_CASE("no stretch lies on a broken range or reaches into one")
+{
+    std::vector<ScaffoldStretchFiber> fibers(2);
+    fibers[0].length = 3000.;
+    fibers[1].length = 500.;
+    // Constraints at 1000 and 1400, the second violated and right beside a
+    // broken range that starts at 1450.
+    const std::vector<ScaffoldStretchPlace> places{{0, 1000., 1}, {0, 1400., 1}};
+    std::vector<ScaffoldStretchViolation> violations{{0, 1400., 7., 1, 250.}};
+    ScaffoldStretchOptions options;
+    options.joinVx = 0.;
+    ScaffoldStretchReport report;
+    auto listed = scaffoldStretches(fibers, places, violations, options, report);
+    REQUIRE(listed.size() == 1);
+    CHECK(listed[0].piece.arcTo == doctest::Approx(1500.));
+    fibers[0].broken = {{1450., 2500.}};
+    fibers[0].cuts = {1975.};
+    listed = scaffoldStretches(fibers, places, violations, options, report);
+    REQUIRE(listed.size() == 1);
+    // It ends at the broken range and takes its length on the other side.
+    CHECK(listed[0].piece.arcTo == doctest::Approx(1450.));
+    CHECK(listed[0].piece.arcFrom == doctest::Approx(850.));
+    CHECK(listed[0].cost == doctest::Approx(7.));
+    // A violation on the broken range itself lists nothing.
+    violations = {{0, 2000., 7., 1, 250.}};
+    CHECK(scaffoldStretches(fibers, places, violations, options, report).empty());
+}
+
+TEST_CASE("stretches follow the approvals without a new solve")
+{
+    // One fiber of 3000 voxels with constraints anchored at 1000, 1400 and
+    // 2200; the one at 1400 is violated. Nothing here is a solve: the same
+    // violation is listed differently as the approvals change.
+    std::vector<ScaffoldStretchFiber> fibers(2);
+    fibers[0].length = 3000.;
+    fibers[1].length = 500.;
+    const std::vector<ScaffoldStretchPlace> places{{0, 1000., 2}, {0, 1400., 2}, {0, 2200., 1}};
+    const std::vector<ScaffoldStretchViolation> violations{{0, 1400., 7., 1, 250.}};
+    ScaffoldStretchOptions options;
+    options.minStretchVx = 500.;
+    options.joinVx = 0.;
+    options.marginVx = 100.;
+    ScaffoldStretchReport report;
+    auto listed = scaffoldStretches(fibers, places, violations, options, report);
+    REQUIRE(listed.size() == 1);
+    // 1000 to 1400 is 400 long: the next place is taken to reach 500.
+    CHECK(listed[0].piece.arcFrom == doctest::Approx(900.));
+    CHECK(listed[0].piece.arcTo == doctest::Approx(2300.));
+    CHECK(listed[0].cost == doctest::Approx(7.));
+    CHECK(listed[0].violations == 1);
+    CHECK(listed[0].constraints == 5);
+    CHECK(listed[0].other == 1);
+
+    // Approved around the violation: that stretch is listed, exactly.
+    fibers[0].approved = {{1210., 1650.}};
+    listed = scaffoldStretches(fibers, places, violations, options, report);
+    REQUIRE(listed.size() == 1);
+    CHECK(listed[0].piece.arcFrom == doctest::Approx(1210.));
+    CHECK(listed[0].piece.arcTo == doctest::Approx(1650.));
+    CHECK(listed[0].cost == doctest::Approx(7.));
+
+    // Approved beside it instead: the new stretch lies outside the approved
+    // one and no longer takes the place inside it.
+    fibers[0].approved = {{0., 1200.}};
+    listed = scaffoldStretches(fibers, places, violations, options, report);
+    REQUIRE(listed.size() == 1);
+    CHECK(listed[0].piece.arcFrom == doctest::Approx(1300.));
+    CHECK(listed[0].piece.arcTo == doctest::Approx(2300.));
+    CHECK(listed[0].constraints == 3);
+    // Approved up to just before the violation: at most the margin into it.
+    fibers[0].approved = {{0., 1390.}};
+    listed = scaffoldStretches(fibers, places, violations, options, report);
+    REQUIRE(listed.size() == 1);
+    CHECK(listed[0].piece.arcFrom == doctest::Approx(1300.));
+    fibers[0].approved = {{0., 1399.}};
+    options.marginVx = 20.;
+    listed = scaffoldStretches(fibers, places, violations, options, report);
+    REQUIRE(listed.size() == 1);
+    CHECK(listed[0].piece.arcFrom == doctest::Approx(1380.));
 }
 
 TEST_CASE("a stretch ties a violated constraint to other crossings of its fiber")

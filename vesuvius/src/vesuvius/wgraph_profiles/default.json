@@ -22,6 +22,9 @@
       "crossing_filter": true
     },
     "winding": {
+      "weights": {"parallel": 0.1, "perpendicular": 1.0, "sign": 3.0, "enclosure": 0.0, "manual": 0.0},
+      "normal_dot_weight_power": 2,
+      "winding_distance_weight": "inverse_square",
       "crossing_filter": true
     },
     "uv": {}

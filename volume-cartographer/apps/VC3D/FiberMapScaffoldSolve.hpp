@@ -66,7 +66,6 @@ struct ScaffoldSolveRequest {
     std::vector<std::string> approvalStates{"approved"};
     bool includeAuto = false;
     double manualWeight = 1.0;
-    bool fixApprovedSubgraphs = true;
     std::string lemonBackend = "cost_scaling";
     std::string volume;
     std::optional<int> fallbackHandedness;
@@ -77,7 +76,7 @@ struct ScaffoldSolveRequest {
     double perpendicularWeight = 1.0, parallelWeight = 0.0, enclosureWeight = 0.0;
     // Weight of the local sign constraint every signed perpendicular crossing
     // states (ScaffoldMeasuredOptions::signWeight); zero states none.
-    double signWeight = 100.0;
+    double signWeight = 3.0;
     // Measure each connector's winding separation on the bound normal
     // dataset. Off keeps the crossings as enclosure evidence only.
     bool measureWindingDistances = true;
@@ -103,11 +102,10 @@ struct ScaffoldRunView {
     // Normal flip suspects: a map link whose inside/outside order the solved
     // normals contradict, one row per accused fiber (ScaffoldSolveRuns.hpp).
     std::vector<vc::fiber_graph::ScaffoldStoredResidual> flips;
-    // Sign suspects: per violated sign constraint and fiber, the stretch from
-    // that crossing to other crossings of the fiber (ScaffoldConstraints.hpp).
-    std::vector<vc::fiber_graph::ScaffoldStoredResidual> stretches;
     // The run's perpendicular crossings, for the approval window.
     std::vector<vc::fiber_graph::ScaffoldStoredCrossing> crossings;
+    // The run's continuation links: where a fiber may break, and whether it did.
+    std::vector<vc::fiber_graph::ScaffoldStoredContinuation> continuations;
     std::map<std::string, vc::fiber_graph::ScaffoldStoredWinding> windings;
     // The accused stretches, highest score first (rankScaffoldPieces).
     std::vector<ScaffoldRankedPiece> pieces;
@@ -122,6 +120,8 @@ struct ScaffoldFiberCrossing {
     std::int64_t estimateHalves = 0;
     // The normals state which of the two fibers lies outside.
     bool signKnown = false;
+    // The crossing states a winding separation in the solve.
+    bool separation = false;
     // What a reviewer stated: 0 undefined, 1 direct neighbour, 2 distant.
     int state = 0;
 };
@@ -285,7 +285,6 @@ public:
     // the panel does not go looking for either.
     void setFrame(const std::string& volume, std::optional<int> fallbackHandedness);
     [[nodiscard]] ScaffoldSolveRequest request() const;
-    [[nodiscard]] bool fixApprovedSubgraphs() const;
 
 signals:
     void solveRequested();
@@ -402,11 +401,14 @@ private:
         kNormalsColumn,
         // "X/Y": crossings of the stretch with a neighbour state, of all.
         kReviewedColumn,
-        // "X of Y": violated constraints anchored on the stretch, of all.
+        // "X/Y": violated winding constraints (separations and links) anchored
+        // on the stretch, of all on it.
         kViolatedColumn,
-        // "X of Y": violated sign constraints on the stretch, of its crossings
+        // "X/Y": violated sign constraints on the stretch, of its crossings
         // whose normals state a side.
         kSignColumn,
+        // "X/Y": continuation links on the stretch the solve broke, of all on it.
+        kContinuationColumn,
         kWhereColumn,
         kCostColumn,
         kDensityColumn,
@@ -433,7 +435,7 @@ private:
         double arcFrom = std::numeric_limits<double>::quiet_NaN();
         double arcTo = std::numeric_limits<double>::quiet_NaN();
         // Sort keys of the crossings and violated columns.
-        double reviewedShare = 0, violated = 0, signViolated = 0;
+        double reviewedShare = 0, violated = 0, signViolated = 0, continuationsBroken = 0;
         // Share of the stretch approved for geometry and for normals.
         std::array<double, 2> approvedShare{0., 0.};
         ScaffoldApprovalRow keys;

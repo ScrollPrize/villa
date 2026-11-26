@@ -137,6 +137,12 @@ std::vector<ScaffoldEvent> scaffoldEvents(const ScaffoldGraph&, const ScaffoldGe
                                           const ScaffoldEventOptions&, const ScaffoldWindingDistances&,
                                           ScaffoldEventReport&);
 
+// The normals of `events` looked up again and their crossing findings
+// followed again: after the normals changed (ScaffoldNormals::face), the
+// crossings themselves being a matter of the geometry alone.
+void scaffoldRefreshEventNormals(const ScaffoldGraph&, const ScaffoldGeometry&, const ScaffoldNormals&,
+                                 const ScaffoldEventOptions&, std::vector<ScaffoldEvent>&, ScaffoldEventReport&);
+
 struct ScaffoldSignOptions {
     fiber_tracer::FiberSignOptions sign;
     // Decide the gauge of the fibers no anchor fixed, from the perpendicular
@@ -171,6 +177,45 @@ struct ScaffoldSignResult {
 ScaffoldSignResult scaffoldNormalSigns(const ScaffoldGraph&, const ScaffoldNormals&, std::span<const ScaffoldEvent>,
                                        const ScaffoldSignOptions& = {});
 
+// The facing of the stretches approved for normals, decided before any
+// winding is solved.
+//
+// A normals approval states an axis along a stretch, not which way it faces.
+// Every perpendicular crossing whose two anchors lie on approved stretches
+// carries the facing from one to the other (their two normals point the same
+// way through the sheets), so the stretches the crossings connect are one
+// object with one free sign. Crossings that contradict each other there are
+// an annotation error and fail the run: one of the approvals on that loop is
+// wrong. The object's sign is the one that agrees best with the signed
+// normals of the resolved fiber volume around its stretches (the neighbour
+// normals), each sample weighted by the cosine of its angle, so a sample
+// counts with cos^2; without neighbour normals it is the radial prior the sign
+// solve uses.
+struct ScaffoldFacingReport {
+    std::int64_t stretches = 0, objects = 0;
+    // Crossings that carried a facing, and objects faced by the neighbour
+    // normals (the others by the radial prior).
+    std::int64_t crossings = 0, facedByNeighbours = 0;
+    // Samples of the neighbour normals read along the stretches.
+    std::int64_t samples = 0;
+    // The weakest object: the share of its weighted samples that agree with
+    // the facing it got, 1 without any object.
+    double weakestAgreement = 1;
+};
+// Throws std::runtime_error naming the crossing where two approved normals
+// contradict the others. `signs` supplies the crossing rule and `normals`
+// the neighbour field (ScaffoldNormalOptions::neighbours).
+std::vector<ScaffoldApprovedFacing> scaffoldApprovedFacing(const ScaffoldGraph&, const ScaffoldGeometry&,
+                                                           const ScaffoldNormals&, std::span<const ScaffoldEvent>,
+                                                           const ScaffoldNormalOptions& normals,
+                                                           const ScaffoldSignOptions& signs, ScaffoldFacingReport&);
+// The whole step: the facing, applied to the normals, and the events' normals
+// refreshed. Nothing happens where no stretch is approved for normals.
+ScaffoldFacingReport scaffoldFaceApprovedNormals(const ScaffoldGraph&, const ScaffoldGeometry&, ScaffoldNormals&,
+                                                 std::vector<ScaffoldEvent>&, const ScaffoldNormalOptions&,
+                                                 const ScaffoldEventOptions&, const ScaffoldSignOptions&,
+                                                 ScaffoldEventReport&);
+
 // How a fractional measured separation becomes integer constraints. Both
 // modes exist in the Python reference stage, so both are kept here.
 enum class ScaffoldSeparationMode {
@@ -199,9 +244,16 @@ struct ScaffoldMeasuredOptions {
     // pair's H->V step from one side (the bound an enclosure needs from both).
     // Each becomes a sign constraint of this weight, costing only when the
     // solve breaks it; zero states none. It needs no winding separation.
-    // The defaults - perpendicular 1, sign 100, parallel and enclosure 0 -
+    // The defaults - perpendicular 1, sign 3, parallel and enclosure 0 -
     // are the scaffold workflow's.
-    double signWeight = 100.0;
+    double signWeight = 3.0;
+    // A sign constraint with an anchor on a stretch approved for normals
+    // counts this many times: the normal there was looked at.
+    double approvedSignFactor = 10.0;
+    // The weight of a separation a reviewer stated (direct, or distant with
+    // a measurement that agrees). It is not scaled by the crossing's
+    // confidence, and it is not exact: nothing is held rigid.
+    double reviewedWeight = 10.0;
     // The confidence of one crossing, exactly as the sign stage weights it
     // (fiber_tracer::fiberSignEventWeight: |dot|^power of its two normal axes
     // times the winding-distance factor, min(1, 1/d^2) by default). It scales
@@ -271,9 +323,8 @@ struct ScaffoldMeasuredReport {
     // Stated direct where the normals do not say which fiber lies outside:
     // nothing can be stated there until they do.
     std::int64_t statedWithoutSign = 0;
-    // Reviewed separations that are held rigid, and those that are used but
-    // not held because a covering piece is not approved geometry.
-    std::int64_t statedRigid = 0, statedWithoutPieces = 0;
+    // Sign constraints with an anchor on a stretch approved for normals.
+    std::int64_t signOnApprovedNormals = 0;
 };
 
 // The measured constraints of a scaffold, one per asserted relation (a
@@ -305,11 +356,6 @@ struct ScaffoldConstraintSpans {
 std::optional<ScaffoldConstraintSpans> scaffoldConstraintSpans(const ScaffoldGraph&, const ScaffoldGeometry&,
                                                                const ScaffoldConstraint&);
 
-// Whether the geometry of both covering pieces is an approved span of its
-// fiber right now. A constraint may only count as approved when it is: an
-// approval of a relation between unreviewed geometry would pin a solve to
-// geometry nobody has looked at. False when the spans cannot be resolved.
-bool scaffoldConstraintPiecesApproved(const ScaffoldGraph&, const ScaffoldGeometry&, const ScaffoldConstraint&);
 objects::FiberConstraintIdentity scaffoldConstraintIdentity(const ScaffoldGraph&, const ScaffoldConstraint&);
 
 // A fresh approval row for one measured constraint, fingerprinted over the
@@ -365,51 +411,84 @@ struct ScaffoldNormalFlipReport {
 };
 // The stretches to approve: the one list the approval workflow works through.
 //
+// A stretch is not part of a solve. It is derived from two things: what a
+// solve left violated, and what is approved right now. Whoever lists stretches
+// (the approval dock, the command line's report) computes them from those,
+// so an approval moves the list at once and a solve only changes the costs.
+//
 // An annotation states a normal without a facing and a crossing's distance
 // without a side, so approving at one constraint alone says nothing: a
 // stretch has to tie constraints together. Per violated constraint (of any
-// kind) and per fiber of it: the stretch from its anchor to the nearest other
-// crossing of that fiber (always), grown over the next crossings until it is
-// `minStretchVx` long (whatever their distance), then over further crossings
-// no farther than `joinVx` from it while it stays within `maxStretchVx`.
-// Stretches of one fiber that overlap are one while that stays within
-// `maxStretchVx`. A stretch does not end on its outer crossings: it reaches
-// `marginVx` past them and is padded to `minStretchVx`, within the fiber part. The cost of a stretch is the summed cost of every violated constraint
-// anchored on it.
+// kind, a broken continuation link included: it counts on both sides of its
+// cut) and per fiber of it: the stretch from its anchor to the nearest other
+// place of that fiber where a constraint is anchored (always), grown over the
+// next places until it is `minStretchVx` long (whatever their distance), then
+// over further places no farther than `joinVx` from it while it stays within
+// `maxStretchVx`. Stretches of one fiber that overlap are one while that stays
+// within `maxStretchVx`. A stretch does not end on its outer places: it
+// reaches `marginVx` past them and is padded to `minStretchVx`. The cost of a
+// stretch is the summed cost of every violated constraint anchored on it.
 //
-// A stretch that is already approved (for geometry or normals) is fixed: it is
-// offered exactly as it was approved, with the violated constraints anchored
-// on it, and never cut up or shifted. New stretches lie in the fiber between
-// the approved ones and reach at most `marginVx` into one.
-// A fiber (a part of a fiber with broken geometry) with no other crossing has
-// no stretch, which is counted.
+// A stretch that is already approved is fixed: it is offered exactly as it
+// was approved, with the violated constraints anchored on it, and never cut
+// up or shifted. New stretches lie in the fiber between the approved ones and
+// reach at most `marginVx` into one. A broken range holds no stretch and no
+// stretch reaches into it. A fiber part with no other place and no approved
+// neighbour has no stretch, which is counted.
+struct ScaffoldStretchFiber {
+    double length = 0;                                // of the annotated line, voxels
+    std::vector<double> cuts;                         // arcs where broken geometry splits the fiber
+    std::vector<std::pair<double, double>> approved;  // arc ranges approved for geometry or normals
+    // Arc ranges marked broken (geometry or normals). The solve drops them, so
+    // the list does too: no stretch lies on a broken range or reaches into one.
+    std::vector<std::pair<double, double>> broken;
+};
+// A place of a fiber where constraints are anchored, and how many.
+struct ScaffoldStretchPlace {
+    std::int64_t fiber = 0;
+    double arc = 0;
+    std::int64_t constraints = 1;
+};
+// One fiber side of a violated constraint.
+struct ScaffoldStretchViolation {
+    std::int64_t fiber = 0;
+    double arc = 0, cost = 0;
+    std::int64_t other = 0;
+    double otherArc = 0;
+};
 struct ScaffoldStretch {
     std::int64_t fiber = 0;
     // The violated constraints anchored on the stretch and their summed
     // cost, and all constraints anchored on it.
     std::int64_t violations = 0, constraints = 0;
     double cost = 0;
-    // The first of them: its crossing on this fiber, and the other fiber.
+    // The worst of them: its anchor on this fiber, and the other fiber.
     double arc = 0, otherArc = 0;
     std::int64_t other = 0;
-    // The fiber's crossings on the stretch, its two ends included.
+    // The fiber's places on the stretch.
     std::int64_t crossings = 0;
     ScaffoldPiece piece;
 };
 struct ScaffoldStretchOptions {
     double minStretchVx = 500.0, joinVx = 300.0, maxStretchVx = 2000.0;
-    // How far a stretch reaches past its outer crossings.
+    // How far a stretch reaches past its outer places.
     double marginVx = 100.0;
 };
 struct ScaffoldStretchReport {
     std::int64_t violations = 0, suspects = 0;
-    // Fiber sides of a violation without another crossing.
+    // Fiber sides of a violation without another place to tie it to.
     std::int64_t withoutCrossing = 0;
 };
-// Highest cost first.
+// Highest cost first. Fiber indices are into `fibers`.
+std::vector<ScaffoldStretch> scaffoldStretches(std::span<const ScaffoldStretchFiber> fibers,
+                                               std::span<const ScaffoldStretchPlace>,
+                                               std::span<const ScaffoldStretchViolation>,
+                                               const ScaffoldStretchOptions&, ScaffoldStretchReport&);
+// The same from a solve in memory and the approvals its graph was read with;
+// the pieces also name their control range.
 std::vector<ScaffoldStretch> scaffoldStretches(const ScaffoldGraph&, const ScaffoldGeometry&,
-                                                      const ScaffoldSolveResult&, const ScaffoldStretchOptions&,
-                                                      ScaffoldStretchReport&);
+                                               const ScaffoldSolveResult&, const ScaffoldStretchOptions&,
+                                               ScaffoldStretchReport&);
 
 // `constraints` are a solve's; only its map links are compared. Ordered with
 // the bracketed stretches first, the shortest before the longer.

@@ -51,10 +51,12 @@ struct WindingArc {
 // the bound one signed perpendicular crossing alone states - the step
 // k_b - k_a is at least, or at most, the target. a sign constraint costs
 // only when the solve breaks the bound; it is not an equation.
+// Continuation: two neighbouring parts of one fiber lie on the same winding
+// (`a` and `b` are that fiber, the two arcs the place where it may break).
 enum class ScaffoldConstraintKind : int {
-    Perpendicular = 1, Parallel = 2, Enclosure = 3, SignAtLeast = 4, SignAtMost = 5
+    Perpendicular = 1, Parallel = 2, Enclosure = 3, SignAtLeast = 4, SignAtMost = 5, Continuation = 6
 };
-inline constexpr std::size_t kScaffoldConstraintKinds = 6;
+inline constexpr std::size_t kScaffoldConstraintKinds = 7;
 
 const char* scaffoldConstraintKindName(ScaffoldConstraintKind);
 // 0 for an equation, +1 for SignAtLeast, -1 for SignAtMost.
@@ -73,10 +75,6 @@ struct ScaffoldConstraint {
     std::int64_t step = 0;          // the anchor-level assertion (0, or +-1 adjacent)
     std::int64_t target = 0;        // the whole-fiber step
     double weight = 0;
-    // Approved: a link whose record approval state is approved, or a
-    // measured constraint with a live approval row
-    // (vc_object_store FiberConstraintApprovalExtension.hpp).
-    bool approved = false;
     // The crossing a measured constraint came from (an index into the event
     // list it was assembled from), -1 for a manual link.
     std::int64_t event = -1;
@@ -113,9 +111,6 @@ struct ScaffoldLinkReport {
     std::int64_t links = 0, used = 0, ordinary = 0, adjacent = 0, skippedApprovalState = 0, skippedAutomatic = 0,
                  skippedEndpoint = 0, skippedSelfLink = 0, skippedAdjacentSameFamily = 0, skippedMissingAnchor = 0,
                  skippedUntagged = 0;
-    // Links the record approved whose covering pieces are not both approved
-    // for geometry: they are used, but they are not held rigid.
-    std::int64_t approvedWithoutPieces = 0;
     double maxAnchorDistance = 0;
     // Links the refinement rejected, by the rule that rejected them: the two
     // fibers do not meet at the angle their families state (or at no clear
@@ -191,12 +186,36 @@ struct ScaffoldPieceScore {
     std::int64_t constraints = 0;
 };
 
+// A fiber is not one node of the solve: it may break where nobody approved it.
+// It is cut at the ends of its approved stretches (an approved stretch is one
+// node, never cut) and, in the fiber between them, about every `intervalVx`,
+// each of those cuts moved to the middle between the two constraints around
+// it. Every cut is a continuation link: the two parts lie on the same winding,
+// at `weight`. Broken geometry cuts a fiber without a link, as before.
+struct ScaffoldContinuationOptions {
+    bool enabled = true;
+    double weight = 10.0;
+    double intervalVx = 2000.0;
+};
+
+// Approved ranges of one fiber as the stretches use them: sorted, ranges that
+// overlap by more than a voxel are one, ranges that only touch stay two.
+std::vector<std::pair<double, double>> scaffoldMergeApprovedRanges(std::vector<std::pair<double, double>>);
+// The arc ranges of a loaded fiber approved for geometry or for normals, merged.
+std::vector<std::pair<double, double>> scaffoldApprovedArcRanges(const ScaffoldGraph&, const ScaffoldGeometry&,
+                                                                 std::size_t fiber);
+// Where one fiber's continuation links lie, ascending: the ends of its
+// approved ranges and the regular cuts between them. `hardCuts` are the arcs
+// broken geometry splits it at, `anchors` the arcs its constraints are
+// anchored at (ascending).
+std::vector<double> scaffoldContinuationArcs(double length, std::span<const double> hardCuts,
+                                             std::span<const std::pair<double, double>> approved,
+                                             std::span<const double> anchors, double intervalVx);
+
 struct ScaffoldSolveOptions {
     ScaffoldLinkArcOptions links;
     geometry::WindingFlowOptions flow;
-    // Solve the approved constraints alone first and keep their relative
-    // windings fixed by contracting each approved subgraph into one node.
-    bool fixApprovedSubgraphs = true;
+    ScaffoldContinuationOptions continuation;
     // Cap on the edge-disjoint alternative paths counted per violated
     // constraint.
     std::int64_t maxAlternativePaths = 4;
@@ -216,35 +235,37 @@ struct ScaffoldSolveResult {
     std::vector<WindingArc> arcs; // aggregated, as solved
     std::vector<std::int64_t> winding, component; // per fiber; unconstrained fibers get their own component
     std::int64_t components = 0, isolatedFibers = 0;
-    // A fiber with broken geometry is solved as its parts (the stretches of
-    // arc between the broken ones), each with a winding of its own. `winding`
-    // and `component` hold the longest part; all parts are listed here.
-    // Components and isolated fibers count parts.
+    // A fiber is solved as its parts: the stretches of arc between its
+    // broken geometry and its continuation links, each with a winding of its
+    // own. `winding` and `component` hold the longest part; the parts of
+    // every fiber that has more than one are listed here. Components and
+    // isolated fibers count parts.
     struct Part {
         std::int64_t fiber = 0;
         double arcFrom = 0, arcTo = 0;
         std::int64_t winding = 0, component = 0;
         bool main = false;
+        // A continuation link ties this part to the one before it.
+        bool continues = false;
     };
     std::vector<Part> parts;
-    std::int64_t splitFibers = 0;
+    // Fibers broken geometry splits, continuation links, and those of them
+    // the solve broke.
+    std::int64_t splitFibers = 0, continuationLinks = 0, brokenContinuations = 0;
     std::vector<ScaffoldResidual> residuals; // violated constraints, worst cost first
     std::vector<ScaffoldPieceScore> pieces;  // highest score first
     double objective = 0, maxResidual = 0;
     std::int64_t violatedConstraints = 0, violatedArcs = 0;
-    std::int64_t approvedSubgraphs = 0, contractedFibers = 0;
     geometry::WindingFlowQuantization quantization;
     double seconds = 0;
     ScaffoldLinkReport linkReport;
 };
 
-// Throws std::runtime_error when the library was built without LEMON, and
-// std::invalid_argument when an approved subgraph cannot be satisfied (the
-// message names the violated approved constraints so they can be revoked).
+// Throws std::runtime_error when the library was built without LEMON.
 // `measured` holds the constraints of the measured crossings
 // (ScaffoldConstraints.hpp), which the solve treats exactly like the links:
-// same aggregation, same contraction of the approved ones, same residual
-// analysis.
+// same aggregation, same residual analysis. Nothing is held rigid: an
+// approval makes a constraint heavier, never exact.
 ScaffoldSolveResult solveScaffoldWinding(const ScaffoldGraph&, const ScaffoldGeometry&,
                                          const ScaffoldSolveOptions& = {},
                                          std::span<const ScaffoldConstraint> measured = {});

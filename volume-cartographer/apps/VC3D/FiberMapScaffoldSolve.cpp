@@ -315,8 +315,8 @@ void ScaffoldSolveController::selectRun(const std::string& runUuid)
         session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
             view.residuals = readScaffoldResiduals(reader, runUuid);
             view.flips = readScaffoldNormalFlips(reader, runUuid);
-            view.stretches = readScaffoldStretches(reader, runUuid);
             view.crossings = readScaffoldCrossings(reader, runUuid);
+            view.continuations = readScaffoldContinuations(reader, runUuid);
             view.windings = readScaffoldWindings(reader, runUuid);
         });
     } catch (const std::exception& problem) {
@@ -438,6 +438,37 @@ ApprovedRanges approvedRangesOfLayer(const vc::objects::StoreReader& reader, con
     return ranges;
 }
 
+// The line positions where broken geometry splits the fiber into parts: the
+// middle of each broken stretch, as the solve splits it.
+std::vector<double> splitPositionsOfLayer(const vc::objects::StoreReader& reader, const std::string& fiberUuid,
+                                          const vc::objects::FiberPieceContent& content)
+{
+    using namespace vc::objects;
+    std::vector<double> positions;
+    const auto layer = readFiberApproval(reader, fiberUuid);
+    if (!layer || layer->empty()) return positions;
+    const auto status = fiberApprovalStatus(*layer, content.linePoints);
+    for (const auto& [from, to] : fiberStretchRanges(*layer, status, FiberApprovalAspect::Geometry, FiberStretchState::Broken))
+        positions.push_back(0.5 * (from + to));
+    return positions;
+}
+
+// The stretches marked broken, geometry or normals, as line position ranges.
+std::vector<std::pair<double, double>> brokenRangesOfLayer(const vc::objects::StoreReader& reader,
+                                                           const std::string& fiberUuid,
+                                                           const vc::objects::FiberPieceContent& content)
+{
+    using namespace vc::objects;
+    std::vector<std::pair<double, double>> ranges;
+    const auto layer = readFiberApproval(reader, fiberUuid);
+    if (!layer || layer->empty()) return ranges;
+    const auto status = fiberApprovalStatus(*layer, content.linePoints);
+    for (const auto aspect : {FiberApprovalAspect::Geometry, FiberApprovalAspect::Normals})
+        for (const auto& range : fiberStretchRanges(*layer, status, aspect, FiberStretchState::Broken))
+            ranges.emplace_back(range.first, range.second);
+    return ranges;
+}
+
 // Per span between two control points and per aspect: whether one approved
 // stretch covers the whole span.
 std::array<std::vector<std::uint8_t>, 2> approvedSpans(const ApprovedRanges& ranges,
@@ -492,6 +523,9 @@ void ScaffoldSolveController::loadApprovals()
                 ScaffoldApprovalSpans entry;
                 // Taken over the stored line, before it is mapped below.
                 const auto ranges = approvedRangesOfLayer(reader, record.uuid, content);
+                const auto splits = splitPositionsOfLayer(reader, record.uuid, content);
+                ApprovedRanges brokenRanges;
+                brokenRanges[0] = brokenRangesOfLayer(reader, record.uuid, content);
                 entry.approved = approvedSpans(ranges, content);
                 // The line in the runs' frame, read as the solve reads it:
                 // the arcs below are then the arcs a run states.
@@ -502,7 +536,13 @@ void ScaffoldSolveController::loadApprovals()
                 }
                 entry.controlIds = content.controlIds;
                 entry.controlArcs = scaffoldControlArcs(content);
-                entry.approvedArcs = approvedArcs(ranges, scaffoldLineArcs(content));
+                const auto lineArcs = scaffoldLineArcs(content);
+                entry.approvedArcs = approvedArcs(ranges, lineArcs);
+                // One range per split position, read back as its arc.
+                ApprovedRanges splitRanges;
+                for (const double position : splits) splitRanges[0].emplace_back(position, position);
+                for (const auto& [arc, same] : approvedArcs(splitRanges, lineArcs)[0]) entry.splitArcs.push_back(arc);
+                entry.brokenArcs = approvedArcs(brokenRanges, lineArcs)[0];
                 loaded.emplace(record.uuid, std::move(entry));
             }
         });
@@ -645,7 +685,6 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             options.links.approvalStates = job->request.approvalStates;
             options.links.includeAuto = job->request.includeAuto;
             options.links.weight = job->request.manualWeight;
-            options.fixApprovedSubgraphs = job->request.fixApprovedSubgraphs;
             options.flow.backend = vc::geometry::parseWindingFlowBackend(job->request.lemonBackend);
             options.workers = std::max<std::size_t>(1, job->request.workers);
             options.monitor = &job->monitor;
@@ -672,6 +711,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                 ScaffoldMeasuredReport measuredReport;
                 ScaffoldSignResult signs;
                 ScaffoldApprovalReport approvals;
+                vc::fiber_graph::ScaffoldFacingReport facing;
                 std::vector<ScaffoldCrossing> crossings;
                 ScaffoldRunStages stages;
                 if (job->request.measureCrossings) {
@@ -712,6 +752,11 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                         };
                     normals.emplace(graph, geometry, normalOptions, job->axes);
                     events = scaffoldEvents(graph, geometry, *normals, eventOptions, distances, eventReport);
+                    // The approved normals are faced first, as one object per
+                    // connected set of stretches; contradictions fail the run.
+                    facing = vc::fiber_graph::scaffoldFaceApprovedNormals(graph, geometry, *normals, events,
+                                                                          normalOptions, eventOptions, signOptions,
+                                                                          eventReport);
                     signs = scaffoldNormalSigns(graph, *normals, events, signOptions);
                     const auto stated = scaffoldCrossingApprovals(
                         graph, geometry, events, vc::objects::readFiberConstraintApprovals(reader), approvals);
@@ -728,6 +773,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     stages.signOptions = &signOptions;
                     stages.signs = &signs;
                     stages.approvals = &approvals;
+                    stages.facing = &facing;
                 }
                 const auto result = solveScaffoldWinding(graph, geometry, options, measured);
                 // Where the map links and the solved normals disagree about
@@ -739,22 +785,18 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     stages.flips = &flips;
                     stages.flipReport = &flipReport;
                 }
-                // The stretches to look at for the violated sign constraints.
-                ScaffoldStretchReport stretchReport;
-                const auto stretches = scaffoldStretches(graph, geometry, result, {}, stretchReport);
-                stages.stretches = &stretches;
-                stages.stretchReport = &stretchReport;
                 record.input = {graph.source.storeUuid, graph.source.generation, graph.source.commitSequence};
                 job->rows = scaffoldSolveRunRows(graph, result, options, record, stages);
                 job->runUuid = record.runUuid;
                 job->summary = QObject::tr("%1 fibers in %2 components, %3 turns of residual, %4 violated of %5 \n"
-                                           "constraints, %6 approved subgraphs, %7 s")
+                                           "constraints, %6 of %7 continuation links broken, %8 s")
                                    .arg(graph.fibers.size())
                                    .arg(result.components)
                                    .arg(result.objective, 0, 'f', 3)
                                    .arg(result.violatedConstraints)
                                    .arg(result.constraints.size())
-                                   .arg(result.approvedSubgraphs)
+                                   .arg(result.brokenContinuations)
+                                   .arg(result.continuationLinks)
                                    .arg(result.seconds, 0, 'f', 3);
                 if (job->request.measureCrossings)
                     job->summary += QObject::tr("; %1 crossings, %2 measured relations, %3 enclosures, %4 signs from \n"
@@ -932,6 +974,7 @@ std::vector<ScaffoldFiberCrossing> ScaffoldSolveController::crossingsOf(const st
         entry.otherArc = first ? crossing.arcB : crossing.arcA;
         entry.estimateHalves = crossing.estimateHalves;
         entry.signKnown = crossing.signKnown;
+        entry.separation = crossing.separation;
         try {
             const auto found = _constraintApprovals.find(vc::objects::fiberConstraintIdentity(
                 crossing.fiberA, crossing.arcA, crossing.fiberB, crossing.arcB,
@@ -1055,8 +1098,9 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     _profileCombo->addItem(tr("default scaffold"), QStringLiteral("default_scaffold"));
     _profileCombo->setToolTip(tr("The solver profile of the run.\n"
                                  "default scaffold: the whole scaffold, no links, measured crossings with\n"
-                                 "winding separations, perpendicular weight 1, sign weight 100, normals\n"
-                                 "from the full-volume neighbours, approved subgraphs held fixed."));
+                                 "winding separations, perpendicular weight 1, sign weight 3 (30 on\n"
+                                 "approved normals), continuation links at weight 10, normals from the\n"
+                                 "full-volume neighbours."));
     form->addRow(tr("Profile"), _profileCombo);
     layout->addLayout(form);
 
@@ -1199,7 +1243,6 @@ ScaffoldSolveRequest ScaffoldSolverPanel::request() const
     request.useLinks = false;
     request.includeAuto = false;
     request.manualWeight = 1.0;
-    request.fixApprovedSubgraphs = true;
     request.lemonBackend = "cost_scaling";
     request.volume = _volume;
     request.fallbackHandedness = _fallbackHandedness;
@@ -1208,7 +1251,7 @@ ScaffoldSolveRequest ScaffoldSolverPanel::request() const
     request.perpendicularWeight = 1.0;
     request.parallelWeight = 0.0;
     request.enclosureWeight = 0.0;
-    request.signWeight = 100.0;
+    request.signWeight = 3.0;
     request.normalSource = "neighbours";
     request.signBackend = "irls";
     request.workers = std::size_t(std::max(1, QThread::idealThreadCount()));
@@ -1216,7 +1259,6 @@ ScaffoldSolveRequest ScaffoldSolverPanel::request() const
     return request;
 }
 
-bool ScaffoldSolverPanel::fixApprovedSubgraphs() const { return true; }
 
 ScaffoldRunsPanel::ScaffoldRunsPanel(ScaffoldSolveController* controller, QWidget* parent)
     : QWidget(parent)
@@ -1436,17 +1478,22 @@ ScaffoldApprovalPanel::ScaffoldApprovalPanel(ScaffoldSolveController* controller
     _tree = new QTreeWidget(this);
     _tree->setObjectName(QStringLiteral("fiberMapApprovalTree"));
     _tree->setColumnCount(kColumnCount);
-    _tree->setHeaderLabels({tr("geo"), tr("nrm"), tr("crossings"), tr("violated"), tr("sign"), tr("where"), tr("cost"),
+    _tree->setHeaderLabels({tr("geo"), tr("nrm"), tr("approved w."), tr("winding"), tr("sign"), tr("cont"), tr("where"), tr("cost"),
                             tr("cost/kvx"), tr("length"), tr("fiber")});
     _tree->headerItem()->setToolTip(kGeometryColumn, tr("A check: the stretch is approved for geometry."));
     _tree->headerItem()->setToolTip(kNormalsColumn, tr("A check: the stretch is approved for normals."));
     _tree->headerItem()->setToolTip(kReviewedColumn,
-                                    tr("Crossings on the stretch with a neighbour state (direct or distant), of all."));
+                                    tr("Crossings on the stretch whose winding distance you approved (direct or distant),\n"
+                                       "of all crossings on it."));
     _tree->headerItem()->setToolTip(kViolatedColumn,
-                                    tr("Violated constraints anchored on the stretch, of all constraints on it."));
+                                    tr("Violated winding constraints on the stretch (how many windings two fibers\n"
+                                       "are apart; a violated link counts too), of the winding constraints on it."));
     _tree->headerItem()->setToolTip(kSignColumn,
                                     tr("Violated sign constraints on the stretch (which fiber lies outside), of its\n"
-                                       "crossings whose normals state a side. They are counted in \"violated\" too."));
+                                       "crossings whose normals state a side."));
+    _tree->headerItem()->setToolTip(kContinuationColumn,
+                                    tr("Continuation links on the stretch that the solve broke (the fiber changes\n"
+                                       "winding there), of the links on it."));
     _tree->headerItem()->setToolTip(kCostColumn, tr("Summed cost of the violated constraints on the stretch, in weighted turns."));
     _tree->headerItem()->setToolTip(kDensityColumn, tr("Cost per 1000 voxels of the stretch."));
     _tree->headerItem()->setToolTip(kLengthColumn, tr("The stretch's length (voxels)."));
@@ -1634,24 +1681,83 @@ void ScaffoldApprovalPanel::rebuild()
                                 : tr("cp %1").arg(positionText(positionFrom));
         return entry;
     };
-    // The stretches of the run: each ties the violated constraints on it to
-    // the fiber's other crossings there, and its cost is theirs summed.
+    // The stretches: derived here, from what the selected solve left violated
+    // and what is approved now (scaffoldStretches). A solve does not hold
+    // stretches; an approval moves this list at once.
+    static const std::map<std::string, ScaffoldApprovalSpans> noApprovals;
+    const auto& approvals = _controller ? _controller->approvals() : noApprovals;
+    std::vector<std::string> stretchUuids;
+    std::map<std::string, std::int64_t> stretchIndex;
+    std::vector<vc::fiber_graph::ScaffoldStretchFiber> stretchFibers;
+    for (const auto& [uuid, spans] : approvals) {
+        // Only the fibers this run solved, placed among their controls.
+        if (!view->windings.contains(uuid) || spans.controlArcs.size() < 2) continue;
+        vc::fiber_graph::ScaffoldStretchFiber fiber;
+        fiber.length = spans.controlArcs.back();
+        fiber.cuts = spans.splitArcs;
+        fiber.broken = spans.brokenArcs;
+        for (const auto& ranges : spans.approvedArcs) fiber.approved.insert(fiber.approved.end(), ranges.begin(), ranges.end());
+        stretchIndex.emplace(uuid, std::int64_t(stretchFibers.size()));
+        stretchUuids.push_back(uuid);
+        stretchFibers.push_back(std::move(fiber));
+    }
+    const auto indexOf = [&](const std::string& uuid) {
+        const auto found = stretchIndex.find(uuid);
+        return found == stretchIndex.end() ? std::int64_t(-1) : found->second;
+    };
+    std::vector<vc::fiber_graph::ScaffoldStretchPlace> stretchPlaces;
+    for (const auto& crossing : view->crossings) {
+        const std::int64_t constraints = (crossing.signKnown ? 1 : 0) + (crossing.separation ? 1 : 0);
+        stretchPlaces.push_back({indexOf(crossing.fiberA), crossing.arcA, constraints});
+        stretchPlaces.push_back({indexOf(crossing.fiberB), crossing.arcB, constraints});
+    }
+    std::vector<vc::fiber_graph::ScaffoldStretchViolation> stretchViolations;
+    for (const auto& residual : view->residuals) {
+        const double cost = residual.weight * residual.residual;
+        const auto a = indexOf(residual.fiberA), b = indexOf(residual.fiberB);
+        stretchViolations.push_back({a, residual.arcA, cost, b, residual.arcB});
+        stretchViolations.push_back({b, residual.arcB, cost, a, residual.arcA});
+    }
+    vc::fiber_graph::ScaffoldStretchReport stretchReport;
+    const auto stretches =
+        vc::fiber_graph::scaffoldStretches(stretchFibers, stretchPlaces, stretchViolations, {}, stretchReport);
     std::map<std::string, std::vector<ScaffoldFiberCrossing>> crossingsOfFiber;
     const QString check = QStringLiteral("\u2713");
-    for (const auto& stretch : view->stretches) {
-        if (stretch.pieces.empty()) continue;
-        const auto& piece = stretch.pieces.front();
+    for (const auto& computed : stretches) {
+        // The row's values under the names the columns below read.
+        struct {
+            std::string fiberA, fiberB;
+            double residual = 0, weight = 0;
+            std::int64_t target = 0;
+        } stretch;
+        stretch.fiberA = stretchUuids[std::size_t(computed.fiber)];
+        if (computed.other >= 0 && std::size_t(computed.other) < stretchUuids.size())
+            stretch.fiberB = stretchUuids[std::size_t(computed.other)];
+        stretch.residual = computed.cost;
+        stretch.weight = double(computed.constraints);
+        stretch.target = computed.violations;
+        const auto& piece = computed.piece;
         // Per aspect: how much of the stretch is approved, 0 to 1.
         std::array<double, 2> approved{0., 0.};
-        std::int64_t crossings = 0, reviewed = 0, signed_ = 0, signViolated = 0;
+        // Violated on the stretch, by what the constraint is about: the side
+        // (sign) or the winding step (a separation or a link).
+        std::int64_t crossings = 0, reviewed = 0, signed_ = 0, signViolated = 0, separations = 0, windingViolated = 0;
+        std::int64_t continuations = 0, continuationsBroken = 0;
+        for (const auto& link : view->continuations) {
+            if (link.fiber != stretch.fiberA || link.arc < piece.arcFrom || link.arc > piece.arcTo) continue;
+            ++continuations;
+            if (link.residual > 0) ++continuationsBroken;
+        }
         for (const auto& residual : view->residuals) {
-            if (residual.kind != std::int64_t(ScaffoldConstraintKind::SignAtLeast) &&
-                residual.kind != std::int64_t(ScaffoldConstraintKind::SignAtMost))
-                continue;
             const auto on = [&](const std::string& fiber, double arc) {
                 return fiber == stretch.fiberA && arc >= piece.arcFrom && arc <= piece.arcTo;
             };
-            if (on(residual.fiberA, residual.arcA) || on(residual.fiberB, residual.arcB)) ++signViolated;
+            if (!on(residual.fiberA, residual.arcA) && !on(residual.fiberB, residual.arcB)) continue;
+            // A broken continuation link has its own column.
+            if (residual.kind == std::int64_t(ScaffoldConstraintKind::Continuation)) continue;
+            const bool sign = residual.kind == std::int64_t(ScaffoldConstraintKind::SignAtLeast) ||
+                              residual.kind == std::int64_t(ScaffoldConstraintKind::SignAtMost);
+            ++(sign ? signViolated : windingViolated);
         }
         if (_controller) {
             const auto found = _controller->approvals().find(stretch.fiberA);
@@ -1671,6 +1777,7 @@ void ScaffoldApprovalPanel::rebuild()
                 ++crossings;
                 if (crossing.state != 0) ++reviewed;
                 if (crossing.signKnown) ++signed_;
+                if (crossing.separation) ++separations;
             }
         }
         QString where;
@@ -1680,8 +1787,9 @@ void ScaffoldApprovalPanel::rebuild()
         entry.row.keys.density = stretch.residual / std::max(length, 1.);
         entry.row.otherUuid = stretch.fiberB;
         entry.row.reviewedShare = crossings > 0 ? double(reviewed) / double(crossings) : 0.;
-        entry.row.violated = double(stretch.target);
+        entry.row.violated = double(windingViolated);
         entry.row.signViolated = double(signViolated);
+        entry.row.continuationsBroken = double(continuationsBroken);
         // A check for a stretch approved as a whole. A new
         // stretch only reaches a margin into an approved neighbour, which
         // is not an approval of it.
@@ -1692,8 +1800,9 @@ void ScaffoldApprovalPanel::rebuild()
         entry.row.approvedShare = approved;
         entry.text << approvalText(approved[0]) << approvalText(approved[1])
                    << tr("%1/%2").arg(reviewed).arg(crossings)
-                   << tr("%1 of %2").arg(stretch.target).arg(qlonglong(stretch.weight))
-                   << tr("%1 of %2").arg(signViolated).arg(std::max(signed_, signViolated)) << where
+                   << tr("%1/%2").arg(windingViolated).arg(std::max(separations, windingViolated))
+                   << tr("%1/%2").arg(signViolated).arg(std::max(signed_, signViolated))
+                   << tr("%1/%2").arg(continuationsBroken).arg(continuations) << where
                    << QString::number(stretch.residual, 'f', 3)
                    << QString::number(1000. * entry.row.keys.density, 'f', 3) << QString::number(length, 'f', 0)
                    << label(stretch.fiberA);
@@ -1746,6 +1855,7 @@ void ScaffoldApprovalPanel::rebuild()
         number(kReviewedColumn, row.reviewedShare);
         number(kViolatedColumn, row.violated);
         number(kSignColumn, row.signViolated);
+        number(kContinuationColumn, row.continuationsBroken);
         _rows.push_back(row);
         return item;
     };

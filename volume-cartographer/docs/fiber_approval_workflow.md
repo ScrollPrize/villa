@@ -20,6 +20,7 @@ Store format: `vc_object_store/docs/fiber-approval.md`. Solver: [fiber_map_scaff
   - added by placing a control point, or by a Shift-drag in the cross view (which also sets the normal);
   - deleted like control points;
   - stored in the approval layer, never on the fiber.
+- At most one normal point between two line points: setting one there replaces the one already in that segment.
 - Shown normal = the solve's normal + correction. The correction is interpolated between normal points only;
   the fiber's own control points do not end it.
 - A stretch is selected by its two ends; the two combo boxes set its geometry and normals state. The overview
@@ -51,8 +52,18 @@ Store format: `vc_object_store/docs/fiber-approval.md`. Solver: [fiber_map_scaff
   known side it states nothing.
 - A crossing stated distant: a measurement that also says "not direct" is kept. Otherwise the separation is
   dropped (how far is not known). In both cases the side's bound moves one sheet out.
-- A reviewed separation counts with full weight, and is held rigid where both pieces it lies on are approved
-  geometry.
+- A reviewed separation is heavy (weight 10), never exact: nothing is held rigid.
+
+## Before the solve
+
+- The stretches approved for normals are faced first. Crossings between approved stretches carry the facing, so
+  connected stretches are one object; its sign is the one that agrees best with the full volume's signed normals.
+- Approved normals that contradict each other around a loop fail the solve with a message naming the crossing.
+- The fiber normals are traced out from the approved stretches. Between two stretches that face opposite ways
+  the half turn is spread evenly over the gap.
+- A fiber may break: continuation links (same winding, weight 10) lie at the ends of every approved stretch and
+  about every 2,000 voxels between them, between constraints. An approved stretch never breaks.
+- Sign constraints weigh 3, and 30 where an anchor lies on a stretch approved for normals.
 
 ## Dock
 
@@ -60,7 +71,14 @@ Store format: `vc_object_store/docs/fiber-approval.md`. Solver: [fiber_map_scaff
 - The solve list is sorted newest on top. Selecting a solve shows it and updates the map.
 - A solve that finishes is selected.
 - Closing the approval window with changes solves again; while a solve runs, once it has finished.
-- The approval list offers stretches that reach from one constraint to another (an approval ties what lies on
-  it): geometry stretches along the cycles of violated constraints, normals stretches from the crossing of a
-  violated sign constraint to at least one other crossing of that fiber. Close constraints are covered by one
-  stretch.
+- The approval list holds stretches only. A stretch is not part of a solve: the list is derived from what the
+  selected solve left violated and from what is approved now, so an approval changes it at once and a solve only
+  changes the costs.
+- A stretch ties constraints together (an approval at one constraint alone says nothing): from a violated
+  constraint to at least one other constraint of the fiber, at least 500 voxels, 100 voxels past its outer
+  constraints; close constraints are covered by one stretch. Its cost is every violated constraint on it.
+- An approved stretch is fixed: it is listed exactly as approved and never cut or shifted. New stretches lie
+  between approved ones and reach at most 100 voxels into one.
+- Columns: geometry and normals approved, approved w. (crossings with an approved winding distance, of all), violated winding constraints
+  of all, violated sign constraints of all, broken continuation links of all (each as X/Y), where, cost, cost per 1000 voxels, length, fiber.
+- A stretch opens with its exact ends (double-click, or "Open this stretch" in the window's context menu).

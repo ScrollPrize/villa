@@ -15,6 +15,9 @@
 #include <optional>
 #include <span>
 #include <cmath>
+#include <cstdio>
+#include <map>
+#include <numbers>
 #include <cstring>
 #include <stdexcept>
 
@@ -363,6 +366,7 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
     const auto frame = graph.volume + "@" + std::to_string(graph.scale);
     for (std::size_t i = 0; i < fibers; ++i)
         if (cacheable[i]) inputs[i] = scaffoldNormalInputs(options, frame, fused, anchoredBy[i]);
+    inputs_ = inputs;
     // Which fibers the cache already answers. Nothing is inferred or solved
     // for those: the neighbour stage below runs for the others only.
     std::vector<char> cachedAhead(fibers, 0);
@@ -708,6 +712,127 @@ ScaffoldNormals::ScaffoldNormals(const ScaffoldGraph& graph, const ScaffoldGeome
         else ++report_.anchoredFibers;
     }
     report_.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+}
+
+void ScaffoldNormals::face(std::span<const ScaffoldApprovedFacing> facing, const ScaffoldNormalOptions& options)
+{
+    const auto& graph = *graph_;
+    std::map<std::size_t, std::vector<ScaffoldApprovedFacing>> byFiber;
+    for (const auto& entry : facing) {
+        if (entry.fiber < 0 || std::size_t(entry.fiber) >= graph.fibers.size() || (entry.sign != 1 && entry.sign != -1) ||
+            !(entry.arcTo >= entry.arcFrom))
+            throw std::invalid_argument("scaffold normals: an invalid facing");
+        if (solved(std::size_t(entry.fiber))) byFiber[std::size_t(entry.fiber)].push_back(entry);
+    }
+    const auto arcs = geometry_->arcs();
+    for (auto& [i, stretches] : byFiber) {
+        std::sort(stretches.begin(), stretches.end(),
+                  [](const auto& x, const auto& y) { return x.arcFrom < y.arcFrom; });
+        const auto& fiber = graph.fibers[i];
+        const auto first = std::size_t(fiber.pointFirst), count = std::size_t(fiber.pointCount);
+        const auto point = [&](std::size_t j) {
+            const auto at = 3 * (first + j);
+            return cv::Vec3d(graph.linePoints[at], graph.linePoints[at + 1], graph.linePoints[at + 2]);
+        };
+        const auto gauge = [&](std::size_t j) {
+            const auto at = 3 * (first + j);
+            return cv::Vec3d(normals_[at], normals_[at + 1], normals_[at + 2]);
+        };
+        std::vector<cv::Vec3d> faced(count);
+        // The stretch a point follows where no gap has to be unrolled.
+        std::size_t stretch = 0;
+        for (std::size_t j = 0; j < count; ++j) {
+            const double arc = arcs[first + j];
+            while (stretch + 1 < stretches.size() && arc >= stretches[stretch + 1].arcFrom) ++stretch;
+            faced[j] = gauge(j) * double(stretches[stretch].sign);
+        }
+        // Between two stretches that face opposite ways the gauge normal is
+        // right at one end and upside down at the other: turn it about the
+        // fiber by an angle growing from nothing to a half turn.
+        for (std::size_t k = 0; k + 1 < stretches.size(); ++k) {
+            if (stretches[k].sign == stretches[k + 1].sign) continue;
+            const double from = stretches[k].arcTo, to = stretches[k + 1].arcFrom;
+            std::size_t begin = 0, end = 0;
+            while (begin < count && arcs[first + begin] <= from) ++begin;
+            end = begin;
+            while (end < count && arcs[first + end] < to) ++end;
+            if (begin >= end || !(to > from)) continue;
+            ++report_.unrolledGaps;
+            const auto turned = [&](std::size_t j, double direction) {
+                const auto before = point(j > 0 ? j - 1 : j), after = point(j + 1 < count ? j + 1 : j);
+                auto axis = after - before;
+                const double length = cv::norm(axis);
+                const auto normal = gauge(j) * double(stretches[k].sign);
+                if (!(length > 0)) return normal;
+                axis /= length;
+                const double angle = direction * std::numbers::pi * (arcs[first + j] - from) / (to - from);
+                return normal * std::cos(angle) + axis.cross(normal) * std::sin(angle) +
+                       axis * (axis.dot(normal) * (1. - std::cos(angle)));
+            };
+            double best = 0;
+            std::vector<cv::Vec3d> chosen;
+            for (const double direction : {1., -1.}) {
+                std::vector<cv::Vec3d> candidate;
+                candidate.reserve(end - begin);
+                for (std::size_t j = begin; j < end; ++j) candidate.push_back(turned(j, direction));
+                // The turning it leaves, the two stretch ends included.
+                double turning = 0;
+                auto previous = begin > 0 ? faced[begin - 1] : candidate.front();
+                for (const auto& normal : candidate) {
+                    turning += std::acos(std::clamp(previous.dot(normal), -1., 1.));
+                    previous = normal;
+                }
+                if (end < count) turning += std::acos(std::clamp(previous.dot(faced[end]), -1., 1.));
+                if (chosen.empty() || turning < best) {
+                    best = turning;
+                    chosen = std::move(candidate);
+                }
+            }
+            std::copy(chosen.begin(), chosen.end(), faced.begin() + std::ptrdiff_t(begin));
+        }
+        for (std::size_t j = 0; j < count; ++j)
+            for (std::size_t k = 0; k < 3; ++k) normals_[3 * (first + j) + k] = faced[j][int(k)];
+        signSources_[i] = ScaffoldSignSource::ApprovedPiece;
+        fixedSigns_[i] = 1;
+        radialAgreement_[i] = radialAgreementOf(graph, *geometry_, fiber, normals_);
+        ++report_.facedFibers;
+        report_.facedStretches += std::int64_t(stretches.size());
+
+        // The faced normals are a row of their own: what a run references.
+        const auto values = count * 3;
+        if (inputs_[i].empty() || !fiber.version) {
+            cacheRows_[i].clear();
+            continue;
+        }
+        std::string inputs = inputs_[i] + "facing=";
+        for (const auto& entry : stretches) {
+            char buffer[96];
+            std::snprintf(buffer, sizeof buffer, "%.17g:%.17g:%d,", entry.arcFrom, entry.arcTo, entry.sign);
+            inputs += buffer;
+        }
+        inputs += ";";
+        const auto* row = options.cache ? options.cache->normals(fiber.uuid, *fiber.version, inputs) : nullptr;
+        if (row != nullptr && row->normals.size() == values * sizeof(double)) {
+            std::memcpy(normals_.data() + 3 * first, row->normals.data(), values * sizeof(double));
+            cacheRows_[i] = row->normalsUuid;
+            continue;
+        }
+        cacheRows_[i].clear();
+        if (!options.sink) continue;
+        objects::FiberScaffoldNormalsRow cached;
+        cached.fiberUuid = fiber.uuid;
+        cached.fiberVersion = *fiber.version;
+        cached.normalsUuid = cacheRows_[i] = objects::util::newUuid();
+        cached.inputs = inputs;
+        cached.signSource = std::int64_t(signSources_[i]);
+        cached.sign = 1;
+        cached.converged = true;
+        cached.normals.resize(values * sizeof(double));
+        std::memcpy(cached.normals.data(), normals_.data() + 3 * first, values * sizeof(double));
+        cached.author = options.sink->author;
+        cached.computedAt = options.sink->computedAt;
+        options.sink->normals.push_back(std::move(cached));
+    }
 }
 
 std::optional<geometry::Point> ScaffoldNormals::at(std::size_t fiber, double arc) const

@@ -12,7 +12,7 @@
       "record_family": "any",
       "normal_sign": "none",
       "umbilicus": "store",
-      "weights": {"parallel": 0, "perpendicular": 0, "enclosure": 0, "manual": 1},
+      "weights": {"parallel": 0, "perpendicular": 0, "sign": 0, "enclosure": 0, "manual": 1},
       "manual_links": {"approval_states": ["approved", "pending"], "include_auto": false}
     }
   }

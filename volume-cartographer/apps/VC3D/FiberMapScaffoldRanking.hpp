@@ -117,6 +117,10 @@ struct ScaffoldApprovalSpans {
     // The approved stretches themselves, per aspect, as arc ranges: their
     // ends are arbitrary positions of the line, not control points.
     std::array<std::vector<std::pair<double, double>>, 2> approvedArcs;
+    // Arcs where broken geometry splits the fiber into parts.
+    std::vector<double> splitArcs;
+    // The stretches marked broken (geometry or normals), as arc ranges.
+    std::vector<std::pair<double, double>> brokenArcs;
 };
 
 // The span of a fiber covering an anchor, with its approval states. `known`

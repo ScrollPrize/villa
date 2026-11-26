@@ -18686,18 +18686,26 @@ void LineAnnotationController::approvalPlaceNormalPoint(const std::string& surfa
     const auto wanted = vc::fiber_tracer::displayUnit(
         normal ? *normal : vc::fiber_tracer::displayVectorAt(session.shownLineNormals, linePosition));
     if (!wanted) return refuse(tr("there is no normal at line position %1").arg(linePosition));
-    // An existing normal point at this place is changed. A control point of
-    // the fiber there is left alone: the normal point lies on top of it.
-    std::optional<size_t> existing;
-    for (size_t i = 0; i < session.controlPoints.size(); ++i)
-        if (la::isNormalPoint(session.controlPoints[i]) &&
-            std::abs(session.controlPoints[i].linePosition - linePosition) <= 0.5) { existing = i; break; }
+    // One normal point between two line points: the shown normals exist at
+    // the line points, so two points in one segment would fight over the same
+    // two of them. A normal point already in this segment is replaced by the
+    // new one. A control point of the fiber there is left alone: the normal
+    // point lies on top of it.
+    const auto segmentOf = [&](double position) {
+        return std::min(size_t(std::max(position, 0.0)), linePoints - 2);
+    };
     const auto before = session.controlPoints;
     const auto branchesBefore = session.branches;
-    if (existing) {
-        session.controlPoints[*existing].displayNormal = *wanted;
-        linePosition = session.controlPoints[*existing].linePosition;
-    } else {
+    for (size_t i = session.controlPoints.size(); i-- > 0;) {
+        if (!la::isNormalPoint(session.controlPoints[i]) ||
+            segmentOf(session.controlPoints[i].linePosition) != segmentOf(linePosition))
+            continue;
+        std::vector<size_t> oldToNew(session.controlPoints.size());
+        for (size_t k = 0; k < oldToNew.size(); ++k) oldToNew[k] = k <= i ? (k < i || k == 0 ? k : k - 1) : k - 1;
+        session.controlPoints.erase(session.controlPoints.begin() + std::ptrdiff_t(i));
+        remapCollapsedBranchControlPointIndices(oldToNew, session.branches);
+    }
+    {
         la::LineControlPoint control;
         control.linePosition = linePosition;
         control.optimizedIndex = int(std::llround(linePosition));
@@ -18723,20 +18731,8 @@ void LineAnnotationController::approvalPlaceNormalPoint(const std::string& surfa
         restore();
         return refuse(tr("the views could not be rebuilt with it: %1").arg(QString::fromStdString(session.error)));
     }
-    // What is stored is what is shown: the views must show the normal there.
-    const auto shown = vc::fiber_tracer::displayUnit(
-        vc::fiber_tracer::displayVectorAt(session.shownLineNormals, linePosition));
-    const double off = shown
-        ? std::acos(std::clamp(std::abs(shown->dot(*wanted)), 0.0, 1.0)) * 180.0 / std::acos(-1.0) : 180.0;
-    Logger()->info("Fiber approval: normal point at line position {} set to {}; the views show {} ({} degrees off)",
-                   linePosition, vectorText(*wanted).toStdString(),
-                   shown ? vectorText(*shown).toStdString() : std::string("nothing"), off);
-    if (off > 3.0) {
-        restore();
-        return refuse(tr("the views show %1 at line position %2 instead of the wanted %3 (%4 degrees off)")
-                          .arg(shown ? vectorText(*shown) : tr("no normal")).arg(linePosition)
-                          .arg(vectorText(*wanted)).arg(off, 0, 'f', 1));
-    }
+    Logger()->info("Fiber approval: normal point at line position {} set to {}", linePosition,
+                   vectorText(*wanted).toStdString());
     if (!saveApprovalLayer(session)) restore();
     pushApprovalDisplay(session);
 }
