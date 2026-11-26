@@ -162,6 +162,7 @@ class _StrideGridDeduper:
         )
         self._key_chunks: List[np.ndarray] = []
         self._key_count: int = 0
+        self._compact_at: int = _DEDUPE_COMPACT_KEYS
         self._fallback_rows: List[np.ndarray] = []
 
     def add(self, image_centers: np.ndarray) -> None:
@@ -196,10 +197,14 @@ class _StrideGridDeduper:
             else:
                 self._key_chunks.append(flat)
                 self._key_count += flat.size
-                if self._key_count >= _DEDUPE_COMPACT_KEYS:
+                if self._key_count >= self._compact_at:
                     compacted = np.unique(np.concatenate(self._key_chunks))
                     self._key_chunks = [compacted]
                     self._key_count = compacted.size
+                    # Wait for the keys to double so the re-sorts stay amortised.
+                    self._compact_at = max(
+                        _DEDUPE_COMPACT_KEYS, 2 * compacted.size
+                    )
 
     def finalize(self) -> np.ndarray:
         parts: List[np.ndarray] = []
@@ -641,11 +646,15 @@ class CrossFrameZarrDataset(Dataset):
                 return np.isin(arr, self.valid_label_values)
             return arr > 0
 
-        def _ingest_fg_coords(fg_coords: np.ndarray) -> None:
+        def _add_fg_coords(fg_coords: np.ndarray, batched: bool = True) -> None:
             for lo in range(0, fg_coords.shape[0], _DEDUPE_CHUNK_ROWS):
                 fg_label = fg_coords[lo:lo + _DEDUPE_CHUNK_ROWS].astype(np.float64)
                 fg_label *= factor
                 fg_label += half_factor
+                if batched and fg_label.shape[0] == 1:
+                    # matmul can round one point differently from a batch, and
+                    # the cache must match a scan that mapped all FG at once.
+                    fg_label = np.repeat(fg_label, 2, axis=0)
                 # Map each label center to its image-space voxel and snap to
                 # the stride cell that CONTAINS it (the old floor(c - ps/2)
                 # snap could push the start past the mapped FG voxel).
@@ -654,6 +663,18 @@ class CrossFrameZarrDataset(Dataset):
                 )
                 np.floor(fg_image, out=fg_image)
                 deduper.add(fg_image.astype(np.int64))
+
+        # A scan with a single FG voxel maps it unbatched, so hold the first
+        # voxel until the count is known.
+        lone_fg: List[np.ndarray] = []
+
+        def _ingest_fg_coords(fg_coords: np.ndarray) -> None:
+            if n_fg == 1:
+                lone_fg.append(fg_coords)
+                return
+            if lone_fg:
+                _add_fg_coords(lone_fg.pop())
+            _add_fg_coords(fg_coords)
 
         scan_shape = tuple(int(v) for v in self._scan_array.shape)
         _stage(f"coarse scan: scanning {scan_shape}")
@@ -694,6 +715,8 @@ class CrossFrameZarrDataset(Dataset):
                 fg_coarse = np.argwhere(coarse_mask)
                 del coarse_mask
                 _ingest_fg_coords(fg_coarse)
+        if lone_fg:
+            _add_fg_coords(lone_fg.pop(), batched=False)
 
         pct = (100.0 * n_fg / n_total) if n_total else 0.0
         _stage(f"coarse scan: {n_fg} FG voxels / {n_total} total ({pct:.2f}%)")
