@@ -8,13 +8,23 @@ namespace vcr::files::detail {
 // flag itself (NFS on Linux answers EINVAL, exFAT on macOS ENOTSUP).
 bool renameFlagRefused(const std::error_code& error);
 
-using Move = std::function<void(const std::filesystem::path&, const std::filesystem::path&)>;
+using Rename = std::function<void(const std::filesystem::path&, const std::filesystem::path&)>;
 
-// Publishes a staged directory of regular files at a new destination without the
-// no-replace rename: mkdir reserves the destination, the files move in with
-// meta.json last, and a failure moves them back and removes the reservation.
-// Returns false and changes nothing when the destination already exists.
-// `move` replaces the rename, for tests.
-bool publishNewByFiles(const std::filesystem::path& source, const std::filesystem::path& destination,
-                       const Move& move = {});
+// Publishes a staged directory where the filesystem refuses the no-replace rename. A
+// plain rename still publishes the whole directory at once and fails with EEXIST on a
+// destination that holds anything, though one created empty in the meantime would be
+// replaced. An error after the staged directory is gone means the rename took effect
+// (NFS can report it failed), so that counts as published. `rename` is for tests.
+void renameNewDirectory(const std::filesystem::path& source, const std::filesystem::path& destination,
+                        const Rename& rename = {});
+
+// publishPath without overwrite for a staged directory, falling back to
+// renameNewDirectory where the no-replace rename is refused (NFS, exFAT).
+void publishNewDirectory(const std::filesystem::path& source, const std::filesystem::path& destination);
+
+// How a save publishes its staged directory. With overwrite, a destination that existed
+// when the save began goes through publishDirectory's journal, and one that did not is
+// published new, so a segment another save published meanwhile makes this one fail.
+void publishStaged(const std::filesystem::path& source, const std::filesystem::path& destination,
+                   bool overwrite, bool existed);
 }

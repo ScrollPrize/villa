@@ -1,6 +1,6 @@
-// vcr::files publication: publishPath stays strict, publishDirectory with overwrite
-// completes what an interrupted save left, and the file by file publisher used where
-// the no-replace rename is refused. Pass a directory on NFS or exFAT to run it there.
+// vcr::files publication: publishPath and publishDirectory stay strict, and a new
+// directory is published whole even where the no-replace rename is refused (NFS,
+// exFAT). Pass a directory on such a filesystem to run every check there.
 #include "vc_reader/publication.hpp"
 #include "publication_files.hpp"
 
@@ -19,7 +19,9 @@
 namespace fs = std::filesystem;
 using vcr::files::publishDirectory;
 using vcr::files::publishPath;
-using vcr::files::detail::publishNewByFiles;
+using vcr::files::detail::publishNewDirectory;
+using vcr::files::detail::publishStaged;
+using vcr::files::detail::renameNewDirectory;
 using vcr::files::detail::renameFlagRefused;
 
 #define CHECK(condition)                                                        \
@@ -95,10 +97,10 @@ int main(int argc, char** argv)
     std::error_code ignored;
     fs::remove(root / "probe.tmp", ignored);
     fs::remove(root / "probe", ignored);
-    std::printf("no-replace rename %s\n", refused ? "refused, so overwrite saves publish file by file" : "supported");
+    std::printf("no-replace rename %s\n", refused ? "refused, so new directories are renamed whole" : "supported");
 
-    // Without overwrite nothing existing is replaced, an empty directory included, and a
-    // new destination is published atomically or not at all.
+    // publishPath and publishDirectory never replace an existing destination, an empty
+    // directory included, and publish a new one atomically or not at all.
     fs::create_directory(root / "empty");
     stage(root / "a.tmp", "a");
     CHECK(failure([&] { publishPath(root / "a.tmp", root / "empty", false); }) == std::errc::file_exists);
@@ -107,74 +109,61 @@ int main(int argc, char** argv)
     CHECK(failure([&] { publishDirectory(root / "a.tmp", root / "a", false); }) == refused);
     CHECK(refused ? !fs::exists(root / "a") && holds(root / "a.tmp", "a") : holds(root / "a", "a") && !fs::exists(root / "a.tmp"));
 
-    // With overwrite a new destination is published, file by file where the rename is refused.
+    // publishNewDirectory publishes a new directory whole on every filesystem, and fails
+    // on anything already there without changing either side.
     stage(root / "b.tmp", "b");
-    publishDirectory(root / "b.tmp", root / "b", true);
+    publishNewDirectory(root / "b.tmp", root / "b");
     CHECK(holds(root / "b", "b") && !fs::exists(root / "b.tmp"));
-
-    // An interrupted save leaves an empty directory, or one without meta.json. A save with
-    // overwrite completes either through the journal, on every filesystem.
-    fs::create_directory(root / "c");
     stage(root / "c.tmp", "c");
-    publishDirectory(root / "c.tmp", root / "c", true);
-    CHECK(holds(root / "c", "c") && !fs::exists(root / "c.tmp"));
-    fs::create_directory(root / "d");
-    put(root / "d" / "x.tif", "old");
-    stage(root / "d.tmp", "d");
-    publishDirectory(root / "d.tmp", root / "d", true);
-    CHECK(holds(root / "d", "d") && !fs::exists(root / "d.tmp"));
+    CHECK(failure([&] { publishNewDirectory(root / "c.tmp", root / "b"); }) == std::errc::file_exists);
+    CHECK(failure([&] { publishNewDirectory(root / "c.tmp", root / "empty"); }) == std::errc::file_exists);
+    CHECK(holds(root / "b", "b") && fs::is_empty(root / "empty") && holds(root / "c.tmp", "c"));
 
-    // The file by file publisher itself, so these checks run on every filesystem.
-    // Every file moves, meta.json last, and the staging directory goes.
-    std::vector<std::string> order;
-    const auto record = [&](const fs::path& from, const fs::path& to) {
-        order.push_back(from.filename().string());
+    // A save with overwrite replaces what existed when it began, through the journal, and
+    // fails on a segment another save published where nothing was when it began.
+    CHECK(failure([&] { publishStaged(root / "c.tmp", root / "b", true, false); }) == std::errc::file_exists);
+    CHECK(holds(root / "b", "b") && holds(root / "c.tmp", "c"));
+    stage(root / "j.tmp", "j");
+    publishStaged(root / "j.tmp", root / "b", true, true);
+    CHECK(holds(root / "b", "j") && !fs::exists(root / "j.tmp"));
+    stage(root / "k.tmp", "k");
+    publishStaged(root / "k.tmp", root / "k", true, false);
+    CHECK(holds(root / "k", "k") && !fs::exists(root / "k.tmp"));
+
+    // The plain rename itself, so these run on every filesystem. It refuses an existing
+    // destination, an empty directory included, before renaming.
+    CHECK(failure([&] { renameNewDirectory(root / "c.tmp", root / "empty"); }) == std::errc::file_exists);
+    CHECK(fs::is_empty(root / "empty") && holds(root / "c.tmp", "c"));
+
+    // A competitor that publishes at the destination just before the rename wins, and
+    // this save fails.
+    const auto competitor = [&](const fs::path& from, const fs::path& to) {
+        stage(to, "winner");
         fs::rename(from, to);
     };
-    stage(root / "e.tmp", "e");
-    CHECK(publishNewByFiles(root / "e.tmp", root / "e", record));
-    CHECK(holds(root / "e", "e") && !fs::exists(root / "e.tmp"));
-    CHECK(order.size() == kNames.size() && order.back() == "meta.json");
+    CHECK(failure([&] { renameNewDirectory(root / "c.tmp", root / "d", competitor); }) == std::errc::file_exists);
+    CHECK(holds(root / "d", "winner") && holds(root / "c.tmp", "c"));
 
-    // An existing destination, even an empty directory, is left alone.
+    // A rename reported as failed after it took effect (NFS) counts as published.
+    const auto lost_reply = [&](const fs::path& from, const fs::path& to) {
+        fs::rename(from, to);
+        throw fs::filesystem_error("injected", from, to, std::make_error_code(std::errc::io_error));
+    };
+    renameNewDirectory(root / "c.tmp", root / "e", lost_reply);
+    CHECK(holds(root / "e", "c") && !fs::exists(root / "c.tmp"));
+
+    // A rename that fails without effect reports its error and leaves nothing behind.
     stage(root / "f.tmp", "f");
-    CHECK(!publishNewByFiles(root / "f.tmp", root / "empty"));
-    CHECK(fs::is_empty(root / "empty") && holds(root / "f.tmp", "f"));
-
-    // A failed move undoes the publication whichever file fails: the files go back to
-    // staging and the reservation is removed.
-    for (std::size_t k = 0; k < kNames.size(); ++k) {
-        std::size_t moves = 0;
-        const auto fail = [&](const fs::path& from, const fs::path& to) {
-            if (moves++ == k) throw fs::filesystem_error("injected", from, to, std::make_error_code(std::errc::io_error));
-            fs::rename(from, to);
-        };
-        CHECK(failure([&] { publishNewByFiles(root / "f.tmp", root / "g", fail); }) == std::errc::io_error);
-        CHECK(!fs::exists(root / "g") && holds(root / "f.tmp", "f"));
-    }
-
-    // When the files cannot move back either, the original error is reported, meta.json
-    // is not left behind, and the retry with overwrite completes the destination.
-    std::size_t moves = 0;
-    const auto stuck = [&](const fs::path& from, const fs::path& to) {
-        const auto n = moves++;
-        if (n == kNames.size() - 1) throw fs::filesystem_error("injected", from, to, std::make_error_code(std::errc::io_error));
-        if (n >= kNames.size()) throw fs::filesystem_error("injected", from, to, std::make_error_code(std::errc::no_space_on_device));
-        fs::rename(from, to);
+    const auto broken = [&](const fs::path& from, const fs::path& to) {
+        throw fs::filesystem_error("injected", from, to, std::make_error_code(std::errc::io_error));
     };
-    CHECK(failure([&] { publishNewByFiles(root / "f.tmp", root / "h", stuck); }) == std::errc::io_error);
-    CHECK(fs::is_directory(root / "h") && !fs::exists(root / "h" / "meta.json") && fs::exists(root / "h" / "x.tif"));
-    fs::remove_all(root / "f.tmp");
-    stage(root / "h.tmp", "h");
-    publishDirectory(root / "h.tmp", root / "h", true);
-    CHECK(holds(root / "h", "h") && !fs::exists(root / "h.tmp"));
+    CHECK(failure([&] { renameNewDirectory(root / "f.tmp", root / "g", broken); }) == std::errc::io_error);
+    CHECK(!fs::exists(root / "g") && holds(root / "f.tmp", "f"));
 
-    // Only a directory of regular files outside the destination is published this way.
-    stage(root / "i.tmp", "i");
-    fs::create_directory(root / "i.tmp" / "sub");
-    CHECK(refuses([&] { publishNewByFiles(root / "i.tmp", root / "i"); }) && !fs::exists(root / "i"));
-    fs::remove(root / "i.tmp" / "sub");
-    CHECK(refuses([&] { publishNewByFiles(root / "i.tmp", root / "i.tmp" / "i"); }) && holds(root / "i.tmp", "i"));
+    // Only a staged directory outside the destination is published this way.
+    put(root / "file.tmp", "x");
+    CHECK(refuses([&] { renameNewDirectory(root / "file.tmp", root / "h"); }) && !fs::exists(root / "h"));
+    CHECK(refuses([&] { renameNewDirectory(root / "f.tmp", root / "f.tmp" / "h"); }) && holds(root / "f.tmp", "f"));
 
     fs::remove_all(root);
     std::puts("publication checks passed");

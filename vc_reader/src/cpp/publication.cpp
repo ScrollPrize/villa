@@ -63,30 +63,18 @@ void publishPath(const std::filesystem::path& source,const std::filesystem::path
 namespace {
 namespace fs = std::filesystem;
 
-// Publish metadata last so readers do not observe it before the data files.
-void sortMetaLast(std::vector<fs::path>& files)
-{
-    std::sort(files.begin(), files.end(), [](const auto& lhs, const auto& rhs) {
-        const bool lhsMeta = lhs.filename() == "meta.json";
-        const bool rhsMeta = rhs.filename() == "meta.json";
-        return lhsMeta != rhsMeta ? !lhsMeta : lhs.filename() < rhs.filename();
-    });
-}
-
-bool onlyRegularFiles(const fs::path& directory)
-{
-    for (const auto& entry : fs::directory_iterator(directory)) {
-        if (!fs::is_regular_file(entry.symlink_status())) return false;
-    }
-    return true;
-}
-
 bool inside(const fs::path& outer, const fs::path& inner)
 {
     const auto a = fs::absolute(outer).lexically_normal(), b = fs::absolute(inner).lexically_normal();
     auto i = a.begin(), j = b.begin();
     for (; i != a.end() && j != b.end() && *i == *j; ++i, ++j) {}
     return i == a.end() || (i->empty() && std::next(i) == a.end());
+}
+
+fs::filesystem_error destinationExists(const fs::path& source, const fs::path& destination)
+{
+    return fs::filesystem_error("publication destination already exists", source, destination,
+                                std::make_error_code(std::errc::file_exists));
 }
 }  // namespace
 
@@ -98,38 +86,41 @@ bool renameFlagRefused(const std::error_code& error)
     return value == EINVAL || value == ENOTSUP || value == EOPNOTSUPP || value == ENOSYS;
 }
 
-bool publishNewByFiles(const fs::path& source, const fs::path& destination, const Move& move)
+void renameNewDirectory(const fs::path& source, const fs::path& destination, const Rename& rename)
 {
-    const Move rename = move ? move : Move([](const fs::path& from, const fs::path& to) { fs::rename(from, to); });
-    if (!onlyRegularFiles(source) || inside(source, destination))
-        throw std::invalid_argument("file by file publication needs a directory of regular files outside the destination");
-    std::vector<fs::path> files;
-    for (const auto& entry : fs::directory_iterator(source)) files.push_back(entry.path());
-    sortMetaLast(files);
-    std::error_code error;
-    if (!fs::create_directory(destination, error)) {
-        if (error) throw fs::filesystem_error("publication reservation", source, destination, error);
-        return false;
-    }
+    if (!fs::is_directory(fs::symlink_status(source)) || inside(source, destination))
+        throw std::invalid_argument("publication needs a staged directory outside the destination");
+    if (fs::exists(fs::symlink_status(destination))) throw destinationExists(source, destination);
     try {
-        for (const auto& file : files) rename(file, destination / file.filename());
-    } catch (...) {
-        // meta.json moves last, so nothing was published. Move everything back,
-        // meta.json first, and drop the reservation. Whatever cannot move back stays
-        // without meta.json, and the next save with overwrite replaces it.
-        for (auto file = files.rbegin(); file != files.rend(); ++file) {
-            std::error_code missing;
-            if (!fs::exists(fs::symlink_status(destination / file->filename(), missing))) continue;
-            try {
-                rename(destination / file->filename(), *file);
-            } catch (...) {
-            }
-        }
-        fs::remove(destination, error);
+        if (rename) rename(source, destination);
+        else fs::rename(source, destination);
+    } catch (const fs::filesystem_error& error) {
+        // NFS can report a rename that took effect as failed. The staging directory is
+        // gone only if it was renamed, so that counts as published.
+        std::error_code ignored;
+        if (!fs::exists(fs::symlink_status(source, ignored)) && fs::is_directory(fs::symlink_status(destination, ignored)))
+            return;
+        if (error.code() == std::errc::directory_not_empty || error.code() == std::errc::file_exists)
+            throw destinationExists(source, destination);
         throw;
     }
-    fs::remove(source, error);
-    return true;
+}
+
+void publishNewDirectory(const fs::path& source, const fs::path& destination)
+{
+    std::lock_guard<std::recursive_mutex> lock(directoryMutex(destination));
+    try {
+        publishPath(source, destination, false);
+    } catch (const fs::filesystem_error& error) {
+        if (!renameFlagRefused(error.code())) throw;
+        renameNewDirectory(source, destination);
+    }
+}
+
+void publishStaged(const fs::path& source, const fs::path& destination, bool overwrite, bool existed)
+{
+    if (overwrite && !existed) publishNewDirectory(source, destination);
+    else publishDirectory(source, destination, overwrite);
 }
 }  // namespace detail
 
@@ -213,21 +204,8 @@ void publishDirectory(const std::filesystem::path& source,
         return;
     }
     if (!std::filesystem::exists(destination)) {
-        try {
-            publishPath(source,destination,false);
-            return;
-        } catch (const std::filesystem::filesystem_error& error) {
-            // A destination that appeared while the source was staged is overwritten
-            // below like any other. Where the filesystem refuses the no-replace rename
-            // (NFS, exFAT), a new destination is published file by file instead.
-            const bool appeared = error.code() == std::errc::file_exists &&
-                std::filesystem::is_directory(destination);
-            if (!appeared && !(detail::renameFlagRefused(error.code()) && onlyRegularFiles(source) &&
-                               !inside(source,destination)))
-                throw;
-            if (!appeared && detail::publishNewByFiles(source,destination))
-                return;
-        }
+        publishPath(source,destination,false);
+        return;
     }
 
     // If a previous process stopped during publication, restore its complete
@@ -262,8 +240,13 @@ void publishDirectory(const std::filesystem::path& source,
         }
     }
     // Do not mutate a directory while iterating it: directory_iterator may
-    // otherwise skip entries on Windows.
-    sortMetaLast(files);
+    // otherwise skip entries on Windows. Publish metadata last so readers do
+    // not observe it before the corresponding data files are replaced.
+    std::sort(files.begin(), files.end(), [](const auto& lhs, const auto& rhs) {
+        const bool lhsMeta = lhs.filename() == "meta.json";
+        const bool rhsMeta = rhs.filename() == "meta.json";
+        return lhsMeta != rhsMeta ? !lhsMeta : lhs.filename() < rhs.filename();
+    });
     try {
         for (const auto& file : files) {
             replaceFile(file, destination / file.filename());

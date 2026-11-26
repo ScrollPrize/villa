@@ -9,6 +9,7 @@
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "../element_type.hpp"
+#include "../publication_files.hpp"
 #include "../rounding.hpp"
 #include "../platform_io.hpp"
 
@@ -414,7 +415,10 @@ void write(const std::filesystem::path& path, Surface& surface, const WriteOptio
     namespace fs = std::filesystem;
     std::lock_guard<std::recursive_mutex> lock(files::directoryMutex(path));
     files::recoverDirectory(path);
-    if (fs::exists(path) && !options.overwrite) throw fs::filesystem_error("tifxyz directory already exists", path, std::make_error_code(std::errc::file_exists));
+    // Overwrite replaces what is there when the save begins. A segment another save
+    // publishes meanwhile makes this one fail instead of mixing the two.
+    const bool existed = fs::exists(path);
+    if (existed && !options.overwrite) throw fs::filesystem_error("tifxyz directory already exists", path, std::make_error_code(std::errc::file_exists));
     auto& metadata = surface.metadata();
     if (metadata.uuid.empty()) metadata.uuid = newUuid();
     const auto parent = path.has_parent_path() ? path.parent_path() : fs::path(".");
@@ -464,7 +468,7 @@ void write(const std::filesystem::path& path, Surface& surface, const WriteOptio
             sources::writeTiff(temporary / utf8Path(channel.name + ".tif"), channel.data, channel.dtype,
                 channel.rows, channel.cols, channel.components, settings);
         }
-        files::publishDirectory(temporary,path,options.overwrite);
+        files::detail::publishStaged(temporary, path, options.overwrite, existed);
     } catch (...) {
         std::error_code ignored;
         fs::remove_all(temporary, ignored);

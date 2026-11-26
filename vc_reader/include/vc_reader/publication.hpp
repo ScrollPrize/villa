@@ -15,10 +15,6 @@ void publishPath(const std::filesystem::path& source,const std::filesystem::path
 void recoverDirectory(const std::filesystem::path& destination);
 // Replaces staged regular files, preserving sibling artifacts and subdirectories.
 // A rollback journal restores the previous generation after any failed publication.
-// With overwrite, a destination that appears while the source is staged is replaced
-// the same way, and where the filesystem refuses the no-replace rename (NFS, exFAT) a
-// new destination is created with mkdir and filled file by file, meta.json last.
-// Without overwrite, a new destination is published atomically or not at all.
 void publishDirectory(const std::filesystem::path& source,const std::filesystem::path& destination,bool overwrite);
 void snapshot(const std::filesystem::path& path,int maxBackups,std::chrono::seconds throttle,bool force);
 }

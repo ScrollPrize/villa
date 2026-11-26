@@ -166,7 +166,10 @@ struct WriteOptions {
     std::optional<double> pixelUm;  // the TIFFs' resolution tags (micrometres per pixel); none without
 };
 // Writes the directory through a temporary beside it. An existing `path` raises unless
-// `overwrite`, which publishes new files with rollback while retaining sibling artifacts. Metadata carries the extent of the valid
+// `overwrite`, which publishes new files with rollback while retaining sibling artifacts.
+// With `overwrite`, a `path` that did not exist when the save began is published whole, and
+// the save fails if another one published it meanwhile (on NFS and exFAT, which refuse the
+// atomic no-replace rename, with a plain rename). Metadata carries the extent of the valid
 // vertices (zeros without any). A surface without a UUID gets one, kept on `surface`.
 void write(const std::filesystem::path& path, Surface& surface, const WriteOptions& options = {});
 
