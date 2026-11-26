@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "CState.hpp"
+#include "OpenDataVolumeOrientation.hpp"
 
 #include "vc/core/types/Volume.hpp"
 
@@ -91,6 +92,62 @@ std::vector<std::string> retireUmbilici(const CState& state, const AnnotationUmb
             return std::vector<vc::objects::TransactionOperation>{vc::objects::RetireObjectOp{uuid}};
         });
     return umbilici.uuids;
+}
+
+std::optional<WindingDirection> windingDirection(const CState& state)
+{
+    const auto attachment = state.storeFor("umbilicus");
+    if (!attachment || !state.annotationVolume()) return std::nullopt;
+    WindingDirection result;
+    result.volume = state.annotationVolume()->volume;
+    state.objectStoreSession()->readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        const auto records = vc::objects::volumeUmbilici(reader, result.volume);
+        if (records.size() != 1) {
+            result.problem = records.empty() ? "the volume has no umbilicus" : "several umbilici map to the volume";
+            return;
+        }
+        result.handedness = vc::objects::umbilicusWindingHandedness(records.front());
+        result.source = vc::objects::umbilicusWindingHandednessSource(records.front());
+    });
+    return result;
+}
+
+void stateWindingDirection(const CState& state, int handedness, const std::string& source)
+{
+    const auto attachment = state.storeFor("umbilicus");
+    if (!attachment || !state.annotationVolume()) throw std::runtime_error("no project, volume or umbilicus store");
+    const auto volume = state.annotationVolume()->volume;
+    auto& session = *state.objectStoreSession();
+    std::vector<vc::objects::ObjectRecord> records;
+    session.readStore(*attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        records = vc::objects::volumeUmbilici(reader, volume);
+    });
+    if (records.size() != 1)
+        throw std::runtime_error(records.empty() ? "volume " + volume + " has no umbilicus"
+                                                 : "several umbilici map to volume " + volume);
+    auto request = session.newRequest(*attachment);
+    vc::objects::setUmbilicusWindingHandednessRequest(request, records.front(), handedness, source);
+    session.submitDurably(*attachment, request);
+}
+
+std::optional<std::pair<int, std::string>> catalogWindingDirection(const CState& state)
+{
+    if (!state.vpkg() || state.currentVolumeId().empty()) return std::nullopt;
+    const auto catalog = vc3d::opendata::catalogVolumeSense(*state.vpkg(), state.currentVolumeId());
+    if (!catalog) return std::nullopt;
+    const auto handedness = vc3d::opendata::windingChiralityOf(catalog->orientation);
+    if (!handedness) return std::nullopt;
+    return std::pair{*handedness, catalog->volume};
+}
+
+std::optional<WindingDirection> keepCatalogWindingDirection(const CState& state)
+{
+    const auto stated = windingDirection(state);
+    if (!stated || stated->handedness || !stated->problem.empty()) return std::nullopt;
+    const auto catalog = catalogWindingDirection(state);
+    if (!catalog) return std::nullopt;
+    stateWindingDirection(state, catalog->first, "catalog " + catalog->second);
+    return windingDirection(state);
 }
 
 }  // namespace vc3d

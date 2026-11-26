@@ -347,12 +347,13 @@ about the umbilicus, `-1` against it. It is never inferred from the fibers.
   properties are needed; a volume the catalog leaves one of them unset for
   has no catalog direction.
 - **Kept from the catalog.** When the store states none and the catalog
-  orients the volume, the fiber map's solver dock stores the catalog's
-  direction on the umbilicus the first time it sees the store, and
-  `vc_winding_handedness <store> --set catalog` does the same from the command
-  line. After that nothing is looked up: every reader finds it in the store.
-- **Set by hand.** For a volume the catalog does not orient: the *Set...*
-  button beside the dock's winding direction line, or
+  orients the volume, VC3D stores the catalog's direction on the umbilicus as
+  soon as the volume or its umbilicus appears (`keepCatalogWindingDirection`,
+  `ProjectResources.hpp`), and `vc_winding_handedness <store> --set catalog`
+  does the same from the command line. After that nothing is looked up: every
+  reader finds it in the store.
+- **Set by hand.** For a volume the catalog does not orient: *File > Set
+  Winding Direction...*, beside the umbilicus import, or
   `vc_winding_handedness <store> --set +1|-1`. A direction set by hand is
   recorded as `manual` and is not replaced by the catalog's.
 - `vc_winding_handedness <store> [--volume <id>]` prints what the store states

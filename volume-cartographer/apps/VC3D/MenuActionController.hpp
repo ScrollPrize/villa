@@ -132,6 +132,7 @@ public slots:
 private slots:
     void importUmbilicus();
     void removeUmbilicus();
+    void setWindingDirection();
     void detachEntry();
     void openRecentVolpkg();
     void showAboutDialog();
@@ -213,6 +214,7 @@ private:
     QAction* _attachNormalGridAct{nullptr};
     QAction* _importUmbilicusAct{nullptr};
     QAction* _removeUmbilicusAct{nullptr};
+    QAction* _setWindingDirectionAct{nullptr};
     QAction* _attachLasagnaManifestAct{nullptr};
     QAction* _attachRemoteLasagnaManifestAct{nullptr};
     QAction* _detachEntryAct{nullptr};

@@ -160,6 +160,12 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _removeUmbilicusAct = new QAction(QObject::tr("Remove Um&bilicus"), this);
     connect(_removeUmbilicusAct, &QAction::triggered, this, &MenuActionController::removeUmbilicus);
 
+    _setWindingDirectionAct = new QAction(QObject::tr("Set &Winding Direction..."), this);
+    _setWindingDirectionAct->setToolTip(QObject::tr(
+        "The scroll's winding direction in the current volume, stored on its umbilicus. The open-data "
+        "catalog's direction is stored there by itself; this sets it where the catalog gives none."));
+    connect(_setWindingDirectionAct, &QAction::triggered, this, &MenuActionController::setWindingDirection);
+
     _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna / Compound Dataset..."), this);
     connect(_attachLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachLasagnaManifest);
 
@@ -243,6 +249,24 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_importUmbilicusAct);
     _fileMenu->addAction(_removeUmbilicusAct);
+    _fileMenu->addAction(_setWindingDirectionAct);
+    // A direction the catalog gives and the store does not state is kept in
+    // the store when the volume or its umbilicus appears, so nothing has to
+    // look it up again.
+    const auto keepWinding = [qWindow]() {
+        try {
+            if (const auto kept = vc3d::keepCatalogWindingDirection(*qWindow->_state))
+                qWindow->showStatusBarMessage(
+                    QObject::tr("Stored the winding direction %1 of volume %2 on its umbilicus (%3)")
+                        .arg(kept->handedness.value_or(0))
+                        .arg(QString::fromStdString(kept->volume), QString::fromStdString(kept->source)),
+                    8000);
+        } catch (const std::exception& problem) {
+            qWarning().noquote() << "The catalog's winding direction could not be stored:" << problem.what();
+        }
+    };
+    connect(qWindow->_state, &CState::volumeChanged, this, [keepWinding](auto, const auto&) { keepWinding(); });
+    connect(qWindow->_state, &CState::umbilicusChanged, this, keepWinding);
     _fileMenu->addAction(_attachLasagnaManifestAct);
     _fileMenu->addAction(_attachRemoteLasagnaManifestAct);
     _fileMenu->addAction(_detachEntryAct);
@@ -1767,6 +1791,54 @@ void MenuActionController::removeUmbilicus()
     vc3d::retireUmbilici(state, *umbilici);
     _window->showStatusBarMessage(
         QObject::tr("Removed the umbilicus of volume %1").arg(QString::fromStdString(umbilici->volume)), 5000);
+}
+
+void MenuActionController::setWindingDirection()
+{
+    auto& state = *_window->_state;
+    const auto title = QObject::tr("Winding Direction");
+    try {
+        auto stated = vc3d::windingDirection(state);
+        if (!stated) {
+            QMessageBox::information(_window, title, QObject::tr("Open a project and a volume first."));
+            return;
+        }
+        if (!stated->problem.empty()) {
+            QMessageBox::information(_window, title,
+                QObject::tr("Volume %1: %2.").arg(QString::fromStdString(stated->volume), QString::fromStdString(stated->problem)));
+            return;
+        }
+        const auto volume = QString::fromStdString(stated->volume);
+        const auto catalog = vc3d::catalogWindingDirection(state);
+        const QString now = stated->handedness
+            ? QObject::tr("The umbilicus of volume %1 states %2 (%3).")
+                  .arg(volume, *stated->handedness > 0 ? QStringLiteral("+1") : QStringLiteral("-1"),
+                       stated->source.empty() ? QObject::tr("no source recorded") : QString::fromStdString(stated->source))
+            : QObject::tr("The umbilicus of volume %1 states no winding direction.").arg(volume);
+        const QString catalogLine = catalog
+            ? QObject::tr("The open-data catalog gives %1 (%2).")
+                  .arg(catalog->first > 0 ? QStringLiteral("+1") : QStringLiteral("-1"), QString::fromStdString(catalog->second))
+            : QObject::tr("The open-data catalog does not orient this volume.");
+        QStringList choices{QObject::tr("+1: the winding grows with the angle about the umbilicus"),
+                            QObject::tr("-1: the winding grows against the angle about the umbilicus")};
+        if (catalog) choices.push_back(QObject::tr("The catalog's direction"));
+        bool accepted = false;
+        const auto choice = QInputDialog::getItem(_window, title, now + QLatin1Char('\n') + catalogLine, choices,
+                                                  stated->handedness && *stated->handedness < 0 ? 1 : 0, false, &accepted);
+        if (!accepted) return;
+        const auto index = choices.indexOf(choice);
+        if (index == 2) vc3d::stateWindingDirection(state, catalog->first, "catalog " + catalog->second);
+        else vc3d::stateWindingDirection(state, index == 0 ? 1 : -1, "manual");
+        stated = vc3d::windingDirection(state);
+        _window->showStatusBarMessage(
+            QObject::tr("Winding direction of volume %1: %2 (%3)")
+                .arg(volume)
+                .arg(stated && stated->handedness ? *stated->handedness : 0)
+                .arg(QString::fromStdString(stated ? stated->source : std::string())),
+            5000);
+    } catch (const std::exception& problem) {
+        QMessageBox::warning(_window, title, QString::fromUtf8(problem.what()));
+    }
 }
 
 void MenuActionController::attachLasagnaManifest()
