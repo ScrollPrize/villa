@@ -6,9 +6,11 @@ config manager, the layer export and the trainer's ZarrDataset are the real ones
 import importlib
 import inspect
 import sys
+import tomllib
 import tempfile
 import types
 from copy import deepcopy
+from fnmatch import fnmatch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -327,3 +329,11 @@ def test_offered_losses_fit_the_default_target_and_keep_its_ignore_label(main_wi
         changed[:, :, :4] = torch.randn_like(changed[:, :, :4]) * 10  # only where the label is ignored
         torch.testing.assert_close(loss_fn(changed, target), loss, msg=name)
 
+
+def test_default_config_is_package_data(main_window):
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    patterns = tomllib.loads(pyproject.read_text())["tool"]["setuptools"]["package-data"]["vesuvius"]
+    package_dir = Path(main_window.__file__).resolve().parents[1]
+    relative = main_window.DEFAULT_CONFIG_PATH.relative_to(package_dir).as_posix()
+
+    assert any(fnmatch(relative, pattern) for pattern in patterns)
