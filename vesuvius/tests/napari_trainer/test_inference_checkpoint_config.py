@@ -169,3 +169,113 @@ def test_extra_checkpoint_tensors_are_not_rejected(tmp_path):
     model, _ = ModelLoader(path).load()
 
     assert _differing_tensors(model, trained.state_dict()) == []
+
+
+def _checkpoint(tmp_path, **saved):
+    """A small 2D U-Net checkpoint (32x32 patch) as the trainer saves it, plus `saved`."""
+    torch.manual_seed(0)
+    trained = NetworkFromConfig(_manager([4, 8], {"ink": {"out_channels": 2, "activation": "none"}}))
+    path = tmp_path / "unet2d.pth"
+    torch.save({"model": trained.state_dict(), "model_config": trained.final_config, **saved}, path)
+    return str(path)
+
+
+@pytest.fixture
+def model_inputs(monkeypatch):
+    """Every batch the loaded network is called with, and whether it was contiguous."""
+    seen = []
+    real_load = ModelLoader.load
+
+    def load(self):
+        model, config = real_load(self)
+        model.register_forward_pre_hook(
+            lambda module, args: seen.append((args[0].detach().cpu().clone(), args[0].is_contiguous())))
+        return model, config
+
+    monkeypatch.setattr(ModelLoader, "load", load)
+    return seen
+
+
+def _first_window(model_inputs):
+    return model_inputs[0][0][0, 0].numpy()
+
+
+def test_zscore_checkpoint_sees_zscored_windows(tmp_path, no_gui_config, model_inputs):
+    # save_checkpoint stores the training dataset's normalization_scheme and intensity_properties
+    path = _checkpoint(tmp_path, normalization_scheme="zscore", intensity_properties={})
+    data = np.random.default_rng(0).normal(100, 10, (20, 48)).astype(np.float32)
+
+    run_inference(_Viewer(), SimpleNamespace(name="vol", data=data), path)
+
+    window = _first_window(model_inputs)  # the window at (0, 0); the image is 20 rows, the patch 32
+    inside = window[:20]
+    assert abs(inside.mean()) < 1e-4 and abs(inside.std() - 1) < 1e-3
+    np.testing.assert_allclose(inside, (data[:, :32] - data[:, :32].mean()) / data[:, :32].std(), atol=1e-4)
+    assert np.all(window[20:] == 0)  # padded after normalization, as the trainer pads a patch
+
+
+def test_ct_checkpoint_sees_its_saved_intensity_properties(tmp_path, no_gui_config, model_inputs):
+    props = {"mean": 100.0, "std": 10.0, "percentile_00_5": 85.0, "percentile_99_5": 115.0}
+    path = _checkpoint(tmp_path, normalization_scheme="ct", intensity_properties=props)
+    data = np.random.default_rng(0).normal(100, 10, (48, 48)).astype(np.float32)
+
+    run_inference(_Viewer(), SimpleNamespace(name="vol", data=data), path)
+
+    np.testing.assert_allclose(_first_window(model_inputs), (np.clip(data[:32, :32], 85, 115) - 100) / 10, atol=1e-5)
+
+
+def test_checkpoint_without_saved_preprocessing_keeps_whole_image_minmax(tmp_path, no_gui_config, model_inputs):
+    import vc_reader.transforms as A
+
+    path = _checkpoint(tmp_path)
+    data = np.random.default_rng(0).normal(100, 10, (48, 48)).astype(np.float32)
+
+    run_inference(_Viewer(), SimpleNamespace(name="vol", data=data), path)
+
+    expected = A.Normalize("minmax", eps=1e-5)(torch.as_tensor(data)[None]).numpy()[0]
+    np.testing.assert_array_equal(_first_window(model_inputs), expected[:32, :32])
+
+
+@pytest.mark.parametrize("saved", [{}, {"normalization_scheme": "zscore", "intensity_properties": {}}],
+                         ids=["no-saved-preprocessing", "zscore"])
+def test_the_network_gets_contiguous_windows(tmp_path, no_gui_config, model_inputs, saved):
+    path = _checkpoint(tmp_path, **saved)
+    data = np.random.default_rng(0).random((3, 50, 70)).astype(np.float32)[1]  # a strided view
+
+    run_inference(_Viewer(), SimpleNamespace(name="vol", data=data), path, batch_size=3)
+
+    assert len(model_inputs) > 1 and all(contiguous for _, contiguous in model_inputs)
+
+
+class _NapariViewer:
+    def __init__(self):
+        import napari
+
+        self.layers, self._image = [], napari.layers.Image
+
+    def add_image(self, data, **kwargs):
+        layer = self._image(data, **kwargs)
+        self.layers.append(layer)
+        return layer
+
+
+def test_prediction_layers_keep_the_source_layers_transform(tmp_path, no_gui_config):
+    import napari
+
+    path = _checkpoint(tmp_path, normalization_scheme="zscore", intensity_properties={})
+    source = napari.layers.Image(
+        np.random.default_rng(0).random((40, 48)).astype(np.float32), name="vol",
+        scale=(2.0, 0.5), translate=(10.0, -4.0), rotate=30.0, shear=[0.2],
+        affine=np.array([[1.0, 0.1, 3.0], [0.0, 1.0, -2.0], [0.0, 0.0, 1.0]]))
+    viewer = _NapariViewer()
+
+    run_inference(viewer, source, path)
+
+    (prediction,) = viewer.layers
+    assert prediction.data.shape == (1, 2, 40, 48)
+    for point in [(0, 0), (5, 7), (39, 47)]:
+        for channel in (0, 1):
+            np.testing.assert_allclose(prediction.data_to_world((0, channel) + point),
+                                       (0, channel) + tuple(source.data_to_world(point)), atol=1e-9)
+    np.testing.assert_allclose(prediction.scale[-2:], source.scale)
+    np.testing.assert_allclose(prediction.translate[-2:], source.translate)
