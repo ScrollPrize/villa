@@ -75,7 +75,7 @@ class CMakeConfigureTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 install = (Path(build_dir) / "cmake_install.cmake").read_text()
-                rpaths = set(re.findall(r'RPATH "([^"]+)"', install))
+                rpaths = set(re.findall(r'(?:RPATH|-add_rpath) "([^"]+)"', install))
                 self.assertTrue(any(rpath.endswith(f"/../{libdir}") for rpath in rpaths), rpaths)
 
     def cuda_compiler(self):
