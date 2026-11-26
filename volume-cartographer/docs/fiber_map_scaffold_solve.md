@@ -27,7 +27,8 @@ approval layers, and the volume's umbilicus:
 - the umbilicus is the one mapping to the frame the fibers are annotated in,
   and the scroll's winding handedness is read from its `winding_handedness`
   meta. A store that states the handedness nowhere is an error: a mirrored
-  solve must not happen silently.
+  solve must not happen silently. See *The winding direction* below for how
+  it gets there.
 
 Coordinates are voxels of the annotation frame throughout. The loader maps
 every fiber to the requested target volume (by default the one the fibers
@@ -326,6 +327,37 @@ The neighbour stage takes 9.6 s with 32 workers (AMD EPYC 7J13) and 31 s with
 8, and the run peaks at 3.9 GB with 8 workers: the field is held in memory.
 Normals solved from a field are cached like the others, keyed by the field's
 sign run and sample count and the inference parameters.
+
+## The winding direction
+
+The solve and the map need the scroll's winding direction in the annotation
+volume's coordinates: `+1` when the winding index grows with `atan2(dy, dx)`
+about the umbilicus, `-1` against it. It is never inferred from the fibers.
+
+- **Where it is kept.** On the umbilicus record of the fiber store:
+  `meta.winding_handedness` (`+1` or `-1`) and `meta.winding_handedness_source`,
+  who stated it - `catalog <sample>/<volume>` or `manual`
+  (`vc_object_store/objects/VolumeUmbilicus.hpp`,
+  `setUmbilicusWindingHandednessRequest`).
+- **Where it comes from.** The open-data catalog records no direction of its
+  own. Its convention is one spiral for every scroll seen from its top, so
+  the direction follows from the volume's orientation
+  (`z_direction_is_top_to_bottom`, `left_handed_coordinates`): `-1` exactly
+  when one of the two holds (`vcr::catalog::windingHandedness`). Both
+  properties are needed; a volume the catalog leaves one of them unset for
+  has no catalog direction.
+- **Kept from the catalog.** When the store states none and the catalog
+  orients the volume, the fiber map's solver dock stores the catalog's
+  direction on the umbilicus the first time it sees the store, and
+  `vc_winding_handedness <store> --set catalog` does the same from the command
+  line. After that nothing is looked up: every reader finds it in the store.
+- **Set by hand.** For a volume the catalog does not orient: the *Set...*
+  button beside the dock's winding direction line, or
+  `vc_winding_handedness <store> --set +1|-1`. A direction set by hand is
+  recorded as `manual` and is not replaced by the catalog's.
+- `vc_winding_handedness <store> [--volume <id>]` prints what the store states
+  and its source. `vc_scaffold_solve` reads the store, or takes `handedness`
+  in its config for a store that cannot be written.
 
 ## Solve
 

@@ -13,6 +13,8 @@ if(VC_BUILD_FIBERLETS OR VC_BUILD_APPS OR VC_BUILD_PYTHON)
     target_link_libraries(vc_fiber_sign PRIVATE vc_fiber_tracer vc_object_store::vc_objects nlohmann_json::nlohmann_json)
     add_executable(vc_scaffold_solve src/vc_scaffold_solve.cpp)
     target_link_libraries(vc_scaffold_solve PRIVATE vc_fiber_graph_solve nlohmann_json::nlohmann_json)
+    add_executable(vc_winding_handedness src/vc_winding_handedness.cpp)
+    target_link_libraries(vc_winding_handedness PRIVATE vc_object_store::vc_objects vc_reader::catalog nlohmann_json::nlohmann_json)
     add_executable(bench_fiber_projection EXCLUDE_FROM_ALL src/bench_fiber_projection.cpp)
     target_link_libraries(bench_fiber_projection PRIVATE vc_fiber_tracer vc_object_store::vc_objects)
     add_executable(test_fiber_normal_publication EXCLUDE_FROM_ALL
@@ -25,11 +27,11 @@ if(VC_BUILD_FIBERLETS OR VC_BUILD_APPS OR VC_BUILD_PYTHON)
         elseif(NOT WIN32)
             set(_vc_headless_rpath "$ORIGIN/..")
         endif()
-        set_target_properties(vc_fiber_bake_annotations vc_fiber_constraints vc_fiber_sign vc_scaffold_solve
+        set_target_properties(vc_fiber_bake_annotations vc_fiber_constraints vc_fiber_sign vc_scaffold_solve vc_winding_handedness
             vc_fiber_trace_metric vc_cache_root
             PROPERTIES INSTALL_RPATH "${_vc_headless_rpath}")
     endif()
-    install(TARGETS vc_fiber_bake_annotations vc_fiber_constraints vc_fiber_sign vc_scaffold_solve
+    install(TARGETS vc_fiber_bake_annotations vc_fiber_constraints vc_fiber_sign vc_scaffold_solve vc_winding_handedness
         vc_fiber_trace_metric vc_cache_root
         RUNTIME DESTINATION bin COMPONENT vc_runtime)
 endif()
@@ -111,7 +113,7 @@ set(VC_CLI_TARGETS
     vc_grow_seg_from_segments vc_tifxyz2obj vc_obj2tifxyz
     vc_obj2tifxyz_legacy
     vc_fiber_trace_metric vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
-    vc_fiber_sign vc_scaffold_solve
+    vc_fiber_sign vc_scaffold_solve vc_winding_handedness
 
     vc_gen_normalgrids vc_gen_umbilicus vc_ngrids
     vc_thinning)

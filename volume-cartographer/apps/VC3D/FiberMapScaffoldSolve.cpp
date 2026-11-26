@@ -15,6 +15,7 @@
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/Transactions.hpp>
+#include <vc_object_store/objects/VolumeUmbilicus.hpp>
 
 #include <QCheckBox>
 #include <QDateTime>
@@ -25,6 +26,7 @@
 #include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QLabel>
 #include <QProgressBar>
 #include <QPushButton>
@@ -198,6 +200,63 @@ ScaffoldSolveController::~ScaffoldSolveController() = default;
 std::filesystem::path ScaffoldSolveController::neighbourNormalsPath(const std::filesystem::path& fiberStore)
 {
     return fiberStore.string() + ".neighbour_normals.vcstrip";
+}
+
+ScaffoldSolveController::WindingStatement ScaffoldSolveController::storedWindingHandedness(const std::string& volume) const
+{
+    WindingStatement out;
+    const auto store = attachment();
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    if (!store || !session || volume.empty()) {
+        out.problem = tr("No fiber store with an annotation volume.");
+        return out;
+    }
+    try {
+        session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
+            const auto records = vc::objects::volumeUmbilici(reader, volume);
+            if (records.size() != 1) {
+                out.problem = records.empty() ? tr("The fiber store has no umbilicus for this volume.")
+                                              : tr("Several umbilici map to this volume.");
+                return;
+            }
+            out.handedness = vc::objects::umbilicusWindingHandedness(records.front());
+            out.source = vc::objects::umbilicusWindingHandednessSource(records.front());
+        });
+    } catch (const std::exception& problem) {
+        out.problem = QString::fromUtf8(problem.what());
+    }
+    return out;
+}
+
+QString ScaffoldSolveController::stateWindingHandedness(const std::string& volume, int handedness,
+                                                        const std::string& source)
+{
+    const auto store = attachment();
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    if (!store || !session || volume.empty()) return tr("No fiber store with an annotation volume.");
+    if (_busy) return tr("A solve is running.");
+    try {
+        std::optional<vc::objects::ObjectRecord> umbilicus;
+        session->readStore(*store, [&](const vc::objects::StoreReader& reader, const auto&) {
+            const auto records = vc::objects::volumeUmbilici(reader, volume);
+            if (records.size() == 1) umbilicus = records.front();
+        });
+        if (!umbilicus) return tr("The fiber store has not exactly one umbilicus for this volume.");
+        auto request = session->newRequest(*store);
+        vc::objects::setUmbilicusWindingHandednessRequest(request, *umbilicus, handedness, source);
+        session->submitDurably(*store, request);
+    } catch (const std::exception& problem) {
+        return QString::fromUtf8(problem.what());
+    }
+    Logger()->info("scaffold solve: winding direction {} stated on the umbilicus of {} ({})", handedness, volume, source);
+    return {};
+}
+
+std::string ScaffoldSolveController::fiberStorePath() const
+{
+    const auto store = attachment();
+    const auto session = _state ? _state->objectStoreSession() : nullptr;
+    return store && session ? session->path(*store).string() : std::string{};
 }
 
 void ScaffoldSolveController::setWindingSampler(WindingSamplerResolver resolver)
@@ -1212,6 +1271,23 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     layout->addWidget(_statusLabel);
     layout->addStretch(1);
 
+    auto* winding = new QWidget(this);
+    auto* windingLayout = new QHBoxLayout(winding);
+    windingLayout->setContentsMargins(0, 0, 0, 0);
+    _windingLabel = new QLabel(winding);
+    _windingLabel->setObjectName(QStringLiteral("fiberMapSolveWinding"));
+    _windingLabel->setWordWrap(true);
+    _windingLabel->setToolTip(tr("The scroll's winding direction, as the fiber store's umbilicus states it.\n"
+                                 "+1: the winding grows with the angle about the umbilicus; -1: against it.\n"
+                                 "The open-data catalog's direction is stored there the first time it is known.\n"
+                                 "Where the catalog does not orient the volume it has to be set by hand."));
+    _windingButton = new QPushButton(tr("Set..."), winding);
+    _windingButton->setObjectName(QStringLiteral("fiberMapSolveWindingSet"));
+    _windingButton->setToolTip(tr("State the winding direction by hand on the fiber store's umbilicus."));
+    windingLayout->addWidget(_windingLabel, 1);
+    windingLayout->addWidget(_windingButton);
+    layout->insertWidget(1, winding);
+    connect(_windingButton, &QPushButton::clicked, this, [this]() { setWindingByHand(); });
     connect(_runButton, &QPushButton::clicked, this, [this]() { emit solveRequested(); });
     connect(_cancelButton, &QPushButton::clicked, this, [this]() {
         if (_controller) _controller->cancelSolve();
@@ -1224,6 +1300,7 @@ ScaffoldSolverPanel::ScaffoldSolverPanel(ScaffoldSolveController* controller, QW
     if (_controller) {
         connect(_controller, &ScaffoldSolveController::busyChanged, this, [this](bool busy) {
             updateEnabled();
+            if (!busy) refreshWinding(false);
             if (busy) {
                 _progressStage.clear();
                 _progressTimer->start();
@@ -1287,17 +1364,71 @@ void ScaffoldSolverPanel::showProgress()
         tr("%1: %2 of %3%4").arg(stage).arg(progress.done).arg(progress.total).arg(eta));
 }
 
-void ScaffoldSolverPanel::setFrame(const std::string& volume, std::optional<int> fallbackHandedness)
+void ScaffoldSolverPanel::setFrame(const std::string& volume, std::optional<int> fallbackHandedness,
+                                   const std::string& catalogVolume)
 {
     _volume = volume;
     _fallbackHandedness = fallbackHandedness;
+    _catalogVolume = catalogVolume;
+    refreshWinding(false);
     updateEnabled();
+}
+
+void ScaffoldSolverPanel::refreshWinding(bool force)
+{
+    if (!_controller || !_windingLabel) return;
+    const auto key = _controller->fiberStorePath() + '|' + _volume + '|' +
+                     (_fallbackHandedness ? std::to_string(*_fallbackHandedness) : std::string("none"));
+    if (!force && key == _windingKey) return;
+    // Nothing is stored while a solve runs; asked again when it has finished.
+    if (_controller->busy()) return;
+    _windingKey = key;
+    auto stated = _controller->storedWindingHandedness(_volume);
+    QString note;
+    // The catalog knows and the store does not say: kept in the store, so the
+    // next reader - this window or a command-line run - finds it there.
+    if (stated.problem.isEmpty() && !stated.handedness && _fallbackHandedness) {
+        const auto source = "catalog " + (_catalogVolume.empty() ? _volume : _catalogVolume);
+        const auto problem = _controller->stateWindingHandedness(_volume, *_fallbackHandedness, source);
+        if (problem.isEmpty()) stated = _controller->storedWindingHandedness(_volume);
+        else note = tr(" The catalog states %1, which could not be stored: %2").arg(*_fallbackHandedness).arg(problem);
+    }
+    if (!stated.problem.isEmpty())
+        _windingLabel->setText(tr("Winding direction: %1").arg(stated.problem));
+    else if (stated.handedness)
+        _windingLabel->setText(tr("Winding direction: %1 (%2)")
+                                   .arg(*stated.handedness > 0 ? QStringLiteral("+1") : QStringLiteral("-1"))
+                                   .arg(stated.source.empty() ? tr("no source recorded")
+                                                              : QString::fromStdString(stated.source)));
+    else
+        _windingLabel->setText(tr("Winding direction: not stated, and the catalog does not orient this volume. "
+                                  "Set it before solving.") + note);
+}
+
+void ScaffoldSolverPanel::setWindingByHand()
+{
+    if (!_controller) return;
+    const QStringList choices{tr("+1: the winding grows with the angle about the umbilicus"),
+                              tr("-1: the winding grows against the angle about the umbilicus")};
+    const auto stated = _controller->storedWindingHandedness(_volume);
+    bool accepted = false;
+    const auto choice = QInputDialog::getItem(this, tr("Winding direction"),
+                                              tr("The scroll's winding direction in volume %1.\n"
+                                                 "It is stored on the fiber store's umbilicus as set by hand.")
+                                                  .arg(QString::fromStdString(_volume)),
+                                              choices, stated.handedness && *stated.handedness < 0 ? 1 : 0, false,
+                                              &accepted);
+    if (!accepted) return;
+    const auto problem = _controller->stateWindingHandedness(_volume, choice == choices[0] ? 1 : -1, "manual");
+    if (!problem.isEmpty()) _statusLabel->setText(tr("The winding direction could not be stored: %1").arg(problem));
+    refreshWinding(true);
 }
 
 void ScaffoldSolverPanel::updateEnabled()
 {
     const bool busy = _controller && _controller->busy();
     _runButton->setEnabled(!busy && !_volume.empty());
+    if (_windingButton) _windingButton->setEnabled(!busy && !_volume.empty());
     _cancelButton->setEnabled(busy);
     if (_volume.empty()) _runButton->setToolTip(tr("The map has no annotation volume to solve in."));
 }

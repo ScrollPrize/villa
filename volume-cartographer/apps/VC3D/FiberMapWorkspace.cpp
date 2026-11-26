@@ -4353,7 +4353,10 @@ void FiberMapWorkspace::updateSolveFrame()
                     handedness = vc3d::opendata::windingChiralityOf(catalog->orientation);
         }
     }
-    _solverPanel->setFrame(volume, handedness);
+    std::string catalogVolume;
+    if (_controller)
+        if (const auto catalog = _controller->fiberMapCatalogVolume()) catalogVolume = catalog->volume;
+    _solverPanel->setFrame(volume, handedness, catalogVolume);
     _solveController->setFrame(volume);
     // Without a layout there is no selection to restrict a run to.
     // The runs live in the fiber store, so the list follows it: attaching a

@@ -213,6 +213,17 @@ struct OpenDataOrientation {
     std::optional<bool> zTopToBottom;
     std::optional<bool> leftHandedCoordinates;
 };
+// The scroll's winding direction in the volume's own coordinates: +1 when the
+// winding index grows with atan2(dy, dx) about the umbilicus, -1 against it,
+// nullopt while either property is unset. The catalog records no direction
+// of its own; its convention is one spiral for every scroll seen from its
+// top, so the direction follows from the orientation and is -1 exactly when
+// one of the two properties holds.
+[[nodiscard]] inline std::optional<int> windingHandedness(const OpenDataOrientation& orientation)
+{
+    if (!orientation.zTopToBottom || !orientation.leftHandedCoordinates) return std::nullopt;
+    return *orientation.zTopToBottom != *orientation.leftHandedCoordinates ? -1 : 1;
+}
 
 struct OpenDataVolume {
     std::string id;

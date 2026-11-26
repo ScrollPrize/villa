@@ -244,6 +244,22 @@ public:
     // `error` is empty when the comparison was made.
     ScaffoldRunDiff diffRuns(const std::string& first, const std::string& second, QString& error);
 
+    // The scroll's winding direction as the fiber store's umbilicus of
+    // `volume` states it, and who stated it ("catalog <sample>/<volume>",
+    // "manual", or empty). `problem` says why nothing could be read.
+    struct WindingStatement {
+        std::optional<int> handedness;
+        std::string source;
+        QString problem;
+    };
+    [[nodiscard]] WindingStatement storedWindingHandedness(const std::string& volume) const;
+    // States it there (+1 or -1) with who states it: a direction the catalog
+    // gave is kept in the store so it is not looked up again, and one nobody
+    // states is set by hand. Returns the problem, empty when it was stored.
+    QString stateWindingHandedness(const std::string& volume, int handedness, const std::string& source);
+    // The store the runs are read from and written to, as a path; empty without one.
+    [[nodiscard]] std::string fiberStorePath() const;
+
 signals:
     void runsChanged();
     void selectionChanged();
@@ -290,7 +306,11 @@ public:
 
     // The map supplies the frame it drew in and the sense the catalog states;
     // the panel does not go looking for either.
-    void setFrame(const std::string& volume, std::optional<int> fallbackHandedness);
+    // `catalogVolume` names the catalog's volume the sense is from
+    // ("<sample>/<volume>"). A sense the catalog states and the store does
+    // not is stored on the umbilicus here, once.
+    void setFrame(const std::string& volume, std::optional<int> fallbackHandedness,
+                  const std::string& catalogVolume = {});
     [[nodiscard]] ScaffoldSolveRequest request() const;
 
 signals:
@@ -300,6 +320,10 @@ private:
     void updateEnabled();
     // The running solve's stage on the dock's progress line.
     void showProgress();
+    // The winding direction line: what the store states, kept from the
+    // catalog when the store states none.
+    void refreshWinding(bool force);
+    void setWindingByHand();
 
     ScaffoldSolveController* _controller = nullptr;
     QComboBox* _profileCombo = nullptr;
@@ -316,6 +340,11 @@ private:
     std::int64_t _progressStageFirstDone = 0;
     std::string _volume;
     std::optional<int> _fallbackHandedness;
+    std::string _catalogVolume;
+    QLabel* _windingLabel = nullptr;
+    QPushButton* _windingButton = nullptr;
+    // Store, volume and catalog sense the winding line was last read for.
+    std::string _windingKey;
 };
 
 // The list of saved solves, newest on top. Selecting one lays the map out

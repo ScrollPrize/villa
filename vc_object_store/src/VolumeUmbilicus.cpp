@@ -35,7 +35,7 @@ std::optional<int> umbilicusWindingHandedness(const ObjectRecord& record)
     if (record.meta.empty()) return std::nullopt;
     const auto meta = nlohmann::json::parse(record.meta, nullptr, false);
     if (!meta.is_object()) return std::nullopt;
-    const auto found = meta.find("winding_handedness");
+    const auto found = meta.find(kWindingHandednessMetaKey);
     if (found == meta.end() || found->is_null()) return std::nullopt;
     if (!found->is_number_integer())
         throw std::invalid_argument("umbilicus " + record.name + ": winding_handedness must be +1 or -1");
@@ -43,6 +43,41 @@ std::optional<int> umbilicusWindingHandedness(const ObjectRecord& record)
     if (value != 1 && value != -1)
         throw std::invalid_argument("umbilicus " + record.name + ": winding_handedness must be +1 or -1");
     return value;
+}
+
+std::string umbilicusWindingHandednessSource(const ObjectRecord& record)
+{
+    if (record.meta.empty()) return {};
+    const auto meta = nlohmann::json::parse(record.meta, nullptr, false);
+    if (!meta.is_object()) return {};
+    const auto found = meta.find(kWindingHandednessSourceMetaKey);
+    return found != meta.end() && found->is_string() ? found->get<std::string>() : std::string{};
+}
+
+namespace {
+void requireWindingStatement(const ObjectRecord& umbilicus, int handedness, const std::string& source)
+{
+    if (umbilicus.kind != "umbilicus") throw std::invalid_argument("a winding direction is stated on an umbilicus record");
+    if (handedness != 1 && handedness != -1) throw std::invalid_argument("winding_handedness must be +1 or -1");
+    if (source.empty()) throw std::invalid_argument("a winding direction needs who states it");
+}
+}
+
+void setUmbilicusWindingHandednessRequest(TransactionRequest& request, const ObjectRecord& umbilicus, int handedness,
+                                          const std::string& source)
+{
+    requireWindingStatement(umbilicus, handedness, source);
+    request.expectedObjects.insert_or_assign(umbilicus.uuid, umbilicus.reference());
+    request.operations.push_back(SetMetaOp{umbilicus.uuid, kWindingHandednessMetaKey, nlohmann::json(handedness).dump()});
+    request.operations.push_back(SetMetaOp{umbilicus.uuid, kWindingHandednessSourceMetaKey, nlohmann::json(source).dump()});
+}
+
+void setUmbilicusWindingHandedness(ObjectStore& store, WriteTxn& txn, const ObjectRecord& umbilicus, int handedness,
+                                   const std::string& source)
+{
+    requireWindingStatement(umbilicus, handedness, source);
+    store.setMeta(txn, umbilicus.uuid, kWindingHandednessMetaKey, nlohmann::json(handedness).dump());
+    store.setMeta(txn, umbilicus.uuid, kWindingHandednessSourceMetaKey, nlohmann::json(source).dump());
 }
 
 std::optional<VolumeUmbilicus> volumeUmbilicus(const StoreReader& reader, const VolumeVoxels& volume)
@@ -61,7 +96,7 @@ std::optional<VolumeUmbilicus> volumeUmbilicus(const StoreReader& reader, const 
     const auto canonical = GeometrySnapshot(reader).umbilicus(*head);
     VolumeUmbilicus result{record.uuid, record.name, head->reference(),
                            canonical.viewTransformedAt(volume.volume, volume.scale).points("points", 0, canonical.size()),
-                           umbilicusWindingHandedness(record)};
+                           umbilicusWindingHandedness(record), umbilicusWindingHandednessSource(record)};
     return result;
 }
 

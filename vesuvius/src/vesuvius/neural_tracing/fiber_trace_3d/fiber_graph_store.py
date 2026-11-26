@@ -52,6 +52,7 @@ def workflow_volume(config):
 
 
 HANDEDNESS_META_KEY='winding_handedness'
+HANDEDNESS_SOURCE_META_KEY='winding_handedness_source'  # who states it: 'manual' or 'catalog <sample>/<volume>'
 
 
 def catalog_handedness(volume):
@@ -94,6 +95,7 @@ def tag_store_handedness(path, value):
     if len(objects)!=1:raise ValueError('Store must contain exactly one umbilicus object to tag, found %d'%len(objects))
     with ObjectStore.open(str(path),author='vc_wgraph') as store:
         store.set_meta(objects[0]['uuid'],HANDEDNESS_META_KEY,int(value))
+        store.set_meta(objects[0]['uuid'],HANDEDNESS_SOURCE_META_KEY,'manual')
 
 
 def winding_handedness(config, path, volume):

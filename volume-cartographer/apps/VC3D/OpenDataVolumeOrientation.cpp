@@ -8,10 +8,7 @@ namespace vc3d::opendata {
 
 std::optional<int> windingChiralityOf(const vcr::catalog::OpenDataOrientation& orientation)
 {
-    if (!orientation.zTopToBottom || !orientation.leftHandedCoordinates) {
-        return std::nullopt;
-    }
-    return *orientation.zTopToBottom != *orientation.leftHandedCoordinates ? -1 : 1;
+    return vcr::catalog::windingHandedness(orientation);
 }
 
 WindingSense statedWindingSense(std::optional<int> umbilicusHandedness,

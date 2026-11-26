@@ -272,6 +272,21 @@ int main() try {
             require(volumeUmbilicus(LocalStoreReader(db,read),{"c"})->uuid==second.uuid&&db.objectByUuid(read,first.uuid)->retired,
                     "importing replaces the volume's umbilicus");
         }
+        {
+            // The winding direction and who states it, in a write transaction.
+            ObjectRecord stated;
+            {auto read=db.read();stated=volumeUmbilici(LocalStoreReader(db,read),"c").front();}
+            require(!umbilicusWindingHandedness(stated)&&umbilicusWindingHandednessSource(stated).empty(),"an umbilicus states no winding direction of its own");
+            {auto txn=db.write();setUmbilicusWindingHandedness(db,txn,stated,-1,"catalog S/c");txn.commit();}
+            auto read=db.read();const auto found=volumeUmbilicus(LocalStoreReader(db,read),{"c"});
+            require(found&&found->windingHandedness==-1&&found->windingHandednessSource=="catalog S/c","the winding direction is kept with its source");
+            bool refused=false;
+            try{auto txn=db.write();setUmbilicusWindingHandedness(db,txn,stated,2,"manual");}catch(const std::invalid_argument&){refused=true;}
+            require(refused,"a winding direction is +1 or -1");
+            refused=false;
+            try{auto txn=db.write();setUmbilicusWindingHandedness(db,txn,stated,1,"");}catch(const std::invalid_argument&){refused=true;}
+            require(refused,"a winding direction names who states it");
+        }
         auto elsewhere=first;elsewhere.uuid=vc::objects::util::newUuid();
         elsewhere.meta=R"({"coordinates":{"volume_uuid":"d","scale_factor":1}})";
         bool refused=false;
@@ -355,6 +370,16 @@ int main() try {
         importVolumeUmbilicus(session,attachment,"v",plain,1.0,"plain",{{"tool","test"}});
         found=volumeUmbilicus(session,attachment,{"v"});
         require(found&&found->name=="plain","importing again replaces the volume's umbilicus");
+        {
+            // The same as a checked request through a session.
+            ObjectRecord record;
+            session.readStore(attachment,[&](const StoreReader& reader,const auto&){record=volumeUmbilici(reader,"v").front();});
+            auto request=session.newRequest(attachment);
+            setUmbilicusWindingHandednessRequest(request,record,1,"manual");
+            session.submitDurably(attachment,request);
+            found=volumeUmbilicus(session,attachment,{"v"});
+            require(found&&found->windingHandedness==1&&found->windingHandednessSource=="manual","a request states the winding direction by hand");
+        }
         const auto malformed=readUmbilicusFile(write("bad.json",R"({"points":[[0,1,2]],"metadata":{"volume_width":-5}})"));
         require(umbilicusBinding(malformed,half,std::nullopt).refusal.has_value(),"malformed frame metadata is refused");
         require(umbilicusBinding(stamped,{{150,150,600},std::nullopt},std::nullopt).refusal.has_value(),
