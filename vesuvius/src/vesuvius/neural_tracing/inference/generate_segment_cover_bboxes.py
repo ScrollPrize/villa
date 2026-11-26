@@ -3,7 +3,8 @@ import json
 from pathlib import Path
 import colorsys
 from collections import OrderedDict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from itertools import islice
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -464,49 +465,45 @@ class _LruCache:
             self._weight -= self._weigh(*self._entries.popitem(last=False))
 
 
-class _BandItem:
-    """One record of a band, with the values that depend only on its points and initial bbox."""
+class _ItemStats:
+    """Values reusable across trials without retaining a record or its point arrays."""
 
-    __slots__ = (
-        "serial",
-        "record",
-        "cell",
-        "initial_bbox",
-        "points",
-        "extra_idx",
-        "base_points",
-        "_axis_stats",
-        "_limits",
-        "_initial",
-    )
+    __slots__ = ("serial", "axis_stats", "limits", "initial")
 
-    def __init__(self, serial, record, points, extra_idx=None):
+    def __init__(self, serial):
         self.serial = serial
+        self.axis_stats = [None, None]
+        self.limits = None
+        self.initial = None
+
+
+class _BandItem:
+    """An active record and its lazily augmented points."""
+
+    __slots__ = ("stats", "record", "cell", "initial_bbox", "points", "extra_idx")
+
+    def __init__(self, stats, record, points, extra_idx=None):
+        self.stats = stats
         self.record = record
         self.cell = (int(record["grid_index"][1]), int(record["grid_index"][2]))
         self.initial_bbox = record["initial_bbox"]
-        # ``points`` is None for a prune-trial variant until something needs the array:
-        # it is then rebuilt as base_points followed by the band points ``extra_idx``.
         self.points = points
         self.extra_idx = extra_idx
-        self.base_points = None
-        self._axis_stats = [None, None]
-        self._limits = None
-        self._initial = None
 
     def get_points(self, band):
         points = self.points
         if points is None:
-            points = np.asarray(self.base_points, dtype=np.float64)
+            points = np.asarray(self.record["points"], dtype=np.float64)
             if self.extra_idx.shape[0] > 0:
                 points = np.concatenate([points, band.points[self.extra_idx]], axis=0)
             self.points = points
+            self.extra_idx = None
         return points
 
     def shift_range(self, band, axis):
         """(low, high, ideal) shift along ``axis``; ideal is None when no shift fits (low > high)."""
         slot = 0 if axis == "y" else 1
-        stats = self._axis_stats[slot]
+        stats = self.stats.axis_stats[slot]
         if stats is None:
             points = self.get_points(band)
             low, high = _axis_shift_bounds_from_points(points, self.initial_bbox, axis)
@@ -515,17 +512,17 @@ class _BandItem:
                 _, _, base_center = _axis_min_and_size(self.initial_bbox, axis)
                 axis_idx = 1 if axis == "y" else 2
                 ideal = float(np.median(points[:, axis_idx])) - base_center
-            stats = self._axis_stats[slot] = (low, high, ideal)
+            stats = self.stats.axis_stats[slot] = (low, high, ideal)
         return stats
 
     def contains(self, band, bbox):
         # Same half-open test as np.all(_points_within_bbox(points, bbox)), on the
         # per-axis extremes. np.min/np.max return NaN when any coordinate is NaN, and
         # every comparison with NaN is False, exactly as in the per-point test.
-        limits = self._limits
+        limits = self.stats.limits
         if limits is None:
             points = self.get_points(band)
-            limits = self._limits = tuple(
+            limits = self.stats.limits = tuple(
                 float(reduce(points[:, axis_idx])) for axis_idx in range(3) for reduce in (np.min, np.max)
             )
         return (
@@ -538,7 +535,7 @@ class _BandItem:
         )
 
     def objective(self, band, axis, shift, bbox):
-        key = (self.serial, axis, shift)
+        key = (self.stats.serial, axis, shift)
         memo = band.objectives
         value = memo.get(key)
         if value is None:
@@ -555,13 +552,13 @@ class _BandItem:
 
         Returns (state, bbox, y_span, x_span), where a state is (axis, shift, objective).
         """
-        initial = self._initial
+        initial = self.stats.initial
         if initial is None:
             obj_y = self.objective(band, "y", 0, self.initial_bbox)
             obj_x = self.objective(band, "x", 0, self.initial_bbox)
             state = ("y", 0, obj_y) if obj_y <= obj_x else ("x", 0, obj_x)
             bbox = _bbox_from_state(self.initial_bbox, state[0], 0)
-            initial = self._initial = (state, bbox, bbox[2:4], bbox[4:6])
+            initial = self.stats.initial = (state, bbox, bbox[2:4], bbox[4:6])
         return initial
 
 
@@ -569,8 +566,8 @@ def _cover_weight(bbox, index):
     return index.shape[0]
 
 
-def _variant_weight(key, item):
-    return item.extra_idx.shape[0]
+def _variant_weight(key, stats):
+    return len(key[1])
 
 
 class _BandCache:
@@ -583,10 +580,8 @@ class _BandCache:
         "objectives",
         "_cover",
         "_variants",
-        "_trial_variants",
         "_serial",
         "_index_dtype",
-        "_delta",
     )
 
     def __init__(self, points_zyx_band, record_count):
@@ -604,40 +599,31 @@ class _BandCache:
             _COVER_CACHE_ELEMENTS_PER_POINT * points,
             _cover_weight,
         )
-        # (base item serial, bytes of the extra point indices) -> variant item, weighed by the extra points.
+        # Smallest unsigned type that can index the band.
+        self._index_dtype = np.min_scalar_type(max(int(self.points.shape[0]) - 1, 0))
+        # Only the key holds indices. Bound its bytes for this band's index dtype.
         self._variants = _LruCache(
             max(_MIN_CACHE_ENTRIES, _VARIANT_CACHE_ENTRIES_PER_RECORD * records),
-            _VARIANT_CACHE_ELEMENTS_PER_POINT * points,
+            _VARIANT_CACHE_ELEMENTS_PER_POINT * points * self._index_dtype.itemsize,
             _variant_weight,
         )
-        self._trial_variants = []
         self._serial = 0
-        # Smallest unsigned type that can index the band, so cached index lists stay small.
-        self._index_dtype = np.min_scalar_type(max(int(self.points.shape[0]) - 1, 0))
-        self._delta = None
+
+    def _new_stats(self):
+        self._serial += 1
+        return _ItemStats(self._serial)
 
     def item(self, record, points):
-        self._serial += 1
-        return _BandItem(self._serial, record, points)
+        return _BandItem(self._new_stats(), record, points)
 
     def variant(self, base, extra_idx):
-        """``base`` with the band points ``extra_idx`` appended, as a prune trial augments it."""
-        key = (base.serial, extra_idx.tobytes())
-        item = self._variants.get(key)
-        if item is None:
-            self._serial += 1
-            item = _BandItem(self._serial, base.record, None, extra_idx)
-            self._variants.put(key, item)
-        item.base_points = base.points
-        self._trial_variants.append(item)
-        return item
-
-    def end_trial(self):
-        """Drop the point arrays this trial's variants built. An accepted variant's array lives on in its record."""
-        for item in self._trial_variants:
-            item.points = None
-            item.base_points = None
-        self._trial_variants.clear()
+        """Reuse a variant's statistics while its points belong to the current trial."""
+        key = (base.stats.serial, extra_idx.tobytes())
+        stats = self._variants.get(key)
+        if stats is None:
+            stats = self._new_stats()
+            self._variants.put(key, stats)
+        return _BandItem(stats, base.record, None, extra_idx)
 
     def cover_index(self, bbox):
         """Indices of the band points inside ``bbox``."""
@@ -665,34 +651,18 @@ class _BandCache:
             uncovered = np.concatenate([never_covered, uncovered])
         return np.sort(uncovered)
 
-    def still_covered(self, count, never_covered, removed_cover, old_bboxes, new_bboxes):
-        """Whether every band point is covered once ``removed_cover`` is gone and old_bboxes become new_bboxes.
+    def still_covered(self, count, uncovered, removed_cover, old_bboxes, new_bboxes):
+        """Check trial coverage using at most one extra band-sized count array."""
+        if old_bboxes == new_bboxes:
+            return uncovered.size == 0
 
-        ``count`` is cover_count() of the bboxes before the change and ``never_covered``
-        the points it leaves at zero. Only those points, and points that lose a bbox,
-        can end up uncovered, so only they are checked.
-        """
-        if self._delta is None:
-            self._delta = np.zeros((self.points.shape[0],), dtype=np.int32)
-        delta = self._delta
-        lost = [removed_cover]
-        gained = []
+        trial_count = count.copy()
+        trial_count[removed_cover] -= 1
         for old_bbox, new_bbox in zip(old_bboxes, new_bboxes):
             if new_bbox != old_bbox:
-                lost.append(self.cover_index(old_bbox))
-                gained.append(self.cover_index(new_bbox))
-        for index in gained:
-            delta[index] += 1
-        for index in lost:
-            delta[index] -= 1
-        covered = all(bool(np.all(count[index] + delta[index] > 0)) for index in lost) and bool(
-            np.all(delta[never_covered] > 0)
-        )
-        for index in gained:
-            delta[index] = 0
-        for index in lost:
-            delta[index] = 0
-        return covered
+                trial_count[self.cover_index(old_bbox)] -= 1
+                trial_count[self.cover_index(new_bbox)] += 1
+        return bool(np.all(trial_count > 0))
 
 
 def _item_cell(item):
@@ -776,7 +746,7 @@ def _solve_band_states(band, items, neighbor_slots, max_passes, allow_overlap, r
             # A step reads the record, its state, the contact mode, the y-span of the
             # up/down neighbors and the x-span of the left/right neighbors. Nothing else.
             key = (
-                item.serial,
+                item.stats.serial,
                 contact_mode,
                 current[0],
                 current[1],
@@ -826,6 +796,7 @@ def _emit_band_records(band, items, states, bboxes):
         out_item["shift_axis"] = state[0]
         out_item["shift_voxels"] = int(state[1])
         out_item["bbox"] = bbox
+        item.record = out_item
         out.append(out_item)
     return out
 
@@ -909,10 +880,6 @@ def _prune_band_items(
         if max_remove is not None and removed >= int(max_remove):
             break
 
-        for item, rec in zip(kept_items, kept):
-            item.record = rec
-            item.points = rec["points"]
-
         # Try smallest support boxes first. Ties resolve deterministically by grid index.
         candidate_order = sorted(
             range(len(kept)),
@@ -971,15 +938,13 @@ def _prune_band_items(
                 states, new_bboxes = _solve_band_states(
                     band, trial_items, neighbor_slots, max_passes, allow_overlap, require_overlap
                 )
-                if band.still_covered(count, never_covered, removed_cover, trial_bboxes, new_bboxes):
+                if band.still_covered(count, uncovered, removed_cover, trial_bboxes, new_bboxes):
                     trial_states = states
                     break
             if trial_states is None:
-                band.end_trial()
                 continue
 
             kept = _emit_band_records(band, trial_items, trial_states, new_bboxes)
-            band.end_trial()
             kept_items = trial_items
             removed += 1
             removed_one = True
@@ -1230,8 +1195,7 @@ def _generate_segment_cover_records(
     by_band = _build_band_records(points_zyx, grouped, world_min_zyx, crop_size_zyx, stride_zyx=stride_zyx)
 
     def band_jobs():
-        # One band at a time: a band's point array is needed only while that band is
-        # optimized or waits for a worker, so the arrays of all bands are never held at once.
+        # Materialize each band's points when the serial loop or worker queue requests them.
         for z_band in sorted(by_band.keys()):
             band_records = by_band[z_band]
             band_point_indices = np.unique(np.concatenate([item["point_indices"] for item in band_records]))
@@ -1265,30 +1229,21 @@ def _generate_segment_cover_records(
             )
     else:
         with ProcessPoolExecutor(max_workers=band_workers) as executor:
-            futures = [
-                executor.submit(
-                    _optimize_single_band,
-                    z_band,
-                    band_records,
-                    band_points,
-                    prune_bboxes,
-                    prune_max_remove_per_band,
-                    overlap,
-                )
-                for z_band, band_records, band_points in band_jobs()
-            ]
-            if progress_enabled:
-                band_results = []
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc=progress_desc,
-                    unit="band",
-                    leave=False,
-                ):
-                    band_results.append(future.result())
-            else:
-                band_results = [future.result() for future in futures]
+            submissions = (
+                executor.submit(_optimize_single_band, *job, prune_bboxes, prune_max_remove_per_band, overlap)
+                for job in band_jobs()
+            )
+            # Keep the workers fed without queuing a point array for every band.
+            pending = set(islice(submissions, 2 * band_workers))
+            band_results = []
+            with tqdm(
+                total=band_count, desc=progress_desc, unit="band", leave=False, disable=not progress_enabled
+            ) as progress:
+                while pending:
+                    completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    band_results.extend(future.result() for future in completed)
+                    progress.update(len(completed))
+                    pending.update(islice(submissions, len(completed)))
     band_results = sorted(band_results, key=lambda item: int(item[0]))
 
     final_records = []

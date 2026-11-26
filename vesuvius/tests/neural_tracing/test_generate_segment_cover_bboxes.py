@@ -19,7 +19,8 @@ import json
 import sys
 import warnings
 import weakref
-from contextlib import redirect_stdout
+from concurrent.futures import Future
+from contextlib import nullcontext, redirect_stdout
 from types import SimpleNamespace
 
 import numpy as np
@@ -1203,10 +1204,55 @@ def test_band_cache_caps_scale_with_the_band(cover):
     assert large._cover._max_entries == cover._COVER_CACHE_ENTRIES_PER_RECORD * 400
     assert large._cover._max_weight == cover._COVER_CACHE_ELEMENTS_PER_POINT * 5000
     assert large._variants._max_entries == cover._VARIANT_CACHE_ENTRIES_PER_RECORD * 400
-    assert large._variants._max_weight == cover._VARIANT_CACHE_ELEMENTS_PER_POINT * 5000
+    index_bytes = 5000 * np.dtype(np.uint16).itemsize
+    assert large._variants._max_weight == cover._VARIANT_CACHE_ELEMENTS_PER_POINT * index_bytes
     # Point indices are stored in the smallest type that can address the band.
     assert small.cover_index((0, 0, 0, 0, 0, 0)).dtype == np.uint8
     assert large.cover_index((0, 0, 0, 0, 0, 0)).dtype == np.uint16
+
+
+def test_trial_coverage_releases_evicted_indices(cover, monkeypatch):
+    points = np.zeros((512, 3))
+    band = cover._BandCache(points, 32)
+    old = [(0, 1, i - 32, i, -32, 32) for i in range(32)]
+    new = [(0, 1, i - 32, i, -31, 33) for i in range(32)]
+    removed = np.arange(len(points))
+    count = band.cover_count(old) + 1
+    refs = []
+    cover_index = cover._BandCache.cover_index
+
+    def track_indices(self, bbox):
+        indices = cover_index(self, bbox)
+        refs.append(weakref.ref(indices))
+        # Each box covers the full band. Evicted indices must be collectible
+        # during the trial, even when many overlapping boxes move at once.
+        assert sum(ref() is not None for ref in refs) <= cover._COVER_CACHE_ELEMENTS_PER_POINT + 1
+        return indices
+
+    monkeypatch.setattr(cover._BandCache, "cover_index", track_indices)
+    assert band.still_covered(count, removed[:0], removed, old, new)
+    assert np.all(count == len(old) + 1)
+
+
+def test_variant_cache_releases_superseded_points(cover, monkeypatch):
+    bands = _track_band_caches(cover, monkeypatch, keep_alive=True)
+    emit = cover._emit_band_records
+    refs = []
+
+    def track_points(*args):
+        records = emit(*args)
+        refs.extend(weakref.ref(record["points"]) for record in records)
+        return records
+
+    monkeypatch.setattr(cover, "_emit_band_records", track_points)
+    points = np.random.default_rng(15).uniform([0, 0, 0], [1, 120, 150], size=(37, 3))
+    result = cover._generate_segment_cover_records(points, [4, 36, 40], overlap=0.25, prune_bboxes=True)
+    assert result["prune_removed_total"] == 9
+    assert len(bands[0]._variants) > 0
+    live_records = result["by_band"][0] + result["final_records"]
+    live_ids = {id(rec["points"]) for rec in live_records}
+    assert any(ref() is None for ref in refs)
+    assert all(ref() is None or id(ref()) in live_ids for ref in refs)
 
 
 @pytest.mark.parametrize("overlap", [0.0, 0.5])
@@ -1334,6 +1380,32 @@ def test_cli_output_is_the_same_for_one_and_two_band_workers(cover, monkeypatch,
     assert payloads[1]["prune_stats_by_band"] == {str(z_band): stats for z_band, stats in expected_stats.items()}
     assert payloads[1]["meta"]["prune_removed_total"] == sum(stats["removed"] for stats in expected_stats.values())
     assert payloads[1]["meta"]["final_bbox_count"] == len(expected_records)
+
+
+def test_parallel_submission_bounds_outstanding_bands(cover, monkeypatch):
+    workers = 2
+    outstanding = 0
+
+    class BandFuture(Future):
+        def result(self):
+            nonlocal outstanding
+            outstanding -= 1
+            return super().result()
+
+    class Executor:
+        def submit(self, fn, *args):
+            nonlocal outstanding
+            outstanding += 1
+            assert outstanding <= 2 * workers
+            future = BandFuture()
+            future.set_result(fn(*args))
+            return future
+
+    monkeypatch.setattr(cover, "ProcessPoolExecutor", lambda max_workers: nullcontext(Executor()))
+    points = np.column_stack((np.arange(32) * 16, np.ones(32), np.ones(32)))
+    result = cover._generate_segment_cover_records(points, [16, 16, 16], band_workers=workers)
+    assert [rec["z_band"] for rec in result["final_records"]] == list(range(32))
+    assert outstanding == 0
 
 
 def test_generate_segment_cover_records_with_band_workers_matches_reference(cover):
