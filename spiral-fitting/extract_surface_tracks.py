@@ -663,6 +663,7 @@ class MetalSlabs:
         self.device = device
         self.teasar = teasar
         self.settings = settings
+        self.unsupported = None  # teasar's reason when accepts_settings() is False
         kwargs = skeletonize_kwargs()
         self.skeletonize_kwargs = dict(
             settings=settings, anisotropy=kwargs['anisotropy'],
@@ -676,7 +677,8 @@ class MetalSlabs:
         once on an empty slab, since teasar checks settings before any work."""
         try:
             self.device.skeletonize([np.zeros((1, 1, 1), np.uint32)], **self.skeletonize_kwargs)
-        except self.teasar.UnsupportedSettings:
+        except self.teasar.UnsupportedSettings as error:
+            self.unsupported = str(error)
             return False
         return True
 
@@ -797,8 +799,10 @@ def run_metal(predictions_path, tracks_dbm_path):
 
     # every call would decline, and the CPU backend runs slabs in parallel where the fallback
     # inside this loop cannot
-    print(f'teasar {teasar.__version__} does not support target order {teasar_target_order!r}; '
-          'extracting with the CPU backend (Kimimaro) instead')
+    # the slab geometry was checked before this backend was picked, so this is usually the target
+    # order; teasar's own reason says which setting it refused
+    print(f'teasar {teasar.__version__} does not support target order {teasar_target_order!r} with these '
+          f'settings ({slabs.unsupported}); extracting with the CPU backend (Kimimaro) instead')
     run_cpu(predictions_path, tracks_dbm_path)
 
 
