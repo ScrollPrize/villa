@@ -892,6 +892,16 @@ private:
                 if (!cancelled())
                     hint(work[i]);
             });
+        if (!cancel && !stream && (!op || !op->miss) && work.size() > 1 &&
+            source_ && source_->can_batch() && chunk_bytes_ <= ZarrStorage::max_merged_bytes &&
+            !spec_.caller_thread_only && !channel_policy_->enabled.load(std::memory_order_acquire)) {
+            for (std::span<const Work> todo(work); !todo.empty();) {
+                const auto n = std::min(todo.size(), ZarrStorage::max_batch_chunks);
+                run_sharded(todo.first(n), out_strides, op, output);
+                todo = todo.subspan(n);
+            }
+            return;
+        }
         if (!cancel) {
             pool_->parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
             return;
@@ -2101,59 +2111,148 @@ private:
             ++stats_.offline_misses;
     }
 
+    std::optional<ChunkPtr> cached_whole(const Index& idx, const std::string& k, const std::string& ck)
+    {
+        if (cache_) {
+            auto [found, chunk] = cache_->get(ck);
+            if (found) { ++stats_.memory_hits; return chunk; }
+        }
+        if (spec_.offline) {
+            std::lock_guard lock(miss_mutex_);
+            if (misses_.contains(idx)) return ChunkPtr{};
+        }
+        if (writes_) {
+            auto [found, chunk] = writes_->pending(k);
+            if (found) { ++stats_.pending_hits; return chunk; }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<ChunkPtr> disk_whole(const std::string& k, const std::string& ck, bool cached_only, bool& skipped_store)
+    {
+        for (std::size_t li = 0; li < spec_.layers.size(); ++li) {
+            if (cached_only && spec_.layers[li].kind == "array") { skipped_store = true; continue; }
+            if (auto value = read_layer_chunk(li, k)) {
+                ++stats_.disk_hits;
+                if (cache_) cache_->put(ck, *value);
+                return value;
+            }
+        }
+        return std::nullopt;
+    }
+
+    // Claim remote misses before planning any ranges. Resolve our producers
+    // before waiting on other callers, even when their batches overlap ours.
+    void run_sharded(std::span<const Work> work, const std::vector<Index>& out_strides,
+                     const PointOp* op, const BoxOutput* output)
+    {
+        using Claim = SingleFlight<std::shared_ptr<const ChunkLoad>>::Claim;
+        struct Slot {
+            std::string key;
+            std::optional<Claim> claim;
+        };
+        std::vector<Slot> slots(work.size());
+        try {
+            pool_->parallel_for(work.size(), [&](std::size_t i) {
+                auto& slot = slots[i];
+                const auto& item = work[i];
+                slot.key = key(item.idx);
+                const auto ck = spec_.identity + "|" + slot.key;
+                auto value = cached_whole(item.idx, slot.key, ck);
+                if (!value) {
+                    auto& claim = slot.claim.emplace(channel_policy_->reads.acquire(flight_key(ck)));
+                    if (!claim.owner()) return;
+                    value = cached_whole(item.idx, slot.key, ck);
+                    if (!value) {
+                        bool skipped_store = false;
+                        value = disk_whole(slot.key, ck, false, skipped_store);
+                    }
+                    if (!value) return;
+                    claim.resolve([&] { return chunk_result(true, *value); });
+                    slot.claim.reset();
+                }
+                apply(*value, item, out_strides, op, output);
+            });
+
+            std::vector<std::string> keys;
+            std::vector<std::size_t> owners;
+            for (std::size_t i = 0; i < slots.size(); ++i) {
+                if (slots[i].claim && slots[i].claim->owner()) {
+                    keys.push_back(slots[i].key);
+                    owners.push_back(i);
+                }
+            }
+            if (!keys.empty()) {
+                auto bodies = source_->read_batch(keys, *pool_);
+                pool_->parallel_for(owners.size(), [&](std::size_t j) {
+                    const auto i = owners[j];
+                    auto& slot = slots[i];
+                    const auto loaded = slot.claim->resolve([&] {
+                        const bool found = !bodies[j].empty();
+                        auto value = finish_fetch(slot.key, std::move(bodies[j]), found);
+                        if (cache_) cache_->put(spec_.identity + "|" + slot.key, value);
+                        return chunk_result(true, std::move(value));
+                    });
+                    slot.claim.reset();
+                    apply(loaded->whole, work[i], out_strides, op, output);
+                });
+            }
+        } catch (...) {
+            auto error = std::current_exception();
+            for (auto& slot : slots) {
+                if (slot.claim && slot.claim->owner()) {
+                    try {
+                        slot.claim->resolve([&]() -> std::shared_ptr<const ChunkLoad> { std::rethrow_exception(error); });
+                    } catch (...) {}
+                }
+            }
+            throw;
+        }
+        pool_->parallel_for(work.size(), [&](std::size_t i) {
+            if (!slots[i].claim) return;
+            const auto loaded = slots[i].claim->resolve([]() -> std::shared_ptr<const ChunkLoad> {
+                throw std::logic_error("shard batch producer did not complete");
+            });
+            apply(full_span(work[i].idx, false, loaded).second, work[i], out_strides, op, output);
+        });
+    }
+
     // All whole-chunk loads, including local decoded layers, share the same
     // per-key producer as selected-plane loads. Hot hits bypass coordination.
-    std::pair<bool,ChunkPtr> full_span(const Index& idx,bool cached_only)
+    std::pair<bool,ChunkPtr> full_span(const Index& idx, bool cached_only,
+                                      std::shared_ptr<const ChunkLoad> loaded = {})
     {
         const auto k=key(idx),ck=spec_.identity+"|"+k;
-        const auto cached=[&]()->std::optional<ChunkPtr> {
-            if(cache_) {
-                auto entry=cache_->get(ck);
-                if(entry.first){++stats_.memory_hits;return entry.second;}
-            }
-            if(spec_.offline){
-                std::lock_guard lock(miss_mutex_);
-                if(misses_.contains(idx))return ChunkPtr{};
-            }
-            if(writes_) {
-                auto entry=writes_->pending(k);
-                if(entry.first){++stats_.pending_hits;return entry.second;}
-            }
-            return std::nullopt;
-        };
-        if(auto value=cached())return {true,*value};
+        if (!loaded)
+            if (auto value = cached_whole(idx, k, ck)) return {true, *value};
         for(;;) {
-            const auto produce=[&]()->std::shared_ptr<const ChunkLoad> {
-                if(auto value=cached())return chunk_result(true,*value);
-                bool skipped_store=false;
-                for(std::size_t li=0;li<spec_.layers.size();++li) {
-                    if(cached_only&&spec_.layers[li].kind=="array"){skipped_store=true;continue;}
-                    if(auto value=read_layer_chunk(li,k)) {
-                        ++stats_.disk_hits;
-                        if(cache_)cache_->put(ck,*value);
-                        return chunk_result(true,*value);
+            if (!loaded) {
+                const auto produce=[&]()->std::shared_ptr<const ChunkLoad> {
+                    if (auto value = cached_whole(idx, k, ck)) return chunk_result(true, *value);
+                    bool skipped_store = false;
+                    if (auto value = disk_whole(k, ck, cached_only, skipped_store))
+                        return chunk_result(true, *value);
+                    if(cached_only&&(skipped_store||http_||source_||spec_.compute||spec_.offline))
+                        return chunk_result(false);
+                    if(spec_.offline) {
+                        if(spec_.offline_fill){offline_miss(idx);return chunk_result(true);}
+                        throw CacheMiss("chunk "+k+" of "+spec_.identity+" is not in the disk cache (offline)");
                     }
+                    if(!http_&&!source_&&!spec_.compute)return chunk_result(true);
+                    auto value=spec_.compute?compute_now(idx,k):fetch_now(k);
+                    if(cache_)cache_->put(ck,value);
+                    return chunk_result(true,std::move(value));
+                };
+                if(spec_.caller_thread_only)loaded=produce();
+                else {
+                    auto claim=channel_policy_->reads.acquire(flight_key(ck));
+                    if(cached_only&&!claim.owner())return {false,nullptr};
+                    loaded=claim.resolve(produce);
                 }
-                if(cached_only&&(skipped_store||http_||source_||spec_.compute||spec_.offline))
-                    return chunk_result(false);
-                if(spec_.offline) {
-                    if(spec_.offline_fill){offline_miss(idx);return chunk_result(true);}
-                    throw CacheMiss("chunk "+k+" of "+spec_.identity+" is not in the disk cache (offline)");
-                }
-                if(!http_&&!source_&&!spec_.compute)return chunk_result(true);
-                auto value=spec_.compute?compute_now(idx,k):fetch_now(k);
-                if(cache_)cache_->put(ck,value);
-                return chunk_result(true,std::move(value));
-            };
-            std::shared_ptr<const ChunkLoad> loaded;
-            if(spec_.caller_thread_only)loaded=produce();
-            else {
-                auto claim=channel_policy_->reads.acquire(flight_key(ck));
-                if(cached_only&&!claim.owner())return {false,nullptr};
-                loaded=claim.resolve(produce);
             }
             if(!loaded->available) {
                 if(cached_only)return {false,nullptr};
+                loaded.reset();
                 continue;
             }
             if(!loaded->complete) {
@@ -2180,6 +2279,11 @@ private:
             found = http_->get(joinLocation(spec_.remote_url, k), body, chunk_bytes_);
             stats_.remote_bytes += body.size();
         }
+        return finish_fetch(k, std::move(body), found);
+    }
+
+    ChunkPtr finish_fetch(const std::string& k, std::vector<std::uint8_t> body, bool found)
+    {
         if (!found) {
             ++stats_.remote_missing;
             queue_write(k, nullptr, 64, [this, k] { store_missing(k); });

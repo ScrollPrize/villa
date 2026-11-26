@@ -7,7 +7,9 @@ import json
 import multiprocessing
 from pathlib import Path
 import pickle
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 import zlib
 
 import numpy as np
@@ -17,7 +19,7 @@ from build_support import load_build
 load_build()
 
 from vc_reader import Affine, Encoding, Selection, Source, Storage, VolumeRegistration, CacheMissError
-from vc_reader.reader import ZarrReader, ZarrGroup
+from vc_reader.reader import MemoryCache, ZarrReader, ZarrGroup, ZarrWriter
 from vc_reader.reader.zarr_meta import ArrayMeta
 from vc_reader.reader import S3Credentials
 
@@ -280,6 +282,148 @@ class V3RemoteTests(RemoteFixtureCase):
         keys = S3Credentials('example', 'test-secret', region='us-east-1', endpoint_url=self.url)
         with s3.open(auth=keys) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), expected.shape), expected)
+
+    def test_batch_only_fetches_missing_chunks_and_reuses_each_index(self):
+        expected, _ = write_v3(self.root/'batch', missing=None)
+        ranges = []
+
+        def capture(handler):
+            if handler.headers.get('Range'):
+                ranges.append((handler.path, handler.headers['Range']))
+            return False
+
+        self.server.request_hook = capture
+        uri = self.url + '/batch'
+        with ZarrReader.open(uri, cache_dir=self.cache, threads=4, memory_cache=4096) as reader:
+            np.testing.assert_array_equal(reader[:3, :5], expected[:3, :5])
+            selections = [np.s_[0:6, 10:20], np.s_[0:6, 0:10], np.s_[:3, :5], np.s_[:0, :5]]
+            for actual, selection in zip(reader.read_many(selections), selections):
+                np.testing.assert_array_equal(actual, expected[selection])
+            self.assertCountEqual(ranges, [
+                ('/batch/c/0/0', 'bytes=-68'), ('/batch/c/0/0', 'bytes=0-119'),
+                ('/batch/c/0/1', 'bytes=-68'), ('/batch/c/0/0', 'bytes=120-479'),
+                ('/batch/c/0/1', 'bytes=0-479'),
+            ])
+        ranges.clear()
+        with ZarrReader.open(uri, cache_dir=self.cache, offline=True) as reader:
+            np.testing.assert_array_equal(reader[:6, :], expected[:6, :])
+        self.assertEqual(ranges, [])
+
+        with ZarrReader.open(uri, threads=2) as reader:
+            for selection in (np.s_[:3, :5], np.s_[:3, 10:15], np.s_[3:6, :5]):
+                np.testing.assert_array_equal(reader[selection], expected[selection])
+        self.assertEqual(sum(value == 'bytes=-68' for _, value in ranges), 2)
+
+    def test_batch_sorts_and_reconstructs_overlapping_payloads_without_gap_bytes(self):
+        path = self.root/'overlap'
+        expected, _ = write_v3(path, missing=None)
+        shard = path/'c/0/0'
+        body = shard.read_bytes()[:-68]
+        positions = [112, 0, 240, 240]
+        index = np.array([(offset, 120) for offset in positions], dtype='<u8').tobytes()
+        shard.write_bytes(body + index + crc32c(index).to_bytes(4, 'little'))
+        for (y, x), offset in zip(np.ndindex(2, 2), positions):
+            expected[3*y:3*y+3, 5*x:5*x+5] = np.frombuffer(body[offset:offset+120], '<u8').reshape(3, 5)
+        ranges = []
+
+        def capture(handler):
+            if handler.path == '/overlap/c/0/0':
+                ranges.append(handler.headers['Range'])
+            return False
+
+        self.server.request_hook = capture
+        with ZarrReader.open(self.url + '/overlap', threads=4) as reader:
+            np.testing.assert_array_equal(reader[:6, :10], expected[:6, :10])
+            self.assertEqual(reader.stats()['remote_bytes'], 68 + 232 + 120)
+        self.assertCountEqual(ranges, ['bytes=-68', 'bytes=0-231', 'bytes=240-359'])
+
+    def test_overlapping_callers_share_batch_producers(self):
+        expected, _ = write_v3(self.root/'shared', missing=None)
+        index_requested = threading.Event()
+        release_index = threading.Event()
+        ranges = []
+
+        def hold_index(handler):
+            if handler.path != '/shared/c/0/0':
+                return False
+            value = handler.headers['Range']
+            ranges.append(value)
+            if value == 'bytes=-68':
+                index_requested.set()
+                release_index.wait(5)
+            return False
+
+        self.server.request_hook = hold_index
+        uri = self.url + '/shared'
+        storage = MemoryCache(4096)
+        with ZarrReader.open(uri, threads=2, memory_cache=storage) as one, \
+                ZarrReader.open(uri, threads=2, memory_cache=storage) as two, \
+                ThreadPoolExecutor(2) as pool:
+            a = pool.submit(lambda: one[:6, :10])
+            try:
+                self.assertTrue(index_requested.wait(5))
+                b = pool.submit(lambda: two[:6, :10])
+            finally:
+                release_index.set()
+            np.testing.assert_array_equal(a.result(timeout=10), expected[:6, :10])
+            np.testing.assert_array_equal(b.result(timeout=10), expected[:6, :10])
+        self.assertCountEqual(ranges, ['bytes=-68', 'bytes=0-479'])
+
+    def test_batch_caps_merged_range_bytes(self):
+        data = np.arange(3 * 512 * 512, dtype=np.uint32).astype(np.uint8).reshape(3, 512, 512)
+        writer = ZarrWriter.create(self.root/'bounded', shape=data.shape, chunks=(1, 512, 512),
+                                   dtype='u1', version=3, shards=data.shape, compressor=None, separator='/')
+        writer[:] = data
+        ranges = []
+
+        def capture(handler):
+            if handler.path == '/bounded/c/0/0/0' and handler.headers['Range']:
+                ranges.append(handler.headers['Range'])
+            return False
+
+        self.server.request_hook = capture
+        with ZarrReader.open(self.url + '/bounded', threads=4) as reader:
+            np.testing.assert_array_equal(reader[:], data)
+            self.assertEqual(reader.stats()['remote_fetches'], 3)
+        self.assertCountEqual(ranges, ['bytes=-52', 'bytes=0-524287', 'bytes=524288-786431'])
+
+    def test_batch_retry_rejection_and_invalid_range(self):
+        expected, _ = write_v3(self.root/'reject', missing=None)
+        shard = (self.root/'reject/c/0/0').read_bytes()
+        for mode in ('retry', 'fallback', 'invalid', 'truncated'):
+            with self.subTest(mode=mode):
+                attempts = []
+
+                def respond(handler):
+                    if handler.path != '/reject/c/0/0' or handler.headers.get('Range') != 'bytes=0-479':
+                        return False
+                    attempts.append(mode)
+                    if mode == 'retry':
+                        if len(attempts) > 1:
+                            return False
+                        handler.send_error(503)
+                    elif mode == 'fallback':
+                        handler.send_error(416)
+                    else:
+                        handler.send_response(206)
+                        trailer = ' trailing' if mode == 'invalid' else ''
+                        size = 480 if mode == 'invalid' else 100
+                        handler.send_header('Content-Range', f'bytes 0-479/{len(shard)}{trailer}')
+                        handler.send_header('Content-Length', str(size))
+                        handler.end_headers()
+                        handler.wfile.write(shard[:size])
+                    return True
+
+                self.server.request_hook = respond
+                with ZarrReader.open(self.url + '/reject', threads=4) as reader:
+                    if mode in ('invalid', 'truncated'):
+                        message = 'Content-Range' if mode == 'invalid' else 'requested HTTP byte range'
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            reader[:6, :10]
+                    else:
+                        np.testing.assert_array_equal(reader[:6, :10], expected[:6, :10])
+                        self.assertEqual(reader.stats()['remote_fetches'], 6 if mode == 'fallback' else 2)
+                self.assertEqual(len(attempts), 2 if mode == 'retry' else 1)
 
     def test_remote_group_companions_offline(self):
         attrs = dict(multiscales=[dict(axes=['y', 'x'], datasets=[dict(path='0')])])

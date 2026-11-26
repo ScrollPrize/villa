@@ -42,6 +42,16 @@ before inheriting the parent's placement. Changing a parent selection does not
 silently change independently declared companion selections: declare matching
 companion grids when choosing a different pyramid level.
 
+Remote Zarr v3 whole-chunk reads can combine adjacent or overlapping payloads
+from the same shard when its index has a strong ETag. Only requested chunks
+that miss the cache participate. The reader checks the response range and
+keeps per-chunk decoding and disk cache entries. A plan admits at most 16
+chunks at a time and a merged request never exceeds 512 KiB or crosses an
+unrequested gap. An HTTP 416 on a merged range falls back to individual
+ranges for the same shard version. Cancelable, cache-only, streaming and
+selective-channel reads keep their regular chunk path. The remote reader
+retains up to 8 MiB of shard indexes.
+
 ## Plain image files
 
 `vc_reader.images` needs no descriptor. `read(path)` is the whole file, `read(path, page=0)` one
