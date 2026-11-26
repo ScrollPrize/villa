@@ -127,6 +127,16 @@ class TrainingConfigTests(unittest.TestCase):
             mp.spawn(_region_head_sync_worker, args=(str(root / "init"), str(root / "run")),
                      nprocs=2, join=True)
 
+    @unittest.skipUnless(torch.backends.mps.is_available() and not torch.cuda.is_available(), "needs MPS without CUDA")
+    def test_default_device_is_mps_when_cuda_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = DinoIBOTPretrainer({"output_dir": directory, "max_iterations": 2,
+                                          "model": tiny_model_config(model_type="v2")})
+            self.assertEqual(trainer.device.type, "mps")
+            self.assertEqual({p.device.type for p in trainer.model_module.parameters()}, {"mps"})
+            self.assertFalse(trainer.use_amp)
+            self.assertFalse(trainer.fused_optimizer)
+
     def test_v3_defaults_and_legacy_v2_are_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
             config = {"device": "cpu", "use_amp": False, "output_dir": directory,
