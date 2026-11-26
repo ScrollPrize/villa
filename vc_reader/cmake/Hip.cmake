@@ -111,7 +111,7 @@ function(vc_reader_hip_finalize)
         endforeach()
         set_target_properties(${_target} PROPERTIES HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
         target_compile_options(${_target} PRIVATE
-            "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${VC_READER_HIP_COMPAT_DIR}/vcr_hip_prelude.h>")
+            "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include vcr_hip_prelude.h>")
         # hipCUB and rocPRIM are header-only. Their package targets would also add
         # "-x hip" to every C++ source of a consumer, so only their include
         # directories are used, for the HIP sources.

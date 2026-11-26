@@ -56,8 +56,13 @@ bool onDevice(vcr::reader_cuda::Reader& reader, void* out, std::size_t bytes, Re
         vcr::device::Guard guard(reader.device_id());
         const auto result = request();
         if (bytes) {
+#ifdef VC_READER_HIP
             vcr::device::check(vcr::gpu::memcpy_async(out, result.storage->ptr, bytes,
-                                                    vcr::gpu::device_to_host, vcr::device::stream()));
+                                                      vcr::gpu::device_to_host, vcr::device::stream()));
+#else
+            vcr::device::check(cudaMemcpyAsync(out, result.storage->ptr, bytes, cudaMemcpyDeviceToHost,
+                                               vcr::device::stream()));
+#endif
             vcr::device::complete();
         }
         return true;
