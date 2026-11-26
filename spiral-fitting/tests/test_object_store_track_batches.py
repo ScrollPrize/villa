@@ -504,17 +504,21 @@ def _readers_together(path, pool, sliced, plain):
         return ','.join(wrong)
 
 
+def _run_in_child(queue, work, path, pool, sliced, plain):
+    errors = []
+    threading.excepthook = lambda failed: errors.append(repr(failed.exc_value))
+    try:
+        wrong = work(path, pool, sliced) if work else _readers_together(path, pool, sliced, plain)
+        queue.put(('ok', ','.join(filter(None, [wrong, *errors]))))
+    except BaseException as error:  # noqa: BLE001
+        queue.put(('error', repr(error)))
+
+
 def _together_in_a_child(path, pool, sliced, plain, seconds=30, work=None):
     import multiprocessing
-    context = multiprocessing.get_context('fork')
+    context = multiprocessing.get_context('spawn')
     queue = context.Queue()
-
-    def run():
-        try:
-            queue.put(('ok', work(path, pool, sliced) if work else _readers_together(path, pool, sliced, plain)))
-        except BaseException as error:  # noqa: BLE001
-            queue.put(('error', repr(error)))
-    child = context.Process(target=run, daemon=True)
+    child = context.Process(target=_run_in_child, args=(queue, work, path, pool, sliced, plain), daemon=True)
     child.start()
     child.join(seconds)
     if child.is_alive():
