@@ -180,6 +180,20 @@ jobs:
           gh run download "$MACOS_RUN_ID" \
             --name VC3D-macos-app \
             --dir stable-assets
+          # the Python tools from the same run as the app, whose bundled installer
+          # holds their checksums. The run has them exactly when its app ships
+          # that installer; when their build failed, the app offers no install
+          artifacts=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$MACOS_RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.expired | not) | .name')
+          python_tools=false
+          if grep -qx VC3D-macos-python-tools <<< "$artifacts"; then
+            python_tools=true
+            gh run download "$MACOS_RUN_ID" \
+              --name VC3D-macos-python-tools \
+              --dir stable-assets
+          else
+            echo "::warning::macOS run $MACOS_RUN_ID built no Python tools; publishing its app without them"
+          fi
           gh run download "$LINUX_RUN_ID" \
             --name VC3D-linux-appimage \
             --dir stable-assets
@@ -189,6 +203,7 @@ jobs:
           windows_zip=(stable-assets/VC3D-*-win64.zip)
           macos_dmg=(stable-assets/VC3D-*-macos-*.dmg)
           macos_zip=(stable-assets/VC3D-*-macos-*.zip)
+          macos_python_tools=(stable-assets/VC3D-macos-python-tools-*.tar.gz)
           linux_appimage=(stable-assets/VC3D-*.AppImage)
           linux_debug=(stable-assets/VC3D-*-debug.tar.zst)
 
@@ -196,9 +211,10 @@ jobs:
                 ${#windows_zip[@]} -ne 1 ||
                 ${#macos_dmg[@]} -ne 1 ||
                 ${#macos_zip[@]} -ne 1 ||
+                ( $python_tools == true && ( ${#macos_python_tools[@]} -ne 1 || ! -f stable-assets/VC3D-macos-python-tools.sh ) ) ||
                 ${#linux_appimage[@]} -ne 1 ||
                 ${#linux_debug[@]} -ne 1 ]]; then
-            echo "::error::expected exactly one Windows installer, Windows ZIP, macOS DMG, macOS ZIP, Linux AppImage, and Linux debug tarball"
+            echo "::error::expected exactly one Windows installer, Windows ZIP, macOS DMG, macOS ZIP, macOS Python tools (when built), Linux AppImage, and Linux debug tarball"
             find stable-assets -maxdepth 1 -type f -print
             exit 1
           fi

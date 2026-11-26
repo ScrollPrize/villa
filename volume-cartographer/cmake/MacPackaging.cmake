@@ -40,6 +40,20 @@ install(FILES "${CMAKE_BINARY_DIR}/Info.plist"
 install(FILES "${CMAKE_SOURCE_DIR}/apps/VC3D/logo.icns"
     DESTINATION "${_vc_app_dir}/Contents/Resources" COMPONENT vc_runtime)
 
+# The Python tools installer that make-assets.sh fills in for this build's
+# wheels (.github/mac-app). Inside the bundle the app's signature covers it, and
+# VC3D runs it when a feature first needs its Python environment. Builds
+# without it never offer the install
+set(VC_MACOS_PYTHON_TOOLS_INSTALLER "$ENV{VC_MACOS_PYTHON_TOOLS_INSTALLER}" CACHE FILEPATH
+    "Python tools installer to ship in VC3D.app (from .github/mac-app/make-assets.sh)")
+if(VC_MACOS_PYTHON_TOOLS_INSTALLER)
+    if(NOT EXISTS "${VC_MACOS_PYTHON_TOOLS_INSTALLER}")
+        message(FATAL_ERROR "VC_MACOS_PYTHON_TOOLS_INSTALLER does not exist: ${VC_MACOS_PYTHON_TOOLS_INSTALLER}")
+    endif()
+    install(PROGRAMS "${VC_MACOS_PYTHON_TOOLS_INSTALLER}"
+        DESTINATION "${_vc_app_dir}/Contents/Resources" RENAME install-python-tools.sh COMPONENT vc_runtime)
+endif()
+
 # ---- Dependency dylib closure + Qt runtime --------------------------------
 # macdeployqt does both jobs windeployqt + RUNTIME_DEPENDENCY_SET split on
 # Windows: it walks every executable's dependency closure, copies the dylibs

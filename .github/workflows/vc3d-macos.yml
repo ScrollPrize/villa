@@ -7,6 +7,12 @@ run-name: VC3D macOS ${{ github.event_name }} ${{ inputs.request_id || github.sh
 # drag-and-drop DMG by CPack, with a ZIP derived from that deployed bundle. On
 # published releases both are attached to the GitHub release.
 #
+# The python-tools job builds the Python tools for that app as prebuilt wheels
+# (.github/mac-app), with hash-pinned locks, the villa sources they run from and
+# the installer, which the app ships in Contents/Resources and runs when a
+# feature first needs its Python environment. Those files go out with the app,
+# as the VC3D-macos-python-tools artifact, to every release the app goes to.
+#
 # No Developer ID signing / notarization: downloads are Gatekeeper-quarantined,
 # so the first launch is right-click -> Open (or
 # `xattr -dr com.apple.quarantine VC3D.app`).
@@ -56,9 +62,125 @@ jobs:
     steps:
       - run: echo "Native compile coverage is provided by the required vc3d-ci macOS job."
 
+  # A failure here doesn't fail the run: build-macos then packages the app
+  # without the installer, which offers no Python tools install, and the
+  # publish workflows publish it without them
+  python-tools:
+    name: Python tools (arm64)
+    if: github.event_name != 'pull_request'
+    runs-on: blacksmith-6vcpu-macos-15
+    timeout-minutes: 180
+    continue-on-error: true
+    outputs:
+      ready: ${{ steps.uploaded.outputs.ready }}
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
+
+      # the app's floor: MacPackaging.cmake records the runner's major version as
+      # LSMinimumSystemVersion, so the wheels target it and the installer refuses
+      # what the app refuses
+      - name: Choose the macOS floor
+        run: echo "MIN_MACOS=$(sw_vers -productVersion | cut -d. -f1).0" >> "$GITHUB_ENV"
+
+      # the wheels build with Apple clang, and the C++ uses std::jthread, which
+      # libc++ before 20 only offers as experimental (Xcode 16.4's does): take the
+      # newest Xcode, and the experimental library only if it still needs it
+      - name: Choose the Xcode
+        run: |
+          export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
+          xcode=$(find /Applications -maxdepth 1 -name 'Xcode_*.app' | grep -v -i -E "beta|release_candidate" | sort -V | tail -1)
+          sudo xcode-select -s "$xcode/Contents/Developer"
+          /usr/bin/clang++ --version | head -1
+          probe="$RUNNER_TEMP/jthread.cpp"
+          printf '#include <stop_token>\n#include <thread>\nint main() { std::jthread t([](std::stop_token) {}); }\n' > "$probe"
+          if /usr/bin/clang++ -std=c++20 "$probe" -o "$RUNNER_TEMP/jthread"; then
+            echo "$xcode has std::jthread"
+          elif /usr/bin/clang++ -std=c++20 -fexperimental-library "$probe" -o "$RUNNER_TEMP/jthread"; then
+            echo "$xcode has std::jthread with -fexperimental-library"
+            echo "CXXFLAGS=-fexperimental-library" >> "$GITHUB_ENV"
+          else
+            echo "::error::no std::jthread in $xcode for macOS $MACOSX_DEPLOYMENT_TARGET"; exit 1
+          fi
+          "$RUNNER_TEMP/jthread"
+
+      # the formulae scripts/build_macos.sh installs (the vc bindings build the
+      # same C++ tree), plus uv
+      - name: Install build dependencies
+        run: |
+          brew install uv cmake ninja pkgconf ceres-solver eigen opencv c-blosc c-blosc2 concurrentqueue zstd lz4 boost \
+            libtiff libpng jpeg-turbo curl nlohmann-json sqlite openssl@3 lapack openblas libomp scotch hwloc gcc flang \
+            qtbase
+          uv python install 3.14.10
+
+      - name: Build a static OpenCV
+        run: MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS" .github/mac-app/build-opencv.sh "$RUNNER_TEMP/opencv" "$(sysctl -n hw.ncpu)"
+
+      # every torch the locks pin: the wheels must load the libomp each ships
+      - name: Get torch's OpenMP runtimes
+        run: |
+          libomps=()
+          for version in $(grep -h '^torch==' .github/mac-app/lock-inputs/*.in | cut -d= -f3 | sort -u); do
+            uv venv --quiet --python 3.14.10 "$RUNNER_TEMP/torch-$version"
+            uv pip install --quiet --python "$RUNNER_TEMP/torch-$version/bin/python" "torch==$version"
+            libomps+=("$RUNNER_TEMP/torch-$version/lib/python3.14/site-packages/torch/lib/libomp.dylib")
+          done
+          ls -la "${libomps[@]}"
+          echo "TORCH_LIBOMPS=${libomps[*]}" >> "$GITHUB_ENV"
+
+      - name: Build the wheels
+        env:
+          OCV: ${{ runner.temp }}/opencv
+        run: |
+          mkdir -p "$RUNNER_TEMP/src"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/src"
+          MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS" /usr/bin/time -l .github/mac-app/build-wheels.sh "$RUNNER_TEMP/src" \
+            "$RUNNER_TEMP/wheels-build" "$(sysctl -n hw.ncpu)"
+
+      - name: Assemble the release files
+        run: |
+          .github/mac-app/make-assets.sh . "$RUNNER_TEMP/wheels-build/wheels" "$RUNNER_TEMP/python-tools" \
+            "$GITHUB_REPOSITORY" "$MIN_MACOS"
+          ls -la "$RUNNER_TEMP/python-tools"
+
+      # the installer as a user runs it: no Homebrew, only the system's tools on
+      # PATH, a fresh home, and the release files from this run
+      - name: Install the Python tools with Homebrew hidden
+        timeout-minutes: 45
+        run: |
+          home="$RUNNER_TEMP/home"; mkdir -p "$home"
+          tools="$home/Library/Application Support/Vesuvius Challenge/VC3D/python-tools"
+          installer="$RUNNER_TEMP/python-tools/VC3D-macos-python-tools.sh"
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+          env -i HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash "$installer"
+          check=.github/mac-app/omp_check.py
+          env -i HOME="$home" "$tools/envs/lasagna/bin/python" -I $check vc.volume vc.fiber_trace vc_lasagna_amgx \
+            vc_reader vc_object_store
+          env -i HOME="$home" "$tools/envs/spiral/bin/python" -I $check vc_spiral.spiral_sampling vc_spiral.track_store \
+            vc_reader vc_object_store posix_ipc
+          env -i HOME="$home" "$tools/envs/vesuvius/bin/python" -I $check vc_reader vc_object_store
+          # and again: nothing left to do
+          env -i HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin bash "$installer" | tee "$RUNNER_TEMP/second.log"
+          [[ $(grep -c 'already up to date' "$RUNNER_TEMP/second.log") -eq 3 ]]
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-macos-python-tools
+          path: ${{ runner.temp }}/python-tools
+          if-no-files-found: error
+
+      - id: uploaded
+        run: echo "ready=true" >> "$GITHUB_OUTPUT"
+
   build-macos:
     name: Build + package (Homebrew LLVM, arm64)
-    if: github.event_name != 'pull_request'
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    needs: python-tools
     runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 180
     env:
@@ -82,8 +204,24 @@ jobs:
         with:
           version: v0.15.0
 
+      # the installer made for this commit's wheels, which the app bundle ships
+      - name: Download the Python tools installer
+        if: needs.python-tools.outputs.ready == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: VC3D-macos-python-tools
+          path: ${{ runner.temp }}/python-tools
+
       - name: Install Homebrew dependencies + build
-        run: ./scripts/build_macos.sh --install-deps --sccache
+        env:
+          PYTHON_TOOLS_READY: ${{ needs.python-tools.outputs.ready }}
+        run: |
+          if [[ $PYTHON_TOOLS_READY == true ]]; then
+            export VC_MACOS_PYTHON_TOOLS_INSTALLER="$RUNNER_TEMP/python-tools/VC3D-macos-python-tools.sh"
+          else
+            echo "::warning::the Python tools failed to build, so this app ships without their installer"
+          fi
+          ./scripts/build_macos.sh --install-deps --sccache
 
       - name: Package (DMG + ZIP)
         run: |
@@ -128,11 +266,22 @@ jobs:
       - name: Smoke test packaged app
         timeout-minutes: 15
         working-directory: volume-cartographer/build-macos
+        env:
+          PYTHON_TOOLS_READY: ${{ needs.python-tools.outputs.ready }}
         run: |
           hdiutil attach VC3D-*-macos-*.dmg -nobrowse -readonly -mountpoint /tmp/vc3d-dmg
           cp -R /tmp/vc3d-dmg/VC3D.app smoke.app
           hdiutil detach /tmp/vc3d-dmg
           bin="$PWD/smoke.app/Contents/MacOS"
+          installer=smoke.app/Contents/Resources/install-python-tools.sh
+          if [[ $PYTHON_TOOLS_READY == true && ! -x $installer ]]; then
+            echo "::error::the Python tools installer is missing from the bundle"
+            exit 1
+          fi
+          if [[ $PYTHON_TOOLS_READY != true && -e $installer ]]; then
+            echo "::error::the bundle has a Python tools installer whose files weren't built"
+            exit 1
+          fi
 
           # Any absolute Homebrew/build-tree dependency path in the bundle
           # would resolve on this runner but not on a user's machine. Scan
@@ -140,7 +289,7 @@ jobs:
           # suffix); otool noise on non-Mach-O files is discarded.
           leaks=$(find smoke.app -type f \( -perm +111 -o -name '*.dylib' \) \
                     -exec otool -L {} + 2>/dev/null \
-                    | grep -E "$(brew --prefix)/|$GITHUB_WORKSPACE" || true)
+                    | grep -E "$(brew --prefix)/|$GITHUB_WORKSPACE|/usr/local/" || true)
           if [[ -n "$leaks" ]]; then
             echo "::error::absolute dependency paths leaked into the bundle:"
             echo "$leaks"
@@ -152,7 +301,7 @@ jobs:
           rpath_leaks=$(find smoke.app -type f \( -perm +111 -o -name '*.dylib' \) \
                           -exec otool -l {} + 2>/dev/null \
                           | awk '/cmd LC_RPATH/ { getline; getline; print }' \
-                          | grep -E "$(brew --prefix)/|$GITHUB_WORKSPACE" || true)
+                          | grep -E "$(brew --prefix)/|$GITHUB_WORKSPACE|/usr/local/" || true)
           if [[ -n "$rpath_leaks" ]]; then
             echo "::error::absolute library search paths leaked into the bundle:"
             echo "$rpath_leaks"
@@ -203,8 +352,8 @@ jobs:
 
   release-macos:
     name: Attach macOS package to release
-    if: github.event_name == 'release'
-    needs: build-macos
+    if: ${{ !cancelled() && github.event_name == 'release' && needs.build-macos.result == 'success' }}
+    needs: [python-tools, build-macos]
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
@@ -217,11 +366,21 @@ jobs:
           name: VC3D-macos-app
           path: release-assets
 
+      - name: Download the app's Python tools
+        if: needs.python-tools.outputs.ready == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: VC3D-macos-python-tools
+          path: release-assets
+
       - name: Attach app to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          shopt -s nullglob
           gh release upload "${{ github.event.release.tag_name }}" \
             release-assets/VC3D-*-macos-*.dmg \
             release-assets/VC3D-*-macos-*.zip \
+            release-assets/VC3D-macos-python-tools* \
+            release-assets/*.whl \
             --clobber

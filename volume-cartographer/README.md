@@ -129,6 +129,8 @@ Note: the flatboi SLIM flattening tool (PaStiX-based) is not available on Window
 
 A self-contained `VC3D.app` for Apple Silicon (`VC3D-<version>-macos-arm64.dmg`, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases) — drag it to Applications. The app is not notarized, so the first launch is right-click → Open (or `xattr -dr com.apple.quarantine /Applications/VC3D.app`). The `vc_*` command-line tools ship inside the bundle at `VC3D.app/Contents/MacOS/`.
 
+The app offers to install the Python tools that Spiral, Lasagna, sheet strips, fibre follow and the neural tracer need the first time a feature needs them (or from Help → Install or Update Python Tools). They install from prebuilt packages attached to the same release, with no compiler, Homebrew or conda. [`.github/mac-app/README.md`](../.github/mac-app/README.md) describes how they are built.
+
 To build from source on macOS, use the Homebrew LLVM build helper:
 
 ```bash
