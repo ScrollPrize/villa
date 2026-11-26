@@ -2208,6 +2208,8 @@ private:
             }
             throw;
         }
+        if (std::none_of(slots.begin(), slots.end(), [](const Slot& slot) { return slot.claim.has_value(); }))
+            return;
         pool_->parallel_for(work.size(), [&](std::size_t i) {
             if (!slots[i].claim) return;
             const auto loaded = slots[i].claim->resolve([]() -> std::shared_ptr<const ChunkLoad> {

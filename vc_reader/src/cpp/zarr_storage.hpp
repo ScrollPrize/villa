@@ -6,11 +6,16 @@
 #include "thread_pool.hpp"
 #include "shard_index.hpp"
 #include "channel_decode.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
+#include <cctype>
 #include <limits>
 #include <map>
 #include <optional>
+#include <span>
+#include <string_view>
 
 namespace vcr {
 
@@ -20,6 +25,16 @@ class ZarrStorage {
         std::uint64_t total = 0, start = 0;
         std::string etag;
     };
+    struct Position { std::size_t inner, slot; };
+    struct ContentRange { std::uint64_t first, last, total; };
+    struct RetryShardRange : std::runtime_error { using std::runtime_error::runtime_error; };
+
+    template<class Read>
+    static auto refresh_after_shard_switch(Read&& read)
+    {
+        try { return read(); }
+        catch (const RetryShardRange&) { return read(); }
+    }
 public:
     ZarrStorage(std::string root, std::string prefix, std::string separator, Index shards,
                 bool index_end, bool index_crc, std::size_t chunk_bytes, HttpClient* http,
@@ -45,13 +60,16 @@ public:
             return local_read(path, body, std::nullopt, 0, layout_.maxPayload);
         }
         if (!http_) return LocalShard(utf8Path(path), layout_).readEntry(*position, body);
-        auto index = shard_index(path);
-        if (!index) return false;
-        const auto entry = layout_.entry(index->bytes, *position, index->total);
-        if (!entry) return false;
-        const auto [offset, length] = *entry;
-        read_shard_range(path, index->total, index->etag, offset, length, body);
-        return true;
+        const Position requested{*position, 0};
+        return refresh_after_shard_switch([&] {
+            const auto [index, switched] = shard_index(path, {&requested, 1});
+            if (!index) return false;
+            const auto entry = layout_.entry(index->bytes, *position, index->total);
+            if (!entry) return false;
+            const auto [offset, length] = *entry;
+            read_shard_range(path, index->total, index->etag, offset, length, body, switched);
+            return true;
+        });
     }
 
     static constexpr std::size_t max_merged_bytes = 512 << 10;
@@ -67,6 +85,12 @@ public:
     // An empty payload denotes a missing shard or chunk, never valid data.
     std::vector<std::vector<std::uint8_t>> read_batch(const std::vector<std::string>& keys, ThreadPool& pool)
     {
+        return refresh_after_shard_switch([&] { return read_batch_once(keys, pool); });
+    }
+
+private:
+    std::vector<std::vector<std::uint8_t>> read_batch_once(const std::vector<std::string>& keys, ThreadPool& pool)
+    {
         if (keys.size() > max_batch_chunks)
             throw std::invalid_argument("shard batch exceeds chunk limit");
         struct Member {
@@ -77,9 +101,10 @@ public:
             const std::string* path;
             std::uint64_t total, start, stop;
             std::string etag;
+            bool switched;
             std::vector<Member> members;
         };
-        std::map<std::string, std::vector<std::pair<std::size_t, std::size_t>>> shards;
+        std::map<std::string, std::vector<Position>> shards;
         for (std::size_t slot = 0; slot < keys.size(); ++slot) {
             auto [path, position] = location(keys[slot]);
             shards[std::move(path)].emplace_back(*position, slot);
@@ -87,7 +112,7 @@ public:
 
         std::vector<Range> ranges;
         for (const auto& [path, positions] : shards) {
-            auto index = shard_index(path);
+            const auto [index, switched] = shard_index(path, positions);
             if (!index) continue;
             std::vector<Member> members;
             for (const auto& [position, slot] : positions) {
@@ -98,7 +123,7 @@ public:
                 return a.start < b.start;
             });
             const auto first_range = ranges.size();
-            const bool strong_etag = !index->etag.empty() && !index->etag.starts_with("W/");
+            const bool strong_etag = is_strong_etag(index->etag);
             for (const auto& member : members) {
                 if (strong_etag && ranges.size() > first_range) {
                     auto& last = ranges.back();
@@ -109,7 +134,7 @@ public:
                         continue;
                     }
                 }
-                ranges.push_back({&path, index->total, member.start, member.stop, index->etag, {member}});
+                ranges.push_back({&path, index->total, member.start, member.stop, index->etag, switched, {member}});
             }
         }
 
@@ -118,12 +143,13 @@ public:
             const auto& range = ranges[i];
             std::vector<std::uint8_t> body;
             try {
-                read_shard_range(*range.path, range.total, range.etag, range.start, range.stop - range.start, body);
+                read_shard_range(*range.path, range.total, range.etag, range.start, range.stop - range.start,
+                                 body, range.switched);
             } catch (const HttpRangeRejected&) {
                 if (range.members.size() == 1) throw;
                 for (const auto& member : range.members)
                     read_shard_range(*range.path, range.total, range.etag, member.start,
-                                     member.stop - member.start, bodies[member.slot]);
+                                     member.stop - member.start, bodies[member.slot], range.switched);
                 return;
             }
             if (range.members.size() == 1) {
@@ -138,6 +164,7 @@ public:
         return bodies;
     }
 
+public:
     std::optional<ChannelDecodeResult> read_channels(const std::string& key, const ChunkCodec& codec,
         std::size_t decodedBytes, std::size_t channelBytes, std::span<const std::size_t> requested,
         std::span<const std::size_t> relevant)
@@ -166,7 +193,7 @@ public:
         std::string etag;
         std::vector<std::uint8_t> prefix;
         if (position) {
-            auto index = shard_index(path);
+            auto index = shard_index(path).first;
             if (!index) return std::nullopt;
             const auto entry = layout_.entry(index->bytes, *position, index->total);
             if (!entry) return std::nullopt;
@@ -199,7 +226,7 @@ public:
                     std::to_string(base+offset+size-1), size, etag);
                 bytes_ += response.bytes;
                 if (response.status == 404) throw std::runtime_error("channel object disappeared during ranged read");
-                validate_range(response, base+offset, size, total);
+                validate_range(parse_range(response.content_range), base+offset, size, total);
                 if (!etag.empty() && !response.etag.empty() && etag != response.etag)
                     throw std::runtime_error("channel object changed during ranged read");
                 std::memcpy(dst, body.data(), size);
@@ -225,29 +252,74 @@ private:
         }
         return {joinLocation(root_, prefix_ + shard_key), position};
     }
-    static void validate_range(const HttpResponse& response, std::uint64_t offset,
+    static bool is_strong_etag(std::string_view tag)
+    {
+        return tag.size() >= 2 && tag.front() == '"' && tag.back() == '"' &&
+            std::all_of(tag.begin()+1, tag.end()-1, [](unsigned char c) {
+                return c == '!' || (c >= '#' && c <= '~') || c >= 0x80;
+            });
+    }
+
+    static ContentRange parse_range(std::string_view header)
+    {
+        constexpr std::string_view unit = "bytes ";
+        if (header.size() < unit.size() || !std::equal(unit.begin(), unit.end(), header.begin(),
+                [](char expected, unsigned char received) { return expected == std::tolower(received); }))
+            throw std::runtime_error("invalid HTTP Content-Range for shard read");
+        const auto* cursor = header.data() + unit.size();
+        const auto* end = header.data() + header.size();
+        auto number = [&](std::uint64_t& value) {
+            auto [next, error] = std::from_chars(cursor, end, value);
+            cursor = next;
+            return error == std::errc{};
+        };
+        ContentRange range{};
+        if (!number(range.first) || cursor == end || *cursor++ != '-' ||
+            !number(range.last) || cursor == end || *cursor++ != '/' ||
+            !number(range.total) || cursor != end || range.last < range.first || range.last >= range.total)
+            throw std::runtime_error("invalid HTTP Content-Range for shard read");
+        return range;
+    }
+
+    static void validate_range(const ContentRange& range, std::uint64_t offset,
                                std::uint64_t length, std::uint64_t total)
     {
-        unsigned long long first = 0, last = 0, size = 0;
-        int end = 0;
-        if (std::sscanf(response.content_range.c_str(), "bytes %llu-%llu/%llu%n", &first, &last, &size, &end) != 3 ||
-            std::size_t(end) != response.content_range.size() || first != offset ||
-            last < first || last >= size || last-first+1 != length || size != total)
+        if (range.first != offset || range.last-range.first+1 != length || range.total != total)
             throw std::runtime_error("invalid HTTP Content-Range for shard read");
     }
 
+    [[noreturn]] void changed_shard(const std::string& path, const std::string& etag,
+                                   bool switched, const HttpRangeChanged& error)
+    {
+        {
+            std::lock_guard lock(index_mutex_);
+            const auto* cached = indexes_.peek(path);
+            if (cached && (*cached)->etag == etag)
+                indexes_.erase(path);
+        }
+        if (switched) throw RetryShardRange(error.what());
+        throw error;
+    }
+
     void read_shard_range(const std::string& path, std::uint64_t total, const std::string& etag,
-                          std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& body)
+                          std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& body,
+                          bool switched)
     {
         ++requests_;
         body.reserve(length);
-        auto response = http_->get_range(path, body, std::to_string(offset) + "-" + std::to_string(offset + length - 1),
-                                         length, etag);
+        HttpResponse response;
+        try {
+            response = http_->get_range(path, body, std::to_string(offset) + "-" + std::to_string(offset + length - 1),
+                                        length, etag);
+        } catch (const HttpRangeChanged& error) {
+            changed_shard(path, etag, switched, error);
+        }
         bytes_ += response.bytes;
-        if (response.status == 404) throw std::runtime_error("shard disappeared after index read");
-        validate_range(response, offset, length, total);
-        if (!etag.empty() && !etag.starts_with("W/") && !response.etag.empty() && response.etag != etag)
-            throw std::runtime_error("shard changed during ranged read");
+        if (response.status == 404)
+            changed_shard(path, etag, switched, HttpRangeChanged("shard disappeared after index read"));
+        if (is_strong_etag(etag) && !response.etag.empty() && response.etag != etag)
+            changed_shard(path, etag, switched, HttpRangeChanged("shard changed during ranged read"));
+        validate_range(parse_range(response.content_range), offset, length, total);
     }
 
     static bool local_read(const std::string& path, std::vector<std::uint8_t>& body,
@@ -272,26 +344,45 @@ private:
         return true;
     }
 
-    std::shared_ptr<const IndexData> shard_index(const std::string& path)
+    std::pair<std::shared_ptr<const IndexData>, bool> shard_index(const std::string& path,
+                                                               std::span<const Position> positions = {})
     {
         std::lock_guard lock(index_mutex_);
-        if (auto* cached = indexes_.get(path)) return *cached;
+        if (auto* cached = indexes_.get(path)) {
+            if (path == last_index_path_) return {*cached, false};
+            const auto& index = **cached;
+            // A missing entry issues no conditional payload request. Refresh it
+            // on a shard switch, as with the single most-recent index policy.
+            if (can_batch() && !positions.empty() && is_strong_etag(index.etag) &&
+                std::all_of(positions.begin(), positions.end(), [&](const Position& p) {
+                    return layout_.entry(index.bytes, p.inner, index.total).has_value();
+                })) {
+                last_index_path_ = path;
+                return {*cached, true};
+            }
+        }
         auto index = std::make_shared<IndexData>();
         ++requests_;
         auto response = http_->get_range(path, index->bytes,
             layout_.indexEnd ? "-"+std::to_string(layout_.indexBytes) : "0-"+std::to_string(layout_.indexBytes-1), layout_.indexBytes);
         bytes_ += response.bytes;
-        if (response.status == 404) return nullptr;
-        unsigned long long first = 0, last = 0, total = 0;
-        if (std::sscanf(response.content_range.c_str(), "bytes %llu-%llu/%llu", &first, &last, &total) != 3 || total < layout_.indexBytes)
+        if (response.status == 404) {
+            indexes_.erase(path);
+            return {};
+        }
+        const auto range = parse_range(response.content_range);
+        if (range.total < layout_.indexBytes)
             throw std::runtime_error("invalid HTTP shard index Content-Range");
-        index->start = layout_.indexEnd ? total-layout_.indexBytes : 0;
-        index->total = total;
+        index->start = layout_.indexEnd ? range.total-layout_.indexBytes : 0;
+        index->total = range.total;
         index->etag = response.etag;
-        validate_range(response, index->start, layout_.indexBytes, total);
+        validate_range(range, index->start, layout_.indexBytes, range.total);
         layout_.validate(index->bytes, index->total);
-        indexes_.put(path, index, layout_.indexBytes);
-        return index;
+        const auto cost = index->bytes.capacity() + index->etag.capacity() + 2*path.capacity() + sizeof(IndexData);
+        indexes_.erase(path);
+        indexes_.put(path, index, cost);
+        last_index_path_ = path;
+        return {std::move(index), false};
     }
 
     std::string root_, prefix_, separator_;
@@ -300,6 +391,7 @@ private:
     std::atomic<std::uint64_t>& requests_;
     std::atomic<std::uint64_t>& bytes_;
     std::mutex index_mutex_;
+    std::string last_index_path_;
     Lru<std::shared_ptr<const IndexData>> indexes_{8 << 20};
 };
 } // namespace vcr

@@ -49,8 +49,10 @@ keeps per-chunk decoding and disk cache entries. A plan admits at most 16
 chunks at a time and a merged request never exceeds 512 KiB or crosses an
 unrequested gap. An HTTP 416 on a merged range falls back to individual
 ranges for the same shard version. Cancelable, cache-only, streaming and
-selective-channel reads keep their regular chunk path. The remote reader
-retains up to 8 MiB of shard indexes.
+selective-channel reads keep their regular chunk path. A reused index from
+another shard visit requires a strong ETag and present entries for the
+requested chunks. If the server reports that the object changed, the reader
+evicts that index and can refresh the range plan once.
 
 ## Plain image files
 
@@ -230,8 +232,9 @@ A strong ETag binds payload ranges to the index version. Missing inner chunks
 retain the normal fill/cache behavior. Decoded inner chunks use the existing
 v2 disk-cache representation, including offline reads and shared budgets.
 
-Index working storage is limited to 64 MiB. One remote index of at most 8 MiB
-can be retained per array; larger indexes are reread within the working limit.
+Index working storage is limited to 64 MiB. The remote index cache has an
+8 MiB budget charged for buffer capacity and per-entry data. Larger indexes
+are reread within the working limit.
 Encoded payloads are capped at twice the decoded inner-chunk size plus 1 MiB.
 Arrays requiring larger indexes or unusual oversized encoded payloads raise.
 These limits never materialize an entire shard. Source chunk sizes and worker

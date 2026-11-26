@@ -283,6 +283,46 @@ class V3RemoteTests(RemoteFixtureCase):
         with s3.open(auth=keys) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), expected.shape), expected)
 
+    def test_revisiting_replaced_shard_refreshes_cached_index(self):
+        for missing in (None, (0, 0)):
+            for batched in (False, True):
+                with self.subTest(missing=missing, batched=batched):
+                    name = f'replaced-{missing is not None}-{batched}'
+                    root = self.root/name
+                    write_v3(root, missing=missing)
+                    expected, _ = write_v3(self.root/(name+'-new'), missing=None)
+                    replacement = bytearray((self.root/(name+'-new')/'c'/'0'/'0').read_bytes())
+                    if missing is None:
+                        replacement[0] ^= 1
+                        expected[0, 0] = int(expected[0, 0]) ^ 1
+                    with ZarrReader.open(self.url+'/'+name, threads=2) as reader:
+                        reader[0, 5]
+                        reader[0, 10]
+                        (root/'c'/'0'/'0').write_bytes(replacement)
+                        selection = np.s_[:3, :10] if batched else np.s_[:1, :1]
+                        np.testing.assert_array_equal(reader[selection], expected[selection])
+
+    def test_rejects_signed_and_overflowing_content_range(self):
+        name = 'malformed-range'
+        write_v3(self.root/name, missing=None)
+        shard = (self.root/name/'c'/'0'/'0').read_bytes()
+        for header in (f'bytes +0-+119/+{len(shard)}', f'bytes 0-119/{2**64}',
+                       f'bytes 0-119/{len(shard)} trailing'):
+            with self.subTest(header=header):
+                def answer(handler):
+                    if handler.path != f'/{name}/c/0/0' or handler.headers.get('Range') != 'bytes=0-119':
+                        return False
+                    handler.send_response(206)
+                    handler.send_header('Content-Range', header)
+                    handler.send_header('Content-Length', '120')
+                    handler.end_headers()
+                    handler.wfile.write(shard[:120])
+                    return True
+                self.server.request_hook = answer
+                with ZarrReader.open(self.url+'/'+name, threads=2) as reader:
+                    with self.assertRaisesRegex(RuntimeError, 'Content-Range'):
+                        reader[:1, :1]
+
     def test_batch_only_fetches_missing_chunks_and_reuses_each_index(self):
         expected, _ = write_v3(self.root/'batch', missing=None)
         ranges = []

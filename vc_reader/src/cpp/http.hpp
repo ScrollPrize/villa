@@ -53,6 +53,7 @@ struct HttpOptions {
 
 // A server may accept individual ranges while rejecting a wider one.
 struct HttpRangeRejected : std::runtime_error { using std::runtime_error::runtime_error; };
+struct HttpRangeChanged : std::runtime_error { using std::runtime_error::runtime_error; };
 
 struct HttpResponse {
     long status = 0;
@@ -374,6 +375,7 @@ private:
                     const std::string what = std::string(method) + " " + url + ": HTTP " + std::to_string(status) + ": " + transfer.snippet;
                     if (status == 401 || status == 403) throw HttpDenied(what);
                     if (get && body_status == 206 && status == 416) throw HttpRangeRejected(what);
+                    if (get && body_status == 206 && status == 412) throw HttpRangeChanged(what);
                     throw std::runtime_error(what);
                 }
                 last_error = "HTTP " + std::to_string(status);
