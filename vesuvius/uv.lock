@@ -1948,6 +1948,23 @@ wheels = [
 ]
 
 [[package]]
+name = "numcodecs"
+version = "0.16.6"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f9/03/c82563fffd81245a5b0239be8ff7743b30fe35d044080261458ae3c6aee5/numcodecs-0.16.6.tar.gz", hash = "sha256:5e446928af7c40b4dc8f51e960b4c9fb14f617846577d2fcf35ae2f92738f00f", size = 6288989, upload-time = "2026-10-20T19:42:43.925Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fc/a5/338e2fe244a285c9edb5d8764def8d726ccdb5cca83cca914780b27333f7/numcodecs-0.16.6-cp314-cp314-macosx_10_13_x86_64.whl", hash = "sha256:ba4b67038a0542158c5a99004f571c5e11a27d4b7c62290e745dd98e86f15d67", size = 1664019, upload-time = "2026-10-20T19:42:35.814Z" },
+    { url = "https://files.pythonhosted.org/packages/53/fd/b8a52c063f59f4e56747e9b116e7b1ced32420fcdd661a673035a82ea259/numcodecs-0.16.6-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:c69ef06c1ba0c308e62cc8724627291248a4933ee2897ad61bf272258f1a2f12", size = 1174119, upload-time = "2026-10-20T19:42:36.987Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/bc/3b96459c6dd906a7a67d387541aadac207c5330c84d246bfa0dcecb93824/numcodecs-0.16.6-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:5bee914099138110137ad1be750a8ac7be395b8a63873c9c2408551bec6f3d81", size = 8654534, upload-time = "2026-10-20T19:42:38.312Z" },
+    { url = "https://files.pythonhosted.org/packages/14/71/b29cab99bd25b09de92749e4e98473877e7fcbf2a6ac492d4631f55946c1/numcodecs-0.16.6-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9de40cfbc9764313d9badabbe103def759d0676d64292805f80d08b9dee8c39d", size = 9276387, upload-time = "2026-10-20T19:42:40.408Z" },
+    { url = "https://files.pythonhosted.org/packages/46/10/1594ab5a44a7104efdd440d28857425cc524d139b38212d5b52e58304d02/numcodecs-0.16.6-cp314-cp314-win_amd64.whl", hash = "sha256:37f665249aa848ea1600f7513789767753c324d33ca6d7ea887150c2f3ff34e5", size = 858556, upload-time = "2026-10-20T19:42:42.352Z" },
+]
+
+[[package]]
 name = "numexpr"
 version = "2.14.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2567,6 +2584,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c3/b2/bc9c9196916376152d655522fdcebac55e66de6603a76a02bca1b6414f6c/pygments-2.20.0.tar.gz", hash = "sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f", size = 4955991, upload-time = "2026-03-29T13:29:33.898Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
+]
+
+[[package]]
+name = "pynrrd"
+version = "1.1.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/71/6b/c1f1c8666e44c2276f921fc3fc9f2144c310afcc13f037a273f4c0a98c12/pynrrd-1.1.4.tar.gz", hash = "sha256:cfd9d7cc27aec0ca39965bf6dcd271c42abd7216d3c9b12ef226e7683756798e", size = 20216, upload-time = "2026-11-16T12:52:34.187Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/46/05/9b9a01e613221274665b2499ae1421f5609966343451ab02be3352b5c0aa/pynrrd-1.1.4-py3-none-any.whl", hash = "sha256:805be32090080ddb152dff313c234e889b64135f13710e0e18daa40ac31c8c8f", size = 21810, upload-time = "2026-11-16T12:52:32.857Z" },
 ]
 
 [[package]]
@@ -3594,6 +3624,7 @@ dependencies = [
     { name = "cachetools" },
     { name = "numpy" },
     { name = "pillow" },
+    { name = "pynrrd" },
     { name = "pyyaml" },
 ]
 
@@ -3612,6 +3643,7 @@ all = [
     { name = "networkx" },
     { name = "nnunetv2" },
     { name = "numba" },
+    { name = "numcodecs" },
     { name = "opencv-python-headless" },
     { name = "psutil" },
     { name = "pybind11" },
@@ -3659,6 +3691,7 @@ models = [
     { name = "networkx" },
     { name = "nnunetv2" },
     { name = "numba" },
+    { name = "numcodecs" },
     { name = "opencv-python-headless" },
     { name = "psutil" },
     { name = "pytorch-optimizer" },
@@ -3728,6 +3761,8 @@ requires-dist = [
     { name = "nnunetv2", marker = "extra == 'models'", specifier = ">=2.8.1,<2.9" },
     { name = "numba", marker = "extra == 'all'", specifier = ">=0.60.0" },
     { name = "numba", marker = "extra == 'models'", specifier = ">=0.60.0" },
+    { name = "numcodecs", marker = "extra == 'all'", specifier = ">=0.15.1,<0.17" },
+    { name = "numcodecs", marker = "extra == 'models'", specifier = ">=0.15.1,<0.17" },
     { name = "numpy", specifier = ">=2.0.2" },
     { name = "numpy", marker = "extra == 'volume-only'", specifier = ">=2.0.2" },
     { name = "opencv-python-headless", marker = "extra == 'all'", specifier = ">=4.11.0.86" },
@@ -3738,6 +3773,7 @@ requires-dist = [
     { name = "psutil", marker = "extra == 'all'", specifier = ">=7.1.0" },
     { name = "psutil", marker = "extra == 'models'", specifier = ">=7.1.0" },
     { name = "pybind11", marker = "extra == 'all'", specifier = ">=3.0.1" },
+    { name = "pynrrd", specifier = ">=1.1.3" },
     { name = "pyqt6", marker = "extra == 'all'" },
     { name = "pyqt6", marker = "extra == 'gui'" },
     { name = "pytest", marker = "extra == 'all'", specifier = ">=8.4.2" },

@@ -32,6 +32,8 @@ def test_pipeline_accepts_both_flag_spellings(pipeline_cli, separator):
          "zarr_compressor": "lz4", "zarr_compression_level": 5}
         if name == "predict" else {"chunk_size": "64,64,64", "num_workers": 3}
     )
+    if name in {"blend_logits", "blend_and_finalize"}:
+        values["patch_cache_mb"] = 256
     if name in {"finalize_outputs", "blend_and_finalize"}:
         values["threshold_value"] = 0.3
         required = [*required, "--threshold"]

@@ -150,6 +150,9 @@ ProjectDocument ProjectDocument::saveAs(const std::filesystem::path& destination
     for (const auto* key : {"selected_lasagna_dataset", "selected_fiber_inference_dataset"})
         if (data["view"].contains(key) && !data["view"][key].get<std::string>().empty())
             data["view"][key] = rebase(data["view"][key]);
+    if (data["view"].contains("lasagna_normal_choices"))
+        for (auto& location : data["view"]["lasagna_normal_choices"])
+            if (!location.get<std::string>().empty()) location = rebase(location);
     std::filesystem::create_directories(copy.path_.parent_path());
     copy.replace(std::move(data));
     return copy;

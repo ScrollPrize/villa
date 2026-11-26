@@ -3,6 +3,7 @@
 #include "../storage_transform.hpp"
 #include "vc_reader/zarr_metadata.hpp"
 #include "vc_reader/array.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include "files.hpp"
 
 #include <algorithm>
@@ -47,7 +48,7 @@ std::vector<std::string> localNumberedChildren(const fs::path& root)
     std::vector<std::string> paths;
     if (fs::is_directory(root))
         for (const auto& child : fs::directory_iterator(root)) {
-            const auto name = child.path().filename().string();
+            const auto name = utf8String(child.path().filename());
             if (digits(name) && child.is_directory() &&
                 (fs::exists(child.path() / ".zarray") || fs::exists(child.path() / "zarr.json")))
                 paths.push_back(name);
@@ -174,7 +175,7 @@ std::optional<std::string> knownArrayPath(const std::string& location, const Acc
             if (const auto scheme = spelled.find("://"); scheme != std::string::npos)
                 spelled = "s3" + spelled.substr(scheme);
         // decodedCachePath drops a query; a slash before it goes here.
-        return stripSlashes(decodedCachePath({}, access.cacheUrl(spelled)).generic_string());
+        return stripSlashes(utf8GenericString(decodedCachePath({}, access.cacheUrl(spelled))));
     } catch (const std::invalid_argument&) {
         return std::nullopt;
     }
@@ -330,7 +331,7 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
         spec.channel_identity = keyUrl;
     } else {
         std::error_code ec;
-        root = fs::absolute(location, ec).lexically_normal().string();
+        root = utf8String(fs::absolute(utf8Path(location), ec).lexically_normal());
         if (ec)
             root = location;
         while (root.size() > 1 && root.back() == '/')
@@ -384,7 +385,7 @@ void keepAttributes(const OpenedArray& array, const OpenOptions& options)
         return;
     try {
         // The .zattrs of a decoded cache belongs to the cache, not the source.
-        (void)detail::writeCacheMetadata(fs::path(array.layers[std::size_t(array.writer)].root) / kSourceAttributes,
+        (void)detail::writeCacheMetadata(utf8Path(array.layers[std::size_t(array.writer)].root) / kSourceAttributes,
                                          array.attributes.dump(), options.cacheDirs, options.vc3dVolumeDir,
                                          options.cacheMaxBytes, options.cacheMinFreeBytes);
     } catch (const std::exception&) {
@@ -400,7 +401,7 @@ const Json& arrayAttributes(OpenedArray& array, const OpenOptions& options)
     if (options.offline && isRemote(array.location)) {
         auto dirs = cachedNodeDirs(options.cacheDirs, options.access.cacheUrl(array.location));
         if (options.vc3dVolumeDir && !array.levelKey.empty())
-            dirs.insert(dirs.begin(), *options.vc3dVolumeDir / array.levelKey);
+            dirs.insert(dirs.begin(), *options.vc3dVolumeDir / utf8Path(array.levelKey));
         for (const auto& dir : dirs) {
             std::ifstream in(dir / kSourceAttributes);
             if (in) {
@@ -474,7 +475,7 @@ Group Group::open(const std::string& input, OpenOptions options)
         if (read(location, ".zarray"))
             throw std::invalid_argument(location + " is an array, not a group");
         // Zarr v2 permits implicit parent groups in local hierarchies.
-        if (remote || localNumberedChildren(location).empty())
+        if (remote || localNumberedChildren(utf8Path(location)).empty())
             throw NotFound("no Zarr group at " + location + " (.zgroup/zarr.json not found)");
     }
     Json attrs = zattrs ? Json::parse(*zattrs) : Json::object();
@@ -574,7 +575,7 @@ std::vector<std::string> Group::keys()
     const auto meta = consolidated();
     const auto scan = [&](const fs::path& directory, bool skipHidden) {
         for (const auto& entry : fs::directory_iterator(directory)) {
-            const auto name = entry.path().filename().string();
+            const auto name = utf8String(entry.path().filename());
             if (entry.is_directory() && !(skipHidden && name.starts_with(".")) && isLocalZarrNode(entry.path()))
                 names.insert(name);
         }
@@ -589,7 +590,7 @@ std::vector<std::string> Group::keys()
                 names.insert(key.substr(0, slash));
         }
     } else if (!isRemote(location_)) {
-        scan(location_, false);
+        scan(utf8Path(location_), false);
     } else if (options_.offline) {
         for (const auto& d : cachedNodeDirs(options_.cacheDirs, options_.access.cacheUrl(location_)))
             scan(d, true);
@@ -619,7 +620,7 @@ std::vector<std::string> Group::levels(int probeLevels)
     }
     std::vector<std::string> candidates;
     if (!isRemote(location_)) {
-        candidates = localNumberedChildren(location_);
+        candidates = localNumberedChildren(utf8Path(location_));
     }
     const auto meta = consolidated();
     if (meta && meta->is_object()) {

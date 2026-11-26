@@ -4,6 +4,7 @@
 #include "vc_reader/s3_listing.hpp"
 #include "vc_reader/sftp.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include "vc_reader/native/http.hpp"
 
 #include <curl/curl.h>
@@ -170,7 +171,7 @@ std::optional<std::string> levelGroupLocation(const std::string& location)
     if (!std::all_of(leaf.begin(), leaf.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
         return std::nullopt;
     const auto parentPath = path.substr(0, slash);
-    const bool group = parentPath.ends_with(".zarr") || (!url && isLocalZarrNode(parentPath));
+    const bool group = parentPath.ends_with(".zarr") || (!url && isLocalZarrNode(utf8Path(parentPath)));
     if (!group)
         return std::nullopt;
     return parentLocation(location);
@@ -313,7 +314,7 @@ std::pair<std::string, std::string> loadBasicAuth(const std::filesystem::path& p
         throw std::filesystem::filesystem_error("cannot read credentials", path, std::error_code(errno, std::generic_category()));
     const auto data = nlohmann::json::parse(in);
     if (!data.is_object())
-        throw std::invalid_argument(path.string() + ": expected a JSON object");
+        throw std::invalid_argument(utf8String(path) + ": expected a JSON object");
     const auto& root = data.contains("auth") && data.at("auth").is_object() ? data.at("auth") : data;
     const auto field = [&](const char* name) {
         const auto it = root.find(name);
@@ -325,7 +326,7 @@ std::pair<std::string, std::string> loadBasicAuth(const std::filesystem::path& p
         user = field("user");
     const auto password = field("password");
     if (!user || user->empty() || !password)
-        throw std::invalid_argument(path.string() + ": needs 'username' (or 'user') and 'password'");
+        throw std::invalid_argument(utf8String(path) + ": needs 'username' (or 'user') and 'password'");
     return {*user, *password};
 }
 
@@ -470,7 +471,7 @@ MetadataReader metadataReader(const Access& access, int connections)
     auto http = std::make_shared<HttpClient>(options);
     return [access, http](const std::string& location, const std::string& name) -> std::optional<std::string> {
         if (!isRemote(location)) {
-            const auto path = std::filesystem::path(location) / name;
+            const auto path = utf8Path(location) / utf8Path(name);
             std::error_code ec;
             const auto status = std::filesystem::status(path, ec);
             if (status.type() == std::filesystem::file_type::not_found)

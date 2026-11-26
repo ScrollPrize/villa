@@ -220,10 +220,12 @@ std::vector<std::string> LasagnaDatasetManifest::fiberPredictionPrefixes() const
 
 LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
 {
-    // A compact manifest is the "lasagna" attribute of a Zarr group.
-    const bool compact = std::filesystem::is_directory(manifestPath);
+    // A compact manifest is the "lasagna" attribute of a Zarr group, named by
+    // the group's directory or its .zattrs.
+    const bool directory = std::filesystem::is_directory(manifestPath);
+    const bool compact = directory || manifestPath.filename() == ".zattrs";
     nlohmann::json root;
-    if (compact) {
+    if (directory) {
         root = vcr::zarr::readAttributes(manifestPath);
     } else {
         std::ifstream input(manifestPath);
@@ -257,7 +259,7 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::
         }
         if (!found) throw std::runtime_error("invalid embedded validity_channel");
     }
-    LasagnaDatasetManifest manifest = parseText(root.dump(), compact ? manifestPath / ".zattrs" : manifestPath);
+    LasagnaDatasetManifest manifest = parseText(root.dump(), directory ? manifestPath / ".zattrs" : manifestPath);
     return manifest;
 }
 

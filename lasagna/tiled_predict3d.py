@@ -56,8 +56,8 @@ DEFAULT_PREFETCH_TILES_PER_GPU = 4
 DEFAULT_INPUT_CACHE_BYTES = 4 << 30
 DEFAULT_INPUT_IO_THREADS = 16
 DEFAULT_ACCUMULATOR_WORKERS = min(32, max(1, os.cpu_count() or 1))
-DEFAULT_OME_COMPRESSOR = "blosc-zstd"
-OME_COMPRESSOR_CHOICES = (DEFAULT_OME_COMPRESSOR, "none")
+DEFAULT_OME_COMPRESSOR = None
+OME_COMPRESSOR_CHOICES = ("vc-delta3d", "blosc-zstd", "none")
 _BLOSC_ZSTD_CONFIG = {
 	"id": "blosc",
 	"cname": "zstd",
@@ -1343,11 +1343,13 @@ def _omezarr_level_shape(
 	return z, y, x
 
 
-def omezarr_compressor_config(name: str) -> dict[str, Any] | None:
-	"""Return the exact Zarr-v2 compressor metadata for a public CLI choice."""
-	value = str(name).strip().lower()
-	if value == DEFAULT_OME_COMPRESSOR:
+def omezarr_compressor_config(name: str | None, ndim: int = 3) -> dict[str, Any] | None:
+	"""Return the exact Zarr-v2 compressor metadata for a public CLI choice, for ZYX or (``ndim`` 4) CZYX arrays."""
+	value = "blosc-zstd" if name is None else str(name).strip().lower()
+	if value == "blosc-zstd":
 		return dict(_BLOSC_ZSTD_CONFIG)
+	if value == "vc-delta3d":
+		return {"id": value, "quant": 1, **({"channel_axis": "first"} if ndim == 4 else {})}
 	if value == "none":
 		return None
 	raise ValueError(
@@ -1360,6 +1362,8 @@ def _writer_codec(config: dict[str, Any] | None) -> dict[str, Any]:
 	"""ZarrWriter.create arguments for a compressor config of omezarr_compressor_config."""
 	if config is None:
 		return {"compressor": None}
+	if config["id"] == "vc-delta3d":  # lossless, channel-first 4-D arrays: ZarrWriter's only form
+		return {"compressor": config["id"]}
 	return {"compressor": config["id"], "cname": config["cname"], "shuffle": config["shuffle"], "level": config["clevel"]}
 
 
@@ -1370,7 +1374,7 @@ def _create_omezarr(
 	n_levels: int,
 	chunk: int,
 	channel_name: str,
-	compressor: str = DEFAULT_OME_COMPRESSOR,
+	compressor: str | None = DEFAULT_OME_COMPRESSOR,
 	dtype: Any = np.uint8,
 ) -> ZarrWriteGroup:
 	"""Create an OME-Zarr group with pyramid level arrays."""
@@ -1410,7 +1414,7 @@ def _open_or_create_omezarr(
 	n_levels: int,
 	chunk: int,
 	channel_name: str,
-	compressor: str = DEFAULT_OME_COMPRESSOR,
+	compressor: str | None = DEFAULT_OME_COMPRESSOR,
 	dtype: Any = np.uint8,
 ) -> ZarrWriteGroup:
 	"""Open existing OME-Zarr group or create a new one."""
@@ -1466,7 +1470,7 @@ def create_product_omezarr_groups(
 	base_shape_zyx: tuple[int, int, int],
 	n_levels: int,
 	ome_chunk: int,
-	ome_compressor: str = DEFAULT_OME_COMPRESSOR,
+	ome_compressor: str | None = DEFAULT_OME_COMPRESSOR,
 ) -> dict[str, ZarrWriteGroup]:
 	"""Create or open per-channel OME-Zarr groups for product specs."""
 	groups: dict[str, ZarrWriteGroup] = {}
