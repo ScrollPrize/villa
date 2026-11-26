@@ -121,10 +121,10 @@ class HostedStoreHandle:
     def relationships_at_versions(self, refs):
         return self.session.relationships_at_versions(self._require(), list(refs))
 
-    def selected_inputs(self, refs, position, relationship_refs=None):
+    def selected_inputs(self, refs, position, relationship_refs=None, slice_size=None, on_slice=None):
         return self.session.selected_inputs(
             self._require(), list(refs), position,
-            None if relationship_refs is None else list(relationship_refs))
+            None if relationship_refs is None else list(relationship_refs), slice_size, on_slice)
 
     def select_objects(self, object_kind=None, tag=None, object_uuids=(), fields=None, include_retired=False,
                        limit=None):

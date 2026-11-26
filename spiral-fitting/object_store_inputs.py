@@ -838,26 +838,22 @@ def _cut_track_revision(revision, shared):
 
 
 def _read_selected_inputs(store, refs, tracks, position):
-    """``store.selected_inputs`` of ``refs`` at ``position``, the tracks read
-    TRACK_READ_BATCH at a time with their revisions cut (_cut_track_revision).
-    Everything else, and the relationships of every object but a track, is
-    read in one call as before; the tracks enumerate none."""
+    """``store.selected_inputs`` of ``refs`` at ``position``: one native read,
+    which validates every object against the one position. Its objects come
+    to ``cut`` TRACK_READ_BATCH at a time, inside the read, and each track is
+    cut (_cut_track_revision) as its slice arrives, so the whole records of
+    all tracks never exist in Python together. The relationships of every
+    object but a track are enumerated; the tracks enumerate none."""
     if not tracks:
         return store.selected_inputs(refs, position.provenance())
-    others = [ref for ref in refs if ref['object'] not in tracks]
-    captured = (store.selected_inputs(others, position.provenance(), relationship_refs=others)
-                if others else {'objects': [], 'relationships': []})
-    captured = {**captured, 'objects': list(captured['objects']),
-                'track_datasets': dict(captured.get('track_datasets') or {})}
     shared = {}
-    wanted = [ref for ref in refs if ref['object'] in tracks]
-    for start in range(0, len(wanted), TRACK_READ_BATCH):
-        part = store.selected_inputs(wanted[start:start + TRACK_READ_BATCH],
-                                     position.provenance(), relationship_refs=[])
-        captured['objects'].extend(_cut_track_revision(revision, shared)
-                                   for revision in part['objects'])
-        captured['track_datasets'].update(part.get('track_datasets') or {})
-    return captured
+
+    def cut(part):
+        return [_cut_track_revision(revision, shared) if revision['object_uuid'] in tracks else revision
+                for revision in part]
+    return store.selected_inputs(
+        refs, position.provenance(), slice_size=TRACK_READ_BATCH, on_slice=cut,
+        relationship_refs=[ref for ref in refs if ref['object'] not in tracks])
 
 
 def read_snapshot(store, request, selected=None):
@@ -870,11 +866,11 @@ def read_snapshot(store, request, selected=None):
     object is read at the version the selection resolved it at
     (objects_at_versions), and the relationships between those versions
     (relationships_at_versions) are guarded against moving overlay membership.
-    Native reads (selected_inputs) validate and return the objects: one for
-    all but the tracks, then one per TRACK_READ_BATCH tracks. Of the tracks
-    they enumerate no relationship (``relationship_refs``), since the fit
-    computes their crossings itself, and report each track's dataset as the
-    store resolves it.
+    One native read (selected_inputs) validates and returns every object, the
+    tracks cut down as they arrive (_read_selected_inputs). Of the tracks it
+    enumerates no relationship (``relationship_refs``), since the fit
+    computes their crossings itself, and it reports each track's dataset as
+    the store resolves it.
     Every selected object must declare a frame in the fit volume; all frame
     problems are reported together. The selected outer shell is
     read alongside, in the same volume, but is not among ``objects``.

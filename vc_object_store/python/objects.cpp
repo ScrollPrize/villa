@@ -35,6 +35,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/FiberJson.hpp"
 #include <mutex>
+#include <set>
 #include "vc_reader/zarr.hpp"
 using namespace vc::python;
 namespace {
@@ -92,19 +93,55 @@ nb::list relationshipsToPy(const std::vector<vo::SelectedRelationship>& selected
     }
     return result;
 }
+// Millions of tracks name a handful of datasets: one str per dataset.
+void trackDatasetsToPy(const vo::SelectedInputs& selected, nb::dict& datasets)
+{
+    std::vector<nb::str> names;
+    for (const auto& dataset : selected.trackDatasets.datasets) names.emplace_back(dataset.c_str(), dataset.size());
+    for (size_t index = 0; index < selected.trackDatasets.objects.size(); ++index)
+        if (const auto dataset = selected.trackDatasets.objects[index]; dataset >= 0)
+            datasets[selected.objects[index].objectUuid.c_str()] = names[size_t(dataset)];
+}
 nb::dict selectedInputsToPy(const vo::SelectedInputs& selected)
 {
     nb::list objects;
     for (const auto& object : selected.objects) objects.append(objectRevisionToPy(object));
     nb::dict result; result["objects"] = objects; result["relationships"] = relationshipsToPy(selected.relationships);
-    // Millions of tracks name a handful of datasets: one str per dataset.
-    std::vector<nb::str> names;
-    for (const auto& dataset : selected.trackDatasets.datasets) names.emplace_back(dataset.c_str(), dataset.size());
     nb::dict datasets;
-    for (size_t index = 0; index < selected.trackDatasets.objects.size(); ++index)
-        if (const auto dataset = selected.trackDatasets.objects[index]; dataset >= 0)
-            datasets[selected.objects[index].objectUuid.c_str()] = names[size_t(dataset)];
+    trackDatasetsToPy(selected, datasets);
     result["track_datasets"] = datasets;
+    return result;
+}
+// Objects handed to `onSlice` at most `sliceSize` at a time, each slice as Python records that are freed natively
+// once converted; what it returns (a list) is kept, in order. A million tracks converted at once hold every stored
+// record as Python objects beside the native ones; a caller that keeps only part of each cuts every slice before the
+// next is converted. `seen` guards one selection over reads.
+void handOverInSlices(std::vector<vo::ObjectRevision>& objects, size_t sliceSize, const nb::object& onSlice,
+                      nb::list& kept, std::set<std::string>& seen)
+{
+    for (size_t at = 0; at < objects.size();) {
+        nb::list slice;
+        for (const size_t end = std::min(objects.size(), at + sliceSize); at < end; ++at) {
+            if (!seen.insert(objects[at].objectUuid).second)
+                throw std::invalid_argument("object history: object selected twice: " + objects[at].objectUuid);
+            slice.append(objectRevisionToPy(objects[at]));
+            objects[at] = {};
+        }
+        const nb::object returned = onSlice(slice);
+        if (!nb::isinstance<nb::list>(returned)) throw nb::type_error("selected_inputs: on_slice must return a list");
+        for (const auto item : returned) kept.append(item);
+    }
+}
+// The result of one read of everything (a served store's reply), its objects handed over slice by slice.
+nb::dict selectedInputsToPy(vo::SelectedInputs& selected, size_t sliceSize, const nb::object& onSlice)
+{
+    nb::dict result; result["relationships"] = relationshipsToPy(selected.relationships);
+    nb::dict datasets;
+    trackDatasetsToPy(selected, datasets);  // before the objects are released
+    result["track_datasets"] = datasets;
+    nb::list kept; std::set<std::string> seen;
+    handOverInSlices(selected.objects, sliceSize, onSlice, kept, seen);
+    result["objects"] = kept;
     return result;
 }
 // Convert native results after the transaction (and any GIL release) ends.
@@ -119,17 +156,74 @@ const char* const kSelectedInputsDoc =
     "The objects at these numbered references with the relationships among them, and each selected track's "
     "dataset ('track_datasets': {uuid: dataset}), guarded against a store that moved from `position`. "
     "`relationship_refs`, a subset of `refs`, limits the relationships to those of these objects "
-    "(None: of all of them); every object is validated and returned either way.";
-template<class Read>
-nb::dict readSelectedInputs(const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs, Read&& read)
+    "(None: of all of them); every object is validated and returned either way. With `slice_size` and `on_slice`, "
+    "the objects reach `on_slice(list)` at most `slice_size` at a time, and 'objects' is the lists it returned, "
+    "joined in order: its records need not exist at once. A store opened here reads them inside the one read "
+    "(`relationship_refs`, required then, are read first, with their relationships); a served store's reply is one "
+    "response, handed over in slices. `on_slice` runs inside the read, so it must not read the same store when the "
+    "store was opened with a single reader.";
+void checkSlicing(const std::optional<size_t>& sliceSize, const nb::object& onSlice)
 {
+    if (onSlice.is_none() != !sliceSize)
+        throw std::invalid_argument("selected_inputs: slice_size and on_slice are given together or not at all");
+    if (!onSlice.is_none() && !PyCallable_Check(onSlice.ptr())) throw nb::type_error("selected_inputs: on_slice must be callable");
+}
+template<class Read>
+nb::dict readSelectedInputs(const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs,
+                            const std::optional<size_t>& sliceSize, const nb::object& onSlice, Read&& read)
+{
+    checkSlicing(sliceSize, onSlice);
     const auto versions = objectVersionsFromPy(refs);
     const auto snapshot = vo::detail::storePositionFrom(nlohmann::json::parse(jsonDumps(position)));
     std::optional<std::vector<vo::ObjectVersion>> subset;
     if (!relationshipRefs.is_none()) subset = objectVersionsFromPy(relationshipRefs);
     vo::SelectedInputs result;
     { nb::gil_scoped_release release; result = read(versions, snapshot, subset); }
-    return selectedInputsToPy(result);
+    if (onSlice.is_none()) return selectedInputsToPy(result);
+    return selectedInputsToPy(result, std::max<size_t>(*sliceSize, 1), onSlice);
+}
+
+// selected_inputs with on_slice for a store of this process: all inside this one call, the read a local variable
+// of it, the GIL held throughout. The objects of `relationship_refs` are read first with their relationships,
+// then the others `sliceSize` at a time, each read from the same transaction: one position, one snapshot, as if
+// all had been read at once, without their native records existing at once.
+nb::dict readSelectedInputsInSlices(PyObjectStore& self, const nb::list& refs, const nb::dict& position,
+                                    const nb::object& relationshipRefs, const std::optional<size_t>& sliceSize,
+                                    const nb::object& onSlice)
+{
+    checkSlicing(sliceSize, onSlice);
+    if (relationshipRefs.is_none())
+        throw std::invalid_argument("selected_inputs: on_slice on a store opened here needs relationship_refs");
+    self.require();
+    const auto lease = self.db;
+    const size_t step = std::max<size_t>(*sliceSize, 1);
+    const auto versions = objectVersionsFromPy(refs);
+    const auto snapshot = vo::detail::storePositionFrom(nlohmann::json::parse(jsonDumps(position)));
+    const auto subset = objectVersionsFromPy(relationshipRefs);
+    std::set<std::string> related;
+    for (const auto& ref : subset) related.insert(ref.objectUuid);
+    std::vector<vo::ObjectVersion> first, rest;
+    for (const auto& ref : versions) (related.contains(ref.objectUuid) ? first : rest).push_back(ref);
+    nb::dict result, datasets; nb::list kept; std::set<std::string> seen;
+    // Waiting for a pooled reader gives the GIL up (a thread that waits holding it would stop the reader
+    // it waits for from finishing); nothing that touches a Python object runs in this scope.
+    auto txn = [&] { nb::gil_scoped_release release; return lease->read(); }();
+    const vo::LocalStoreReader reader(*lease, txn);
+    {
+        auto read = reader.selectedInputs(first, snapshot, subset);
+        result["relationships"] = relationshipsToPy(read.relationships);
+        trackDatasetsToPy(read, datasets);
+        handOverInSlices(read.objects, step, onSlice, kept, seen);
+    }
+    for (size_t at = 0; at < rest.size(); at += step) {
+        const std::vector<vo::ObjectVersion> part(rest.begin() + at, rest.begin() + std::min(rest.size(), at + step));
+        auto read = reader.selectedInputs(part, snapshot, std::vector<vo::ObjectVersion>{});
+        trackDatasetsToPy(read, datasets);
+        handOverInSlices(read.objects, step, onSlice, kept, seen);
+    }
+    result["track_datasets"] = datasets;
+    result["objects"] = kept;
+    return result;
 }
 
 std::optional<vo::ObjectVersion> optionalObjectVersionFromPy(const nb::object& reference)
@@ -612,10 +706,11 @@ void bindHostedStore(nb::module_& m)
             { nb::gil_scoped_release release; history = self.objectHistory(uuid, nullptr, ifRetained); }
             return toPy(history);
         }, nb::arg("object_uuid"), nb::arg("if_retained") = false)
-        .def("selected_inputs", [](Hosted& self, const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs) {
-            return readSelectedInputs(refs, position, relationshipRefs, [&](const auto& versions, const auto& snapshot, const auto& subset) {
+        .def("selected_inputs", [](Hosted& self, const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs,
+                                   const std::optional<size_t>& sliceSize, const nb::object& onSlice) {
+            return readSelectedInputs(refs, position, relationshipRefs, sliceSize, onSlice, [&](const auto& versions, const auto& snapshot, const auto& subset) {
                 return self.selectedInputs(versions, snapshot, subset); });
-        }, nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), kSelectedInputsDoc)
+        }, nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), nb::arg("slice_size") = nb::none(), nb::arg("on_slice") = nb::none(), kSelectedInputsDoc)
         .def("relationships_at_versions", [](Hosted& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<vo::SelectedRelationship> revisions;
@@ -795,14 +890,14 @@ void bindSessionOperations(nb::class_<vo::ObjectStoreSession> session)
         }, nb::arg("attachment"), nb::arg("revision_uuid"), nb::arg("array_name"),
            "Per-point annotations of a sequence array (as ObjectStore.geometry_point_annotations).")
         .def("selected_inputs", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs, const nb::dict& position,
-                                   const nb::object& relationshipRefs) {
-            return readSelectedInputs(refs, position, relationshipRefs, [&](const auto& versions, const auto& snapshot, const auto& subset) {
+                                   const nb::object& relationshipRefs, const std::optional<size_t>& sliceSize, const nb::object& onSlice) {
+            return readSelectedInputs(refs, position, relationshipRefs, sliceSize, onSlice, [&](const auto& versions, const auto& snapshot, const auto& subset) {
                 vo::SelectedInputs result;
                 self.readStore(attachment, [&](const vo::StoreReader& reader, const auto&) {
                     result = reader.selectedInputs(versions, snapshot, subset); });
                 return result;
             });
-        }, nb::arg("attachment"), nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), kSelectedInputsDoc)
+        }, nb::arg("attachment"), nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), nb::arg("slice_size") = nb::none(), nb::arg("on_slice") = nb::none(), kSelectedInputsDoc)
         .def("relationships_at_versions", [](Session& self, const vo::AttachmentIdentity& attachment, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             std::vector<vo::SelectedRelationship> revisions;
@@ -1763,14 +1858,16 @@ NB_MODULE(_native, m)
             const auto versions = objectVersionsFromPy(refs);
             return toPy(self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectsAtVersions(txn, versions); }));
         }, nb::arg("refs"), "Numbered references {store, generation, object, version}, answered in order (None where not recorded).")
-        .def("selected_inputs", [](PyObjectStore& self, const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs) {
+        .def("selected_inputs", [](PyObjectStore& self, const nb::list& refs, const nb::dict& position, const nb::object& relationshipRefs,
+                                   const std::optional<size_t>& sliceSize, const nb::object& onSlice) {
+            if (!onSlice.is_none()) return readSelectedInputsInSlices(self, refs, position, relationshipRefs, sliceSize, onSlice);
             return self.withStore([&](auto& db) {
-                return readSelectedInputs(refs, position, relationshipRefs, [&](const auto& versions, const auto& snapshot, const auto& subset) {
+                return readSelectedInputs(refs, position, relationshipRefs, sliceSize, onSlice, [&](const auto& versions, const auto& snapshot, const auto& subset) {
                     auto txn = db.read();
                     return vo::LocalStoreReader(db, txn).selectedInputs(versions, snapshot, subset);
                 });
             });
-        }, nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), kSelectedInputsDoc)
+        }, nb::arg("refs"), nb::arg("position"), nb::arg("relationship_refs") = nb::none(), nb::arg("slice_size") = nb::none(), nb::arg("on_slice") = nb::none(), kSelectedInputsDoc)
         .def("relationships_at_versions", [](PyObjectStore& self, const nb::list& refs) {
             const auto versions = objectVersionsFromPy(refs);
             const auto revisions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.relationshipsAt(txn, versions); });

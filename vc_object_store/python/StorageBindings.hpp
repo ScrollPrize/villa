@@ -373,7 +373,13 @@ struct PyObjectStore {
     auto withRead(Fn&& fn)
     {
         return withStore<ReleaseGil>([&](auto& store) {
-            auto txn = store.read();
+            // Waiting for a pooled reader gives the GIL up when it is held here: a thread that waits holding it
+            // stops the reader it waits for (a sliced selected_inputs, inside on_slice) from finishing. Nothing
+            // that touches a Python object runs in that scope; fn runs with the GIL exactly as before.
+            auto txn = [&] {
+                if constexpr (ReleaseGil) { return store.read(); }
+                else { nb::gil_scoped_release release; return store.read(); }
+            }();
             return fn(store, txn);
         });
     }

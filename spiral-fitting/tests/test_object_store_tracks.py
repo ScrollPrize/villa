@@ -306,10 +306,10 @@ class _Recording:
     def __getattr__(self, name):
         return getattr(self._store, name)
 
-    def selected_inputs(self, refs, position, relationship_refs=None):
+    def selected_inputs(self, refs, position, relationship_refs=None, **options):
         self.endpoints.update(
             ref['object'] for ref in (refs if relationship_refs is None else relationship_refs))
-        return self._store.selected_inputs(refs, position, relationship_refs)
+        return self._store.selected_inputs(refs, position, relationship_refs, **options)
 
     def relationships_at_versions(self, refs):
         self.endpoints.update(ref['object'] for ref in refs)
