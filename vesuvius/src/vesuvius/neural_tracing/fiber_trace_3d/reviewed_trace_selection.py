@@ -20,6 +20,10 @@ SCHEMA_VERSION = 1
 
 
 def _fsync_directory(path: Path) -> None:
+    # Windows cannot open a directory with os.open (EACCES); its os.replace
+    # needs no directory flush.
+    if os.name == "nt":
+        return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
@@ -244,7 +248,8 @@ def _save_checkpoint(destination: Path, payload: Mapping[str, Any]) -> None:
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     try:
         torch.save(payload, temporary)
-        with temporary.open("rb") as stream:
+        # Windows flushes only handles opened for writing (EBADF otherwise).
+        with temporary.open("r+b") as stream:
             os.fsync(stream.fileno())
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
