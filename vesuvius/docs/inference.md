@@ -169,6 +169,7 @@ vesuvius.blend_logits /tmp/logits /tmp/merged_logits.zarr \
 | `--num_workers` | Number of worker processes. Defaults to `CPU_COUNT - 1`.
 | `--compression_level` | Zarr compression level (0–9, default `1`).
 | `--quiet` | Suppress verbose logging.
+| `--patch_cache_mb` | Memory (MiB) each worker may use to reuse decoded patches across neighbouring chunks, e.g. `256` (default `0`, off). The output is the same either way.
 
 The merged logits retain the same class/channel dimension as the individual parts.
 

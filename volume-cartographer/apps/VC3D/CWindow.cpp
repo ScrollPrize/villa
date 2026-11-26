@@ -2427,6 +2427,9 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId)
     if (_projectWorkspace) {
         _projectWorkspace->refresh();
     }
+    if (_lineAnnotationController) {
+        _lineAnnotationController->syncAnnotationInputsWithProject();
+    }
 }
 
 void CWindow::updateNormalGridAvailability()

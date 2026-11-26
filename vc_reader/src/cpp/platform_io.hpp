@@ -7,6 +7,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "utf8_path.hpp"
 
 #include <cerrno>
 #include <cstddef>

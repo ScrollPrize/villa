@@ -16,6 +16,7 @@
 
 #include "../disk_cache.hpp"
 #include "../output_pool.hpp"
+#include "../utf8_path.hpp"
 #include "../reader_types.hpp"
 #include "../sigv4.hpp"
 
@@ -203,7 +204,7 @@ void EncodedFiles::close()
     process();
     if (!temporary_.empty()) {
         std::error_code ignored;
-        fs::remove_all(temporary_, ignored);
+        fs::remove_all(utf8Path(temporary_), ignored);
         temporary_.clear();
     }
 }
@@ -255,7 +256,7 @@ zarr::OpenOptions EncodedFiles::resolve(const std::string& location, std::vector
         std::string path = dir;
         if (path.starts_with("~/"))
             if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
-        roots.push_back(fs::weakly_canonical(path));
+        roots.push_back(fs::weakly_canonical(utf8Path(path)));
     }
     return options;
 }
@@ -325,10 +326,10 @@ EncodedFiles::Ranges EncodedFiles::readRanges(const std::string& location,
         std::string path = location;
         if (path.starts_with("~/") || path == "~")
             if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
-        const int fd = platform::open_file(path, O_RDONLY);
+        const int fd = platform::open_file(utf8Path(path), O_RDONLY);
         if (fd < 0) {
             if (errno == ENOENT || errno == ENOTDIR) throw zarr::NotFound(path + ": no such file");
-            throw fs::filesystem_error("open", path, std::error_code(errno, std::generic_category()));
+            throw fs::filesystem_error("open", utf8Path(path), std::error_code(errno, std::generic_category()));
         }
         inPlace(fd, path);
         return out;
@@ -337,7 +338,7 @@ EncodedFiles::Ranges EncodedFiles::readRanges(const std::string& location,
     const auto options = resolve(location, roots);
     {
         std::lock_guard guard(mutex_);
-        if (!temporary_.empty()) roots.emplace_back(temporary_);
+        if (!temporary_.empty()) roots.push_back(utf8Path(temporary_));
     }
     for (const auto& root : roots) {
         const auto path = zarr::decodedCachePath(root, location);
@@ -346,7 +347,7 @@ EncodedFiles::Ranges EncodedFiles::readRanges(const std::string& location,
             if (errno == ENOENT || errno == ENOTDIR) continue;
             throw fs::filesystem_error("open", path, std::error_code(errno, std::generic_category()));
         }
-        inPlace(fd, path.string());
+        inPlace(fd, utf8String(path));
         std::lock_guard guard(mutex_);
         ++cacheHits_;
         return out;
@@ -420,9 +421,9 @@ bool EncodedFiles::chargeFile(const std::string& location, const std::string& pa
     std::vector<fs::path> roots;
     const auto options = resolve(location, roots);
     if (roots.empty() || !options.cacheWrites) return true;
-    auto budget = zarr::diskBudget(roots.front().string(), options.cacheMaxBytes);
+    auto budget = zarr::diskBudget(utf8String(roots.front()), options.cacheMaxBytes);
     if (options.cacheMinFreeBytes) budget->set_min_free_bytes(*options.cacheMinFreeBytes);
-    return budget->account_file(fs::weakly_canonical(path).string(), bytes);
+    return budget->account_file(utf8String(fs::weakly_canonical(utf8Path(path))), bytes);
 }
 
 EncodedFiles::Opened EncodedFiles::open(const std::string& location)
@@ -431,16 +432,16 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
         std::string path = location;
         if (path.starts_with("~/") || path == "~")
             if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
-        const int fd = platform::open_file(path, O_RDONLY);
+        const int fd = platform::open_file(utf8Path(path), O_RDONLY);
         if (fd < 0) {
             if (errno == ENOENT || errno == ENOTDIR) throw zarr::NotFound(path + ": no such file");
-            throw fs::filesystem_error("open", path, std::error_code(errno, std::generic_category()));
+            throw fs::filesystem_error("open", utf8Path(path), std::error_code(errno, std::generic_category()));
         }
         Opened opened(fd, {});
         platform::FileStat st;
-        if (platform::fstat(fd, st) != 0) throw fs::filesystem_error("fstat", path, std::error_code(errno, std::generic_category()));
-        if (st.directory) throw fs::filesystem_error("open", path, std::make_error_code(std::errc::is_a_directory));
-        opened.token = fs::absolute(path).string() + "|" + std::to_string(st.device) + "|" + std::to_string(st.inode) + "|" + std::to_string(st.size) + "|" +
+        if (platform::fstat(fd, st) != 0) throw fs::filesystem_error("fstat", utf8Path(path), std::error_code(errno, std::generic_category()));
+        if (st.directory) throw fs::filesystem_error("open", utf8Path(path), std::make_error_code(std::errc::is_a_directory));
+        opened.token = utf8String(fs::absolute(utf8Path(path))) + "|" + std::to_string(st.device) + "|" + std::to_string(st.inode) + "|" + std::to_string(st.size) + "|" +
                        std::to_string(st.modified.seconds) + "." + std::to_string(st.modified.nanoseconds) + "|" +
                        std::to_string(st.changed.seconds) + "." + std::to_string(st.changed.nanoseconds);
         return opened;
@@ -452,7 +453,7 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
     lookIn = roots;
     {
         std::lock_guard guard(mutex_);
-        if (!temporary_.empty()) lookIn.emplace_back(temporary_);
+        if (!temporary_.empty()) lookIn.push_back(utf8Path(temporary_));
     }
     for (const auto& root : lookIn) {
         const auto path = zarr::decodedCachePath(root, location);
@@ -477,15 +478,15 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
         limit = limit.value_or(std::int64_t{1} << 30);
         std::lock_guard guard(mutex_);
         if (temporary_.empty()) {
-            temporary_ = platform::make_temp_directory((fs::temp_directory_path() / "vc-reader-images-XXXXXX").string());
+            temporary_ = platform::make_temp_directory(utf8String(fs::temp_directory_path() / "vc-reader-images-XXXXXX"));
         }
-        root = temporary_;
+        root = utf8Path(temporary_);
     }
     // No limit reuses the directory's configured one, unlimited for a new directory; it
     // never resets another reader's explicit budget.
-    auto budget = zarr::diskBudget(root.string(), limit);
+    auto budget = zarr::diskBudget(utf8String(root), limit);
     if (options.cacheMinFreeBytes) budget->set_min_free_bytes(*options.cacheMinFreeBytes);
-    auto [fd, received] = budget->open_file(zarr::decodedCachePath(root, location).string(), options.access.url(location), options.access.auth);
+    auto [fd, received] = budget->open_file(utf8String(zarr::decodedCachePath(root, location)), options.access.url(location), options.access.auth);
     {
         std::lock_guard guard(mutex_);
         bytesRead_ += received;

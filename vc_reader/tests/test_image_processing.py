@@ -17,6 +17,10 @@ def _torch_tensor_reference(image, sigma, rho):
     """Full convolutions provide an independent reference for separable native passes."""
     import torch
     import torch.nn.functional as F
+
+    # Keep reference convolutions and their gradients off cuDNN's TF32 path.
+    device = image.device
+    image = image.cpu()
     dim = image.ndim - 2
     conv = F.conv2d if dim == 2 else F.conv3d
     def smooth(value, width):
@@ -41,7 +45,8 @@ def _torch_tensor_reference(image, sigma, rho):
         if dim == 3:
             kernel = kernel[:, :, None] * taps[2][None, None, :]
         gradients.append(conv(image, kernel[None, None], padding=tuple(len(t)//2 for t in taps)))
-    return smooth(torch.cat([gradients[a] * gradients[b] for a in range(dim) for b in range(a, dim)], dim=1), rho)
+    products = torch.cat([gradients[a] * gradients[b] for a in range(dim) for b in range(a, dim)], dim=1)
+    return smooth(products, rho).to(device)
 
 
 @pytest.mark.parametrize("dim", [2, 3])

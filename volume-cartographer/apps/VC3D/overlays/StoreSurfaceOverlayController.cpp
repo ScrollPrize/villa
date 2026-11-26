@@ -13,6 +13,7 @@
 
 #include <QGraphicsView>
 #include <QPainterPath>
+#include <QVariant>
 #include <algorithm>
 #include <cmath>
 #include <utility>

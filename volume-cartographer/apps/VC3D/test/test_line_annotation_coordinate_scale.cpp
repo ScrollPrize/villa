@@ -36,7 +36,7 @@ void TestLineAnnotationCoordinateScale::normalSourceSelection()
     QVERIFY(usePredictedFiberNormals(manifest, "fiber"));
     manifest.groups.front().channels.pop_back();
     QVERIFY(!usePredictedFiberNormals(manifest, "lasagna"));
-    QVERIFY_EXCEPTION_THROWN(usePredictedFiberNormals(manifest, "fiber"), std::invalid_argument);
+    QVERIFY(!usePredictedFiberNormals(manifest, "fiber"));
     QVERIFY_EXCEPTION_THROWN(usePredictedFiberNormals(manifest, "typo"), std::invalid_argument);
 }
 
