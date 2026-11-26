@@ -281,6 +281,14 @@ def test_cpu_device_writes_the_same_store_as_cuda_workers(run, tmp_path):
         np.testing.assert_array_equal(cpu_arrays[key], cuda_arrays[key])
 
 
+def test_cpu_resume_recomputes_bf16_cuda_parts(run, tmp_path):
+    with pytest.raises(ValueError, match="simulated interruption"):
+        run(tmp_path / "direct", "--spiral-supervision-only", fail_at=40)
+    extracted = run(tmp_path / "direct", "--spiral-supervision-only",
+                    "--device", "cpu", gpus=None)
+    assert sorted(extracted) == list(range(NUM_RAYS))
+
+
 def test_worker_device_follows_the_device_option():
     def args(device):
         return types.SimpleNamespace(device=device)

@@ -1692,6 +1692,9 @@ def _prepare_spiral_supervision(args, rays, model_cfg):
         "num_slabs": int(total),
         "seed_rays_sha256": seed_digest.hexdigest(),
     }
+    if getattr(args, "device", "cuda") != "cuda":
+        # Resume must not mix parts decoded on different backends.
+        attributes["device"] = args.device
     identity = _canonical_digest(attributes)
     name = "shard_0"
     signature = {
@@ -2776,7 +2779,10 @@ def _aggregate_winding_cuda(keys, totals, maxima):
     maxima = torch.cat(maxima)
     keys, order = torch.sort(keys)
     totals, maxima = totals[order], maxima[order]
-    unique, inverse = torch.unique_consecutive(keys, return_inverse=True)
+    # Not unique_consecutive: on MPS it narrows int64 keys to int32.
+    first = torch.ones_like(keys, dtype=torch.bool)
+    first[1:] = keys[1:] != keys[:-1]
+    unique, inverse = keys[first], torch.cumsum(first, 0) - 1
     out_total = torch.zeros(
         len(unique), dtype=torch.float32, device=keys.device)
     out_max = torch.zeros(

@@ -506,7 +506,13 @@ def accumulate_registration(archive, plan, blocks, patch_grid, num_patches,
         omega = joined["omega"][selected]
         winding = joined["winding"][selected]
         xyz = joined["xyz"][selected]
-        unique, inverse = torch.unique(key, return_inverse=True)
+        # Not torch.unique: on MPS it narrows int64 keys to int32.
+        sorted_key, order = torch.sort(key)
+        first = torch.ones_like(sorted_key, dtype=torch.bool)
+        first[1:] = sorted_key[1:] != sorted_key[:-1]
+        unique = sorted_key[first]
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.cumsum(first, 0) - 1
         stats = torch.zeros((len(unique), 6), device=device)
         columns = torch.stack([
             omega, omega * winding, omega * winding * winding,
