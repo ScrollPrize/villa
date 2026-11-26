@@ -1,0 +1,303 @@
+#!/bin/bash
+# Install the Python tools for VC3D's Spiral, Lasagna, sheet-strip and fibre-follow features on an Apple-silicon Mac.
+#
+# VC3D for Mac ships this script inside the app and runs it when you click Install, the first time a feature needs the
+# tools or from Help > Install or Update Python Tools. To run it yourself: bash VC3D-macos-python-tools.sh. It needs no
+# administrator password, compiler, Xcode, Homebrew or conda: it downloads a pinned copy of uv, which installs Python
+# 3.14 and three environments from prebuilt packages.
+# Everything goes into one folder:
+#   ~/Library/Application Support/Vesuvius Challenge/VC3D/python-tools
+#     bin/uv          the package installer
+#     python/         Python 3.14
+#     envs/spiral     Spiral fitting and track extraction
+#     envs/lasagna    Lasagna surface fits
+#     envs/vesuvius   sheet strips, fibre follow, fibre collections and the neural tracer
+#     villa/          the villa sources the tools run from
+# VC3D finds these environments on its own. Running this again checks what is already installed and only redoes what
+# changed. To remove everything, delete that folder.
+#
+# The prebuilt packages come from the GitHub release that carries this build: the latest or stable release it was
+# published in, or, once those tags have moved on, the release they left behind. Release files in the folder this
+# installer is in (a downloaded copy of the whole release) are used instead of downloading them; each must still match
+# its checksum.
+#
+# Environment overrides (for testing): VC3D_PYTHON_TOOLS sets the install folder, VC3D_TOOLS_ASSETS another local
+# folder holding the release files.
+set -Eeuo pipefail
+
+# only the system's own tools: a Homebrew, conda or pyenv command must never be picked up
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+unset PYTHONPATH PYTHONHOME VIRTUAL_ENV CONDA_PREFIX UV_PYTHON UV_INDEX_URL UV_EXTRA_INDEX_URL PIP_INDEX_URL
+unset CC CXX CFLAGS CXXFLAGS LDFLAGS
+
+# the repository whose releases carry this build's files
+REPOSITORY=@REPOSITORY@
+VILLA_COMMIT=@VILLA_COMMIT@
+# which build of that commit's wheels and locks: builds of one commit hold different bytes, and this installer has only
+# its own build's checksums, so its source tarball is named for both
+TOOLS_BUILD=@TOOLS_BUILD@
+# the oldest macOS the prebuilt packages and the libraries inside them are built for
+MIN_MACOS=@MIN_MACOS@
+PYTHON_VERSION=3.14.10
+UV_VERSION=0.13.8
+UV_URL=https://github.com/astral-sh/uv/releases/download/$UV_VERSION/uv-aarch64-apple-darwin.tar.gz
+UV_SHA256=6b71028a6b904f2ae3340ef52e595512de807d06c0a20eaef2f692581b246558
+# sha256 and name of every release file this installer uses
+ASSETS=$(cat <<'EOF'
+@ASSETS@
+EOF
+)
+ENVS=(spiral lasagna vesuvius)
+
+ROOT=${VC3D_PYTHON_TOOLS:-"$HOME/Library/Application Support/Vesuvius Challenge/VC3D/python-tools"}
+LOCAL_ASSETS=${VC3D_TOOLS_ASSETS:-$(cd "$(/usr/bin/dirname "$0")" && pwd)}
+DOWNLOADS=$ROOT/downloads
+step() { printf '\n==> %s\n' "$*"; }
+fail() { printf '\nInstall failed: %s\n' "$*" >&2; exit 1; }
+trap 'fail "the command on line $LINENO stopped with status $?. Run this installer again to retry; finished steps are kept."' ERR
+
+sha256() { /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'; }
+asset_sha256() { printf '%s\n' "$ASSETS" | /usr/bin/awk -v name="$1" '$2 == name {print $1}'; }
+assets_matching() { printf '%s\n' "$ASSETS" | /usr/bin/awk -v pattern="$1" '$2 ~ pattern {print $2}'; }
+
+# the release download URL that holds this build's files, set by find_release
+RELEASE=
+# The latest and stable releases are replaced as their tags move on, and the release a tag leaves behind keeps its
+# files under a vc3d-archive-* tag. So look for this build's source tarball under latest, then stable, then in every
+# release through the GitHub API
+find_release() {
+  [ -z "$RELEASE" ] || return 0
+  local base=https://github.com/$REPOSITORY/releases/download tag
+  for tag in latest stable; do
+    if /usr/bin/curl --location --silent --fail --range 0-0 --output /dev/null "$base/$tag/$source_tarball"; then
+      RELEASE=$base/$tag
+      return 0
+    fi
+  done
+  printf '    looking for the release with %s\n' "$source_tarball"
+  tag=$("$PYTHON" -I - "$REPOSITORY" "$source_tarball" <<'PY'
+# Print the tag of the release that has an asset with this name, searching the newest 1000 releases
+import json
+import sys
+import urllib.request
+
+repository, asset = sys.argv[1:]
+for page in range(1, 11):
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repository}/releases?per_page=100&page={page}",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "vc3d-python-tools-installer"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            releases = json.load(response)
+    except OSError as error:
+        sys.exit(f"    {error}")
+    for release in releases:
+        if any(a["name"] == asset for a in release.get("assets", [])):
+            print(release["tag_name"])
+            sys.exit()
+    if len(releases) < 100:
+        break
+PY
+  ) || fail "couldn't list the releases of $REPOSITORY. Check the internet connection and install again; finished steps are kept."
+  [ -n "$tag" ] || fail "no release of $REPOSITORY has the files for this build ($source_tarball). They may not be published yet."
+  RELEASE=$base/$tag
+}
+
+# fetch NAME URL SHA256: DOWNLOADS/NAME with that checksum, downloaded only when missing or different. An empty URL
+# means the file is in this build's release
+fetch() {
+  local name=$1 url=$2 want=$3 file=$DOWNLOADS/$1
+  [ -n "$want" ] || fail "no checksum for $name"
+  if [ -f "$file" ] && [ "$(sha256 "$file")" = "$want" ]; then
+    return
+  fi
+  if [ -f "$LOCAL_ASSETS/$name" ]; then
+    /bin/cp "$LOCAL_ASSETS/$name" "$file.part"
+  else
+    if [ -z "$url" ]; then
+      find_release
+      url=$RELEASE/$name
+    fi
+    printf '    downloading %s\n' "$name"
+    local code
+    # the HTTP status, so a missing file reads as such rather than as curl's exit status
+    if ! code=$(/usr/bin/curl --location --silent --show-error --retry 3 --write-out '%{http_code}' \
+      --output "$file.part" "$url"); then
+      /bin/rm -f "$file.part"
+      fail "couldn't download $name from $url. Check the internet connection and install again; finished steps are kept."
+    fi
+    case $code in
+      2??) ;;
+      404)
+        /bin/rm -f "$file.part"
+        fail "couldn't download $name from $url (HTTP 404). The release files for this build may not be published yet." ;;
+      *)
+        /bin/rm -f "$file.part"
+        fail "couldn't download $name from $url (HTTP $code). Install again later; finished steps are kept." ;;
+    esac
+  fi
+  [ "$(sha256 "$file.part")" = "$want" ] || { /bin/rm -f "$file.part"; fail "$name does not match its checksum"; }
+  /bin/mv "$file.part" "$file"
+}
+fetch_asset() { fetch "$1" "" "$(asset_sha256 "$1")"; }
+
+step "Checking this Mac"
+[ "$(/usr/bin/uname -m)" = arm64 ] || fail "these tools need an Apple-silicon Mac (M1 or later)"
+macos=$(/usr/bin/sw_vers -productVersion)
+/usr/bin/awk -v v="$macos" -v min="$MIN_MACOS" \
+  'BEGIN { split(v, p, "."); split(min, m, "."); exit !(p[1] * 100 + p[2] >= m[1] * 100 + m[2]) }' \
+  || fail "these tools need macOS $MIN_MACOS or later; this Mac has $macos"
+echo "    macOS $macos on Apple silicon; installing into $ROOT"
+/bin/mkdir -p "$ROOT/bin" "$DOWNLOADS"
+
+step "Getting uv $UV_VERSION"
+fetch uv-aarch64-apple-darwin.tar.gz "$UV_URL" "$UV_SHA256"
+if [ ! -x "$ROOT/bin/uv" ] || [ "$("$ROOT/bin/uv" --version | /usr/bin/awk '{print $2}')" != "$UV_VERSION" ]; then
+  /usr/bin/tar -xzf "$DOWNLOADS/uv-aarch64-apple-darwin.tar.gz" -C "$ROOT/bin" --strip-components 1 \
+    uv-aarch64-apple-darwin/uv
+fi
+UV=$ROOT/bin/uv
+"$UV" --version
+
+# uv keeps everything inside ROOT and ignores any uv or pip configuration elsewhere on this Mac
+export UV_NO_CONFIG=1 UV_CACHE_DIR=$ROOT/cache UV_PYTHON_INSTALL_DIR=$ROOT/python UV_PYTHON_PREFERENCE=only-managed
+export UV_CREDENTIALS_DIR=$ROOT/uv-credentials
+export UV_PYTHON_DOWNLOADS=automatic UV_NO_PROGRESS=1
+
+step "Installing Python $PYTHON_VERSION"
+# --no-bin: no python3.14 link in ~/.local/bin, so nothing lands outside ROOT
+"$UV" python install --no-bin "$PYTHON_VERSION"
+PYTHON=$("$UV" python find --python-preference only-managed "$PYTHON_VERSION")
+
+step "Getting the prebuilt packages and the villa sources"
+source_tarball=VC3D-macos-python-tools-$VILLA_COMMIT-$TOOLS_BUILD.tar.gz
+fetch_asset "$source_tarball"
+/bin/mkdir -p "$ROOT/wheels"
+for wheel in $(assets_matching '[.]whl$'); do
+  fetch_asset "$wheel"
+  /bin/cp -c "$DOWNLOADS/$wheel" "$ROOT/wheels/$wheel" 2>/dev/null || /bin/cp "$DOWNLOADS/$wheel" "$ROOT/wheels/$wheel"
+done
+
+for env in "${ENVS[@]}"; do
+  lock=VC3D-macos-python-tools-requirements-$env.txt
+  step "Installing the $env environment"
+  fetch_asset "$lock"
+  venv=$ROOT/envs/$env
+  stamp="$(sha256 "$DOWNLOADS/$lock") $PYTHON_VERSION"
+  if [ -x "$venv/bin/python" ] && [ "$(/bin/cat "$venv/.vc3d-installed" 2>/dev/null || true)" = "$stamp" ]; then
+    echo "    already up to date"
+  else
+    # VC3D uses an environment only while .vc3d-installed exists, so it never picks up a half-installed one
+    /bin/rm -f "$venv/.vc3d-installed"
+    "$UV" venv --quiet --clear --python "$PYTHON_VERSION" "$venv"
+    # --no-build: every package must come as a prebuilt wheel, so nothing is ever compiled here. Every version and
+    # hash is pinned, so the best match of PyPI and the release's wheels is always the pinned file (posix-ipc is on
+    # PyPI, but only the release has a wheel of it for this Python)
+    "$UV" pip install --python "$venv/bin/python" --no-build --require-hashes --find-links "$ROOT/wheels" \
+      --index-strategy unsafe-best-match -r "$DOWNLOADS/$lock"
+    echo "$stamp" > "$venv/.vc3d-installed"
+  fi
+done
+
+# the sources go in after the environments, so VC3D never runs new sources against the old packages
+step "Unpacking the villa sources ($VILLA_COMMIT)"
+if [ "$(/bin/cat "$ROOT/villa/.villa-commit" 2>/dev/null || true)" != "$VILLA_COMMIT" ]; then
+  /bin/rm -rf "$ROOT/villa.new"
+  /bin/mkdir -p "$ROOT/villa.new"
+  /usr/bin/tar -xzf "$DOWNLOADS/$source_tarball" -C "$ROOT/villa.new" --strip-components 1
+  echo "$VILLA_COMMIT" > "$ROOT/villa.new/.villa-commit"
+  /bin/rm -rf "$ROOT/villa.old"
+  [ ! -d "$ROOT/villa" ] || /bin/mv "$ROOT/villa" "$ROOT/villa.old"
+  /bin/mv "$ROOT/villa.new" "$ROOT/villa"
+  /bin/rm -rf "$ROOT/villa.old"
+fi
+echo "    $ROOT/villa"
+
+# the vesuvius package runs from the villa sources (sheet strips, fibre follow and the neural tracer import it)
+vesuvius_site=$("$ROOT/envs/vesuvius/bin/python" -I -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+printf '%s\n' "$ROOT/villa/vesuvius/src" > "$vesuvius_site/vc3d-villa-vesuvius.pth"
+
+step "Checking each environment"
+check() {
+  local env=$1 code=$2
+  (cd "$ROOT/villa" && "$ROOT/envs/$env/bin/python" -c "$code") || fail "the $env environment does not import"
+}
+check spiral 'import torch, vc_reader, vc_object_store, vc_spiral, teasar, kimimaro, zarr
+print("    spiral: torch", torch.__version__, "| Apple GPU:", torch.backends.mps.is_available())'
+check lasagna 'import sys; sys.path.insert(0, "lasagna")
+import torch, vc, vc_reader, vc_object_store, fit, optimizer, cli_data
+print("    lasagna: torch", torch.__version__, "| Apple GPU:", torch.backends.mps.is_available())'
+check vesuvius 'import torch, vc_reader, vc_object_store
+import vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all
+import vesuvius.neural_tracing.tracers.fibers.tracing.service
+import vesuvius.neural_tracing.trace_service
+import vesuvius.fiber_spline_generator.cli, vesuvius.fiber_spline_generator.splines
+import vesuvius.utils.models.load_nnunet_model
+print("    vesuvius: torch", torch.__version__, "| Apple GPU:", torch.backends.mps.is_available())'
+
+step "Pointing VC3D at the Spiral environment"
+# VC3D checks [spiral] python before anything else, so a stale value there would hide these environments. A value that
+# still names a working Python is the user's choice and stays
+config_dir=${VC3D_CONFIG_DIR:-$HOME/.VC3D}
+/bin/mkdir -p "$config_dir"
+"$ROOT/envs/spiral/bin/python" -I - "$config_dir/VC3D.ini" "$ROOT/envs/spiral/bin/python" <<'PY'
+# Set [spiral] python in VC3D's settings, keeping every other line as VC3D wrote it
+import os
+import sys
+from pathlib import Path
+
+path, python = Path(sys.argv[1]), sys.argv[2]
+lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+section, current = None, None
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        section = stripped[1:-1]
+    elif section == "spiral" and stripped.split("=", 1)[0].strip() == "python":
+        current = stripped.split("=", 1)[1].strip().strip('"')
+if current == python:
+    print(f"    {path} already uses this environment")
+    sys.exit()
+if current and os.path.isfile(current) and os.access(current, os.X_OK):
+    print(f"    {path} keeps the Python chosen before: {current}")
+    print(f"    To use the installed one, quit VC3D and set python={python} under [spiral] there")
+    sys.exit()
+
+out, section, done = [], None, False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if section == "spiral" and not done:
+            while out and not out[-1].strip():
+                out.pop()
+            out += [f"python={python}", ""]
+            done = True
+        section = stripped[1:-1]
+    elif section == "spiral" and stripped.split("=", 1)[0].strip() == "python":
+        if not done:
+            out.append(f"python={python}")
+            done = True
+        continue
+    out.append(line)
+if not done:
+    if section != "spiral":
+        if out and out[-1].strip():
+            out.append("")
+        out.append("[spiral]")
+    out.append(f"python={python}")
+backup = Path(f"{path}.before-python-tools")
+if path.exists() and not backup.exists():
+    backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+print(f"    {path}: [spiral] python={python}")
+PY
+
+step "Done"
+cat <<EOF
+The Python tools are installed. VC3D finds them on its own: Spiral, Lasagna, sheet strips and fibre follow use them
+from now on.
+From Terminal, the environments are:
+  "$ROOT/envs/spiral/bin/python"
+  "$ROOT/envs/lasagna/bin/python"
+  "$ROOT/envs/vesuvius/bin/python"
+EOF
