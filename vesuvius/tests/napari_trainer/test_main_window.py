@@ -337,3 +337,71 @@ def test_default_config_is_package_data(main_window):
     relative = main_window.DEFAULT_CONFIG_PATH.relative_to(package_dir).as_posix()
 
     assert any(fnmatch(relative, pattern) for pattern in patterns)
+
+
+_TINY_2D_UNET = """
+tr_setup:
+  model_name: "tiny2d"
+tr_config:
+  patch_size: [32, 32]
+  batch_size: 2
+  max_steps_per_epoch: 2
+  max_val_steps_per_epoch: 1
+  num_dataloader_workers: 0
+  enable_deep_supervision: false
+model_config:
+  basic_encoder_block: "BasicBlockD"
+  basic_decoder_block: "ConvBlock"
+  bottleneck_block: "BasicBlockD"
+  features_per_stage: [4, 8]
+  n_stages: 2
+  n_blocks_per_stage: [1, 1]
+  n_conv_per_stage_decoder: [1]
+  kernel_sizes: [[3, 3], [3, 3]]
+  strides: [[1, 1], [2, 2]]
+  separate_decoders: false
+  autoconfigure: false
+dataset_config:
+  normalization_scheme: "zscore"
+  targets:
+    ink:
+      out_channels: 2
+      activation: "none"
+      ignore_label: 2
+      losses:
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0
+"""
+
+
+def _tiny_manager(tmp_path, extra_targets=""):
+    """A config with a small 2D U-Net, for runs of the real trainer."""
+    from vesuvius.models.configuration.config_manager import ConfigManager
+
+    path = tmp_path / "tiny2d.yaml"
+    path.write_text(_TINY_2D_UNET + extra_targets)
+    mgr = ConfigManager(verbose=False)
+    mgr.load_config(path)
+    return mgr
+
+
+def _files(root):
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
+
+
+def test_a_split_without_training_patches_stops_before_saving(main_window, tmp_path):
+    main_window._config_manager = _tiny_manager(tmp_path)
+    image, label = _pair()
+    label.data = np.zeros_like(label.data)
+    label.data[4:8, 4:8] = 1  # one patch qualifies at 1%; the default split sends it to validation
+    _viewer(image, label)
+    final = tmp_path / "checkpoints" / "tiny2d" / "tiny2d_final.pth"
+    final.parent.mkdir(parents=True, exist_ok=True)
+    final.write_bytes(b"an earlier run's checkpoint")
+    before = _files(tmp_path / "checkpoints")
+
+    with pytest.raises(ValueError, match="nothing to train on"):
+        _train(main_window, percent=1.0)
+
+    assert final.read_bytes() == b"an earlier run's checkpoint"
+    assert _files(tmp_path / "checkpoints") == before

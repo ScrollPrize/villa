@@ -146,7 +146,7 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
 
         from vesuvius.models.training.train import BaseTrainer
 
-        trainer = BaseTrainer(mgr=mgr, verbose=True)
+        trainer = _viewer_layer_trainer(BaseTrainer)(mgr=mgr, verbose=True)
         print("\nStarting training...")
         trainer.train()
 
@@ -158,6 +158,27 @@ def run_training(patch_size_z: int = 0, patch_size_x: int = 128, patch_size_y: i
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
         print(f"Removed the exported layers ({run_dir})")
+
+
+def _viewer_layer_trainer(base):
+    """The trainer class for a run on the viewer's layers: `base` (BaseTrainer), stopping
+    before the model directory or any checkpoint is written when the train/validation
+    split leaves no training patch (a run without an optimizer step would still save a
+    final checkpoint and could overwrite an earlier one)."""
+
+    class ViewerLayerTrainer(base):
+        def _configure_dataloaders(self, train_dataset, val_dataset=None):
+            loaders = super()._configure_dataloaders(train_dataset, val_dataset)
+            train_indices, val_indices = loaders[2], loaders[3]
+            if len(train_indices) == 0:
+                raise ValueError(
+                    f"The train/validation split (tr_val_split {self.mgr.tr_val_split}) puts all "
+                    f"{len(val_indices)} selected patches into validation, so there is nothing to train on; "
+                    "nothing was saved. Label more, or lower Min Labeled Percentage or the patch size, "
+                    "so that more patches qualify.")
+            return loaders
+
+    return ViewerLayerTrainer
 
 
 def _pair_layers(image_layers, label_layers):
