@@ -72,7 +72,7 @@ class CMakeConfigureTests(unittest.TestCase):
 
     def cached_cuda(self, build_dir):
         for line in (Path(build_dir) / "CMakeCache.txt").read_text().splitlines():
-            if line.startswith("VC_READER_ENABLE_CUDA:BOOL="):
+            if line.startswith(("VC_READER_ENABLE_CUDA:BOOL=", "_VC_READER_CUDA_AUTO:INTERNAL=")):
                 return line.split("=", 1)[1]
         return None
 

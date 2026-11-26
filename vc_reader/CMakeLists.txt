@@ -34,19 +34,17 @@ set(_vc_reader_cuda_default OFF)
 if(CMAKE_CUDA_COMPILER)
     set(_vc_reader_cuda_default ON)
 endif()
-# VC_READER_ENABLE_CUDA is explicit when it was set before this point: by -D, by a parent
-# project, or by an earlier run. The one exception is the value this file chose itself
-# (remembered in _VC_READER_CUDA_AUTO), so a second configure of the same build folder
-# reaches the same decision as the first.
+# Automatic detection caches its choice in _VC_READER_CUDA_AUTO, so a cached
+# VC_READER_ENABLE_CUDA is always an explicit request.
 set(_vc_reader_cuda_explicit OFF)
 if(DEFINED VC_READER_ENABLE_CUDA)
     set(_vc_reader_cuda_explicit ON)
-    if(DEFINED CACHE{_VC_READER_CUDA_AUTO} AND "${VC_READER_ENABLE_CUDA}" STREQUAL "${_VC_READER_CUDA_AUTO}")
-        set(_vc_reader_cuda_explicit OFF)
-    endif()
+    option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends" OFF)
+elseif(DEFINED CACHE{_VC_READER_CUDA_AUTO})
+    set(VC_READER_ENABLE_CUDA ${_VC_READER_CUDA_AUTO})
+else()
+    set(VC_READER_ENABLE_CUDA ${_vc_reader_cuda_default})
 endif()
-option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends"
-    ${_vc_reader_cuda_default})
 if(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
@@ -58,12 +56,14 @@ if(VC_READER_ENABLE_CUDA)
     if(NOT _vc_reader_cuda_usable)
         if(_vc_reader_cuda_explicit)
             message(FATAL_ERROR "VC_READER_ENABLE_CUDA=ON was requested, but the CUDA backend cannot "
-                "be built with this toolkit. Use a newer toolkit (CMAKE_CUDA_COMPILER, CUDAToolkit_ROOT) "
-                "or set VC_READER_ENABLE_CUDA=OFF. ${_vc_reader_cuda_why}")
+                "be built with this toolkit. Configure a new build directory with CMAKE_CUDA_COMPILER set "
+                "to a newer nvcc, or set VC_READER_ENABLE_CUDA=OFF. If you did not request ON, an older "
+                "configure cached it: -UVC_READER_ENABLE_CUDA removes it. ${_vc_reader_cuda_why}")
         endif()
         message(WARNING "Building vc_reader without CUDA. ${_vc_reader_cuda_why}\n"
-            "After installing a newer toolkit, configure with -DVC_READER_ENABLE_CUDA=ON.")
-        set(VC_READER_ENABLE_CUDA OFF CACHE BOOL "Build optional CUDA reader and transform backends" FORCE)
+            "After installing a newer toolkit, configure a new build directory with "
+            "-DVC_READER_ENABLE_CUDA=ON -DCMAKE_CUDA_COMPILER=<its nvcc>.")
+        set(VC_READER_ENABLE_CUDA OFF)
     endif()
 endif()
 if(_vc_reader_cuda_explicit)
