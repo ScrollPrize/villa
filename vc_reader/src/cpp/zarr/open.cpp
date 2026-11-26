@@ -251,8 +251,10 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
     std::optional<std::string> group = hints.group, levelKey = hints.levelKey;
     if (group) {
         *group = stripSlashes(*group);
-        if (!levelKey)
-            levelKey = location.substr(group->size() + 1);
+        if (!levelKey) {
+            const bool root = !group->empty() && isSeparator(group->back(), locationSeparators(*group));
+            levelKey = location.substr(group->size() + (root ? 0 : 1));
+        }
     } else if (!levelKey) {
         // An OME-Zarr level is a digits-only path under its group.
         const auto level = numberedLevel(location, locationSeparators(location));

@@ -834,7 +834,7 @@ def _make_settings(
     loc = os.fspath(location).rstrip("/")
     level_key = None
     if level is not None:
-        group, level_key = loc, str(level)
+        group, level_key = os.fspath(location), str(level)  # the native reader keeps a drive root's separator
         loc = f"{loc}/{level}"
     if cache_dir is None:
         dirs = None

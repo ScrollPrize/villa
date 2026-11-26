@@ -306,9 +306,7 @@ void forgetVolumeMetadata()
 
 StoreMetadata volumeMetadata(const std::string& input, const OpenOptions& options, bool refresh)
 {
-    auto location = input;
-    while (location.size() > 1 && location.back() == '/')
-        location.pop_back();
+    const auto location = trimSeparators(input, locationSeparators(input));
     const bool remote = isRemote(location);
     const bool offline = options.offline && remote;
     if (refresh && offline)
