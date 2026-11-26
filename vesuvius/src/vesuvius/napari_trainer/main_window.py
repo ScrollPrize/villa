@@ -225,6 +225,11 @@ def _check_trains_on_viewer_layers(mgr, pairs):
             f"The selected config uses dataset_type '{dataset_type}', which reads its own image and "
             "label data instead of the viewer's layers. Choose a config with the default 'zarr' dataset.")
 
+    if getattr(mgr, 'auxiliary_tasks', None) or any(
+            info.get("auxiliary_task", False) for info in (getattr(mgr, 'targets', None) or {}).values()):
+        raise ValueError(
+            "The selected config defines auxiliary tasks; the napari trainer does not generate auxiliary "
+            "targets, so their heads would not be trained. Choose a config without auxiliary tasks.")
     if getattr(mgr, 'unlabeled_foreground_enabled', False):
         raise ValueError(
             "The selected config sets unlabeled_foreground_enabled; the napari trainer trains only on "
@@ -409,8 +414,9 @@ def _write_patch_cache(mgr, min_labeled_percentage):
         unlabeled_fg_threshold=float(getattr(mgr, "unlabeled_foreground_threshold", 0.05)),
         unlabeled_fg_bbox_threshold=float(getattr(mgr, "unlabeled_foreground_bbox_threshold", 0.15)),
     )
+    label_arrays = [open_node(data_path / "labels" / f"{v}_{target}.zarr") for v in volume_ids]
     found = find_valid_patches(
-        label_arrays=[open_node(data_path / "labels" / f"{v}_{target}.zarr") for v in volume_ids],
+        label_arrays=label_arrays,
         label_names=volume_ids,
         patch_size=patch_size,
         bbox_threshold=params.bbox_threshold,
@@ -422,6 +428,10 @@ def _write_patch_cache(mgr, min_labeled_percentage):
     )
     fg = [PatchEntry(volume_idx=p["volume_idx"], volume_name=p["volume_name"], position=tuple(p["start_pos"]))
           for p in found["fg_patches"]]
+    if ignore is not None and params.min_labeled_ratio == 0:
+        # At 0% the scanner also admits patches that are all ignore label, which give no gradient.
+        fg = [e for e in fg if np.any(np.asarray(label_arrays[e.volume_idx][
+            tuple(slice(start, start + size) for start, size in zip(e.position, patch_size))]) != ignore)]
     if not fg:
         raise ValueError(
             f"No {'x'.join(map(str, patch_size))} patch of the paired layers has at least "

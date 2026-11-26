@@ -428,7 +428,23 @@ def test_ignored_voxels_do_not_count_toward_the_labeled_percentage(main_window, 
 
     label.data[4:8, 4:8] = 1  # 16 labeled pixels in patch (0, 0), everything else ignored
     _train(main_window, percent=1.0)
-    assert _patches(recorded[0]) == [("image0", (0, 0))]
+    _train(main_window, percent=0.0)
+    assert _patches(recorded[0]) == _patches(recorded[1]) == [("image0", (0, 0))]
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_auxiliary_tasks_are_rejected(main_window, recorded, saved):
+    mgr = _default_manager()
+    if saved:  # the form ConfigManager.save_config writes: the flag on the target, no auxiliary_tasks
+        mgr.targets["inplane_direction"] = {"auxiliary_task": True, "source_target": "ink"}
+    else:
+        mgr.auxiliary_tasks = {"inplane_direction": {"type": "inplane_direction", "source_target": "ink"}}
+    main_window._config_manager = mgr
+    _viewer(*_pair())
+
+    with pytest.raises(ValueError, match="auxiliary tasks"):
+        _train(main_window)
+    assert recorded == []
 
 
 def test_training_reads_exactly_the_selected_patches(main_window, recorded):
