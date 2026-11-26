@@ -14,7 +14,8 @@ Design (after MLX's steel attention, ``mlx/backend/metal/kernels/steel/attn/kern
 - log2(e) is folded into the query scale, so the exponentials are exp2 (``precise::exp2``: as fast as
   ``fast::exp2`` here and no less accurate in the parity runs);
 - no infinities: a masked score is -FLT_MAX and the running maximum starts at -1e38, so a fully masked row or block
-  gives exp2(-huge) = 0 and a row sum of 0, which stores zeros; this holds under the default fast-math mode;
+  gives exp2(-huge) = 0 and a row sum of 0, which stores zeros; this holds under PyTorch's default safe math mode
+  (``PYTORCH_MPS_FAST_MATH`` unset);
 - a key block that no row of a simdgroup reads is skipped by that simdgroup;
 - per-lane partial row sums, reduced across the row once at the end;
 - int32 offsets (64-bit multiplies are emulated on this GPU) and uchar2 mask loads where the mask's key stride is 1.
