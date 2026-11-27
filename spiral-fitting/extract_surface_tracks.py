@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import dbm
 import importlib.util
+import itertools
 import os
 import pickle
 import re
@@ -294,12 +295,20 @@ def find_yx_range(predictions_zarr_array):
     min_yx = np.array([shape[1], shape[2]])
     max_yx = np.array([0, 0])
     step = max(1, (z_range_max - z_range_min) // 20)
-    for z in tqdm(range(z_range_min, z_range_max, step), desc='finding yx range'):
-        predictions = predictions_zarr_array[z]
-        yxs = np.stack(np.where(predictions > 0), axis=-1)
-        if len(yxs) > 0:
-            min_yx = np.minimum(min_yx, yxs.min(axis=0))
-            max_yx = np.maximum(max_yx, yxs.max(axis=0))
+    # Read the sampled slices of one chunk row together (at most 256 MB at once): each chunk
+    # is then decoded once, not once per sampled slice.
+    chunk_depth = getattr(predictions_zarr_array, 'chunks', (1,))[0]
+    per_read = max(1, (256 << 20) // (shape[1] * shape[2] * predictions_zarr_array.dtype.itemsize))
+    reads = []
+    for _, zs in itertools.groupby(range(z_range_min, z_range_max, step), key=lambda z: z // chunk_depth):
+        zs = list(zs)
+        reads += [np.asarray(zs[i:i + per_read]) for i in range(0, len(zs), per_read)]
+    for zs in tqdm(reads, desc='finding yx range'):
+        for predictions in predictions_zarr_array[zs]:
+            yxs = np.stack(np.where(predictions > 0), axis=-1)
+            if len(yxs) > 0:
+                min_yx = np.minimum(min_yx, yxs.min(axis=0))
+                max_yx = np.maximum(max_yx, yxs.max(axis=0))
     return min_yx, max_yx
 
 
