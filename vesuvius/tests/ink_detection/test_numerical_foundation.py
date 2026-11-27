@@ -503,6 +503,13 @@ def test_all_three_sampling_policies(tmp_path):
         "observed_by_physical_segment": {"A:1": 2, "A:2": 2, "B:1": 4},
         "observed_by_representation": {"ra1": 2, "ra2": 2, "rb1": 4},
         "patch_queue_recycles": {"ra1": 0, "ra2": 0, "rb1": 0},
+        "fast_forwarded": {
+            "batches": 0,
+            "samples": 0,
+            "by_scroll": {},
+            "by_physical_segment": {},
+            "by_representation": {},
+        },
     }
     second = FixedScrollPriorStratifiedBatchSampler(
         fixed_patches, fixed_config, batch_size=4

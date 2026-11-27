@@ -417,6 +417,21 @@ scheduler, step, and W&B run ID. EMA-enabled checkpoints may also contain
 preprocessing from this embedded config; editing a separate JSON file does not
 override a checkpoint.
 
+Checkpoints also record the training sample stream they were written from
+(`sampling_stream`: a key over the config without its launch, save,
+validation and logging fields, the process count, the training sample count,
+the sampling policy definition and the ordered training patches; and the step
+at which the stream started).
+A full-state resume with the same key skips the steps already taken in that
+stream, indices only, so the run continues its batches instead of replaying
+them; for `fixed_scroll_prior_stratified` the order is exactly that of an
+uninterrupted run, on any process count. Any other resume, such as the next
+phase of a recipe chain, a different process count or data, or a checkpoint
+written before this record existed, starts a new stream at its beginning
+while restoring the model, optimizer, scheduler and step.
+`sampling_observed.json` counts only the batches requested by the loader;
+the draws skipped on resume are reported separately under `fast_forwarded`.
+
 ## Flat inference
 
 Run one surface volume:
