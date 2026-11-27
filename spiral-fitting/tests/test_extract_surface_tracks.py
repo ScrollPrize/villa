@@ -375,6 +375,22 @@ def test_import_and_parse_args_stay_lazy():
                    check=True, timeout=120)
 
 
+def test_cpu_options_on_every_os(monkeypatch):
+    # The slab workers are forked on Linux and spawned elsewhere, so --slab-workers is accepted
+    # on every OS. Kimimaro starts its processes anew for every slab, which is slow on Windows:
+    # there a slab gets one by default.
+    argv = ['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'cpu']
+    est.parse_args(argv)  # imports what parse_args needs, on the real OS
+    for platform, kimimaro_parallel in (('linux', 8), ('darwin', 8), ('win32', 1)):
+        monkeypatch.setattr(sys, 'platform', platform)
+        spec = importlib.util.spec_from_file_location(f'est_{platform}', est.__file__)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # the defaults are set on import
+        assert module.parse_args(argv).kimimaro_parallel == kimimaro_parallel
+        args = module.parse_args([*argv, '--slab-workers', '4', '--kimimaro-parallel', '1'])
+        assert (args.slab_workers, args.kimimaro_parallel) == (4, 1)
+
+
 def test_command_line_reaches_the_backend(monkeypatch, tmp_path):
     runs = []
     monkeypatch.setattr(est, 'z_min', est.z_min)  # main() sets the z range; restore it after
