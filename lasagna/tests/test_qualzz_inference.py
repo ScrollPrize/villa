@@ -156,6 +156,38 @@ def normalize_ct(x):
                                   np.broadcast_to(_quantize(p)[:,None,None,None], (2,4,4,4)))
 
 
+def test_single_mps_device_loads_the_model_in_process(tmp_path, monkeypatch):
+    from lasagna import qualzz_inference as module
+    seen = {}
+    monkeypatch.setattr(module.QualzzModelAdapter, "load_model",
+                        lambda self, *, device: seen.setdefault("load", device) and "model")
+    monkeypatch.setattr(module, "run_tiled_inference_3d",
+                        lambda model, *a, **kw: seen.update(model=model, device=kw["device"]))
+    folder = tmp_path / "model"
+    folder.mkdir()
+    for name in ("model.py", "plans.json", "checkpoint_final.pth"):
+        (folder / name).write_text("fixture")
+    ZarrWriter.create(tmp_path / "ct.zarr/0", shape=(8,8,8), chunks=(8,8,8), dtype=np.uint8,
+                      compressor=None, separator="/")[:] = 128
+    run_inference(model_dir=folder, input_path=tmp_path / "ct.zarr/0", output=tmp_path / "out.zarr",
+                  voxel_size_um=9.6, devices=(torch.device("mps"),), chunk_size=4)
+    assert seen["load"] == torch.device("mps")
+    assert seen["model"] == "model" and seen["device"] == torch.device("mps")
+
+
+def test_cli_auto_device_picks_mps_without_cuda(monkeypatch):
+    from lasagna import qualzz_inference as module
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    seen = []
+    monkeypatch.setattr(module, "run_inference", lambda **kw: seen.append(kw))
+    module.main(["--model-dir", "model", "--input", "ct", "--output", "out", "--voxel-size-um", "9.6"])
+    module.main(["--model-dir", "model", "--input", "ct", "--output", "out", "--voxel-size-um", "9.6",
+                 "--device", "cpu"])
+    assert [kw["devices"] for kw in seen] == [(torch.device("mps"),), (torch.device("cpu"),)]
+
+
 def test_cli_always_enables_cooperative_gpu_handling(monkeypatch):
     from lasagna import qualzz_inference as module
     monkeypatch.delenv("LASAGNA_COOPERATIVE", raising=False)

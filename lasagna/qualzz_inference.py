@@ -178,7 +178,8 @@ def run_inference(*, model_dir, input_path, output, voxel_size_um, devices,
     writer.prepare()
     if any(d.type == "cuda" for d in devices) and os.environ.get("LASAGNA_COOPERATIVE") != "1":
         raise ValueError("CUDA inference requires GPU-manager handling (LASAGNA_COOPERATIVE=1)")
-    model = adapter.load_model(device=devices[0]) if devices[0].type == "cpu" else None
+    # One CPU or Apple-GPU device runs in this process; CUDA goes through the GPU manager.
+    model = adapter.load_model(device=devices[0]) if len(devices) == 1 and devices[0].type in ("cpu", "mps") else None
     nz, ny, nx = shape
     run_tiled_inference_3d(model, source, crop_slices=(0,nz,0,ny,0,nx), device=devices[0],
         model_adapter=adapter, output_adapter=writer, products=(product,),
@@ -208,7 +209,7 @@ def main(argv=None):
     parser.add_argument("--flush-workers", type=int, default=8)
     parser.add_argument("--accumulator-workers", type=int, default=8)
     args = vars(parser.parse_args(argv))
-    args["devices"] = resolve_inference_devices(device=args.pop("device"), devices=args["devices"])
+    args["devices"] = resolve_inference_devices(device=args.pop("device"), devices=args["devices"], auto_mps=True)
     args["input_path"] = args.pop("input")
     os.environ["LASAGNA_COOPERATIVE"] = "1"
     run_inference(**args)
