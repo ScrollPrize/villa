@@ -1,3 +1,4 @@
+import platform
 import warnings
 
 import torch
@@ -63,17 +64,59 @@ def cuda_device_supported(device_index: int = 0) -> tuple[bool, str]:
             if (arch_major, arch_minor) <= (major, minor):
                 return True, ""
     name = torch.cuda.get_device_name(device_index)
-    version = torch.__version__.split("+")[0]
     message = (
         f"{name} (compute capability {major}.{minor}) is not supported by the "
         f"installed torch {torch.__version__}, which was built for "
-        f"{', '.join(arch_list) or 'no CUDA architectures'}. CUDA 13 builds of torch "
-        f"dropped GPUs older than compute capability 7.5. To use this GPU, install "
-        f"the same torch version from the CUDA 12.6 wheels, e.g. "
-        f"`uv pip install --reinstall torch=={version}+cu126 torchvision --index-url "
-        f"https://download.pytorch.org/whl/cu126` (match torchvision's version to torch)."
+        f"{', '.join(arch_list) or 'no CUDA architectures'}. {_recovery_hint(major, minor)}"
     )
     return False, message
+
+
+# CUDA 12.6 wheels, the last with kernels below compute capability 7.5, exist for torch
+# 2.6 through 2.14; 2.15 dropped them (https://github.com/pytorch/pytorch/blob/main/RELEASE.md).
+# This is a fixed fact about published wheels; it only needs revisiting if pyproject.toml's torch
+# floor rises above 2.14, when these GPUs would have no supported GPU build left.
+_CU126_TORCH_RELEASES = ((2, 6), (2, 14))
+_LAST_CU126_TORCH = "2.14.1"
+# Jetson/integrated GPUs: desktop wheels exclude them (see torch.cuda.DEVICE_REQUIREMENT).
+_INTEGRATED_GPUS = ((5, 3), (6, 2), (7, 2), (8, 7))
+
+
+def _recovery_hint(major: int, minor: int) -> str:
+    """How to get a torch build with kernels for this GPU, keeping the other installed packages."""
+    capability = (major, minor)
+    integrated = capability in _INTEGRATED_GPUS
+    x86_64 = platform.machine().lower() in ("x86_64", "amd64")
+    if (5, 0) <= capability < (7, 5) and x86_64 and not integrated:
+        version = torch.__version__.split("+")[0]
+        try:
+            release = tuple(int(part) for part in version.split(".")[:2])
+        except ValueError:
+            release = None
+        first, last = _CU126_TORCH_RELEASES
+        if release is None or not first <= release <= last or not version.replace(".", "").isdigit():
+            version = _LAST_CU126_TORCH
+        return (
+            "CUDA 13 builds of torch dropped GPUs older than compute capability 7.5; the CUDA 12.6 "
+            f"builds of torch {last[0]}.{last[1]} and earlier still support them. From villa/vesuvius, "
+            f"run `uv pip install torch=={version}+cu126 torchvision --index-url "
+            "https://download.pytorch.org/whl/cu126 --reinstall-package torch "
+            "--reinstall-package torchvision` (already-installed packages such as NumPy are kept), "
+            "then start commands with `uv run --no-sync`: a plain `uv run` re-syncs uv.lock and puts "
+            "the CUDA 13 build back."
+        )
+    cuda_major = (getattr(torch.version, "cuda", None) or "").split(".")[0]
+    if capability >= (7, 5) and not integrated and cuda_major.isdigit() and int(cuda_major) < 13:
+        return (
+            "This GPU needs a newer CUDA build of torch. From villa/vesuvius, restore the locked "
+            "CUDA 13 build with `uv sync --inexact --extra models --reinstall-package torch "
+            "--reinstall-package torchvision` (--inexact keeps packages from other extras)."
+        )
+    return (
+        f"Install a torch build that includes compute capability {major}.{minor} "
+        "(https://pytorch.org/get-started/locally/; Jetson boards need NVIDIA's Jetson builds), "
+        "or run on the CPU with `--device cpu`."
+    )
 
 
 def get_accelerator():

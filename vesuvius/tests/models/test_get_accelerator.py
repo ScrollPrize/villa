@@ -68,6 +68,53 @@ def test_cuda_device_supported(monkeypatch, capability, archs, expected):
         assert f"{capability[0]}.{capability[1]}" in message
 
 
+@pytest.mark.parametrize(
+    "torch_version, target",
+    [
+        ("2.12.1+cu130", "2.12.1"),  # villa's lock: same release, CUDA 12.6 build
+        ("2.14.1+cu130", "2.14.1"),
+        ("2.15.0+cu132", "2.14.1"),  # 2.15 has no CUDA 12.6 wheels: newest release that does
+        ("2.16.0.dev20261201+cu132", "2.14.1"),
+    ],
+)
+def test_pascal_volta_hint_names_an_available_cu126_build(monkeypatch, torch_version, target):
+    fake_backend(monkeypatch, "nvidia", (6, 1), CUDA13_ARCHS, torch_version=torch_version)
+    message = ga.cuda_device_supported(0)[1]
+    assert f"torch=={target}+cu126 torchvision --index-url https://download.pytorch.org/whl/cu126" in message
+    # Reinstalling only torch and torchvision keeps the locked NumPy/Numba pair intact.
+    assert "--reinstall-package torch --reinstall-package torchvision" in message
+    assert "--reinstall " not in message and "numpy" not in message
+    # A plain `uv run` would re-sync the lock and restore the CUDA 13 build.
+    assert "uv run --no-sync" in message
+
+
+def test_newer_gpu_on_cuda12_build_is_sent_back_to_the_locked_build(monkeypatch):
+    fake_backend(monkeypatch, "nvidia", (12, 0), CUDA126_ARCHS, cuda_version="12.6", torch_version="2.14.1+cu126")
+    message = ga.cuda_device_supported(0)[1]
+    assert "uv sync --inexact --extra models --reinstall-package torch --reinstall-package torchvision" in message
+    assert "whl/cu126" not in message
+
+
+@pytest.mark.parametrize(
+    "capability, archs, machine",
+    [
+        ((3, 7), CUDA126_ARCHS, "AMD64"),   # Kepler: no current wheel supports it
+        ((6, 1), CUDA13_ARCHS, "aarch64"),  # Arm cu126 wheels only carry sm_80/sm_90
+        ((6, 2), CUDA13_ARCHS, "x86_64"),   # Jetson TX2
+        ((5, 3), CUDA13_ARCHS, "aarch64"),  # Jetson Nano
+        ((8, 7), CUDA126_ARCHS, "aarch64"),  # Jetson Orin: torch's table excludes 8.7 from sm_80/sm_86
+    ],
+)
+def test_gpus_without_a_standard_wheel_get_a_generic_hint(monkeypatch, capability, archs, machine):
+    def desktop_table(device_cc, code_cc):  # torch's rule: same major, minus integrated GPUs
+        return device_cc not in (53, 62, 72, 87) and device_cc // 10 == code_cc // 10 and device_cc >= code_cc
+
+    fake_backend(monkeypatch, "nvidia", capability, archs, cuda_version="12.6", machine=machine, torch_rule=desktop_table)
+    message = ga.cuda_device_supported(0)[1]
+    assert message and "pytorch.org/get-started/locally" in message and "--device cpu" in message
+    assert "+cu126" not in message and "uv sync" not in message
+
+
 def test_get_accelerator_falls_back_to_cpu_on_unsupported_gpu(monkeypatch):
     fake_backend(monkeypatch, "nvidia", (6, 1), CUDA13_ARCHS)
     with pytest.warns(RuntimeWarning, match="not supported by the installed torch"):
@@ -94,7 +141,7 @@ def test_explicit_cuda_device_on_unsupported_gpu_raises_with_fix(monkeypatch):
     fake_backend(monkeypatch, "nvidia", (6, 1), CUDA13_ARCHS)
     model = torch.nn.Conv2d(1, 1, 1)
     for kwargs in ({"gpu_ids": (), "device_type": "cuda"}, {"gpu_ids": (0,), "device_type": "auto"}):
-        with pytest.raises(ValueError, match="cu126"):
+        with pytest.raises(ValueError, match=r"torch==2\.12\.1\+cu126"):
             rt.prepare_model_for_inference(model, compile_model=False, compile_mode="default", **kwargs)
 
 
