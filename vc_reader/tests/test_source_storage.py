@@ -606,6 +606,18 @@ class RemoteTests(RemoteFixtureCase):
                 read.result(timeout=30)
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
 
+    def test_budget_named_through_a_symlink_is_the_readers_budget(self):
+        # macOS temp dirs are reached through /var -> /private/var; readers resolve
+        # the cache root, so a budget opened by another spelling must be the same one.
+        from vc_reader import LowDiskSpaceError
+        self.cache.mkdir()
+        link = self.root/'cache_link'
+        link.symlink_to(self.cache, target_is_directory=True)
+        disk_budget(str(link), None).set_min_free_bytes(2**62)
+        with self.assertRaises(LowDiskSpaceError):
+            read_remote_source(Source('linked', Storage(self.url+'/image.png', 'png')), dict(cache_dir=self.cache))
+        self.assertTrue(disk_budget(str(self.cache), None).low_space)
+
     def test_low_free_space_refuses_a_download_and_keeps_cached_files(self):
         from vc_reader import LowDiskSpaceError
         options = dict(cache_dir=self.cache)
