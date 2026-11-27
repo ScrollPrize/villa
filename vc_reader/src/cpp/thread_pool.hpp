@@ -175,6 +175,14 @@ private:
         stopping_.store(true,std::memory_order_release);
         available_.fetch_add(1,std::memory_order_release);
         available_.notify_all();
+        if(owner_!=getpid()) {
+            // A forked child inherited this pool from its parent (an array opened
+            // before fork and released in the child). The parent's workers do not
+            // exist here: joining them throws "No such process" on macOS, which
+            // aborts the child. Keep the handles without joining them.
+            new std::vector<std::thread>(std::move(workers_));
+            return;
+        }
         for(auto& worker:workers_)worker.join();
     }
 
@@ -212,6 +220,7 @@ private:
     }
 
     std::vector<std::thread> workers_;
+    const pid_t owner_=getpid();  // the process whose threads are workers_
     // Implicit producer state belongs to the queue, not to caller-local tokens
     // that could outlive the pool. try_enqueue never grows the message blocks;
     // initial producer registration may allocate once per participating thread.
