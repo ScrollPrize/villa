@@ -122,9 +122,11 @@ public:
             }
             if (!foreign_revisions_compatible(pin.exists, pin.etag, pin.modified, pin.total, pin.index_hash,
                                               exists, etag, modified, total, index_hash)) {
-                if (pin.committed)
+                if (pin.committed || !pin.retained || pin.refreshes >= max_shard_refreshes)
                     throw HttpRangeChanged("shard changed during read: " + path);
-                // Pre-commit foreign claim supersedes an uncommitted pin.
+                // Pre-commit foreign claim supersedes an uncommitted retained pin.
+                ++pin.refreshes;
+                pin.superseded_index = pin.index;
                 pin.exists = exists;
                 pin.index = nullptr;
                 pin.etag = etag;
@@ -474,8 +476,10 @@ private:
             return;
         }
         if (!revisions_compatible(pin, index)) {
-            if (pin.committed)
+            if (pin.committed || !pin.retained || pin.refreshes >= max_shard_refreshes)
                 throw HttpRangeChanged("shard changed during read: " + path);
+            ++pin.refreshes;
+            pin.superseded_index = pin.index;
             bind_pin(pin, index, false, true);
             return;
         }
@@ -559,11 +563,29 @@ private:
                 const auto reval = shard_index(path, positions, /*force_refresh=*/true);
                 if (!revisions_compatible(pin_copy, reval.index)) {
                     {
-                        std::lock_guard lock(session->mutex);
+                        std::unique_lock lock(session->mutex);
+                        session->refresh_cv.wait(lock, [&] {
+                            const auto it = session->shards.find(path);
+                            return it == session->shards.end() || !it->second.refreshing;
+                        });
                         auto& pin = session->shards[path];
-                        if (!pin.committed && pin.retained && pin.refreshes < max_shard_refreshes) {
-                            ++pin.refreshes;
-                            pin.superseded_index = pin.index;
+                        if (pin.initialized && revisions_compatible(pin, reval.index)) {
+                            if (!pin.index && reval.index)
+                                pin.index = reval.index;
+                            if (pin.modified.empty() && reval.index && !reval.index->modified.empty())
+                                pin.modified = reval.index->modified;
+                            if (pin.index_hash == 0 && reval.index)
+                                pin.index_hash = reval.index->hash;
+                            return IndexLookup{pin.index ? pin.index : reval.index, false};
+                        }
+                        if (!pin.committed &&
+                            ((pin.initialized && pin.retained && pin.refreshes < max_shard_refreshes) ||
+                             (!pin.initialized && pin.superseded_index &&
+                              pin.superseded_index.get() == pin_copy.index.get()))) {
+                            if (pin.initialized) {
+                                ++pin.refreshes;
+                                pin.superseded_index = pin.index;
+                            }
                             bind_pin(pin, reval.index, false);
                             return IndexLookup{reval.index, false};
                         }
@@ -597,6 +619,8 @@ private:
 
         // First lookup for `path` in this ReadSession (or explicit pre-commit refresh).
         auto lookup = shard_index(path, positions, force_refresh, extra_positions);
+        bool reconcile_foreign = false;
+        ShardPin foreign_pin;
         {
             std::unique_lock lock(session->mutex);
             if (!force_refresh) {
@@ -608,17 +632,24 @@ private:
             auto& pin = session->shards[path];
             if (!pin.initialized) {
                 bind_pin(pin, lookup.index, lookup.retained);
-            } else if (!force_refresh && pin.superseded_index && lookup.index &&
-                       pin.superseded_index.get() == lookup.index.get()) {
-                // Sibling thread already refreshed away from this exact stale retained index.
-                return IndexLookup{pin.index, false};
-            } else if (!force_refresh && !pin.retained && lookup.retained) {
-                // Sibling thread already established a fresh non-retained pin; adopt it.
+            } else if (!force_refresh && (pin.index || !pin.exists) &&
+                       ((pin.superseded_index && lookup.index &&
+                         pin.superseded_index.get() == lookup.index.get()) ||
+                        (!pin.retained && lookup.retained))) {
+                // Sibling thread already refreshed away from this stale retained index
+                // or established a fresh non-retained pin; adopt it.
                 return IndexLookup{pin.index, false};
             } else if (!revisions_compatible(pin, lookup.index)) {
-                if (pin.committed)
-                    throw HttpRangeChanged("shard changed during read: " + path);
-                bind_pin(pin, lookup.index, lookup.retained);
+                if (!force_refresh && !pin.retained && lookup.retained && pin.exists && !pin.index) {
+                    foreign_pin = pin;
+                    reconcile_foreign = true;
+                } else {
+                    if (pin.committed || !pin.retained || pin.refreshes >= max_shard_refreshes)
+                        throw HttpRangeChanged("shard changed during read: " + path);
+                    ++pin.refreshes;
+                    pin.superseded_index = pin.index;
+                    bind_pin(pin, lookup.index, lookup.retained);
+                }
             } else {
                 if (!pin.index && lookup.index)
                     pin.index = lookup.index;
@@ -627,6 +658,21 @@ private:
                 if (pin.index_hash == 0 && lookup.index)
                     pin.index_hash = lookup.index->hash;
             }
+        }
+        if (reconcile_foreign) {
+            lookup = shard_index(path, positions, /*force_refresh=*/true);
+            if (!revisions_compatible(foreign_pin, lookup.index))
+                throw HttpRangeChanged("shard changed during read: " + path);
+            std::lock_guard lock(session->mutex);
+            auto& pin = session->shards[path];
+            if (!pin.index && lookup.index && revisions_compatible(pin, lookup.index)) {
+                pin.index = lookup.index;
+                if (pin.modified.empty() && !lookup.index->modified.empty())
+                    pin.modified = lookup.index->modified;
+                if (pin.index_hash == 0)
+                    pin.index_hash = lookup.index->hash;
+            }
+            return IndexLookup{lookup.index, false};
         }
         return lookup;
     }

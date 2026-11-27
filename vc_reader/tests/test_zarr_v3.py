@@ -1621,6 +1621,114 @@ class V3RemoteTests(RemoteFixtureCase):
                 self.assertTrue(swapped)
                 self.assertEqual(suffix_after_swap, 0)
 
+        # 5. Pre-read replacement (v1 -> v2 once before read_many) on a retained shard containing
+        #    mixed Present and Missing entries across sibling threads on the non-batched path must
+        #    share/adopt the refreshed v2 pin rather than spuriously failing with HttpRangeChanged.
+        with self.subTest(case='mixed_present_and_missing_retained_concurrent_refresh'):
+            v1_data = np.full((128, 64, 520), 11, dtype=np.uint8)
+            v2_data = np.full((128, 64, 520), 22, dtype=np.uint8)
+
+            # (a) 2 threads: Thread A hits 412 on Present-in-v1 chunk and refreshes pin to v2 while
+            #     Thread B revalidates a Missing-in-v1 chunk concurrently.
+            name_2t = 'nb-mixed-pm-2t'
+            write_custom_shard_array(
+                self.root / name_2t, v1_data, (64, 64, 130), (64, 64, 520),
+                missing_chunks=[(0, 0, 2)],
+            )
+            write_custom_shard_array(self.root / (name_2t + '-v2'), v2_data, (64, 64, 130), (64, 64, 520))
+            v1_etag_2t = '"' + hashlib.sha256((self.root / name_2t / 'c/0/0/0').read_bytes()).hexdigest() + '"'
+            v2_bytes_2t = (self.root / (name_2t + '-v2') / 'c/0/0/0').read_bytes()
+            v2_etag_2t = '"' + hashlib.sha256(v2_bytes_2t).hexdigest() + '"'
+
+            a_bound = threading.Event()
+            b_in_reval = threading.Event()
+            a_refreshed = threading.Event()
+            suffix_seq = 0
+            hook_lock = threading.Lock()
+
+            def hook_2t(handler):
+                nonlocal suffix_seq
+                if handler.path == f'/{name_2t}/c/0/0/0':
+                    rng = handler.headers.get('Range') or ''
+                    if_match = handler.headers.get('If-Match') or ''
+                    if if_match == v1_etag_2t and not rng.startswith('bytes=-'):
+                        a_bound.set()
+                        b_in_reval.wait(5)
+                    elif rng.startswith('bytes=-'):
+                        a_bound.wait(5)
+                        with hook_lock:
+                            suffix_seq += 1
+                            idx = suffix_seq
+                        if idx == 1:
+                            b_in_reval.set()
+                            a_refreshed.wait(5)
+                    elif if_match == v2_etag_2t and not rng.startswith('bytes=-'):
+                        a_refreshed.set()
+                return False
+
+            with ZarrReader.open(self.url + '/' + name_2t, threads=2, memory_cache=None) as reader:
+                self.assertEqual(int(reader[0, 0, 0]), 11)
+                self.assertEqual(int(reader[64, 0, 0]), 11)
+                (self.root / name_2t / 'c/0/0/0').write_bytes(v2_bytes_2t)
+                self.server.request_hook = hook_2t
+                try:
+                    out = reader.read_many([np.s_[0:1, 0:1, 130:131], np.s_[0:1, 0:1, 260:261]])
+                finally:
+                    self.server.request_hook = None
+                self.assertEqual([int(x[0, 0, 0]) for x in out], [22, 22])
+
+            # (b) 3 threads: 1 Present-in-v1 chunk + 2 Missing-in-v1 chunks concurrently revalidating.
+            name_3t = 'nb-mixed-pm-3t'
+            write_custom_shard_array(
+                self.root / name_3t, v1_data, (64, 64, 130), (64, 64, 520),
+                missing_chunks=[(0, 0, 2), (0, 0, 3)],
+            )
+            write_custom_shard_array(self.root / (name_3t + '-v2'), v2_data, (64, 64, 130), (64, 64, 520))
+            v1_etag_3t = '"' + hashlib.sha256((self.root / name_3t / 'c/0/0/0').read_bytes()).hexdigest() + '"'
+            v2_bytes_3t = (self.root / (name_3t + '-v2') / 'c/0/0/0').read_bytes()
+
+            a_bound_3t = threading.Event()
+            release_a_3t = threading.Event()
+            reval_barrier = threading.Barrier(2, timeout=5)
+            reval_seen = 0
+            hook_lock_3t = threading.Lock()
+
+            def hook_3t(handler):
+                nonlocal reval_seen
+                if handler.path == f'/{name_3t}/c/0/0/0':
+                    rng = handler.headers.get('Range') or ''
+                    if_match = handler.headers.get('If-Match') or ''
+                    if if_match == v1_etag_3t and not rng.startswith('bytes=-'):
+                        a_bound_3t.set()
+                        release_a_3t.wait(5)
+                    elif rng.startswith('bytes=-'):
+                        a_bound_3t.wait(5)
+                        with hook_lock_3t:
+                            reval_seen += 1
+                            idx = reval_seen
+                        if idx <= 2:
+                            try:
+                                reval_barrier.wait()
+                            except threading.BrokenBarrierError:
+                                pass
+                            release_a_3t.set()
+                return False
+
+            with ZarrReader.open(self.url + '/' + name_3t, threads=3, memory_cache=None) as reader:
+                self.assertEqual(int(reader[0, 0, 0]), 11)
+                self.assertEqual(int(reader[64, 0, 0]), 11)
+                (self.root / name_3t / 'c/0/0/0').write_bytes(v2_bytes_3t)
+                self.server.request_hook = hook_3t
+                try:
+                    out = reader.read_many([
+                        np.s_[0:1, 0:1, 130:131],
+                        np.s_[0:1, 0:1, 260:261],
+                        np.s_[0:1, 0:1, 390:391],
+                    ])
+                finally:
+                    self.server.request_hook = None
+                self.assertEqual([int(x[0, 0, 0]) for x in out], [22, 22, 22])
+
         self.server.request_hook = None
 
     def test_weak_absent_etag_last_modified_and_commit_once_controls(self):
