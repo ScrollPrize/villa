@@ -69,11 +69,11 @@ READS = {"block-0": ((0, 0, 0), (96, 96, 192)), "block-1": ((0, 0, 128), (96, 96
 REACH = ((0, 0, 0), (96, 96, 320))
 
 
-def trimmed(name, spline, other_name, other_spline):
+def trimmed(name, spline, other_name, other_spline, reads=READS, reach=REACH):
     """``spline`` (absolute ZYX) of block ``name``, trimmed against ``other_spline`` of the other block."""
-    low, high = READS[name]
-    other_low, other_high = READS[other_name]
-    (family, kept), = trim_cut_ends([("V", spline - np.asarray(low))], low, high, *REACH,
+    low, high = reads[name]
+    other_low, other_high = reads[other_name]
+    (family, kept), = trim_cut_ends([("V", spline - np.asarray(low))], low, high, *reach,
                                     [("V", other_spline, other_low, other_high)])
     return kept + np.asarray(low)
 
@@ -115,6 +115,34 @@ def test_an_end_no_neighbouring_block_detects_is_kept():
     # A trace lying wholly in the cut band, along the block face, is kept whatever the neighbour holds.
     along = np.stack([np.full(125, 48.0), np.linspace(-0.5, 61.5, 125) + 17, np.full(125, 185.0)], axis=1)
     assert np.array_equal(trimmed("block-0", along, "block-1", line(130, 298)), along)
+
+
+# Two default 512-voxel blocks of a 1024-voxel zone: block 0 owns x < 512 and reads x 0..544, block 1 owns x >= 512
+# and reads x 480..1024.
+DEFAULT_READS = {"block-0": ((0, 0, 0), (160, 160, 544)), "block-1": ((0, 0, 480), (160, 160, 1024))}
+DEFAULT_REACH = ((0, 0, 0), (160, 160, 1024))
+
+
+def test_main_s_join_at_the_default_block_size_is_kept(tmp_path):
+    # Main joins the copies at x 100..537 and 507..770. Trimming block 0's end would leave them 19.5 voxels of overlap.
+    a, b = line(100, 537), line(507, 770)
+    assert np.array_equal(trimmed("block-0", a, "block-1", b, DEFAULT_READS, DEFAULT_REACH), a)
+    assert np.array_equal(trimmed("block-1", b, "block-0", a, DEFAULT_READS, DEFAULT_REACH), b)
+    stitcher = Stitcher(tmp_path)
+    try:
+        stitcher.add_block("block-0", [0, 0, 0], [544, 160, 160], [("V", a)], (np.zeros(3), np.array([512, 160, 160])))
+        stitcher.add_block("block-1", [480, 0, 0], [544, 160, 160], [("V", b - [0, 0, 480])],
+                           (np.array([512, 0, 0]), np.array([1024, 160, 160])))
+        assert len(list(stitcher.chains())) == 1
+    finally:
+        stitcher.close()
+
+
+def test_a_trace_only_one_block_detects_along_its_face_is_kept():
+    # Block 0 alone predicts a 125-voxel trace parallel to its face at x 535; block 1's nearest spline is far away.
+    along = np.stack([np.full(251, 48.0), np.linspace(10, 135, 251), np.full(251, 535.0)], axis=1)
+    kept = trimmed("block-0", along, "block-1", line(600, 900), DEFAULT_READS, DEFAULT_REACH)
+    assert np.array_equal(kept, along)
 
 
 def test_only_ends_cut_by_a_border_another_block_reads_past_are_trimmed():
