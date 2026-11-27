@@ -590,7 +590,13 @@ def parse_args(argv=None):
     parser.add_argument("--volume-uuid", type=str, default=None)
     parser.add_argument("--volume-path", type=str, required=True)
     parser.add_argument("--checkpoint-path", type=str, required=True)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=(
+            "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+        ),
+    )
     parser.add_argument("--volume-scale", type=int, default=0)
     parser.add_argument("--volume-chunk-cache-gb", type=float, default=_DEFAULT_VOLUME_CHUNK_CACHE_GB)
     parser.add_argument("--compile", dest="compile_model", action="store_true", default=True)
