@@ -81,9 +81,10 @@ def _station_mesh_scale(res: fit_model.FitResult3D) -> float:
 
 
 def _huberized_loss_map(residual: torch.Tensor, *, delta: float) -> torch.Tensor:
-    d = residual.new_tensor(max(1.0e-6, float(delta)))
+    # a Python scalar, not new_tensor: a fresh device constant is an upload that waits for the queue on MPS
+    d = max(1.0e-6, float(delta))
     abs_r = residual.abs()
-    quad = torch.minimum(abs_r, d)
+    quad = abs_r.clamp(max=d)
     linear = abs_r - quad
     return quad.square() + 2.0 * d * linear
 
@@ -496,6 +497,32 @@ def _station_anchor_from_local_ray_update(
     return None, max_iters
 
 
+def _station_anchor_from_local_ray_update_on_host(
+    seed: torch.Tensor,
+    surf: torch.Tensor,
+    h_ref: float,
+    w_ref: float,
+    n_ray: torch.Tensor,
+) -> tuple[tuple[torch.Tensor, float, float, torch.Tensor] | None, int]:
+    """`_station_anchor_from_local_ray_update` run on CPU copies of its inputs.
+
+    The ray walk is scalar code that reads a few values back per iteration (about 20 `.item()` calls per
+    step). On a GPU device each one waits for the queue, so read the surface back once, walk on the host,
+    and send the anchor point and normal back in one upload.
+    """
+    if surf.device.type == "cpu":
+        return _station_anchor_from_local_ray_update(seed, surf, h_ref=h_ref, w_ref=w_ref, n_ray=n_ray)
+    device = surf.device
+    anchor, iters = _station_anchor_from_local_ray_update(
+        seed.detach().cpu(), surf.detach().cpu(), h_ref=h_ref, w_ref=w_ref, n_ray=n_ray.detach().cpu(),
+    )
+    if anchor is None:
+        return None, iters
+    point, h_frac, w_frac, normal = anchor
+    both = torch.cat([point.reshape(3), normal.reshape(3)]).to(device)
+    return (both[:3], h_frac, w_frac, both[3:]), iters
+
+
 def _station_anchor_from_ray_min_station_t(
     seed: torch.Tensor,
     surf: torch.Tensor,
@@ -638,7 +665,7 @@ def station_loss(
                     anchor = None
                     update_iters = 0
                 else:
-                    anchor, update_iters = _station_anchor_from_local_ray_update(
+                    anchor, update_iters = _station_anchor_from_local_ray_update_on_host(
                         seed,
                         surf,
                         h_ref=_h_frac[d],

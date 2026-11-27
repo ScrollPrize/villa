@@ -344,6 +344,13 @@ def _parse_init_grow_config(args_cfg: dict | None, *, target_depth: int) -> Init
 
 
 def _require_torch_device_available(device: torch.device) -> None:
+	if device.type == "mps" and not torch.backends.mps.is_available():
+		raise RuntimeError(
+			"MPS device was requested, but PyTorch cannot access an Apple GPU "
+			"(needs Apple silicon and a PyTorch build with MPS). Refusing to "
+			"continue because falling back to CPU would make fit smoke/perf runs "
+			"misleading."
+		)
 	if device.type != "cuda":
 		return
 	if not torch.cuda.is_available():
@@ -1342,7 +1349,7 @@ def _run_flatten_mode(
 	if model_cfg.model_input is not None:
 		raise ValueError("model-init=flatten must not set --model-input")
 
-	device = torch.device(str(getattr(args, "device", "cuda")))
+	device = torch.device(cli_data.resolve_device(getattr(args, "device", None)))
 	from tifxyz_io import load_tifxyz
 	xyz, valid, meta = load_tifxyz(
 		ext0["path"], device=device, store=args.store, volume=args.volume_uuid, target_scale=args.voxel_scale)
@@ -1742,7 +1749,9 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		init_shell_dir = _require_init_shell_dir(
 			prep_params, override=data_cfg.init_shell_dir)
 		corr_point_roi_shell_index = InitShellIndex.from_directory(init_shell_dir)
-		if device.type == "cuda":
+		# the ROI needs normals at a few points only, so the GPUs stream chunks instead of dense-loading whole
+		# volumes, as the main fit does; the CPU keeps its dense load
+		if device.type in ("cuda", "mps"):
 			corr_point_roi_normal_data = fit_data.load_3d_streaming(
 				path=str(data_cfg.input),
 				device=device,
@@ -2221,6 +2230,8 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		cfg,
 		init_mode=model_cfg.init_mode if model_init == "seed" else None,
 	)
+	# fail before the data loads, not at the first backward
+	optimizer.require_device_support(stages, device)
 	print("[fit] optimizer stages:", flush=True)
 	for i, st in enumerate(stages):
 		if st.children:

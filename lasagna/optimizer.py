@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import math
 import os
@@ -8,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 import cli_data
 import fit_data
@@ -266,6 +268,54 @@ def _stage_to_modifiers(
 
 def _need_term(name: str, stage_eff: dict[str, float]) -> float:
 	return float(stage_eff.get(name, 0.0))
+
+
+@functools.cache
+def _mps_grid_sample_3d_backward() -> bool:
+	"""True when 5D F.grid_sample can run its backward on MPS in this PyTorch.
+
+	PyTorch 2.11 has no MPS kernel for it and 2.15 has one; a tiny probe answers for the installed build,
+	including under PYTORCH_ENABLE_MPS_FALLBACK, which runs it on the CPU instead.
+	"""
+	vol = torch.zeros(1, 1, 2, 2, 2, device="mps")
+	grid = torch.zeros(1, 1, 1, 1, 3, device="mps", requires_grad=True)
+	try:
+		F.grid_sample(vol, grid, align_corners=True).sum().backward()
+	except NotImplementedError:
+		return False
+	return True
+
+
+def _stage_weighting(stages, term: str) -> Stage | None:
+	"""The first stage, wrapped ones included, that gives `term` a positive weight outside the cylinder stages."""
+	for stage in stages:
+		opt_cfg = stage.global_opt
+		# cylinder stages keep only the cylinder terms (_stage_eff_for_opt)
+		if opt_cfg is not None and "cyl_params" not in opt_cfg.params and _need_term(term, opt_cfg.eff) > 0:
+			return stage
+		child = _stage_weighting(stage.children, term)
+		if child is not None:
+			return child
+	return None
+
+
+def require_device_support(stages: list[Stage], device: torch.device) -> None:
+	"""Raise ValueError when a stage weights a loss term whose backward cannot run on `device`.
+
+	Runs before optimization so the fit fails at once instead of at the term's first backward. The winding_vol
+	loss samples its volume with 5D F.grid_sample, which has no MPS backward in some PyTorch versions.
+	"""
+	if torch.device(device).type != "mps":
+		return
+
+	stage = _stage_weighting(stages, "winding_vol")
+	if stage is None or _mps_grid_sample_3d_backward():
+		return
+
+	raise ValueError(
+		f"stage '{stage.name}' weights the winding_vol loss, whose 3D grid sample has no MPS backward in "
+		f"PyTorch {torch.__version__}; set its weight to 0, run with --device cpu or cuda, or use PyTorch 2.15 or newer"
+	)
 
 
 def _parse_opt_settings(
@@ -1033,6 +1083,7 @@ def optimize(
 	snap_surf_boundary: dict | None = None,
 ) -> fit_data.FitData3D:
 	_optimize_t0 = time.perf_counter()
+	require_device_support(stages, next(model.parameters()).device)
 	opt_loss_corr.reset_state()
 	opt_loss_snap_surf.reset_state()
 	opt_loss_atlas_line.reset_state()
@@ -1496,6 +1547,9 @@ def optimize(
 	def _timing_cuda_sync() -> None:
 		if torch.cuda.is_available():
 			torch.cuda.synchronize()
+		elif torch.backends.mps.is_available():
+			# MPS work is asynchronous too; without this the timing window would report only encode time
+			torch.mps.synchronize()
 
 	def _truthy(value) -> bool:
 		if isinstance(value, bool):
@@ -2641,7 +2695,7 @@ def optimize(
 		if isinstance(opt, FlattenClampedAdam) and not is_cyl_shelling_stage:
 			print(
 				f"[optimizer] {label}: fused_flatten_adam_clamp=1 "
-				f"(Triton CUDA with PyTorch fallback)",
+				f"(Triton on CUDA, Metal on MPS, PyTorch elsewhere)",
 				flush=True,
 			)
 		if flatten_renorm_interval > 0 and not is_cyl_shelling_stage:
@@ -3476,6 +3530,9 @@ def optimize(
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
 			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
+			# per-term values are read back together at the end: one device-to-host transfer per
+			# evaluation instead of one per term, each of which waits for the queue on GPU devices
+			tv_pending: dict[str, torch.Tensor] = {}
 			if stage_uses_cyl_loss:
 				opt_loss_cyl.reset_candidate_terms()
 			D = res_.xyz_lr.shape[0]
@@ -3579,7 +3636,7 @@ def optimize(
 						w = _need_term(sub_name, eff_)
 						if w == 0.0:
 							continue
-						tv[sub_name] = float(lv.detach().cpu())
+						tv_pending[sub_name] = lv.detach()
 						total = total + w * lv
 					if name == "atlas_line":
 						tv.update(opt_loss_atlas_line.last_stats())
@@ -3593,9 +3650,9 @@ def optimize(
 						"flatten_avg_offset",
 						"flatten_orient",
 					)
-					tv[name] = float(lv.detach().cpu())
+					tv_pending[name] = lv.detach()
 					if is_flatten_term:
-						tv[f"{name}_contrib"] = float((lv * w).detach().cpu())
+						tv_pending[f"{name}_contrib"] = (lv * w).detach()
 					if name == "pred_dt":
 						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					if name == "cyl_outside":
@@ -3607,6 +3664,11 @@ def optimize(
 					if _flatten_diagnostics and name in ("flatten_sdir", "flatten_avg_offset", "flatten_orient"):
 						tv.update(opt_loss_flatten.last_stats())
 					total = total + w * lv
+			if tv_pending:
+				# keep float64 terms in float64: auto-steps compares relative changes of 1e-5
+				dtype = functools.reduce(torch.promote_types, (v.dtype for v in tv_pending.values()))
+				values = torch.stack([v.reshape(()).to(dtype) for v in tv_pending.values()]).cpu().tolist()
+				tv.update(zip(tv_pending.keys(), values, strict=True))
 			display_loss: float | None = None
 			if stage_uses_cyl_loss and not bool(getattr(res_, "cyl_shell_mode", False)):
 				best_idx, display_loss, display_tv = opt_loss_cyl.display_stats(eff_)

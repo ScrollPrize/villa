@@ -71,5 +71,7 @@ def normal_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torc
 	"""Normal direction loss: mesh normal vs stored data normal."""
 	lm, mask = normal_loss_maps(res=res)
 	wsum = mask.sum()
-	loss = (lm * mask).sum() / wsum if float(wsum.detach().cpu()) > 0.0 else lm.mean()
+	# chosen on the device: reading wsum back would wait for the queue every step on GPU devices. The mask is
+	# 0/1, so a nonzero wsum is >= 1 and the clamp only keeps the unused branch finite (and its gradient NaN-free)
+	loss = torch.where(wsum > 0.0, (lm * mask).sum() / wsum.clamp_min(1.0), lm.mean())
 	return loss, (lm,), (mask,)

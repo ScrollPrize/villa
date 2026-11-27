@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable
 
 import torch
@@ -32,7 +33,7 @@ class FlattenClampedAdam(torch.optim.Adam):
 			fused=False,
 		)
 		self.base_step = float(base_step)
-		self._triton_disabled_reason: str | None = None
+		self._native_disabled_reason: str | None = None
 		self.last_backend = "none"
 
 	@staticmethod
@@ -70,22 +71,35 @@ class FlattenClampedAdam(torch.optim.Adam):
 		else:
 			param.add_(delta.clamp_(min=-float(max_step), max=float(max_step)))
 
-	def _try_triton_step(self, *args, **kwargs) -> bool:
-		param = args[0]
-		if param.device.type != "cuda" or self._triton_disabled_reason is not None:
-			return False
+	@staticmethod
+	def _native_backend(param: torch.Tensor) -> str | None:
+		"""The fused kernel for this device: Triton on CUDA, Metal on MPS (unless LASAGNA_METAL=0)."""
+		if param.device.type == "cuda":
+			return "triton"
+		if param.device.type == "mps" and os.environ.get("LASAGNA_METAL", "1") != "0":
+			return "metal"
+		return None
+
+	def _try_native_step(self, *args, **kwargs) -> str | None:
+		"""Run the fused step if this device has one; the backend name, or None to use the PyTorch step."""
+		backend = self._native_backend(args[0])
+		if backend is None or self._native_disabled_reason is not None:
+			return None
 		try:
-			from flatten_clamped_adam_triton import clamped_adam_step
+			if backend == "triton":
+				from flatten_clamped_adam_triton import clamped_adam_step
+			else:
+				from flatten_clamped_adam_metal import clamped_adam_step
 
 			clamped_adam_step(*args, **kwargs)
 		except Exception as exc:
-			self._triton_disabled_reason = f"{type(exc).__name__}: {exc}"
+			self._native_disabled_reason = f"{type(exc).__name__}: {exc}"
 			print(
-				f"[flatten_clamped_adam] Triton disabled after failure: {self._triton_disabled_reason}",
+				f"[flatten_clamped_adam] {backend} disabled after failure: {self._native_disabled_reason}",
 				flush=True,
 			)
-			return False
-		return True
+			return None
+		return backend
 
 	@torch.no_grad()
 	def step(self, closure=None):
@@ -94,7 +108,7 @@ class FlattenClampedAdam(torch.optim.Adam):
 			with torch.enable_grad():
 				loss = closure()
 
-		used_triton = False
+		used_native: set[str] = set()
 		used_torch = False
 		for group in self.param_groups:
 			beta1, beta2 = (float(group["betas"][0]), float(group["betas"][1]))
@@ -134,10 +148,11 @@ class FlattenClampedAdam(torch.optim.Adam):
 					"max_step": max_step,
 				}
 				args = (param, grad, state["exp_avg"], state["exp_avg_sq"])
-				if self._try_triton_step(*args, **kwargs):
-					used_triton = True
+				backend = self._try_native_step(*args, **kwargs)
+				if backend is not None:
+					used_native.add(backend)
 				else:
 					self._torch_step(*args, **kwargs)
 					used_torch = True
-		self.last_backend = "triton" if used_triton and not used_torch else "torch"
+		self.last_backend = used_native.pop() if len(used_native) == 1 and not used_torch else "torch"
 		return loss
