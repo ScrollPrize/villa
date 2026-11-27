@@ -86,6 +86,12 @@ VCR_SHEET_HD inline bool principal(const double* sums, double* normal, double& g
 VCR_SHEET_HD inline float magnitude(float x,float y,float z) {
     return float(sqrt(double(x)*x+double(y)*y+double(z)*z));
 }
+// The first pass's weight of site i, exactly as contribution() computes it.
+VCR_SHEET_HD inline double plain_weight(int i,const float* center) {
+    double x=3*(i%sites)-center[0], y=3*((i/sites)%sites)-center[1], z=3*(i/(sites*sites))-center[2];
+    double exponent=(x*x+y*y+z*z)/576.;
+    return exp(-.5*exponent);
+}
 VCR_SHEET_HD inline void contribution(int i,const float* g,const float* center,
                                     const double* normal,float floor,bool refine,double* sums) {
     double x=3*(i%sites)-center[0], y=3*((i/sites)%sites)-center[1], z=3*(i/(sites*sites))-center[2];
@@ -99,6 +105,15 @@ VCR_SHEET_HD inline void contribution(int i,const float* g,const float* center,
 }
 // Filtered gradients depend only on the patch, not the query center. Keep
 // them immutable while evaluating nearby centers (e.g. integration stages).
+inline const double* lattice_weights() {
+    static const std::vector<double> weights=[] {
+        const float center[3]={48.f,48.f,48.f};
+        std::vector<double> w(count);
+        for(int i=0;i<count;++i) w[i]=plain_weight(i,center);
+        return w;
+    }();
+    return weights.data();
+}
 struct CpuPatch {
     std::unique_ptr<float[]> gradients=std::make_unique_for_overwrite<float[]>(6*count);
     float floor=0;
@@ -106,9 +121,24 @@ struct CpuPatch {
         std::fill_n(output,4,0.f);
         if(!center[3]) return;
         double normal[3]{},gap=0; bool valid=true;
+        // The first pass's weights depend only on the center. At the lattice point
+        // itself (center 48,48,48, every query of a lattice-cached field) they are
+        // the same for every patch, so they come from a table computed once.
+        const bool lattice=center[0]==48.f && center[1]==48.f && center[2]==48.f;
         for(int pass=0;pass<4 && valid;++pass) {
             double sums[7]{};
-            for(int i=0;i<count;++i) contribution(i,gradients.get()+(pass ? 3*count : 0),center,normal,floor,pass!=0,sums);
+            if(pass==0 && lattice) {
+                const double* weights=lattice_weights();
+                const float* g=gradients.get();
+                for(int i=0;i<count;++i) {
+                    double gx=g[i], gy=g[count+i], gz=g[2*count+i];
+                    double weight=weights[i];
+                    sums[0]+=weight*gx*gx; sums[1]+=weight*gx*gy; sums[2]+=weight*gx*gz;
+                    sums[3]+=weight*gy*gy; sums[4]+=weight*gy*gz; sums[5]+=weight*gz*gz; sums[6]+=weight;
+                }
+            } else {
+                for(int i=0;i<count;++i) contribution(i,gradients.get()+(pass ? 3*count : 0),center,normal,floor,pass!=0,sums);
+            }
             valid=principal(sums,normal,gap);
         }
         if(valid) { for(int j=0;j<3;++j) output[j]=float(normal[j]); output[3]=float(gap); }
@@ -122,22 +152,35 @@ struct CpuWorkspace {
     std::vector<float> mags=std::vector<float>(count);
     template<class T> void prepare(const T* src,CpuPatch& patch) {
         float* g=patch.gradients.get();
-        for(int c=0;c<4;++c) for(int zz=0;zz<sites;++zz) {
-            float* dst=z.get()+c*zcount+zz*width*width;
-            std::fill_n(dst,width*width,0.f);
+        // z filter, all four channels from one pass over each source plane, a block of
+        // voxels at a time held in registers. Every output adds its taps in the same
+        // order as one channel at a time would; an exactly zero tap adds +0 or -0 to a
+        // sum that is never -0, which leaves it unchanged, so those taps are skipped.
+        constexpr int plane=width*width, block=64;
+        for(int zz=0;zz<sites;++zz) for(int i0=0;i0<plane;i0+=block) {
+            const int n=std::min(block,plane-i0);
+            float acc[4][block]{};
+            float scaled[block];
             for(int j=0;j<13;++j) {
-                const T* plane=src+(3*zz+j)*width*width;
-                const float w=k.taps[c][j];
-                for(int i=0;i<width*width;++i) dst[i]+=w*(float(plane[i])*(1.f/255.f));
+                const T* row=src+(3*zz+j)*plane+i0;
+                for(int i=0;i<n;++i) scaled[i]=float(row[i])*(1.f/255.f);
+                for(int c=0;c<4;++c) {
+                    const float w=k.taps[c][j];
+                    if(w==0.f) continue;
+                    for(int i=0;i<n;++i) acc[c][i]+=w*scaled[i];
+                }
             }
+            for(int c=0;c<4;++c) std::copy_n(acc[c],n,z.get()+c*zcount+zz*plane+i0);
         }
         for(int c=0;c<6;++c) for(int zz=0;zz<sites;++zz) for(int yy=0;yy<sites;++yy) {
             int scale=c/3, axis=c%3, zc=2*scale+(axis==2), yc=2*scale+(axis==1);
             float* dst=y.get()+c*ycount+(zz*sites+yy)*width;
             std::fill_n(dst,width,0.f);
             for(int j=0;j<13;++j) {
+                const float w=k.taps[yc][j];
+                if(w==0.f) continue;  // adds a signed zero to a sum that is never -0
                 const float* row=z.get()+zc*zcount+(zz*width+3*yy+j)*width;
-                for(int xx=0;xx<width;++xx) dst[xx]+=k.taps[yc][j]*row[xx];
+                for(int xx=0;xx<width;++xx) dst[xx]+=w*row[xx];
             }
         }
         for(int c=0;c<6;++c) for(int i=0;i<count;++i) {

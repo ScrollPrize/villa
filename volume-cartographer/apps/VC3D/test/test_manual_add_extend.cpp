@@ -11,10 +11,12 @@
 #include <opencv2/core.hpp>
 
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -70,6 +72,8 @@ private slots:
     void undoHistoryFollowsGridPadding();
     void sheetWalkFollowsACurvedSheet();
     void sheetFrontDoesNotBridgeGridGaps();
+    void sheetGrowthIsTheSameOnEveryThreadCount();
+    void sheetGrowthReportsTheFirstFailingStrip();
     void streamlineConverges_data();
     void streamlineConverges();
     void streamlineReusesEndpointNormals();
@@ -612,6 +616,65 @@ void TestManualAddExtend::sheetFrontDoesNotBridgeGridGaps()
         for (int line = 0; line < 4; ++line)
             for (int k = 0; k < walk.cells; ++k)
                 QCOMPARE(result[line * walk.cells + k], walk.origins[line] + walk.steps[line] * float(k + 1));
+    }
+}
+
+namespace {
+// A sheet edge broken into one long strip and several short ones (grid gaps
+// between them), growing over a cylinder of radius 300 about the z axis
+// (cylinderNormal), so every normal depends on position.
+struct BrokenEdge {
+    ManualAddTool::SheetWalk walk;
+    std::vector<SegmentationEditManager::GridKey> fill;
+};
+BrokenEdge brokenEdge()
+{
+    BrokenEdge edge;
+    edge.walk.cells = 4;
+    int row = 0;
+    for (int length : {1, 24, 1, 2, 1, 3, 1, 1}) {
+        for (int i = 0; i < length; ++i, ++row) {
+            const float z = 2.0f * row;
+            edge.walk.origins.push_back({300.0f, 0.0f, z});
+            edge.walk.steps.push_back({0.0f, 2.0f, 0.5f});
+            for (int k = 0; k < edge.walk.cells; ++k) edge.fill.push_back({row, 10 + k});
+        }
+        row += 2;  // a gap: the next line is not grid-adjacent
+    }
+    return edge;
+}
+} // namespace
+
+void TestManualAddExtend::sheetGrowthIsTheSameOnEveryThreadCount()
+{
+    const auto edge = brokenEdge();
+    std::vector<cv::Vec3f> reference(edge.fill.size());
+    ManualAddTool::walkSheetExtension(edge.walk, edge.fill, cylinderNormal, reference, 1);
+    for (const auto& point : reference) QVERIFY(std::abs(std::hypot(point[0], point[1]) - 300.0f) < 0.5f);
+    for (unsigned workers : {2u, 3u, 4u, 8u, 64u}) {
+        std::vector<cv::Vec3f> grown(edge.fill.size());
+        ManualAddTool::walkSheetExtension(edge.walk, edge.fill, cylinderNormal, grown, workers);
+        QCOMPARE(std::memcmp(grown.data(), reference.data(), grown.size() * sizeof(cv::Vec3f)), 0);
+    }
+}
+
+void TestManualAddExtend::sheetGrowthReportsTheFirstFailingStrip()
+{
+    // Every short strip from z 58 on fails, each with its own message (z band
+    // 7, 8, 9, ...); a plain loop over the strips reports the first, band 7.
+    const auto edge = brokenEdge();
+    const auto failing = [](const cv::Vec3f& p) -> std::optional<cv::Vec3f> {
+        if (p[2] >= 57.0f) throw std::runtime_error("z band " + std::to_string(int(p[2]) / 8));
+        return cylinderNormal(p);
+    };
+    for (unsigned workers : {1u, 4u, 8u}) {
+        std::vector<cv::Vec3f> grown(edge.fill.size());
+        try {
+            ManualAddTool::walkSheetExtension(edge.walk, edge.fill, failing, grown, workers);
+            QFAIL("expected the growth to fail");
+        } catch (const std::runtime_error& e) {
+            QCOMPARE(std::string(e.what()), std::string("z band 7"));
+        }
     }
 }
 

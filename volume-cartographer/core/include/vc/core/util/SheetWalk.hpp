@@ -1,9 +1,14 @@
 #pragma once
 
 #include <opencv2/core.hpp>
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <optional>
+#include <thread>
 #include <vector>
 
 // Shared CT sheet integration used by manual extensions and GrowPatch seeds.
@@ -49,4 +54,38 @@ void walkSheetLines(const SheetWalk& walk, const SheetNormalFn& normal,
 void walkSheetStrip(const SheetWalk& walk, const SheetNormalFn& normal,
                     std::vector<cv::Vec3f>& guess, unsigned workers,
                     const SheetWalkProgress& vertexCompleted = {});
+// Runs body(i) for every i in [0, n) on up to `workers` threads. Each i must
+// write only its own outputs, so the results do not depend on the schedule.
+// If any body throws, the exception of the lowest such i is rethrown: the
+// one a plain loop would have stopped at. Later i not yet started are skipped.
+template <class Body>
+void forEachIndex(std::size_t n, unsigned workers, const Body& body)
+{
+    const auto count = std::min<std::size_t>(std::max(1u, workers), n);
+    if (count <= 1) {
+        for (std::size_t i = 0; i < n; ++i) body(i);
+        return;
+    }
+    std::vector<std::exception_ptr> errors(n);
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> failed{n};
+    auto work = [&]() {
+        for (std::size_t i = next++; i < failed; i = next++) {
+            try {
+                body(i);
+            } catch (...) {
+                errors[i] = std::current_exception();
+                for (auto f = failed.load(); i < f && !failed.compare_exchange_weak(f, i);) {}
+            }
+        }
+    };
+    {
+        // jthread also joins already-started workers if creating another fails.
+        std::vector<std::jthread> threads;
+        for (std::size_t t = 1; t < count; ++t) threads.emplace_back(work);
+        work();
+    }
+    for (const auto& error : errors)
+        if (error) std::rethrow_exception(error);
+}
 } // namespace vc::sheet
