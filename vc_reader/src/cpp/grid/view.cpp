@@ -94,24 +94,26 @@ int fallbackLevels(const std::vector<Level>& levels, int start, int width, int h
 std::array<float, 18> magnificationPoints(const Raster& raster)
 {
     // Off-centre points too: the view's centre may be over a hole or a boundary.
+    // Spanning the pixel indices, the points stay over the sampled footprint.
+    const double w = std::max(raster.width - 1, 0), h = std::max(raster.height - 1, 0);
     std::array<float, 18> xy{};
     std::size_t i = 0;
     for (const double y : {0.25, 0.5, 0.75})
         for (const double x : {0.25, 0.5, 0.75}) {
-            xy[i++] = float(raster.x0 + x * raster.width * raster.sx);
-            xy[i++] = float(raster.y0 + y * raster.height * raster.sy);
+            xy[i++] = float(raster.x0 + x * w * raster.sx + y * h * raster.kx);
+            xy[i++] = float(raster.y0 + x * w * raster.ky + y * h * raster.sy);
         }
     return xy;
 }
 
-float pixelsPerVoxel(const float* columnTangents, const float* rowTangents, std::size_t n, double sx, double sy)
+float pixelsPerVoxel(const float* columnTangents, const float* rowTangents, std::size_t n, double sx, double sy, double kx, double ky)
 {
     double magnification = 0;
     for (std::size_t i = 0; i < n; ++i) {
         double dx[3], dy[3];
-        for (std::size_t a = 0; a < 3; ++a) {
-            dx[a] = double(columnTangents[i * 3 + a]) * sx;
-            dy[a] = double(rowTangents[i * 3 + a]) * sy;
+        for (std::size_t a = 0; a < 3; ++a) {  // pixel (i, j): column x0 + i sx + j kx, row y0 + i ky + j sy
+            dx[a] = double(columnTangents[i * 3 + a]) * sx + double(rowTangents[i * 3 + a]) * ky;
+            dy[a] = double(columnTangents[i * 3 + a]) * kx + double(rowTangents[i * 3 + a]) * sy;
         }
         const double a = dx[0] * dx[0] + dx[1] * dx[1] + dx[2] * dx[2];
         const double b = dx[0] * dy[0] + dx[1] * dy[1] + dx[2] * dy[2];
@@ -130,7 +132,7 @@ float pixelsPerVoxel(const Surface& surface, const Raster& raster)
     const auto xy = magnificationPoints(raster);
     float du[27], dv[27];
     surface.pointsAt(xy.data(), 9, nullptr, nullptr, du, dv);
-    return pixelsPerVoxel(du, dv, 9, raster.sx, raster.sy);
+    return pixelsPerVoxel(du, dv, 9, raster.sx, raster.sy, raster.kx, raster.ky);
 }
 
 Result sample(const Frame& frame, const Request& request)
