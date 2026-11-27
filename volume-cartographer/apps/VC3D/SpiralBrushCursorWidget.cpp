@@ -17,18 +17,21 @@ SpiralBrushCursorWidget::SpiralBrushCursorWidget(QWidget* parent)
 
 void SpiralBrushCursorWidget::setCursorState(
     const QPointF& position, int diameter, bool brushDiameterVisible,
-    bool pointPlacementVisible, const QColor& pointPlacementColor)
+    bool pointPlacementVisible, const QColor& pointPlacementColor,
+    const QColor& ringColor)
 {
     if (_position == position && _diameter == diameter
         && _brushDiameterVisible == brushDiameterVisible
         && _pointPlacementVisible == pointPlacementVisible
-        && _pointPlacementColor == pointPlacementColor) return;
+        && _pointPlacementColor == pointPlacementColor
+        && _ringColor == ringColor) return;
     const QRect previous = cueBounds();
     _position = position;
     _diameter = diameter;
     _brushDiameterVisible = brushDiameterVisible;
     _pointPlacementVisible = pointPlacementVisible;
     _pointPlacementColor = pointPlacementColor;
+    _ringColor = ringColor;
     repaintCues(previous);
 }
 
@@ -121,7 +124,7 @@ void SpiralBrushCursorWidget::paintEvent(QPaintEvent*)
 
     if (!_brushDiameterVisible) return;
 
-    QPen pen(QColor(255, 255, 255, 220));
+    QPen pen(_ringColor);
     pen.setWidthF(kBrushRingPenWidth);
     painter.setPen(pen);
     painter.setBrush(Qt::NoBrush);

@@ -51,3 +51,14 @@ context. A software-rendered run can use `LIBGL_ALWAYS_SOFTWARE=1`,
 `__GLX_VENDOR_LIBRARY_NAME=mesa`, and `QT_XCB_GL_INTEGRATION=xcb_glx`.
 Use the `vc_object_store` build matching the C++ application's schema (for example,
 `PYTHONPATH=../vc_object_store/build/python` from `volume-cartographer/`).
+
+
+`manual_bridge_inklabels.py` is a separate command because it needs no local
+fixtures: it builds a temporary project with flat segments and checks the
+`ink_labels.*` methods end to end, including a save, a reload from disk and an
+autosave restored after a hard kill:
+
+```sh
+python3 apps/VC3D/agent_bridge/test/manual_bridge_inklabels.py \
+  --vc3d build/ci-release-gcc/bin/VC3D
+```

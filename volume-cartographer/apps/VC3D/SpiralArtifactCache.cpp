@@ -1,5 +1,7 @@
 #include "SpiralArtifactCache.hpp"
 
+#include "FileHash.hpp"
+
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
@@ -41,14 +43,6 @@ bool isSafeRelativeName(const QString& name)
     return true;
 }
 
-QString hashFileSha256(const QString& path)
-{
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) return {};
-    QCryptographicHash hash(QCryptographicHash::Sha256);
-    if (!hash.addData(&file)) return {};
-    return QString::fromLatin1(hash.result().toHex());
-}
 } // namespace
 
 struct SpiralArtifactCache::FetchJob
@@ -307,7 +301,7 @@ void SpiralArtifactCache::fetchFile(const QString& sessionId, const QString& art
                 if (actualSize != declaredSize)
                     return tr("Artifact file %1 has %2 bytes; the manifest declares %3")
                         .arg(relativeName).arg(actualSize).arg(declaredSize);
-                if (hashFileSha256(path) != declaredSha)
+                if (vc3d::fileSha256Hex(path) != declaredSha)
                     return tr("Artifact file %1 failed its SHA-256 digest check")
                         .arg(relativeName);
                 return {};
@@ -465,7 +459,7 @@ void SpiralArtifactCache::startFile(const std::shared_ptr<FetchJob>& job,
                 return tr("Artifact file %1 has %2 bytes; the manifest declares %3")
                     .arg(name).arg(actualSize).arg(declaredSize);
             const QString actualSha = streamedDigest->isEmpty()
-                ? hashFileSha256(targetPath)
+                ? vc3d::fileSha256Hex(targetPath)
                 : *streamedDigest;
             if (actualSha != declaredSha)
                 return tr("Artifact file %1 failed its SHA-256 digest check").arg(name);

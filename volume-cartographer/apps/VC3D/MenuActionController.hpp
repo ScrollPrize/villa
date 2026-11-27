@@ -128,6 +128,8 @@ public slots:
     void openVolpkg();
     void attachRemoteZarr();
     void showSettingsDialog();
+    // Enables Edit > Undo and Edit > Redo; wired to the segmentation history.
+    void setUndoRedoAvailable(bool canUndo, bool canRedo);
 
 private slots:
     void importUmbilicus();
@@ -148,6 +150,8 @@ private slots:
 signals:
     void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
+    void undoRequested();
+    void redoRequested();
 
 private:
     // The Stores menu: the stores beside the project and the store each kind uses.
@@ -232,6 +236,8 @@ private:
     QAction* _selectionClearAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
     QAction* _growTrackPatchesAct{nullptr};
+    QAction* _undoAct{nullptr};
+    QAction* _redoAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;

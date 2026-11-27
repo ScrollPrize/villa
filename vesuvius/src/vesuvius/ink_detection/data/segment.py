@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import json
 from pathlib import Path
 import warnings
 
@@ -47,6 +49,70 @@ def parse_label_asset_path(path: str | Path) -> dict[str, object] | None:
                 "extension": extension,
             }
     return None
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def interrupted_vc3d_save(label_path: str | Path) -> str | None:
+    """Explain why a VC3D-written label TIFF must not be read, or return None.
+
+    VC3D writes ``<segment>_inklabels[_vN].json.saving`` before a save
+    replaces any label TIFF and removes it after writing the sidecar. While
+    it exists, the TIFFs are one save's labels only if every file it lists
+    matches the hashes that save wrote, or the hashes of the files it
+    replaced. Anything else mixes masks from different edits.
+    """
+    label_path = Path(label_path)
+    parsed = parse_label_asset_path(label_path)
+    if parsed is None:
+        return None
+    version_num = int(parsed["version_num"])
+    version_suffix = f"_v{version_num}" if version_num > 1 else ""
+    prefix = str(parsed["prefix"])
+    directory = label_path.parent
+    record_path = directory / f"{prefix}_inklabels{version_suffix}.json.saving"
+    if not record_path.exists():
+        return None
+    problem = (
+        f"{directory}: an interrupted VC3D save left {prefix} label files that "
+        f"may come from two different saves ({record_path.name}); open the "
+        f"labels in VC3D to complete the save or put the previous one back"
+    )
+    try:
+        record = json.loads(record_path.read_text())
+        written = record["sidecar"]["files"]
+        replaced = record["replaces"]
+        if not isinstance(written, dict) or not isinstance(replaced, dict) or not replaced:
+            return problem
+    except (OSError, ValueError, KeyError, TypeError):
+        return problem
+
+    all_written = True
+    all_replaced = True
+    for kind, before in replaced.items():
+        after = written.get(kind)
+        after_sha = after.get("sha256") if isinstance(after, dict) else None
+        before_sha = before.get("sha256") if isinstance(before, dict) else None
+        path = directory / f"{prefix}_{kind}{version_suffix}.tif"
+        current = _file_sha256(path) if path.is_file() else None
+        all_written = all_written and current == after_sha
+        all_replaced = all_replaced and current == before_sha
+    return None if all_written or all_replaced else problem
+
+
+def _refuse_interrupted_vc3d_saves(paths: list[Path | None]) -> None:
+    for path in paths:
+        if path is None or path.suffix.lower() not in {".tif", ".tiff"}:
+            continue
+        problem = interrupted_vc3d_save(path)
+        if problem is not None:
+            raise ValueError(problem)
 
 
 def _warn_if_validation_unused(
@@ -119,6 +185,13 @@ def discover_segment_labels(
         _warn_if_validation_unused(
             segment, selected.get("validation_mask"), normalized_extension
         )
+        _refuse_interrupted_vc3d_saves(
+            [
+                selected["inklabels"],
+                selected["supervision_mask"],
+                selected.get("validation_mask"),
+            ]
+        )
         return replace(
             segment,
             inklabels=selected["inklabels"],
@@ -144,6 +217,7 @@ def discover_segment_labels(
         _warn_if_validation_unused(
             segment, selected_paths["validation_mask"], normalized_extension
         )
+    _refuse_interrupted_vc3d_saves(list(selected_paths.values()))
     return replace(
         segment,
         inklabels=selected_paths["inklabels"],

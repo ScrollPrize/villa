@@ -1,0 +1,13 @@
+{
+  "schema": "vc3d-plugin/1",
+  "id": "example.points-at-focus",
+  "name": "Mark points around focus",
+  "description": "Format example: writes a point collection of seven points around the focus point, which VC3D adds to the Point Collections panel.",
+  "menu": "Examples",
+  "program": "python3",
+  "args": ["{plugin_dir}/points_at_focus.py", "--point", "{point}", "--radius", "{input:radius}",
+           "--out", "{output}/points.json"],
+  "inputs": [{"name": "radius", "label": "Distance from the focus point in voxels", "default": "20"}],
+  "result": {"kind": "points", "path": "{output}/points.json"},
+  "license": "GPL-3.0"
+}

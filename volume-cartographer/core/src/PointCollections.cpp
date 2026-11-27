@@ -1,5 +1,8 @@
 #include "vc/core/PointCollections.hpp"
 #include <algorithm>
+#include <cmath>
+#include <map>
+#include <set>
 #include <vector>
 #include <fstream>
 #include <iostream>
@@ -639,6 +642,126 @@ bool PointCollections::loadFromJSON(const std::string& filename)
     onCollectionsAdded(collectionIds);
 
     return true;
+}
+
+PointCollections::MergeOutcome PointCollections::mergeUnanchoredFromJSON(const std::string& filename, double scale)
+{
+    MergeOutcome outcome;
+    if (!std::isfinite(scale) || scale <= 0) {
+        outcome.error = "the scale between the file's voxels and these is not a positive number";
+        return outcome;
+    }
+    std::map<uint64_t, Collection> parsed;  // By the file's ids, in order
+    try {
+        const Json j = nlohmann::json::parse(std::ifstream(filename));
+        if (!j.contains("vc_pointcollections_json_version") ||
+            j.at("vc_pointcollections_json_version").get<std::string>() != VC_POINTCOLLECTIONS_JSON_VERSION) {
+            throw std::runtime_error("the file has another version or none");
+        }
+        const Json collections = j.at("collections");
+        if (!collections.is_object()) {
+            throw std::runtime_error("the file has no collections");
+        }
+        for (auto it = collections.begin(); it != collections.end(); ++it) {
+            Collection col;
+            from_json(*it, col);
+            if (col.anchor2d.has_value()) {
+                continue;
+            }
+            col.id = std::stoull(it.key());
+            for (auto& [_, point] : col.points) {
+                point.p *= static_cast<float>(scale);
+            }
+            parsed.emplace(col.id, std::move(col));
+        }
+    } catch (const std::exception& e) {
+        outcome.error = e.what();
+        return outcome;
+    }
+
+    // What the comparison ignores: runtime ids of linked collections.
+    const auto content = [](const Collection& col) {
+        Json j;
+        to_json(j, col);
+        j.erase("windings_linked");
+        return j;
+    };
+    std::set<std::string> names;
+    for (const auto& [_, col] : _collections) {
+        names.insert(col.name);
+    }
+    std::map<uint64_t, uint64_t> collectionIds;  // File id to id in memory
+    std::set<uint64_t> unchangedPoints;          // Same ids in the file and here
+    std::vector<Collection> added;
+    for (auto& [fileId, col] : parsed) {
+        const auto same = std::find_if(_collections.begin(), _collections.end(), [&](const auto& entry) {
+            return !entry.second.anchor2d && entry.second.uuid == col.uuid;
+        });
+        if (same != _collections.end() && content(same->second) == content(col)) {
+            collectionIds[fileId] = same->first;
+            for (const auto& [pointId, _] : col.points) {
+                unchangedPoints.insert(pointId);
+            }
+            ++outcome.unchanged;
+            continue;
+        }
+        if (same != _collections.end() || names.contains(col.name)) {
+            const std::string base = col.name + " (recovered)";
+            std::string name = base;
+            for (int n = 2; names.contains(name); ++n) {
+                name = base + " " + std::to_string(n);
+            }
+            outcome.renamed.emplace_back(col.name, name);
+            col.name = name;
+        }
+        names.insert(col.name);
+        added.push_back(std::move(col));
+    }
+
+    std::map<uint64_t, uint64_t> pointIds;  // File id to new id
+    for (auto& col : added) {
+        const uint64_t fileId = col.id;
+        col.id = getNextCollectionId();
+        col.uuid = vc::objects::util::newUuid();
+        collectionIds[fileId] = col.id;
+        for (const auto& [pointId, _] : col.points) {
+            pointIds[pointId] = getNextPointId();
+        }
+    }
+    std::vector<uint64_t> addedIds;
+    for (auto& col : added) {
+        std::unordered_map<uint64_t, ColPoint> points;
+        for (auto& [pointId, point] : col.points) {
+            point.id = pointIds.at(pointId);
+            point.collectionId = col.id;
+            std::vector<uint64_t> links;
+            for (const uint64_t linked : point.links) {
+                if (const auto found = pointIds.find(linked); found != pointIds.end()) {
+                    links.push_back(found->second);
+                } else if (unchangedPoints.contains(linked)) {
+                    links.push_back(linked);
+                }
+            }
+            point.links = std::move(links);
+            points.emplace(point.id, std::move(point));
+        }
+        col.points = std::move(points);
+        std::vector<uint64_t> linked;
+        for (const uint64_t other : col.windings_linked) {
+            if (const auto found = collectionIds.find(other); found != collectionIds.end()) {
+                linked.push_back(found->second);
+            }
+        }
+        col.windings_linked = std::move(linked);
+        addedIds.push_back(col.id);
+        _collections[col.id] = std::move(col);
+    }
+    outcome.added = static_cast<int>(addedIds.size());
+    if (!addedIds.empty()) {
+        onCollectionsAdded(addedIds);
+    }
+    outcome.ok = true;
+    return outcome;
 }
 
 std::map<uint64_t, Json> PointCollections::anchoredCollections() const

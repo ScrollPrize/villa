@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <utility>
 
 namespace {
 constexpr int kResizeHitWidth = 10;
@@ -281,6 +282,41 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     }
 }
 
+QWidget* StatusDockPanelHost::panelPage(const QDockWidget* dock) const
+{
+    for (const Item& item : _items) {
+        if (dock && item.dock == dock) {
+            return item.detached ? nullptr : item.page.data();
+        }
+    }
+    return nullptr;
+}
+
+QDockWidget* StatusDockPanelHost::expandedDock() const
+{
+    if (_currentIndex < 0 || _currentIndex >= static_cast<int>(_items.size())) {
+        return nullptr;
+    }
+    return _items[static_cast<std::size_t>(_currentIndex)].dock.data();
+}
+
+bool StatusDockPanelHost::expandDock(QDockWidget* dock)
+{
+    Item* item = itemForDock(dock);
+    if (!item || item->detached || !item->visibleInBar) {
+        return false;
+    }
+    if (_currentIndex != itemIndex(*item)) {
+        expandItem(*item);
+    }
+    return _currentIndex == itemIndex(*item);
+}
+
+void StatusDockPanelHost::collapsePanel()
+{
+    collapseCurrent();
+}
+
 void StatusDockPanelHost::showDock(QDockWidget* dock)
 {
     Item* item = itemForDock(dock);
@@ -296,6 +332,45 @@ void StatusDockPanelHost::showDock(QDockWidget* dock)
     if (_currentIndex != itemIndex(*item)) {
         expandItem(*item);
     }
+}
+
+QWidget* StatusDockPanelHost::contentForDock(QDockWidget* dock) const
+{
+    const Item* item = itemForDock(dock);
+    return item ? item->content.data() : nullptr;
+}
+
+QWidget* StatusDockPanelHost::panelWidgetForDock(QDockWidget* dock) const
+{
+    const Item* item = itemForDock(dock);
+    if (!item)
+        return nullptr;
+    if (item->detached)
+        return item->dock.data();
+    // Never capture another dock's page, or reveal a collapsed panel by grab().
+    if (_currentIndex != itemIndex(*item) || !item->page || _stack->currentWidget() != item->page)
+        return nullptr;
+    return item->page.data();
+}
+
+bool StatusDockPanelHost::isDockDetached(QDockWidget* dock) const
+{
+    const Item* item = itemForDock(dock);
+    return item && item->detached;
+}
+
+bool StatusDockPanelHost::setDockDetached(QDockWidget* dock, bool detached)
+{
+    Item* item = itemForDock(dock);
+    if (!item || !item->dock || !item->content || !item->page)
+        return false;
+    setItemVisibleInBar(*item, true);
+    if (detached)
+        detachItem(*item);
+    else
+        attachItem(*item, true);
+    showDock(dock);
+    return item->detached == detached;
 }
 
 bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
@@ -449,6 +524,11 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
 }
 
 StatusDockPanelHost::Item* StatusDockPanelHost::itemForDock(QDockWidget* dock)
+{
+    return const_cast<Item*>(std::as_const(*this).itemForDock(dock));
+}
+
+const StatusDockPanelHost::Item* StatusDockPanelHost::itemForDock(QDockWidget* dock) const
 {
     auto it = std::find_if(_items.begin(), _items.end(), [dock](const Item& item) {
         return item.dock == dock;

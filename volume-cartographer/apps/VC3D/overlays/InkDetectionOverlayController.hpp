@@ -30,6 +30,9 @@ public:
         std::string name;  // the published file (vc::objects::CatalogFile::name)
         std::string url;   // where it is published
         std::filesystem::path localPath; // its copy in VC3D's remote cache
+        // An image on this computer shown for this session (a plugin's
+        // result); not published, so name and url are empty.
+        bool local{false};
     };
 
     explicit InkDetectionOverlayController(CState* state, QObject* parent = nullptr);
@@ -43,9 +46,17 @@ public:
     [[nodiscard]] bool horizontalFlip() const { return _horizontalFlip; }
     [[nodiscard]] bool verticalFlip() const { return _verticalFlip; }
     [[nodiscard]] bool selectedIsSingleChannel() const { return _selectedImage.singleChannel; }
+    // The selected prediction as drawn, before flips: 8-bit as is, other
+    // depths min-max scaled to 0..255. Empty for color predictions.
+    [[nodiscard]] const cv::Mat_<uint8_t>& selectedScalar() const { return _selectedImage.scalar; }
     [[nodiscard]] bool hasLoadedSelection() const;
+    // Lists an image on this computer as an option of the active segment for
+    // this session and selects it. False when no segment is active or the
+    // image cannot be read; then the selection is unchanged.
+    bool showLocalImage(const std::filesystem::path& path, const QString& label);
 #ifdef VC_TESTING
     [[nodiscard]] const QImage& selectedImageForTesting() const { return _selectedImage.image; }
+    [[nodiscard]] bool drawsOnForTesting(const QuadSurface& surface) const { return imageMatchesSurface(surface); }
 #endif
 
 public slots:
@@ -62,6 +73,7 @@ signals:
     void availableDetectionsChanged();
     void selectionChanged();
     void opacityChanged(int opacity);
+    void colormapChanged(const QString& colormapId);
     void flipChanged(bool horizontal, bool vertical);
 
 protected:
@@ -93,6 +105,7 @@ private:
     std::filesystem::path _selectedPath;
     std::string _selectedSegmentKey;
     std::unordered_map<std::string, std::filesystem::path> _selectedPathBySegment;
+    std::unordered_map<std::string, std::vector<Option>> _localOptionsBySegment;
     LoadedImage _selectedImage;
     int _opacity{70};
     int _opacityBeforeToggle{70};

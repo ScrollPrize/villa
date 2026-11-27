@@ -1,6 +1,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_reader/publication.hpp>
 #include "vc/core/util/ImageMat.hpp"
+#include "vc/core/util/OpenCvCompat.hpp"
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"

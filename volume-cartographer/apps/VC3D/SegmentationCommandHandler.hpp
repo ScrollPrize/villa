@@ -15,6 +15,7 @@
 #include <QJsonObject>
 #include <QTemporaryFile>
 #include <QVector3D>
+#include <QVector>
 
 #include "elements/VolumeSelector.hpp"
 #include "AlphaCompRefineRequest.hpp"
@@ -125,6 +126,38 @@ public:
 
     using AlphaCompRefineParams = AlphaCompRefineRequest;
 
+    // Arguments accepted by startNeighborCopy; defaults match the dialog.
+    struct NeighborCopyParams {
+        QString     volumeId;                 // empty => current volume
+        QString     outputTag{QStringLiteral("paths")};  // tag of the new surface
+        int         neighborMaxDistance{200};
+        int         neighborMinClearance{4};
+        bool        neighborFill{true};
+        int         neighborInterpWindow{5};
+        int         generations{2};
+        int         neighborSpikeWindow{2};
+        // The same run refines the projected surface (gen_neighbor's "refine").
+        int         resumeLocalOptStep{20};
+        int         resumeLocalOptRadius{40};
+        int         resumeLocalMaxIters{1000};
+        bool        resumeLocalDenseQr{false};
+        int         refineOmpThreads{1};      // >= 1; the refinement's thread_limit
+        QJsonObject refineParamOverrides;     // merged over the refine params
+    };
+
+    // Arguments accepted by startConvertToObj. The tool writes the OBJ into
+    // the surface's artifact directory and reports its path.
+    struct ConvertToObjParams {
+        QString objName;          // a file name; empty => <surface name>.obj
+        bool    normalizeUV{false};
+        bool    alignGrid{false};
+        int     ompThreads{-1};   // -1 => runner default
+    };
+
+    /// Grid transforms offered by the surface context menu's Flip and Rotate
+    /// entries. The "Normals (H Flip)" entry is FlipV.
+    enum class SurfaceTransform { FlipU, FlipV, Rotate90 };
+
     // --- Construction ---
 
     explicit SegmentationCommandHandler(QWidget* parentWidget,
@@ -173,6 +206,15 @@ signals:
      * with an empty message denotes a user cancel.
      */
     void flattenJobFinished(bool success, QString message, QString outputPath);
+
+    /**
+     * Emitted once when a segment operation whose result the tool runner does
+     * not report reaches its terminal state. Emitted for interactive and
+     * dialog-free launches. `kind` names the operation;
+     * `outputPath` is the produced artifact on success.
+     */
+    void segmentOperationFinished(QString kind, bool success, QString message,
+                                  QString outputPath);
 
 public slots:
     void onRenderSegment(const std::string& segmentId);
@@ -249,6 +291,32 @@ public:
     /// channel-size mismatch, and save failures.
     bool cropSurfaceToValidRegion(const std::string& segmentId,
                                   QString* errorMessage = nullptr);
+
+    /// Dialog-free core of onFlipSurface / onRotateSurface. The surface must
+    /// be the active one. Applies the transform, publishes the surface to the
+    /// object store and refreshes the shared surface state; failures via
+    /// `errorMessage` (never a dialog). A failed publish leaves the in-memory
+    /// surface transformed, matching the interactive slots.
+    bool transformSurface(const std::string& segmentId,
+                          SurfaceTransform transform,
+                          QString* errorMessage = nullptr);
+
+    /// Dialog-free OBJ export (vc_tifxyz2obj). The interactive slot gathers the
+    /// same params from its dialog. Completion is observable via
+    /// CommandLineToolRunner::toolFinished, whose output path is the OBJ file.
+    bool startConvertToObj(const std::string& segmentId,
+                           const ConvertToObjParams& params,
+                           CommandLaunchError* error = nullptr);
+
+    /// Dialog-free neighbor copy (one vc_grow_seg_from_seed run that projects
+    /// and refines). The interactive slot gathers the same params from its
+    /// dialog. Completion is observable via CommandLineToolRunner::toolFinished
+    /// (the new surface's UUID as the output).
+    bool startNeighborCopy(const QString& segmentId,
+                           bool copyOut,
+                           const NeighborCopyParams& params,
+                           CommandLaunchError* error = nullptr);
+
 
 
 private:
@@ -331,6 +399,19 @@ private:
                                   CommandLaunchError* error);
     static QJsonObject alphaCompRefineParamsJson(
         const AlphaCompRefineParams& params);
+    bool startConvertToObjImpl(const std::string& segmentId,
+                               const ConvertToObjParams& params,
+                               bool interactive,
+                               CommandLaunchError* error);
+    bool transformSurfaceImpl(const std::string& segmentId,
+                              SurfaceTransform transform,
+                              bool interactive,
+                              QString* errorMessage);
+    bool startNeighborCopyImpl(const QString& segmentId,
+                               bool copyOut,
+                               const NeighborCopyParams& params,
+                               bool interactive,
+                               CommandLaunchError* error);
 
 
     QWidget* _parentWidget{nullptr};

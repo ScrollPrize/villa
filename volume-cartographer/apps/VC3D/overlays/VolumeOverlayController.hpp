@@ -52,6 +52,7 @@ public:
         bool intensityAsAlpha{false};
         int maxDisplayedResolution{0};
         OverlayCompositeSettings composite;
+        int samplingMethod{0};  // 0 nearest, 1 trilinear
     };
 
     struct Update {
@@ -63,6 +64,8 @@ public:
         std::optional<bool> intensityAsAlpha;
         std::optional<int> maxDisplayedResolution;
         std::optional<OverlayCompositeSettings> composite;
+        // 0 nearest, 1 trilinear; other values fall back to nearest.
+        std::optional<int> samplingMethod;
     };
 
     enum class ApplyResult {

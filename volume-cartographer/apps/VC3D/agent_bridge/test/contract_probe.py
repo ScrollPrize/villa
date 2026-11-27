@@ -48,7 +48,9 @@ def _sample(schema: dict[str, Any]) -> Any:
     if kind == "number":
         return 1.0
     if kind == "integer":
-        return 1
+        # 1, or the minimum when that is larger, so a sibling of the probed
+        # value passes validation.
+        return max(1, int(schema.get("minimum", 1)))
     if kind == "boolean":
         return True
     if kind == "array":
