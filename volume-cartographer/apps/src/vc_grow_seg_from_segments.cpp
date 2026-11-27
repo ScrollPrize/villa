@@ -492,44 +492,17 @@ static std::vector<SweepRun> sample_sweep_runs_latin_hypercube(const nlohmann::j
 
 static double median_surface_step_vx(const QuadSurface& surface)
 {
-    std::vector<double> steps;
     const auto* points = surface.rawPointsPtr();
     if (!points || points->empty()) {
         return 1.0;
     }
-
-    steps.reserve(static_cast<size_t>(points->rows + points->cols));
-    for (int y = 0; y < points->rows; ++y) {
-        for (int x = 0; x + 1 < points->cols; ++x) {
-            const cv::Vec3f& a = (*points)(y, x);
-            const cv::Vec3f& b = (*points)(y, x + 1);
-            if (a[0] != -1.0f && b[0] != -1.0f) {
-                const double d = cv::norm(b - a);
-                if (std::isfinite(d) && d > 0.0) {
-                    steps.push_back(d);
-                }
-            }
-        }
-    }
-    for (int y = 0; y + 1 < points->rows; ++y) {
-        for (int x = 0; x < points->cols; ++x) {
-            const cv::Vec3f& a = (*points)(y, x);
-            const cv::Vec3f& b = (*points)(y + 1, x);
-            if (a[0] != -1.0f && b[0] != -1.0f) {
-                const double d = cv::norm(b - a);
-                if (std::isfinite(d) && d > 0.0) {
-                    steps.push_back(d);
-                }
-            }
-        }
-    }
-
-    if (steps.empty()) {
-        return 1.0;
-    }
-    auto mid = steps.begin() + static_cast<std::ptrdiff_t>(steps.size() / 2);
-    std::nth_element(steps.begin(), mid, steps.end());
-    return *mid;
+    // Valid as before: x is not the -1 marker (no finiteness check); measureSpacing skips nonfinite and zero distances.
+    vcr::tifxyz::SpacingOptions options;
+    options.invalidMarker = -1.0f;
+    options.requireFinite = false;
+    options.rowStride = points->step1();
+    options.medians = vcr::tifxyz::kSpacingBoth;
+    return vcr::tifxyz::measureSpacing(reinterpret_cast<const float*>(points->ptr()), points->rows, points->cols, options).both.value_or(1.0);
 }
 
 static cv::Point find_center_seed_point(const cv::Mat_<cv::Vec3f>& points)

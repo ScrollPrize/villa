@@ -7,6 +7,7 @@
 #include "vc/core/util/Surface.hpp"
 #include <vc_reader/image_write.hpp>
 #include <vc_reader/source_reader.hpp>
+#include <vc_reader/tifxyz.hpp>
 #include "vc/core/util/StreamOperators.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -51,6 +52,9 @@ using Affine = vcr::catalog::Affine;
 // Logging infrastructure
 // ============================================================
 
+// Relative difference between a surface's scale and its measured vertex spacing above which it is reported
+// (and, with --strict-scale, not rendered). Keep the --strict-scale help text in step.
+static constexpr double kScaleTolerance = 0.10;
 static FILE* g_logFile = nullptr;       // non-null when --log-path active
 static std::string g_logPrefix;         // e.g. "[part 2/8] " — prepended when logging to file
 static bool g_flipNormals = false;      // negate surface normals (--flip-normals); reverses slice ordering along the normal
@@ -850,6 +854,9 @@ int main(int argc, char *argv[])
         // left-handed frame. So --flip-normals is usually what we want: it negates N so the
         // slice stack grows in front of the sheet rather than behind it.
         ("flip-normals", po::bool_switch()->default_value(false), "Negate surface normals (reverses slice ordering along the normal)")
+        // The output size comes from the surface's scale (meta.json). A surface whose measured vertex spacing is more
+        // than kScaleTolerance off that scale is rendered anyway with a warning; this switch stops with an error instead.
+        ("strict-scale", po::bool_switch()->default_value(false), "Stop with an error instead of rendering a surface whose scale disagrees with its measured vertex spacing by more than 10%")
         // How the surface itself is resampled, as opposed to how the volume is
         // sampled along the normal (trilinear slices, nearest-voxel composites).
         ("surface-interpolation", po::value<std::string>()->default_value("bicubic"),
@@ -1091,6 +1098,7 @@ int main(int argc, char *argv[])
     int flip_axis = parsed["flip"].as<int>();
     g_flipNormals = parsed["flip-normals"].as<bool>();
     const bool quickTif = parsed["quick-tif"].as<bool>();
+    const bool strictScale = parsed["strict-scale"].as<bool>();
 
     // --- Load affines ---
     Affine affineTransform;
@@ -1359,12 +1367,64 @@ int main(int argc, char *argv[])
         }
 
         std::unique_ptr<QuadSurface> surf;
+        // The affine the store applied to this surface's stored coordinates (identity for tifxyz input).
+        vcr::catalog::Affine toVolume = vcr::catalog::Affine::identity();
         try {
-            surf = store_mode ? StoreSurfaces(store_options->store, "vc_render_tifxyz").load(seg_folder.string(), true, view_volume)
+            surf = store_mode ? StoreSurfaces(store_options->store, "vc_render_tifxyz").load(seg_folder.string(), true, view_volume, &toVolume)
                               : load_quad_from_tifxyz(seg_folder);
         }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
+        // The scale sets the output size below; check it against the grid it describes. Valid vertices are the
+        // ones this renderer uses (not the -1 marker, all coordinates finite). The store adjusts scale together
+        // with the coordinates only for identity and uniformly scaled mappings; under any other registration the
+        // check runs on a copy of these same loaded points mapped back to the surface's own frame, which the stored
+        // scale describes. The surface is not read a second time, so the checked and rendered revisions are one.
+        do {
+            cv::Mat_<cv::Vec3f> ownFrame;
+            const cv::Mat_<cv::Vec3f>* checked = surf->rawPointsPtr();
+            if (!(toVolume == vcr::catalog::Affine::identity()) && !toVolume.similarityScale()) {
+                std::optional<vcr::catalog::Affine> back;
+                try { back = toVolume.inverse(); }
+                catch (const std::invalid_argument&) {}
+                if (!back) {
+                    logPrintf(stdout, "%s: scale check skipped: non-invertible registration\n", seg_folder.string().c_str());
+                    break;
+                }
+                ownFrame = checked->clone();
+                for (auto& p : ownFrame) {
+                    if (p[0] == -1.0f || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
+                    const auto q = back->apply({double(p[0]), double(p[1]), double(p[2])});
+                    p = {float(q[0]), float(q[1]), float(q[2])};
+                }
+                checked = &ownFrame;
+            }
+            const auto& points = *checked;
+            // QuadSurface keeps scale as (x, y) = (columns, rows); vcr::tifxyz takes (rows, columns).
+            const std::array<double, 2> scale = {double(surf->_scale[1]), double(surf->_scale[0])};
+            vcr::tifxyz::SpacingOptions options;
+            options.invalidMarker = -1.0f;
+            options.requireFinite = true;
+            options.rowStride = points.step1();
+            options.maxPairs = std::int64_t(1) << 20;
+            options.medians = vcr::tifxyz::kSpacingRows | vcr::tifxyz::kSpacingCols;  // the median over both axes is not used here
+            const auto check = vcr::tifxyz::checkScale(reinterpret_cast<const float*>(points.ptr()), points.rows, points.cols, scale, options);
+            const char* names[2] = {"rows", "columns"};
+            const std::optional<double> spacing[2] = {check.measured.rows, check.measured.cols};
+            bool off = false;
+            for (int a = 0; a < 2; ++a)
+                if (check.deviation[a] && std::abs(*check.deviation[a]) > kScaleTolerance) {
+                    off = true;
+                    logPrintf(stderr, "Warning: %s: surface scale %.6g means one vertex every %.3g voxels along %s, "
+                              "but neighbouring vertices are %.3g voxels apart (%+.0f%%); the output will be %s along that axis.\n",
+                              seg_folder.string().c_str(), scale[a], 1.0 / scale[a], names[a], *spacing[a],
+                              100.0 * *check.deviation[a], *check.deviation[a] > 0 ? "squeezed" : "stretched");
+                }
+            if (off && strictScale) {
+                logPrintf(stderr, "Not rendering %s (--strict-scale).\n", seg_folder.string().c_str());
+                return false;
+            }
+        } while (false);
 
         // Replace sentinel -1 with NaN
         auto* raw_points = surf->rawPointsPtr();

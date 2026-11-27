@@ -45,6 +45,38 @@ struct Metadata {
     return xyz[0] >= 0 && xyz[1] >= 0 && xyz[2] >= 0 && std::isfinite(xyz[0]) && std::isfinite(xyz[1]) && std::isfinite(xyz[2]);
 }
 
+// A stored grid's spacing, measured: the median 3-D distance between neighbouring valid vertices
+// whose distance is finite and nonzero, along a column (rows), along a row (columns) and over both,
+// in the units of the coordinates (full-resolution voxels). An axis without such a pair has none.
+struct GridSpacing {
+    std::optional<double> rows, cols, both;
+};
+// Which medians measureSpacing computes; the others stay empty. All pairs share one buffer, so asking for the
+// median over both axes costs no extra memory.
+enum SpacingMedian : unsigned { kSpacingRows = 1, kSpacingCols = 2, kSpacingBoth = 4, kSpacingAll = 7 };
+struct SpacingOptions {
+    // Which vertices count. Unset: vertexValid. Set: x is not this marker (QuadSurface stores -1), and with
+    // requireFinite all three coordinates are finite as well.
+    std::optional<float> invalidMarker;
+    bool requireFinite = true;
+    std::size_t rowStride = 0;            // floats from one row to the next; 0 means cols * 3
+    std::int64_t maxPairs = 0;            // > 0: each axis on a regular lattice of about this many valid pairs
+    unsigned medians = kSpacingAll;       // SpacingMedian bits
+};
+[[nodiscard]] GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t cols, const SpacingOptions& options = {});
+
+// How far a grid's measured spacing is from the one its scale (rows, columns) implies, one stored
+// vertex every 1/scale full-resolution pixels: measured * scale - 1 per axis, none where the
+// spacing could not be measured. vc_render_tifxyz sizes its output from the scale, so a large
+// deviation means the render comes out stretched or squeezed along that axis. By default each
+// axis is measured on about 2^20 pairs. The per-axis medians are always computed.
+struct ScaleCheck {
+    GridSpacing measured;
+    std::array<std::optional<double>, 2> deviation;  // rows, columns
+};
+[[nodiscard]] ScaleCheck checkScale(const float* xyz, std::int64_t rows, std::int64_t cols, const std::array<double, 2>& scale,
+                                    SpacingOptions options = {.maxPairs = std::int64_t(1) << 20});
+
 // The raster of a full-resolution window over a grid stored at `scale` (rows, columns):
 // `start` and `size` in rows and columns of full-resolution pixels, one pixel each.
 [[nodiscard]] grid::Raster fullRaster(const std::array<double, 2>& scale, const std::array<std::int64_t, 2>& start, const std::array<std::int64_t, 2>& size);

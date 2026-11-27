@@ -212,6 +212,44 @@ TEST_CASE("vc_render_tifxyz reads a stored surface through a registered volume l
     CHECK(refused != 0);
 }
 
+TEST_CASE("vc_render_tifxyz checks a surface's scale in its own frame under a nonuniform registration")
+{
+    Fixture f;
+    writeRampVolume(f.dir / "volume.zarr");
+    // The documented registration (vc_object_store/docs/transforms.md): doubles X and shears it by Y. It changes the
+    // vertex spacing in target voxels, but the stored scale still describes the surface's own grid.
+    VolumeAffine registration;
+    registration(0, 0) = 2; registration(0, 1) = 0.5; registration(0, 3) = 10; registration(2, 3) = -4;
+    // The same grid with a stored scale that disagrees with its spacing (one vertex every 8 voxels, really 4).
+    const auto wrong = util::newUuid();
+    {
+        OpenOptions options; options.author = "tool-store-test";
+        auto db = ObjectStore::open(f.store, options);
+        const auto uuid = util::newUuid();
+        auto txn = db.write({{uuid, std::nullopt}, {wrong, std::nullopt}});
+        db.registerVolumeTransform(txn, "vol", "rendered", registration, "documented registration", uuid);
+        const auto files = load_quad_from_tifxyz(f.tifxyz);
+        QuadSurface mismatched(*files->rawPointsPtr(), {0.125f, 0.125f});
+        ObjectRecord record; record.uuid = wrong; record.kind = "surface"; record.name = "mismatched";
+        record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
+        db.upsertObject(txn, record);
+        db.putGeometry(txn, wrong, quad_surface_geometry(mismatched));
+        txn.commit();
+    }
+    const auto bin = tool("VC_RENDER_TIFXYZ_BIN") + " --volume \"" + (f.dir / "volume.zarr").string() +
+        "\" --scale 1 --group-idx 0 --num-slices 3 --store \"" + f.store.string() + "\" --volume-uuid rendered --strict-scale";
+    const auto output = run(bin + " --surface " + f.uuid + " --tif-output \"" + (f.dir / "strict").string() + "\"", f.dir / "strict.log");
+    CHECK(output.find("surface scale") == std::string::npos);
+    CHECK(fs::exists(f.dir / "strict"));
+
+    const auto status = std::system((bin + " --surface " + wrong + " --tif-output \"" + (f.dir / "wrong").string() +
+        "\" > \"" + (f.dir / "wrong.log").string() + "\" 2>&1").c_str());
+    const auto log = readFile(f.dir / "wrong.log");
+    CHECK(status != 0);
+    CHECK(log.find("surface scale 0.125") != std::string::npos);
+    CHECK(log.find("Not rendering") != std::string::npos);
+}
+
 namespace {
 std::string surfaceUuid(const std::string& output)
 {

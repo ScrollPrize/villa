@@ -38,6 +38,106 @@ static tifxyz::Surface plane(int rows, int cols, double scale, const std::string
     return tifxyz::Surface(rows, cols, std::move(xyz), {}, std::move(metadata));
 }
 
+// measureSpacing / checkScale: the plane's vertices are 3 voxels apart along rows and 2 along columns.
+static void scaleCheck()
+{
+    auto surface = plane(40, 50, 0.05, "");
+    const float* xyz = surface.xyz().data();
+    const auto exact = tifxyz::checkScale(xyz, 40, 50, {1.0 / 3, 0.5});
+    CHECK(exact.measured.rows && std::abs(*exact.measured.rows - 3) < 1e-9);
+    CHECK(exact.measured.cols && std::abs(*exact.measured.cols - 2) < 1e-9);
+    CHECK(std::abs(*exact.deviation[0]) < 1e-9 && std::abs(*exact.deviation[1]) < 1e-9);
+    // 39 x 50 pairs of 3 and 40 x 49 of 2: the median of both is 2.
+    CHECK(exact.measured.both && std::abs(*exact.measured.both - 2) < 1e-9);
+    const auto off = tifxyz::checkScale(xyz, 40, 50, {0.25, 0.25});
+    CHECK(std::abs(*off.deviation[0] + 0.25) < 1e-9 && std::abs(*off.deviation[1] + 0.5) < 1e-9);
+
+    // Invalid vertices (negative marker, NaN) and zero distances (collapsed vertices) are left out.
+    std::vector<float> holes(surface.xyz());
+    for (int c = 0; c < 50; c += 2) holes[(std::size_t(7) * 50 + std::size_t(c)) * 3] = -1;
+    holes[(std::size_t(8) * 50 + 3) * 3 + 2] = std::nanf("");
+    for (int r = 20; r < 40; ++r)
+        for (int c = 0; c < 50; ++c) {
+            float* p = &holes[(std::size_t(r) * 50 + std::size_t(c)) * 3];
+            p[0] = 10, p[1] = 20, p[2] = 30;  // the lower half collapsed onto one point
+        }
+    const auto collapsed = tifxyz::measureSpacing(holes.data(), 40, 50);
+    CHECK(std::abs(*collapsed.rows - 3) < 1e-9 && std::abs(*collapsed.cols - 2) < 1e-9);
+
+    // A row stride (a padded buffer) gives the same result.
+    std::vector<float> padded(std::size_t(40) * 52 * 3, 7.0f);
+    for (int r = 0; r < 40; ++r) std::copy_n(&xyz[std::size_t(r) * 150], 150, &padded[std::size_t(r) * 156]);
+    tifxyz::SpacingOptions options;
+    options.rowStride = 52 * 3;
+    const auto strided = tifxyz::measureSpacing(padded.data(), 40, 50, options);
+    CHECK(std::abs(*strided.rows - 3) < 1e-9 && std::abs(*strided.cols - 2) < 1e-9);
+
+    // The -1 marker rule (QuadSurface): only x == -1 is invalid, so a grid lying at y < 0 still counts, where
+    // vertexValid finds no valid vertex. requireFinite changes nothing here because nonfinite distances are skipped
+    // either way.
+    std::vector<float> marked(surface.xyz());
+    for (std::size_t i = 1; i < marked.size(); i += 3) marked[i] -= 1000;
+    marked[(std::size_t(9) * 50 + 4) * 3] = -1;
+    marked[(std::size_t(11) * 50 + 6) * 3 + 2] = std::nanf("");
+    tifxyz::SpacingOptions marker;
+    marker.invalidMarker = -1.0f;
+    const auto byMarker = tifxyz::measureSpacing(marked.data(), 40, 50, marker);
+    CHECK(std::abs(*byMarker.rows - 3) < 1e-9 && std::abs(*byMarker.cols - 2) < 1e-9);
+    marker.requireFinite = false;
+    const auto byMarkerOnly = tifxyz::measureSpacing(marked.data(), 40, 50, marker);
+    CHECK(*byMarker.rows == *byMarkerOnly.rows && *byMarker.cols == *byMarkerOnly.cols && *byMarker.both == *byMarkerOnly.both);
+    const auto byDefault = tifxyz::measureSpacing(marked.data(), 40, 50);
+    CHECK(!byDefault.rows && !byDefault.cols && !byDefault.both);
+    marker.medians = tifxyz::kSpacingRows;
+    const auto rowsOnly = tifxyz::measureSpacing(marked.data(), 40, 50, marker);
+    CHECK(rowsOnly.rows && *rowsOnly.rows == *byMarker.rows && !rowsOnly.cols && !rowsOnly.both);
+
+    // Only the median over both axes, as vc_grow_seg_from_segments asks: the same value as with all three.
+    tifxyz::SpacingOptions bothOnly;
+    bothOnly.medians = tifxyz::kSpacingBoth;
+    const auto onlyBoth = tifxyz::measureSpacing(holes.data(), 40, 50, bothOnly);
+    const auto all = tifxyz::measureSpacing(holes.data(), 40, 50);
+    CHECK(!onlyBoth.rows && !onlyBoth.cols && onlyBoth.both && *onlyBoth.both == *all.both);
+
+    // A lattice subsample of a large grid still covers it: the right half is twice as far apart along columns,
+    // so a subsample that aliased onto the left columns would report 2.
+    const int rows = 300, cols = 4000;
+    std::vector<float> wide(std::size_t(rows) * cols * 3);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            float* p = &wide[(std::size_t(r) * cols + std::size_t(c)) * 3];
+            p[0] = c < cols / 4 ? float(c) * 2 : float(cols / 4) * 2 + float(c - cols / 4) * 4, p[1] = float(r) * 3, p[2] = 5;
+        }
+    tifxyz::SpacingOptions lattice;
+    lattice.maxPairs = 10000;
+    const auto sampled = tifxyz::measureSpacing(wide.data(), rows, cols, lattice);
+    CHECK(std::abs(*sampled.cols - 4) < 1e-9 && std::abs(*sampled.rows - 3) < 1e-9);
+
+    // An even number of distances gives the upper of the two middle ones (element n / 2), as
+    // vc_grow_seg_from_segments' median did before: one row with column gaps 1 and 3 reports 3.
+    const float two[9] = {0, 0, 0, 1, 0, 0, 4, 0, 0};
+    const auto even = tifxyz::measureSpacing(two, 1, 3);
+    CHECK(even.cols && *even.cols == 3);
+
+    // A large grid that is mostly invalid: only rows 100-109 are valid. The lattice from the grid size (step 11)
+    // would step over all of them (rows 99 and 110) and find nothing; the lattice from the valid pairs finds them.
+    std::vector<float> sparse(wide.size(), -1.0f);
+    for (int r = 100; r < 110; ++r)
+        for (int c = 0; c < cols; ++c) {
+            float* p = &sparse[(std::size_t(r) * cols + std::size_t(c)) * 3];
+            p[0] = float(c) * 2, p[1] = float(r) * 3, p[2] = 5;
+        }
+    const auto band = tifxyz::measureSpacing(sparse.data(), rows, cols, lattice);
+    CHECK(band.rows && std::abs(*band.rows - 3) < 1e-9 && band.cols && std::abs(*band.cols - 2) < 1e-9);
+
+    // A single row has no spacing along rows; an empty grid has none at all.
+    const auto row = tifxyz::checkScale(xyz, 1, 50, {1.0 / 3, 0.5});
+    CHECK(!row.measured.rows && !row.deviation[0] && row.measured.cols);
+    std::vector<float> none(std::size_t(4) * 5 * 3, -1.0f);
+    const auto empty = tifxyz::checkScale(none.data(), 4, 5, {1, 1});
+    CHECK(!empty.deviation[0] && !empty.deviation[1] && !empty.measured.both);
+}
+
 int main()
 {
     const auto root = fs::temp_directory_path() / ("vc_reader_tifxyz_" + std::to_string(::getpid()));
@@ -247,5 +347,6 @@ int main()
         CHECK(mapping.shape == (std::vector<std::int64_t>{3000, 200}) && mapping.dtype == "|u1" && mapping.offset > 0);
     }
     fs::remove_all(root);
+    scaleCheck();
     return 0;
 }
