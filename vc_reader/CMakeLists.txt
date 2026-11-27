@@ -34,11 +34,42 @@ set(_vc_reader_cuda_default OFF)
 if(CMAKE_CUDA_COMPILER)
     set(_vc_reader_cuda_default ON)
 endif()
-option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends"
-    ${_vc_reader_cuda_default})
+# Automatic detection caches its choice in _VC_READER_CUDA_AUTO, so a cached
+# VC_READER_ENABLE_CUDA is always an explicit request.
+set(_vc_reader_cuda_explicit OFF)
+if(DEFINED VC_READER_ENABLE_CUDA)
+    set(_vc_reader_cuda_explicit ON)
+    option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends" OFF)
+elseif(DEFINED CACHE{_VC_READER_CUDA_AUTO})
+    set(VC_READER_ENABLE_CUDA ${_VC_READER_CUDA_AUTO})
+else()
+    set(VC_READER_ENABLE_CUDA ${_vc_reader_cuda_default})
+endif()
 if(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    # Not every toolkit that has an nvcc can build the backend (the toolkit packaged by
+    # Ubuntu 24.04, nvcc 12.0, cannot). Automatic detection then builds without CUDA;
+    # an explicit VC_READER_ENABLE_CUDA=ON stops here.
+    include(cmake/CheckCudaBackend.cmake)
+    vc_reader_check_cuda_backend(_vc_reader_cuda_usable _vc_reader_cuda_why)
+    if(NOT _vc_reader_cuda_usable)
+        if(_vc_reader_cuda_explicit)
+            message(FATAL_ERROR "VC_READER_ENABLE_CUDA=ON was requested, but the CUDA backend cannot "
+                "be built with this toolkit. Configure a new build directory with CMAKE_CUDA_COMPILER set "
+                "to a newer nvcc, or set VC_READER_ENABLE_CUDA=OFF. If you did not request ON, an older "
+                "configure cached it: -UVC_READER_ENABLE_CUDA removes it. ${_vc_reader_cuda_why}")
+        endif()
+        message(WARNING "Building vc_reader without CUDA. ${_vc_reader_cuda_why}\n"
+            "After installing a newer toolkit, configure a new build directory with "
+            "-DVC_READER_ENABLE_CUDA=ON -DCMAKE_CUDA_COMPILER=<its nvcc>.")
+        set(VC_READER_ENABLE_CUDA OFF)
+    endif()
+endif()
+if(_vc_reader_cuda_explicit)
+    unset(_VC_READER_CUDA_AUTO CACHE)
+else()
+    set(_VC_READER_CUDA_AUTO "${VC_READER_ENABLE_CUDA}" CACHE INTERNAL "Value chosen by automatic CUDA detection")
 endif()
 
 

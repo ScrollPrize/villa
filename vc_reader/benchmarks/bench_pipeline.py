@@ -176,10 +176,13 @@ def environment(args, *, transform=False):
     cache = args.build_dir / "CMakeCache.txt" if args.build_dir else None
     result["build"] = {"type": "unknown (use --build-dir to record CMake settings)"}
     if cache and cache.is_file():
-        keys = ("CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER", "CMAKE_CUDA_ARCHITECTURES", "VC_READER_ENABLE_CUDA")
+        keys = ("CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER", "CMAKE_CUDA_ARCHITECTURES", "VC_READER_ENABLE_CUDA",
+                "_VC_READER_CUDA_AUTO")
         result["build"] = {line.split(":", 1)[0]: line.split("=", 1)[1]
                            for line in cache.read_text().splitlines()
                            if "=" in line and line.split(":", 1)[0] in keys}
+        if "_VC_READER_CUDA_AUTO" in result["build"]:
+            result["build"]["VC_READER_ENABLE_CUDA"] = result["build"].pop("_VC_READER_CUDA_AUTO")
     if args.backend in ("cuda", "both"):
         try:
             info = subprocess.run(["nvidia-smi", "--query-gpu=index,name,driver_version", "--format=csv,noheader"],

@@ -3,6 +3,7 @@
 #include "rows.hpp"
 
 #include <cub/device/device_scan.cuh>
+#include <cuda/std/functional>
 #include <climits>
 #include <stdexcept>
 #include <string>
