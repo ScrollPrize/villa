@@ -33,6 +33,14 @@ def test_a_box_by_z_range_is_the_box_zarr_reads(tmp_path):
         assert volumes.read_patch(array, (60, 40, 40), (80, 60, 60)).shape == (10, 10, 5)
 
 
+def test_without_fsstore_a_box_is_read_through_zarr(tmp_path, monkeypatch):
+    # zarr 3 has no zarr.storage.FSStore: by_z_range must say no instead of raising.
+    array, data = raw_store(tmp_path, "/")
+    monkeypatch.delattr(zarr.storage, "FSStore")
+    assert not volumes.by_z_range(array)
+    assert np.array_equal(volumes.read_patch(array, (3, 5, 7), (40, 30, 20)), data[3:40, 5:30, 7:20])
+
+
 def test_a_compressed_store_is_read_through_zarr(tmp_path):
     array = zarr.create(shape=(8, 8, 8), chunks=(4, 4, 4), dtype="u1",
                         store=zarr.storage.FSStore(f"file://{tmp_path}/c.zarr"))
