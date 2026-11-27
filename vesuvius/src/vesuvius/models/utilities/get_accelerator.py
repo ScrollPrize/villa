@@ -18,11 +18,15 @@ def cuda_device_supported(device_index: int = 0) -> tuple[bool, str]:
 
     Returns ``(supported, message)``; the message explains the fix when not.
     """
+    if getattr(torch.version, "hip", None):
+        # ROCm builds report gfx targets (e.g. gfx90a), not sm_XY; this check is CUDA-only.
+        return True, ""
     major, minor = torch.cuda.get_device_capability(device_index)
     arch_list = torch.cuda.get_arch_list()
     for arch in arch_list:
         kind, _, number = arch.partition("_")
-        if not number.isdigit():
+        number = number.rstrip("abcdefghijklmnopqrstuvwxyz")  # sm_90a -> 90
+        if not number.isdigit() or len(number) < 2:
             continue
         arch_major, arch_minor = int(number[:-1]), int(number[-1])
         if kind == "sm" and arch_major == major and arch_minor <= minor:

@@ -10,6 +10,8 @@ CUDA126_ARCHS = ["sm_50", "sm_60", "sm_61", "sm_70", "sm_75", "sm_80", "sm_86", 
 
 
 def fake_cuda(monkeypatch, capability, archs, available=True):
+    if not hasattr(torch.version, "hip") or torch.version.hip is None:
+        monkeypatch.setattr(torch.version, "hip", None, raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: available)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index=0: capability)
@@ -69,3 +71,21 @@ def test_explicit_cuda_device_on_unsupported_gpu_raises_with_fix(monkeypatch):
     for kwargs in ({"gpu_ids": (), "device_type": "cuda"}, {"gpu_ids": (0,), "device_type": "auto"}):
         with pytest.raises(ValueError, match="cu126"):
             rt.prepare_model_for_inference(model, compile_model=False, compile_mode="default", **kwargs)
+
+
+def test_rocm_builds_are_not_second_guessed(monkeypatch):
+    # ROCm torch reports gfx targets from get_arch_list(); the sm_XY check must not reject AMD GPUs.
+    fake_cuda(monkeypatch, (9, 0), ["gfx90a", "gfx942", "gfx1100"])
+    monkeypatch.setattr(torch.version, "hip", "6.2.41133", raising=False)
+    assert ga.cuda_device_supported(0) == (True, "")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert ga.get_accelerator() == torch.device("cuda")
+
+
+def test_arch_suffixes_are_understood(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    fake_cuda(monkeypatch, (9, 0), ["sm_80", "sm_90a"])
+    assert ga.cuda_device_supported(0)[0] is True
+    fake_cuda(monkeypatch, (10, 0), ["sm_90a", "sm_100a"])
+    assert ga.cuda_device_supported(0)[0] is True
