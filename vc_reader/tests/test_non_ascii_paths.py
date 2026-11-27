@@ -5,6 +5,7 @@ told otherwise, which turned ``café.zarr`` into ``cafÃ©.zarr`` on a code page
 mixes scripts, so no single Windows code page holds all of it and a round trip through one cannot pass either.
 """
 import json
+import sys
 
 import numpy as np
 import pytest
@@ -53,6 +54,16 @@ def test_missing_array_reports_the_name(folder):
     with pytest.raises(FileNotFoundError) as error:
         open_zarr(folder / 'absent.zarr')
     assert NAME in str(error.value)
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Windows file sharing')
+def test_locked_file_reports_windows_error_and_unicode_name(folder):
+    target = folder / 'locked.bin'
+    target.write_bytes(b'original')
+    with target.open('rb'), pytest.raises(PermissionError) as error:
+        atomic_write(target, b'replacement')
+    assert error.value.winerror in (5, 32)  # access denied or sharing violation
+    assert NAME in error.value.filename
 
 
 def test_writer_writes_where_python_looks(folder):

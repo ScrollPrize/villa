@@ -48,8 +48,8 @@ template<class T> VCR_TARGET_CLONES void bin_indices(const T* data,std::size_t n
     int uncertain=0;
     for(std::size_t i=0;i<n;++i){
         const double q=(double(data[i])-lo)*rate,t=1e-9*(q+1);
-        const int f=int(q),near=int(int(q-t)!=int(q+t));
-        out[i]=std::uint16_t(near?0xffff:(f<top?f:top));uncertain|=near;
+        const int f=int(q),ambiguous=int(int(q-t)!=int(q+t));
+        out[i]=std::uint16_t(ambiguous?0xffff:(f<top?f:top));uncertain|=ambiguous;
     }
     if(uncertain)for(std::size_t i=0;i<n;++i)if(out[i]==0xffff)out[i]=std::uint16_t(bin(double(data[i]),lo,hi,bins));
 }

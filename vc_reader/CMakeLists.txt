@@ -345,4 +345,7 @@ endif()
 if(WIN32)
     # Windows has no RPATH: a module loads the DLLs it links from its own directory.
     install(FILES $<TARGET_FILE:vc_reader_sftp> DESTINATION vc_reader)
+    if(VC_READER_BUILD_READER AND VC_READER_SHARED_READER)
+        install(FILES $<TARGET_FILE:vc_reader_native> DESTINATION vc_reader)
+    endif()
 endif()

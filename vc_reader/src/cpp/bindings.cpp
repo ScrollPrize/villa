@@ -186,8 +186,20 @@ NB_MODULE(_reader, m)
             nb::object cls = nb::module_::import_("vc_reader.errors").attr("LowDiskSpaceError");
             PyErr_SetString(cls.ptr(), e.what());
         } catch (const std::filesystem::filesystem_error& e) {
+#ifdef _WIN32
+            const auto& path = e.path1().native();
+            nb::object filename = nb::steal(PyUnicode_FromWideChar(path.data(), path.size()));
+            if (!filename.is_valid()) return;
+            if (e.code().category() == std::system_category()) {
+                PyErr_SetExcFromWindowsErrWithFilenameObject(PyExc_OSError, e.code().value(), filename.ptr());
+            } else {
+                errno = e.code().value();
+                PyErr_SetFromErrnoWithFilenameObject(PyExc_OSError, filename.ptr());
+            }
+#else
             errno = e.code().value();
-            PyErr_SetFromErrnoWithFilename(PyExc_OSError, reinterpret_cast<const char*>(e.path1().u8string().c_str()));
+            PyErr_SetFromErrnoWithFilename(PyExc_OSError, e.path1().c_str());
+#endif
         }
     });
 
