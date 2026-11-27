@@ -23,6 +23,9 @@ struct SurfaceGrid {
     // Payload identity of its geometry (its channels read through it).
     std::string geometryRevision;
     std::vector<std::string> channels;  // per-vertex arrays other than points and valid
+    // Present in editable transformed grids: a canonical XYZ exists even when
+    // its target-frame value is indistinguishable from the display sentinel.
+    std::vector<uint8_t> coordinatePresence;
 };
 
 // The surface's current version, or numbered `version` in `generation` (default

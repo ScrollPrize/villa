@@ -380,7 +380,7 @@ static QuadSurface* finish_resume_surface(QuadSurface* working, const cv::Vec2f&
         const bool keep_solved = factor == 1 && corrected && vc::geometry::validSurfacePoint(point);
         const auto coords = keep_solved ? point : exclusion.coords;
         if (vc::geometry::validSurfacePoint(coords))
-            output->maskedVertices.push_back({cell, coords});
+            output->maskedVertices.set(cell, coords);
         // Corrections may move the hidden XYZ without changing when it was traced.
         generations(cell) = exclusion.generation;
         point = {-1, -1, -1};

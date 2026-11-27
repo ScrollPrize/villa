@@ -1,6 +1,7 @@
 #include "vc_object_store/objects/SurfaceGrid.hpp"
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <stdexcept>
+#include <utility>
 
 namespace vc::objects {
 namespace {
@@ -50,8 +51,11 @@ SurfaceGrid readSurfaceGrid(const StoreReader& reader,const ObjectRevision& sele
             for(auto value:tile.points[i])grid.points.push_back(valid?float(value):-1.0f);
         }
     };
-    if(transformed)copy(transformed->readTile(0,0,canonical.rows(),canonical.columns(),applyValidity));
-    else copy(canonical.readTile(0,0,canonical.rows(),canonical.columns()));
+    if(transformed) {
+        auto tile = transformed->readTile(0,0,canonical.rows(),canonical.columns(),applyValidity);
+        copy(tile);
+        grid.coordinatePresence = std::move(tile.coordinatePresence);
+    } else copy(canonical.readTile(0,0,canonical.rows(),canonical.columns()));
     grid.record = selected.record;
     grid.geometryRevision = *selected.geometryRevision;
     for (const auto& array : canonical.revision().arrays)

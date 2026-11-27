@@ -106,6 +106,7 @@ std::shared_ptr<QuadSurface> SurfaceStoreEdit::snapshotForSave(QuadSurface& surf
         if (surface.channelLoaded(name))
             snapshot->setChannel(name, surface.channel(name, SURF_CHANNEL_NORESIZE).clone());
     snapshot->maskedVertices = surface.maskedVertices;
+    snapshot->hasTransformedCoordinates = surface.hasTransformedCoordinates;
     snapshot->id = surface.id;
     snapshot->meta = surface.meta;
     return snapshot;
@@ -143,7 +144,8 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
                 desired.rows=points.rows;desired.columns=points.cols;
                 for(const auto& p:surface.pointsForStorage())desired.points.push_back({p[0],p[1],p[2]});
                 for(const auto& array:data.arrays)if(array.name=="valid")desired.validity=array.bytes;
-                const auto canonical=vc::geometry::encode(transformed->canonicalSurface(desired));
+                const auto retained = surface.retainedDisplaySentinels({0, 0, points.cols, points.rows});
+                const auto canonical=vc::geometry::encode(transformed->canonicalSurface(desired, retained));
                 data.arrays.front()=canonical.arrays.front();
                 data.attributes=canonical.attributes;
                 for(const auto& array:canonical.arrays)if(array.name=="valid") {

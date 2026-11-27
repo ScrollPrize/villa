@@ -440,6 +440,70 @@ TEST_CASE("rotate runs without crashing on dense grid")
     CHECK(qs.rawPointsPtr() != nullptr);
 }
 
+TEST_CASE("a small draft looks up retained coordinates and reduces the mask only in its clipped grid area")
+{
+    const cv::Vec3f missing(-1, -1, -1);
+    const cv::Size size(512, 256);
+    const cv::Rect dirty(237, 122, 5, 5);
+    QuadSurface surface(cv::Mat_<cv::Vec3f>(size, missing), {1, 1});
+    for (int y = 0; y < size.height; ++y)
+        for (int x = 0; x < size.width; ++x)
+            if (!dirty.contains(cv::Point(x, y))) surface.maskedVertices.set({x, y}, {float(x), float(y), 10});
+
+    int maskReads = 0;
+    cv::Mat_<uint8_t> mask(2 * size.height, 3 * size.width, uint8_t{255});
+    surface.setChannel("mask", {});
+    surface.setChannelLoader([&](const std::string&) -> cv::Mat { ++maskReads; return mask; });
+    CHECK(surface.pointsForStorage(dirty)(0, 0) == missing);
+    CHECK(maskReads == 0); // Over 130,000 retained vertices, all outside this edit.
+
+    const cv::Point hidden = dirty.br() - cv::Point(1, 1), active = dirty.tl(), repaired = active + cv::Point(1, 0);
+    const cv::Vec3f xyz(10, 20, 30), newer(10, 20, 50);
+    surface.maskedVertices.set(hidden, xyz);
+    surface.maskedVertices.set(hidden, newer); // Repeated edits replace the value at its indexed cell.
+    surface.maskedVertices.set(active, xyz);
+    surface.maskedVertices.set(repaired, xyz);
+    (*surface.rawPointsPtr())(repaired) = newer;
+    // One non-opaque sample at the end of the block hides the vertex.
+    mask(2 * hidden.y + 1, 3 * hidden.x + 2) = 254;
+    mask(2 * repaired.y, 3 * repaired.x) = 0;
+    const auto stored = surface.pointsForStorage(dirty);
+    REQUIRE(stored.size() == dirty.size());
+    CHECK(maskReads == 1);
+    CHECK(stored(hidden - dirty.tl()) == newer);
+    CHECK(stored(active - dirty.tl()) == missing);
+    CHECK(stored(repaired - dirty.tl()) == newer);
+    REQUIRE(surface.maskedVertices.erase(hidden).value() == newer);
+    CHECK(surface.pointsForStorage(dirty)(hidden - dirty.tl()) == missing);
+
+    mask(0, 0) = 0;
+    const auto clipped = surface.pointsForStorage(cv::Rect(-3, -2, 5, 5));
+    REQUIRE(clipped.size() == cv::Size(2, 3));
+    CHECK(clipped(0, 0) == cv::Vec3f(0, 0, 10));
+    CHECK(surface.pointsForStorage(cv::Rect(-10, -10, 2, 2)).empty());
+}
+
+TEST_CASE("local mask reduction matches full reads on strided 16-bit color input")
+{
+    const cv::Size size(7, 5);
+    QuadSurface surface(makePlanarGrid(size.height, size.width), {1, 1});
+    cv::Mat backing(3 * size.height + 4, 2 * size.width + 5, CV_16UC3, cv::Scalar::all(450));
+    auto mask = backing(cv::Rect(2, 1, 2 * size.width, 3 * size.height));
+    REQUIRE_FALSE(mask.isContinuous());
+    mask.at<cv::Vec3w>(7, 7) = {254, 254, 254};
+    surface.setChannel("mask", mask);
+    const cv::Rect area(2, 1, 4, 3);
+    const auto reduced = surface.vertexMask(area);
+    CHECK(reduced.size() == area.size());
+    CHECK(reduced(1, 1) == 0);
+    CHECK(cv::countNonZero(reduced) == area.area() - 1);
+    CHECK(cv::norm(surface.vertexMask()(area), reduced, cv::NORM_INF) == 0);
+
+    const auto clipped = surface.vertexMask(cv::Rect(5, 3, 6, 4));
+    REQUIRE(clipped.size() == cv::Size(2, 2));
+    CHECK(cv::countNonZero(clipped) == 4);
+}
+
 TEST_CASE("right-angle rotation preserves rectangular edges and oversampled exclusions exactly")
 {
     auto points = makePlanarGrid(3, 5);
@@ -454,7 +518,7 @@ TEST_CASE("right-angle rotation preserves rectangular edges and oversampled excl
         (*surface.rawPointsPtr())(cell) = {-1,-1,-1};
         marker(cell) = 255;
         mask(cv::Rect(2*cell.x, 2*cell.y, 2, 2)).setTo(0);
-        if (i%2==0) surface.maskedVertices.push_back({cell, points(cell)});
+        if (i%2==0) surface.maskedVertices.set(cell, points(cell));
     }
     surface.setChannel("mask", mask);
     surface.setChannel("growth_exclusions", marker);
@@ -492,7 +556,7 @@ TEST_CASE("oblique rotation keeps colliding exclusions distinct without sampling
             const auto cell = cells[i];
             (*surface->rawPointsPtr())(cell) = {-1,-1,-1};
             marker(cell)=255; mask(cell)=0; generations(cell)=uint16_t(17+i);
-            if (i<2) surface->maskedVertices.push_back({cell, {float(cell.x),float(cell.y),hiddenZ+float(i)}});
+            if (i<2) surface->maskedVertices.set(cell, {float(cell.x),float(cell.y),hiddenZ+float(i)});
         }
         surface->setChannel("mask",mask);
         surface->setChannel("growth_exclusions",marker);
@@ -508,7 +572,7 @@ TEST_CASE("oblique rotation keeps colliding exclusions distinct without sampling
     CHECK(a->maskedVertices.size() == 2);
     CHECK(cv::norm(*a->rawPointsPtr(), *b->rawPointsPtr(), cv::NORM_INF) == 0);
     std::set<std::pair<int,int>> retained;
-    for (const auto& vertex : a->maskedVertices) {
+    for (const auto& vertex : a->maskedVertices.all()) {
         CHECK(retained.emplace(vertex.cell.y, vertex.cell.x).second);
         CHECK(marker(vertex.cell) == 255);
         CHECK(mask(vertex.cell) == 0);
@@ -550,7 +614,7 @@ TEST_CASE("flips move retained XYZ and marker-only exclusions with lazy channels
     QuadSurface surface(points, {1,1});
     const cv::Point hidden(1,1), empty(5,2);
     (*surface.rawPointsPtr())(hidden) = (*surface.rawPointsPtr())(empty) = {-1,-1,-1};
-    surface.maskedVertices.push_back({hidden,points(hidden)});
+    surface.maskedVertices.set(hidden, points(hidden));
     surface.setChannel("mask",surface.validMask());
     surface.setChannel("growth_exclusions",cv::Mat{});
     int reads = 0;

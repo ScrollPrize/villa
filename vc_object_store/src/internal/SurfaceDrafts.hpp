@@ -15,6 +15,7 @@ namespace vc::objects::detail {
 // query keeps the draft it started with.
 struct SurfaceDraft {
     struct TileData {
+        std::vector<uint8_t> coordinatePresence; // empty for canonical tiles
         SurfaceTile tile;              // what queries read: points and combined validity
         std::vector<uint8_t> channel;  // the valid channel (1 where the surface has none)
     };
@@ -43,7 +44,7 @@ std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface
 vc::geometry::Surface draftGrid(const SurfaceDraft&);
 std::shared_ptr<const SurfaceDraft> editSurfaceDraft(const SurfaceDraft&, int64_t row, int64_t column, int64_t rows,
                                                      int64_t columns, std::span<const vc::geometry::SurfacePoint>,
-                                                     std::span<const uint8_t> validity);
+                                                     std::span<const uint8_t> validity, std::span<const uint8_t> coordinatePresence);
 
 // Where a draft lies for a query's coordinate filters: nothing when they
 // exclude it, else the mapping of its coordinates to the query's (none: as stored).

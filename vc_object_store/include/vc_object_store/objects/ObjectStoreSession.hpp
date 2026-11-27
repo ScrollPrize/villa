@@ -415,9 +415,11 @@ public:
                   const std::optional<AttachmentIdentity>& attachment = std::nullopt,
                   const std::optional<ObjectVersion>& base = std::nullopt);
     // Replace a rows x columns rectangle (row-major) of a draft's vertices at
-    // row, column, and their valid channel unless `validity` is empty.
+    // row, column, and their valid channel unless `validity` is empty. Provide
+    // coordinatePresence for display-frame points; otherwise stored XYZ rules apply.
     void updateDraft(const std::string& objectUuid, int64_t row, int64_t column, int64_t rows, int64_t columns,
-                     std::span<const vc::geometry::SurfacePoint> points, std::span<const uint8_t> validity = {});
+                     std::span<const vc::geometry::SurfacePoint> points, std::span<const uint8_t> validity = {},
+                     std::span<const uint8_t> coordinatePresence = {});
     // Drop a draft (e.g. after committing it, or abandoning the edit). No-op without one.
     void clearDraft(const std::string& objectUuid);
     bool hasDraft(const std::string& objectUuid) const;

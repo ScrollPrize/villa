@@ -1681,9 +1681,10 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
 
     // The cropped grid replaces the stored geometry (a dropped channel goes with it).
     croppedPoints.copyTo(*points);
-    std::vector<QuadSurface::MaskedVertex> maskedVertices;
-    for (const auto& vertex : surface->maskedVertices)
-        if (roi.contains(vertex.cell)) maskedVertices.push_back({vertex.cell - roi.tl(), vertex.coords});
+    QuadSurface::MaskedVertices maskedVertices;
+    for (int y = roi.y; y < roi.br().y; ++y)
+        for (const auto& vertex : surface->maskedVertices.row(y, roi.x, roi.br().x))
+            maskedVertices.set(vertex.cell - roi.tl(), vertex.coords);
     surface->maskedVertices = std::move(maskedVertices);
     for (const auto& ch : croppedChannels) {
         surface->setChannel(ch.name, ch.data);

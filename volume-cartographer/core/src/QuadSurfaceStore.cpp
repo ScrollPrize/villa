@@ -101,14 +101,16 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader
     auto grid=vc::objects::readSurfaceGrid(reader,selected,transformed,false);
     auto points=std::make_unique<cv::Mat_<cv::Vec3f>>(int(grid.rows),int(grid.columns));
     std::memcpy(points->data,grid.points.data(),grid.points.size()*sizeof(float));
-    std::vector<QuadSurface::MaskedVertex> maskedVertices;
+    QuadSurface::MaskedVertices maskedVertices;
     if (applyValidity && !grid.valid.empty()) {
         for (int r = 0; r < points->rows; ++r) {
             for (int c = 0; c < points->cols; ++c) {
                 auto& point = (*points)(r, c);
-                if (grid.valid[std::size_t(r) * points->cols + c] == 0) {
-                    if (vc::geometry::validSurfacePoint(point))
-                        maskedVertices.push_back({{c, r}, point});
+                const auto index = std::size_t(r) * points->cols + c;
+                if (grid.valid[index] == 0) {
+                    const bool present = grid.coordinatePresence.empty()
+                        ? vc::geometry::validSurfacePoint(point) : grid.coordinatePresence[index] != 0;
+                    if (present) maskedVertices.set({c, r}, point);
                     point = {-1, -1, -1};
                 }
             }
@@ -116,6 +118,8 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::StoreReader
     }
     auto surface=std::make_unique<QuadSurface>(points.release(),cv::Vec2f(float(grid.scale[0]),float(grid.scale[1])));
     surface->maskedVertices = std::move(maskedVertices);
+    if (transformed && transformed->mapping() != vc::objects::VolumeAffine::identity())
+        surface->hasTransformedCoordinates = true;
     surface->id = grid.record.uuid;
     surface->meta = nlohmann::json::parse(grid.record.meta);
     surface->setComponents(surface_components(surface->meta));
@@ -181,6 +185,18 @@ vc::objects::GeometryData quad_surface_geometry(QuadSurface& surface)
     return vc::geometry::encode(geometry);
 }
 
+std::vector<uint8_t> QuadSurface::retainedDisplaySentinels(const cv::Rect& area) const
+{
+    std::vector<uint8_t> presence;
+    for (int r = area.y; r < area.y + area.height; ++r)
+        for (const auto& vertex : maskedVertices.row(r, area.x, area.x + area.width))
+            if (vertex.coords == cv::Vec3f(-1, -1, -1)) {
+                if (presence.empty()) presence.resize(size_t(area.width) * area.height);
+                presence[size_t(r - area.y) * area.width + vertex.cell.x - area.x] = 1;
+            }
+    return presence;
+}
+
 std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::TransformedGeometryView& view,
     QuadSurface& surface, const cv::Rect& rect, const std::vector<uint8_t>* validity,
     const std::vector<uint8_t>* clearMaskedCoordinates)
@@ -188,19 +204,18 @@ std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::Tra
     const auto& revision = view.revision();
     if (revision.kind != "surface") throw std::runtime_error("not a stored surface: " + revision.objectUuid);
     const auto shape = pointsShape(revision);
-    const auto points = validity ? surface.pointsForStorage() : surface.rawPoints();
-    if (points.rows != shape[0] || points.cols != shape[1])
+    const auto& raw = *std::as_const(surface).rawPointsPtr();
+    if (raw.rows != shape[0] || raw.cols != shape[1])
         throw std::runtime_error("surface grid differs from the stored grid; resize it first");
-    const auto area = rect & cv::Rect(0, 0, points.cols, points.rows);
+    const auto area = rect & cv::Rect(0, 0, raw.cols, raw.rows);
     if (area.empty()) return std::nullopt;
+    const auto points = validity ? surface.pointsForStorage(area) : raw(area);
     std::vector<vc::geometry::SurfacePoint> desired;
     desired.reserve(size_t(area.width) * area.height);
-    for (int r = area.y; r < area.y + area.height; ++r)
-        for (int c = area.x; c < area.x + area.width; ++c) {
-            const auto p = points(r, c);
-            desired.push_back({p[0], p[1], p[2]});
-        }
-    auto edits = view.surfaceEdits(area.y, area.x, area.height, area.width, desired, validity, clearMaskedCoordinates);
+    for (const auto& p : points) desired.push_back({p[0], p[1], p[2]});
+    const auto retained = validity && view.mapping() != vc::objects::VolumeAffine::identity()
+        ? surface.retainedDisplaySentinels(area) : std::vector<uint8_t>{};
+    auto edits = view.surfaceEdits(area.y, area.x, area.height, area.width, desired, validity, clearMaskedCoordinates, retained);
     if (edits.empty()) return std::nullopt;
     return vc::objects::EditGeometryOp{revision.objectUuid, std::move(edits), {}, true};
 }

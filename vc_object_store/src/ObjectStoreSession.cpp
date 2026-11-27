@@ -850,7 +850,7 @@ void ObjectStoreSession::setDraft(const std::string& objectUuid, const vc::geome
 
 void ObjectStoreSession::updateDraft(const std::string& objectUuid, int64_t row, int64_t column, int64_t rows,
                                      int64_t columns, std::span<const vc::geometry::SurfacePoint> points,
-                                     std::span<const uint8_t> validity)
+                                     std::span<const uint8_t> validity, std::span<const uint8_t> coordinatePresence)
 {
     const auto uuid = util::canonicalUuid(objectUuid);
     std::shared_ptr<const detail::SurfaceDraft> current;
@@ -862,7 +862,7 @@ void ObjectStoreSession::updateDraft(const std::string& objectUuid, int64_t row,
     }
     // Edits of one draft come from its editor, one at a time; build outside the lock.
     auto edited = std::const_pointer_cast<detail::SurfaceDraft>(
-        detail::editSurfaceDraft(*current, row, column, rows, columns, points, validity));
+        detail::editSurfaceDraft(*current, row, column, rows, columns, points, validity, coordinatePresence));
     std::lock_guard lock(mutex_);
     const auto found = drafts_.find(uuid);
     if (found == drafts_.end() || found->second != current)

@@ -10,11 +10,13 @@
 #include <fstream>
 #include <iterator>
 #include <set>
+#include <string_view>
 
 namespace vc::objects::detail {
 namespace {
 using Json = nlohmann::json;
-constexpr char kDraftMagic[8] = {'V', 'C', 'D', 'R', 'A', 'F', 'T', '1'};
+constexpr std::string_view kCanonicalDraft = "VCDRAFT1", kDisplayDraft = "VCDRAFT2";
+constexpr std::size_t kHeaderBytes = kCanonicalDraft.size() + 2 * sizeof(int64_t);
 const char* kManifest = "checkpoint.json";
 
 std::string readFile(const std::filesystem::path& path)
@@ -45,39 +47,50 @@ std::optional<ObjectVersion> versionFrom(const Json& j)
 
 template <class T> Json nullable(const std::optional<T>& value) { return value ? Json(*value) : Json(nullptr); }
 
-// The draft's whole grid: header, float32 xyz per vertex (row-major), then
-// the valid channel, one byte per vertex.
+// Canonical drafts keep the original file format. Display-frame drafts add one
+// presence byte per vertex in a separate plane after the validity array.
 std::vector<uint8_t> encodeDraft(const SurfaceDraft& draft)
 {
-    const auto count = std::size_t(draft.rows * draft.columns);
     const auto grid = draftGrid(draft);
-    const auto& points = grid.points;
-    const auto& validity = grid.validity;
-    std::vector<uint8_t> bytes(sizeof kDraftMagic + 16 + count * sizeof(vc::geometry::SurfacePoint) + count);
+    const auto count = grid.points.size();
+    const auto magic = grid.coordinatePresence.empty() ? kCanonicalDraft : kDisplayDraft;
+    std::vector<uint8_t> bytes(kHeaderBytes + count * (sizeof(vc::geometry::SurfacePoint) + 1) +
+                               grid.coordinatePresence.size());
     auto* out = bytes.data();
-    std::memcpy(out, kDraftMagic, sizeof kDraftMagic); out += sizeof kDraftMagic;
+    std::memcpy(out, magic.data(), magic.size()); out += magic.size();
     const int64_t shape[2] = {draft.rows, draft.columns};
-    std::memcpy(out, shape, 16); out += 16;
-    std::memcpy(out, points.data(), count * sizeof(vc::geometry::SurfacePoint)); out += count * sizeof(vc::geometry::SurfacePoint);
-    std::memcpy(out, validity.data(), count);
+    std::memcpy(out, shape, sizeof shape); out += sizeof shape;
+    if (count) {
+        std::memcpy(out, grid.points.data(), count * sizeof(vc::geometry::SurfacePoint)); out += count * sizeof(vc::geometry::SurfacePoint);
+        std::memcpy(out, grid.validity.data(), count); out += count;
+        if (!grid.coordinatePresence.empty()) std::memcpy(out, grid.coordinatePresence.data(), count);
+    }
     return bytes;
 }
 
 vc::geometry::Surface decodeDraft(const std::string& bytes, int64_t rows, int64_t columns)
 {
-    const auto count = std::size_t(rows * columns);
-    if (rows < 0 || columns < 0 ||
-        bytes.size() != sizeof kDraftMagic + 16 + count * sizeof(vc::geometry::SurfacePoint) + count ||
-        std::memcmp(bytes.data(), kDraftMagic, sizeof kDraftMagic) != 0)
+    const auto magic = std::string_view(bytes).substr(0, kCanonicalDraft.size());
+    const bool explicitPresence = magic == kDisplayDraft;
+    if ((!explicitPresence && magic != kCanonicalDraft) || bytes.size() < kHeaderBytes)
+        throw std::runtime_error("draft checkpoint: malformed draft header");
+    const auto bytesPerVertex = sizeof(vc::geometry::SurfacePoint) + 1 + explicitPresence;
+    const auto payloadBytes = bytes.size() - kHeaderBytes;
+    if (rows < 0 || columns < 0 || (columns && rows > INT64_MAX / columns) || payloadBytes % bytesPerVertex ||
+        payloadBytes / bytesPerVertex != std::size_t(rows * columns))
         throw std::runtime_error("draft checkpoint: malformed draft file");
     int64_t shape[2];
-    std::memcpy(shape, bytes.data() + sizeof kDraftMagic, 16);
+    std::memcpy(shape, bytes.data() + magic.size(), sizeof shape);
     if (shape[0] != rows || shape[1] != columns) throw std::runtime_error("draft checkpoint: draft shape mismatch");
+    const auto count = payloadBytes / bytesPerVertex;
     vc::geometry::Surface surface{rows, columns, {1, 1}, {}};
     surface.points.resize(count);
-    const auto* in = bytes.data() + sizeof kDraftMagic + 16;
-    std::memcpy(surface.points.data(), in, count * sizeof(vc::geometry::SurfacePoint));
-    surface.validity.assign(in + count * sizeof(vc::geometry::SurfacePoint), in + count * sizeof(vc::geometry::SurfacePoint) + count);
+    if (count) {
+        const auto* in = bytes.data() + kHeaderBytes;
+        std::memcpy(surface.points.data(), in, count * sizeof(vc::geometry::SurfacePoint)); in += count * sizeof(vc::geometry::SurfacePoint);
+        surface.validity.assign(in, in + count); in += count;
+        if (explicitPresence) surface.coordinatePresence.assign(in, in + count);
+    }
     return surface;
 }
 
@@ -116,7 +129,7 @@ DraftDirectory::Loaded DraftDirectory::load()
                                                   std::vector<uint8_t>(bytes.begin(), bytes.end())});
             }
         }
-        draft.surface.validate();
+        draft.surface.validateDraft();
         if (!d.at("store").is_null()) draft.meta.storeUuid = d.at("store").get<std::string>();
         draft.meta.base = versionFrom(d.at("base"));
         if (!d.at("submitted_revision").is_null()) draft.meta.submittedRevision = d.at("submitted_revision").get<uint64_t>();

@@ -8,8 +8,11 @@ namespace vc::objects { class TransformedGeometryView; class StoreReader; }
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <ranges>
+#include <span>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -458,14 +461,40 @@ public:
         cv::Point cell;
         cv::Vec3f coords;
     };
-    // Coordinates hidden by the input validity mask, indexed in the raw grid.
-    std::vector<MaskedVertex> maskedVertices;
+    // Rows are sparse; within a row, retained vertices are sorted by column.
+    // Lookups and small draft writes never visit unrelated rows or columns.
+    class MaskedVertices {
+    public:
+        MaskedVertices() = default;
+        MaskedVertices(std::initializer_list<MaskedVertex> vertices) {
+            for (const auto& vertex : vertices) set(vertex.cell, vertex.coords);
+        }
+        void set(cv::Point cell, cv::Vec3f coords);
+        std::optional<cv::Vec3f> get(cv::Point cell) const;
+        std::optional<cv::Vec3f> erase(cv::Point cell);
+        std::span<const MaskedVertex> row(int row, int firstColumn, int endColumn) const;
+        auto all() const { return _rows | std::views::values | std::views::join; }
+        bool empty() const { return _rows.empty(); }
+        std::size_t size() const;
+        void flipRows(int height);
+        void flipColumns(int width);
+        void clear() { _rows.clear(); }
+    private:
+        std::map<int, std::vector<MaskedVertex>> _rows;
+    };
+    MaskedVertices maskedVertices;
+    // Present when the editor grid is expressed in a different frame from the stored XYZ.
+    bool hasTransformedCoordinates = false;
     // Per-vertex input mask using the store's reduction for oversampled masks.
     cv::Mat_<uint8_t> vertexMask();
+    cv::Mat_<uint8_t> vertexMask(const cv::Rect& rectangle);
     // Retain coordinates behind the mask only when writing a surface.
     cv::Mat_<cv::Vec3f> pointsForStorage();
     // The requested grid rectangle, with hidden coordinates restored for storage.
     cv::Mat_<cv::Vec3f> pointsForStorage(const cv::Rect& rectangle);
+    // Row-major presence bits for hidden XYZ equal to the display sentinel.
+    // Empty when no retained coordinate in this area needs disambiguation.
+    std::vector<uint8_t> retainedDisplaySentinels(const cv::Rect& area) const;
     // Loads a registered channel that has no data yet (e.g. from its stored
     // geometry revision) on first access.
     void setChannelLoader(std::function<cv::Mat(const std::string&)> loader) { _channelLoader = std::move(loader); }
@@ -508,6 +537,7 @@ protected:
 
 private:
 
+    cv::Mat* loadChannel(const std::string& name);
     void saveWithUuid(const std::filesystem::path& path, const std::string& uuid, bool force_overwrite);
     std::string objectUuidOrNew() const;
     // Flag for lazy loading - true if points need to be loaded from path

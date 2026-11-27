@@ -838,5 +838,6 @@ std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::cloneSurface(cons
     clone->id = surface->id;
     clone->meta = surface->meta;
     clone->maskedVertices = surface->maskedVertices;
+    clone->hasTransformedCoordinates = surface->hasTransformedCoordinates;
     return clone;
 }
