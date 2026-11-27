@@ -3275,155 +3275,208 @@ class Model3D(nn.Module):
 		# bounding box, so the work scales with the number of source triangles
 		# (a few pixels each) instead of output pixels times k candidate cells,
 		# needs no spatial index, and cannot miss a containing cell that is not
-		# among the k nearest cell centres. The barycentric solve, the inside
-		# test and the output weights are the same expressions as before.
+		# among the k nearest cell centres.
 		del k_candidates  # kept for call compatibility; rasterization needs no k
-		n_cells = int(rows.shape[0])
-		tri0_s_cell = q10 - q00
-		tri0_t_cell = q01 - q00
-		tri1_u_cell = q11 - q10
-		tri1_v_cell = q01 - q10
-		centers64 = (0.25 * (q00 + q10 + q01 + q11)).astype(np.float64, copy=False)
-		lo64 = np.asarray(lo, dtype=np.float64)
-		# Upper bound on candidate (pixel, triangle) pairs processed at once.
-		budget = max(4096, 8 * int(chunk_points))
-		cell_block = 131072
+		work = uv_yx.device if uv_yx.device.type == "cuda" else torch.device("cpu")
+		raster_args = (rows, cols, q00, q10, q01, q11, x00, x10, x01, x11, lo,
+			out_h, out_w, chunk_points, result_device, dtype)
+		if work.type == "cuda":
+			try:
+				return Model3D._flatten_rasterize_cells(*raster_args, work=work)
+			except torch.OutOfMemoryError:
+				# The CPU path computes the same result, only slower.
+				torch.cuda.empty_cache()
+		return Model3D._flatten_rasterize_cells(*raster_args, work=torch.device("cpu"))
 
-		def _solve(points: np.ndarray, base: np.ndarray, e_a: np.ndarray, e_b: np.ndarray):
-			rhs = points - base
-			det = e_a[:, 0] * e_b[:, 1] - e_a[:, 1] * e_b[:, 0]
-			a = (rhs[:, 0] * e_b[:, 1] - e_b[:, 0] * rhs[:, 1]) / det
-			b = (e_a[:, 0] * rhs[:, 1] - rhs[:, 0] * e_a[:, 1]) / det
-			resid = a[:, None] * e_a + b[:, None] * e_b - rhs
-			res2 = (resid * resid).sum(axis=-1)
-			inside = (
-				np.isfinite(res2)
-				& (a >= -1.0e-4)
-				& (b >= -1.0e-4)
-				& (a + b <= 1.0 + 1.0e-4)
-				& (res2 <= 1.0e-5)
-			)
-			return a, b, res2, inside
+	@staticmethod
+	def _flatten_rasterize_cells(
+		rows, cols, q00, q10, q01, q11, x00, x10, x01, x11, lo,
+		out_h: int, out_w: int, chunk_points: int, result_device, dtype, *, work: torch.device,
+	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+		"""Rasterize the valid source cells' two UV triangles (inputs from
+		_flatten_invert_forward_uv_map) and sample the source at each output pixel.
+
+		Runs on `work` (the fit's GPU, or the CPU) with the same dtypes and the
+		same elementwise expressions on either device, so both give bit-identical
+		output. Each output pixel takes the inside candidate with the lowest
+		(residual, squared distance to the cell centre, triangle, cell). That key
+		does not depend on the order candidates are processed in, so block,
+		batch and stripe sizes only trade memory for speed.
+		"""
+		import numpy as np
+
+		f64 = torch.float64
+
+		def _t(a: np.ndarray) -> torch.Tensor:
+			return torch.from_numpy(np.ascontiguousarray(a)).to(work)
+
+		gpu = work.type == "cuda"
+		n_cells = int(rows.shape[0])
+		q00_t, q10_t, q01_t, q11_t = (_t(a) for a in (q00, q10, q01, q11))
+		tri0_s = q10_t - q00_t
+		tri0_t = q01_t - q00_t
+		tri1_u = q11_t - q10_t
+		tri1_v = q01_t - q10_t
+		centers64 = (0.25 * (q00_t + q10_t + q01_t + q11_t)).to(f64)
+		lo64 = np.asarray(lo, dtype=np.float64)
+		lo64_t = torch.as_tensor(lo64, dtype=f64, device=work)
+		lo0, lo1 = float(lo64[0]), float(lo64[1])
+		# Output points are rounded to numpy_float_hi before the solve.
+		point_eps = np.finfo(numpy_float_hi).eps * (np.abs(lo64) + np.array([out_h, out_w], dtype=np.float64))
+		point_eps_t = torch.as_tensor(point_eps, dtype=f64, device=work)
+		chunk = max(1, int(chunk_points))
+		# Upper bound on candidate (pixel, triangle) pairs processed at once.
+		budget = max(4096, 8 * chunk, (1 << 22) if gpu else 0)
+		cell_block = (1 << 21) if gpu else 131072
+		fill_chunk = max(chunk, (1 << 22) if gpu else 0)
+		# Winner state covers one stripe of output rows so it does not grow with the canvas.
+		stripe_rows = max(1, 64 * chunk // int(out_w), ((1 << 23) // int(out_w)) if gpu else 0)
 
 		out_map_t = torch.zeros((out_h * out_w, 2), dtype=torch.float32, device=result_device)
 		out_xyz_t = torch.zeros((out_h * out_w, 3), dtype=torch.float32, device=result_device)
 		out_mask_t = torch.zeros((out_h * out_w,), dtype=torch.bool, device=result_device)
-		chunk = max(1, int(chunk_points))
-		# Output points are rounded to numpy_float_hi before the solve.
-		point_eps = np.finfo(numpy_float_hi).eps * (np.abs(lo64) + np.array([out_h, out_w], dtype=np.float64))
-		# Winner state covers one stripe of output rows so it does not grow with the canvas.
-		stripe_rows = max(1, 64 * chunk // int(out_w))
+		rows_t = _t(rows.astype(np.float64)).to(torch_float_hi)
+		cols_t = _t(cols.astype(np.float64)).to(torch_float_hi)
+		x_t = [_t(a).to(torch_float_hi) for a in (x00, x10, x01, x11)]
+
 		for r0 in range(0, int(out_h), stripe_rows):
 			r1 = min(int(out_h), r0 + stripe_rows)
 			n_pix = (r1 - r0) * int(out_w)
-			best_res2 = np.full(n_pix, np.inf, dtype=numpy_float_hi)
-			best_dist2 = np.zeros(n_pix, dtype=np.float64)
-			best_tri = np.zeros(n_pix, dtype=np.int8)
-			best_cell_all = np.zeros(n_pix, dtype=np.int64)
-			best_a = np.zeros(n_pix, dtype=numpy_float_hi)
-			best_b = np.zeros(n_pix, dtype=numpy_float_hi)
-			with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-				for c0 in range(0, n_cells, cell_block):
-					c1 = min(n_cells, c0 + cell_block)
-					cells = np.arange(c0, c1, dtype=np.int64)
-					# Triangle 0 is (p00, p10, p01); triangle 1 is (p10, p11, p01).
-					tri_cell = np.concatenate([cells, cells])
-					tri_id = np.concatenate([
-						np.zeros(cells.shape[0], dtype=np.int8),
-						np.ones(cells.shape[0], dtype=np.int8),
-					])
-					va = np.concatenate([q00[c0:c1], q10[c0:c1]]).astype(np.float64)
-					vb = np.concatenate([q10[c0:c1], q11[c0:c1]]).astype(np.float64)
-					vc = np.concatenate([q01[c0:c1], q01[c0:c1]]).astype(np.float64)
-					tmin = np.minimum(np.minimum(va, vb), vc) - lo64
-					tmax = np.maximum(np.maximum(va, vb), vc) - lo64
-					# Generous margin: the inside test below decides; the margin only
-					# guarantees every pixel the tolerance could accept is tested.
-					margin = 1.0e-3 * (tmax - tmin).max(axis=1, keepdims=True) + 1.0e-3 + point_eps
-					y0 = np.clip(np.ceil(tmin[:, 0] - margin[:, 0]), r0, r1).astype(np.int64)
-					y1 = np.clip(np.floor(tmax[:, 0] + margin[:, 0]), r0 - 1, r1 - 1).astype(np.int64)
-					x0 = np.clip(np.ceil(tmin[:, 1] - margin[:, 1]), 0, out_w).astype(np.int64)
-					x1 = np.clip(np.floor(tmax[:, 1] + margin[:, 1]), -1, out_w - 1).astype(np.int64)
-					ny = np.maximum(0, y1 - y0 + 1)
-					nx = np.maximum(0, x1 - x0 + 1)
-					counts = ny * nx
-					keep = counts > 0
-					if not bool(keep.any()):
-						continue
-					tri_cell, tri_id = tri_cell[keep], tri_id[keep]
-					y0, x0, ny, nx = y0[keep], x0[keep], ny[keep], nx[keep]
-					# Split triangles whose box exceeds the budget into row bands so a
-					# runaway (huge) UV triangle cannot allocate an unbounded batch.
-					band = np.maximum(1, budget // nx)
-					pieces = (ny + band - 1) // band
-					if bool((pieces > 1).any()):
-						piece_of = np.repeat(np.arange(pieces.shape[0], dtype=np.int64), pieces)
-						piece_k = np.arange(piece_of.shape[0], dtype=np.int64) - np.repeat(np.cumsum(pieces) - pieces, pieces)
-						tri_cell, tri_id = tri_cell[piece_of], tri_id[piece_of]
-						y0 = y0[piece_of] + piece_k * band[piece_of]
-						ny = np.minimum(band[piece_of], ny[piece_of] - piece_k * band[piece_of])
-						x0, nx = x0[piece_of], nx[piece_of]
-					counts = ny * nx
-					ends = np.cumsum(counts)
-					t_start = 0
-					while t_start < int(counts.shape[0]):
-						done = int(ends[t_start - 1]) if t_start > 0 else 0
-						t_stop = int(np.searchsorted(ends, done + budget, side="right"))
-						t_stop = max(t_start + 1, t_stop)
-						sl = slice(t_start, t_stop)
-						cnt = counts[sl]
-						total = int(cnt.sum())
-						owner = np.repeat(np.arange(t_stop - t_start, dtype=np.int64), cnt)
-						first = np.cumsum(cnt) - cnt
-						local = np.arange(total, dtype=np.int64) - np.repeat(first, cnt)
-						nx_o = nx[sl][owner]
-						oy = y0[sl][owner] + local // nx_o
-						ox = x0[sl][owner] + local % nx_o
-						cell = tri_cell[sl][owner]
-						tri = tri_id[sl][owner]
-						points64 = np.stack([lo[0] + oy.astype(numpy_float_hi), lo[1] + ox.astype(numpy_float_hi)], axis=-1)
-						points = points64.astype(numpy_float_hi, copy=False)
-						is1 = tri == 1
-						base = np.where(is1[:, None], q10[cell], q00[cell])
-						e_a = np.where(is1[:, None], tri1_u_cell[cell], tri0_s_cell[cell])
-						e_b = np.where(is1[:, None], tri1_v_cell[cell], tri0_t_cell[cell])
-						a, b, res2, inside = _solve(points, base, e_a, e_b)
-						if bool(inside.any()):
-							d = points64[inside].astype(np.float64, copy=False) - centers64[cell[inside]]
-							pix = (oy[inside] - r0) * int(out_w) + ox[inside]
-							res2, dist2 = res2[inside], (d * d).sum(axis=-1)
-							tri, cell, a, b = tri[inside], cell[inside], a[inside], b[inside]
-							# Lowest residual, then nearest cell centre, then triangle 0; earlier hits win exact ties.
-							order = np.lexsort((tri, dist2, res2, pix))
-							first = np.ones(order.shape[0], dtype=bool)
-							first[1:] = pix[order[1:]] != pix[order[:-1]]
-							sel = order[first]
-							p = pix[sel]
-							cur_res2, cur_dist2 = best_res2[p], best_dist2[p]
-							better = (res2[sel] < cur_res2) | ((res2[sel] == cur_res2) & (
-								(dist2[sel] < cur_dist2) | ((dist2[sel] == cur_dist2) & (tri[sel] < best_tri[p]))))
-							sel, p = sel[better], p[better]
-							best_res2[p] = res2[sel]
-							best_dist2[p] = dist2[sel]
-							best_tri[p] = tri[sel]
-							best_cell_all[p] = cell[sel]
-							best_a[p] = a[sel]
-							best_b[p] = b[sel]
-						t_start = t_stop
+			best_res2 = torch.full((n_pix,), float("inf"), dtype=q00_t.dtype, device=work)
+			best_dist2 = torch.zeros(n_pix, dtype=f64, device=work)
+			best_tri = torch.zeros(n_pix, dtype=torch.int64, device=work)
+			best_cell = torch.zeros(n_pix, dtype=torch.int64, device=work)
+			best_a = torch.zeros(n_pix, dtype=q00_t.dtype, device=work)
+			best_b = torch.zeros(n_pix, dtype=q00_t.dtype, device=work)
+			for c0 in range(0, n_cells, cell_block):
+				c1 = min(n_cells, c0 + cell_block)
+				cells = torch.arange(c0, c1, dtype=torch.int64, device=work)
+				# Triangle 0 is (p00, p10, p01); triangle 1 is (p10, p11, p01).
+				tri_cell = torch.cat([cells, cells])
+				tri_id = torch.cat([torch.zeros_like(cells), torch.ones_like(cells)])
+				va = torch.cat([q00_t[c0:c1], q10_t[c0:c1]]).to(f64)
+				vb = torch.cat([q10_t[c0:c1], q11_t[c0:c1]]).to(f64)
+				vc = torch.cat([q01_t[c0:c1], q01_t[c0:c1]]).to(f64)
+				tmin = torch.minimum(torch.minimum(va, vb), vc) - lo64_t
+				tmax = torch.maximum(torch.maximum(va, vb), vc) - lo64_t
+				del va, vb, vc
+				# Generous margin: the inside test below decides; the margin only
+				# guarantees every pixel the tolerance could accept is tested.
+				margin = 1.0e-3 * (tmax - tmin).amax(dim=1, keepdim=True) + 1.0e-3 + point_eps_t
+				y0 = torch.clamp(torch.ceil(tmin[:, 0] - margin[:, 0]), r0, r1).to(torch.int64)
+				y1 = torch.clamp(torch.floor(tmax[:, 0] + margin[:, 0]), r0 - 1, r1 - 1).to(torch.int64)
+				x0 = torch.clamp(torch.ceil(tmin[:, 1] - margin[:, 1]), 0, out_w).to(torch.int64)
+				x1 = torch.clamp(torch.floor(tmax[:, 1] + margin[:, 1]), -1, out_w - 1).to(torch.int64)
+				del tmin, tmax, margin
+				ny = (y1 - y0 + 1).clamp_min(0)
+				nx = (x1 - x0 + 1).clamp_min(0)
+				keep = (ny * nx) > 0
+				if not bool(keep.any()):
+					continue
+				tri_cell, tri_id = tri_cell[keep], tri_id[keep]
+				y0, x0, ny, nx = y0[keep], x0[keep], ny[keep], nx[keep]
+				# Split triangles whose box exceeds the budget into row bands so a
+				# runaway (huge) UV triangle cannot allocate an unbounded batch.
+				band = (budget // nx).clamp_min(1)
+				pieces = (ny + band - 1) // band
+				if bool((pieces > 1).any()):
+					piece_of = torch.repeat_interleave(torch.arange(pieces.shape[0], dtype=torch.int64, device=work), pieces)
+					piece_k = torch.arange(piece_of.shape[0], dtype=torch.int64, device=work) - torch.repeat_interleave(
+						torch.cumsum(pieces, 0) - pieces, pieces)
+					tri_cell, tri_id = tri_cell[piece_of], tri_id[piece_of]
+					y0 = y0[piece_of] + piece_k * band[piece_of]
+					ny = torch.minimum(band[piece_of], ny[piece_of] - piece_k * band[piece_of])
+					x0, nx = x0[piece_of], nx[piece_of]
+				counts = ny * nx
+				ends_np = torch.cumsum(counts, 0).cpu().numpy()
+				t_start = 0
+				while t_start < int(ends_np.shape[0]):
+					done = int(ends_np[t_start - 1]) if t_start > 0 else 0
+					t_stop = int(np.searchsorted(ends_np, done + budget, side="right"))
+					t_stop = max(t_start + 1, t_stop)
+					sl = slice(t_start, t_stop)
+					total = int(ends_np[t_stop - 1]) - done
+					cnt = counts[sl]
+					owner = torch.repeat_interleave(
+						torch.arange(t_stop - t_start, dtype=torch.int64, device=work), cnt, output_size=total)
+					first = torch.cumsum(cnt, 0) - cnt
+					local = torch.arange(total, dtype=torch.int64, device=work) - first[owner]
+					nx_o = nx[sl][owner]
+					oy = y0[sl][owner] + torch.div(local, nx_o, rounding_mode="floor")
+					ox = x0[sl][owner] + local % nx_o
+					del local, nx_o
+					cell = tri_cell[sl][owner]
+					tri = tri_id[sl][owner]
+					del owner
+					points64 = torch.stack([
+						oy.to(torch_float_hi).to(f64) + lo0,
+						ox.to(torch_float_hi).to(f64) + lo1,
+					], dim=-1)
+					points = points64.to(q00_t.dtype)
+					is1 = (tri == 1)[:, None]
+					base = torch.where(is1, q10_t[cell], q00_t[cell])
+					e_a = torch.where(is1, tri1_u[cell], tri0_s[cell])
+					e_b = torch.where(is1, tri1_v[cell], tri0_t[cell])
+					rhs = points - base
+					det = e_a[:, 0] * e_b[:, 1] - e_a[:, 1] * e_b[:, 0]
+					a = (rhs[:, 0] * e_b[:, 1] - e_b[:, 0] * rhs[:, 1]) / det
+					b = (e_a[:, 0] * rhs[:, 1] - rhs[:, 0] * e_a[:, 1]) / det
+					resid = a[:, None] * e_a + b[:, None] * e_b - rhs
+					res2 = resid[:, 0] * resid[:, 0] + resid[:, 1] * resid[:, 1]
+					inside = (
+						torch.isfinite(res2)
+						& (a >= -1.0e-4)
+						& (b >= -1.0e-4)
+						& (a + b <= 1.0 + 1.0e-4)
+						& (res2 <= 1.0e-5)
+					)
+					del base, e_a, e_b, rhs, det, resid, points
+					idx = torch.nonzero(inside).squeeze(1)
+					if idx.numel() > 0:
+						d = points64[idx] - centers64[cell[idx]]
+						dist2 = d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1]
+						pix = (oy[idx] - r0) * int(out_w) + ox[idx]
+						res2_i, tri_i, cell_i, a_i, b_i = res2[idx], tri[idx], cell[idx], a[idx], b[idx]
+						# Per pixel: lowest residual, then nearest cell centre, then
+						# triangle 0, then the lowest cell index. Each min narrows the
+						# candidates to those that tie on every key so far; (triangle,
+						# cell) is unique, so exactly one candidate per pixel remains.
+						p_u, inv = torch.unique(pix, return_inverse=True)
+						live = torch.ones_like(inv, dtype=torch.bool)
+						for key in (res2_i, dist2, tri_i, cell_i):
+							big = torch.full((), torch.inf if key.is_floating_point() else torch.iinfo(key.dtype).max,
+								dtype=key.dtype, device=work)
+							masked = torch.where(live, key, big)
+							kmin = torch.full((p_u.shape[0],), big.item(), dtype=key.dtype, device=work)
+							kmin = kmin.scatter_reduce(0, inv, masked, reduce="amin", include_self=True)
+							live = live & (masked == kmin[inv])
+						sel = torch.nonzero(live).squeeze(1)
+						p = pix[sel]
+						cr, cd, ct, cc = best_res2[p], best_dist2[p], best_tri[p], best_cell[p]
+						nr, nd, nt, nc = res2_i[sel], dist2[sel], tri_i[sel], cell_i[sel]
+						better = (nr < cr) | ((nr == cr) & ((nd < cd) | ((nd == cd) & (
+							(nt < ct) | ((nt == ct) & (nc < cc))))))
+						sel, p = sel[better], p[better]
+						best_res2[p] = res2_i[sel]
+						best_dist2[p] = dist2[sel]
+						best_tri[p] = tri_i[sel]
+						best_cell[p] = cell_i[sel]
+						best_a[p] = a_i[sel]
+						best_b[p] = b_i[sel]
+					t_start = t_stop
 
-			filled = np.flatnonzero(np.isfinite(best_res2))
-			for start in range(0, int(filled.shape[0]), chunk):
-				flat_idx = filled[start:start + chunk]
-				best_cell = best_cell_all[flat_idx]
-				best_tri1_np = best_tri[flat_idx] == 1
+			filled = torch.nonzero(torch.isfinite(best_res2)).squeeze(1)
+			for start in range(0, int(filled.shape[0]), fill_chunk):
+				flat_idx = filled[start:start + fill_chunk]
+				bc = best_cell[flat_idx]
+				best_tri1 = best_tri[flat_idx] == 1
 				a_sel = best_a[flat_idx]
 				b_sel = best_b[flat_idx]
-				zero_np = np.zeros_like(a_sel)
-				best_tri1 = torch.from_numpy(best_tri1_np)
-				best_s0 = torch.from_numpy(np.where(best_tri1_np, zero_np, a_sel))
-				best_t0 = torch.from_numpy(np.where(best_tri1_np, zero_np, b_sel))
-				best_u1 = torch.from_numpy(np.where(best_tri1_np, a_sel, zero_np))
-				best_v1 = torch.from_numpy(np.where(best_tri1_np, b_sel, zero_np))
+				zero = torch.zeros_like(a_sel)
+				best_s0 = torch.where(best_tri1, zero, a_sel).to(torch_float_hi)
+				best_t0 = torch.where(best_tri1, zero, b_sel).to(torch_float_hi)
+				best_u1 = torch.where(best_tri1, a_sel, zero).to(torch_float_hi)
+				best_v1 = torch.where(best_tri1, b_sel, zero).to(torch_float_hi)
 
 				# Clamp tiny shared-edge tolerances, then renormalize barycentric
 				# weights so source coordinates and sampled xyz use the same point.
@@ -3433,25 +3486,20 @@ class Model3D(nn.Module):
 				w01 = torch.where(best_tri1, best_v1, best_t0)
 				w11 = torch.where(best_tri1, best_u1, zero)
 				weights = torch.stack((w00, w10, w01, w11), dim=-1).clamp_min(0.0)
-				weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+				# Summed left to right, as the CPU reduction of 4 values does, so
+				# CPU and GPU agree bit for bit.
+				wsum = ((weights[:, 0] + weights[:, 1]) + weights[:, 2]) + weights[:, 3]
+				weights = weights / wsum.clamp_min(1.0e-12)[:, None]
 
-				def _selected_tensor(values: np.ndarray) -> torch.Tensor:
-					return torch.as_tensor(
-						np.ascontiguousarray(values[best_cell]),
-						dtype=torch_float_hi,
-					)
-
-				best_rows = _selected_tensor(rows_float)
-				best_cols = _selected_tensor(cols_float)
-				src_r = best_rows + weights[:, 1] + weights[:, 3]
-				src_c = best_cols + weights[:, 2] + weights[:, 3]
+				src_r = rows_t[bc] + weights[:, 1] + weights[:, 3]
+				src_c = cols_t[bc] + weights[:, 2] + weights[:, 3]
 				sampled = (
-					weights[:, 0, None] * _selected_tensor(x00)
-					+ weights[:, 1, None] * _selected_tensor(x10)
-					+ weights[:, 2, None] * _selected_tensor(x01)
-					+ weights[:, 3, None] * _selected_tensor(x11)
+					weights[:, 0, None] * x_t[0][bc]
+					+ weights[:, 1, None] * x_t[1][bc]
+					+ weights[:, 2, None] * x_t[2][bc]
+					+ weights[:, 3, None] * x_t[3][bc]
 				)
-				flat_out = torch.as_tensor(flat_idx + r0 * int(out_w), dtype=torch.long, device=result_device)
+				flat_out = (flat_idx + r0 * int(out_w)).to(result_device)
 				out_map_t[flat_out, 0] = src_r.to(device=result_device, dtype=torch.float32)
 				out_map_t[flat_out, 1] = src_c.to(device=result_device, dtype=torch.float32)
 				out_xyz_t[flat_out] = sampled.to(device=result_device, dtype=torch.float32)

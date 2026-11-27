@@ -69,6 +69,8 @@ Reference configs:
   - `flatten_direction == "forward"` uses a source-sized UV map.
   - `_flatten_invert_forward_uv_map(...)` inverts VC's two fixed-diagonal mesh
     triangles for export.
+    It rasterizes on the UV map's device (the fit's CUDA GPU, otherwise the
+    CPU); both give bit-identical output.
 
 - `lasagna/opt_loss_flatten.py`
   - Contains direction-aware flatten losses.

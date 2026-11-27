@@ -283,6 +283,37 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertEqual(tuple(mask.shape), (2, 2))
 		self.assertTrue(bool(mask[0].all()))
 
+	def test_forward_inversion_is_independent_of_batching_and_device(self) -> None:
+		# Integer-aligned UV puts many output pixels exactly on shared triangle
+		# edges and vertices, so every tie-break rule decides some pixel. The
+		# result must not depend on how candidates are batched, nor on the device.
+		gen = torch.Generator().manual_seed(0)
+		xyz = _flat_grid(9, 13)
+		xyz[..., 2] = torch.randn(9, 13, generator=gen)
+		yy, xx = torch.meshgrid(torch.arange(9.0), torch.arange(13.0), indexing="ij")
+		uv = torch.stack([yy * 2.0, xx * 3.0], dim=-1)
+		uv[4:6, 5:8] += torch.randn(2, 3, 2, generator=gen) * 0.7
+		cell_valid = torch.rand(8, 12, generator=gen) > 0.15
+
+		def run(device: str, chunk: int):
+			return fit_model.Model3D._flatten_invert_forward_uv_map(
+				xyz.to(device),
+				cell_valid.to(device),
+				uv.to(device),
+				output_margin=0.1,
+				chunk_points=chunk,
+				output_device="cpu",
+			)
+
+		reference = run("cpu", 65536)
+		self.assertTrue(bool(reference[2].any()))
+		devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+		for device in devices:
+			for chunk in (65536, 3):
+				with self.subTest(device=device, chunk=chunk):
+					for got, want in zip(run(device, chunk), reference):
+						self.assertTrue(torch.equal(got, want))
+
 	def test_flatten_stage_defaults_disable_volume_losses(self) -> None:
 		stages = optimizer.load_stages_cfg({
 			"args": {"model-init": "flatten"},
