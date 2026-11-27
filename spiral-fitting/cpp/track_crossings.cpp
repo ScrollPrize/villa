@@ -1,4 +1,5 @@
 #include "vc_object_store/TrackCrossings.hpp"
+#include "portable_random.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -646,8 +647,9 @@ nb::dict sample_crossing_partners(
                 seed + 0x9e3779b97f4a7c15ULL
                     * (static_cast<uint64_t>(row) + 1));
             for (size_t slot = 0; slot < count; ++slot) {
-                std::uniform_int_distribution<size_t> draw(slot, degree - 1);
-                const size_t choice = draw(random);
+                const size_t choice = slot + static_cast<size_t>(
+                    vc_spiral::uniform_below(
+                        random, static_cast<uint64_t>(degree - slot)));
                 std::swap(candidates[slot], candidates[choice]);
                 const int32_t record = candidates[slot];
                 const int32_t partner = index.partners[record];
