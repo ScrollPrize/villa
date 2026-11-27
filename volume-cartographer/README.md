@@ -368,6 +368,18 @@ This writes `render/00.tif` (360×360 pixels for the segment above, about
   `--voxel-unit` applies to `--voxel-size` and defaults to `nanometer`, so
   pass both flags when overriding; `--voxel-size 45.532` alone yields a TIFF
   resolution 1000× too large.
+  `--voxel-size` is always the size of a level-0 voxel (the working level of a
+  rebased remote volume), whatever `-g` is: the renderer scales it to the
+  rendered level itself and logs the result as
+  `Requested output pixel size (group 1, scale 1): ...`. Passing the
+  rendered level's size instead overstates the pixel size by the level's
+  factor (twice, for `-g 1` of a pyramid that halves each level), so when the
+  volume records its own size, the rendered level is scaled equally on every
+  axis and `--voxel-size` is that level's voxel size, the render is refused
+  unless `--allow-voxel-size-mismatch` is given; other differences only warn.
+  Output already written with a wrong size keeps it: for a multi-part Zarr,
+  rerun `--pre` with the corrected `--voxel-size`; rerender TIFFs without
+  `--resume`.
 - `-g` selects the pyramid level: `-g 3` renders the same segment at 1/8
   scale (45×45 pixels, about 4 MiB fetched). A level the remote pyramid does
   not have fails immediately with

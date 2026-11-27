@@ -373,6 +373,9 @@ vc3d::ToolProcess::Launch CommandLineToolRunner::launchFor(Tool tool)
     launch.volume = tool == Tool::RenderTifXYZ ? _renderVolumeUuid
                                                : _volumeUuid;
     launch.voxelScale = tool == Tool::RenderTifXYZ ? _renderVoxelScale : _voxelScale;
+    // An environment variable, not a flag, so renderers that predate it still run.
+    if (tool == Tool::RenderTifXYZ && _useRenderVoxelSize)
+        launch.environment.insert(QStringLiteral("VC_RENDER_ALLOW_VOXEL_SIZE_MISMATCH"), QStringLiteral("1"));
     return launch;
 }
 

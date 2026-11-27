@@ -211,3 +211,143 @@ TEST_CASE("vc_render_tifxyz exits non-zero when a remote volume cannot be read")
     std::error_code ignored;
     fs::remove_all(root, ignored);
 }
+
+TEST_CASE("vc_render_tifxyz checks --voxel-size against the volume's own size")
+{
+    const char* renderer = std::getenv("VC_RENDER_TIFXYZ_BIN");
+    REQUIRE(renderer);
+    const auto root = fs::temp_directory_path() /
+                      ("vc-render-voxel-size-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    // A two-level volume whose own level-0 voxel is 1.129 um (meta.json), as the PHerc1667 volumes record.
+    const auto makeVolume = [&](const std::string& name, const std::string& meta) {
+        const auto volume = root / name;
+        vcr::zarr::createGroup(volume);
+        for (int level = 0; level < 2; ++level) {
+            const int z = 16 >> level, xy = 64 >> level;
+            auto writer = vcr::zarr::Writer::create(volume / std::to_string(level),
+                                                    {.shape = {z, xy, xy}, .chunks = {z, xy, xy}, .compressor = ""});
+            const std::vector<std::uint8_t> voxels(std::size_t(z) * xy * xy, 100);
+            writer.writeChunk({0, 0, 0}, voxels.data(), voxels.size());
+        }
+        if (!meta.empty()) std::ofstream(volume / "meta.json") << meta;
+        return volume;
+    };
+    const auto withSize = makeVolume("sized.zarr", R"({"voxelsize": 1.129})");
+    const auto nested = makeVolume("nested.zarr", R"({"scan": {"voxelsize": 1.129}})");
+    const auto zeroSize = makeVolume("zero.zarr", R"({"voxelsize": 0})");
+    const auto textSize = makeVolume("text.zarr", R"({"voxelsize": "abc"})");
+    const auto noSize = makeVolume("none.zarr", "");
+    const auto surface = root / "surface";
+    fs::create_directories(surface);
+    writeSurfaceAxis(surface / "x.tif", 32, 32, [](int, int x) { return float(x + 4); });
+    writeSurfaceAxis(surface / "y.tif", 32, 32, [](int y, int) { return float(y + 4); });
+    writeSurfaceAxis(surface / "z.tif", 32, 32, [](int, int) { return 8.0f; });
+    std::ofstream(surface / "meta.json") << nlohmann::json{
+        {"format", "tifxyz"}, {"type", "seg"}, {"uuid", "surface"}, {"scale", {1, 1}},
+        {"bbox", {{4, 4, 8}, {35, 35, 8}}}}.dump();
+
+    struct Run {
+        int status;
+        std::string log;
+        std::optional<double> declared;  // in-plane scale of level 0 in .zattrs; none when no output was written
+    };
+    int serial = 0;
+    const auto run = [&](const fs::path& volume, int group, const std::string& flags) {
+        const auto out = root / ("render" + std::to_string(serial++));
+        const std::string command = std::string("\"") + renderer + "\" -v \"" + volume.string() + "\" -s \"" + surface.string() +
+                                    "\" -g " + std::to_string(group) + " --scale 1 --zarr-compressor none --pyramid false --pre " +
+                                    "--zarr-output \"" + out.string() + "\" " + flags + " > \"" + (root / "log.txt").string() + "\" 2>&1";
+        Run result{std::system(command.c_str()), {}, std::nullopt};
+        std::ifstream log(root / "log.txt");
+        result.log.assign(std::istreambuf_iterator<char>(log), {});
+        std::ifstream attributes(out / ".zattrs");
+        if (attributes) {
+            const auto document = nlohmann::json::parse(attributes);
+            result.declared = document.at("multiscales").at(0).at("datasets").at(0).at("coordinateTransformations").at(0).at("scale").at(2).get<double>();
+        }
+        return result;
+    };
+    const auto warned = [](const Run& r) { return r.log.find("Warning: --voxel-size") != std::string::npos; };
+    const std::string um = " --voxel-unit micrometer";
+
+    // The defect: level 1 rendered with the level-1 size (2.258 um) declares 4.516 um pixels. It is refused, and nothing is written.
+    const auto refused = run(withSize, 1, "--voxel-size 2.258" + um);
+    CHECK(refused.status != 0);
+    CHECK(!refused.declared.has_value());
+    CHECK(refused.log.find("--voxel-size 1.129 --voxel-unit micrometer") != std::string::npos);
+    CHECK(refused.log.find("--allow-voxel-size-mismatch") != std::string::npos);
+    // The same through a nested record, and for level 1 given in nanometres (the exact value is in the caller's unit).
+    CHECK(run(nested, 1, "--voxel-size 2.258" + um).status != 0);
+    const auto refusedNm = run(withSize, 1, "--voxel-size 2258 --voxel-unit nanometer");
+    CHECK(refusedNm.status != 0);
+    CHECK(refusedNm.log.find("--voxel-size 1129 --voxel-unit nanometer") != std::string::npos);
+
+    // The override renders it as given: the size written and logged is the one the caller insisted on.
+    const auto forced = run(withSize, 1, "--voxel-size 2.258" + um + " --allow-voxel-size-mismatch");
+    CHECK(forced.status == 0);
+    CHECK(forced.declared.value_or(0) == doctest::Approx(4.516));
+    CHECK(forced.log.find("Requested output pixel size (group 1, scale 1): 4.516 micrometer") != std::string::npos);
+    CHECK(warned(forced));
+
+    // The right value declares the right pixel size, silently. .zattrs keeps the caller's unit, so the number follows it.
+    struct Right { std::string flags; double declared; };
+    for (const auto& [flags, declared] : {Right{"--voxel-size 1.129" + um, 2.258}, Right{"--voxel-size 1129 --voxel-unit nanometer", 2258},
+                                         Right{"--voxel-size 0.001129 --voxel-unit millimeter", 0.002258}, Right{"", 2.258}}) {
+        CAPTURE(flags);
+        const auto right = run(withSize, 1, flags);
+        CHECK(right.status == 0);
+        REQUIRE(right.declared.has_value());
+        CHECK(*right.declared == doctest::Approx(declared));
+        CHECK(!warned(right));
+    }
+    // Within 1 % is the same size.
+    const auto close = run(withSize, 0, "--voxel-size 1.135" + um);
+    CHECK(close.status == 0);
+    CHECK(!warned(close));
+
+    // Not sure enough to refuse: the value is used, with a warning.
+    const auto levelZero = run(withSize, 0, "--voxel-size 2.258" + um);  // a factor of 2, but at level 0 nothing explains it
+    CHECK(levelZero.status == 0);
+    CHECK(warned(levelZero));
+    CHECK(levelZero.declared.value_or(0) == doctest::Approx(2.258));
+    const auto fourAtOne = run(withSize, 1, "--voxel-size 4.516" + um);  // not 2^group-idx
+    CHECK(fourAtOne.status == 0);
+    CHECK(warned(fourAtOne));
+    const auto unit = run(withSize, 0, "--voxel-size 1.129 --voxel-unit nanometer");  // 1000x: the unit
+    CHECK(unit.status == 0);
+    CHECK(warned(unit));
+    CHECK(unit.log.find("--voxel-unit is nanometer") != std::string::npos);
+
+    // The level's declared placement decides, not 2^group-idx; a level not scaled equally on every axis only warns.
+    const auto placed = [&](const std::string& name, nlohmann::json scale) {
+        const auto volume = makeVolume(name, R"({"voxelsize": 1.129})");
+        const auto level = [](const char* path, nlohmann::json factors) {
+            return nlohmann::json{{"path", path}, {"coordinateTransformations", {{{"type", "scale"}, {"scale", factors}}}}};
+        };
+        vcr::zarr::writeAttributes(volume, {{"multiscales", {{{"version", "0.4"},
+            {"axes", {{{"name", "z"}, {"type", "space"}}, {{"name", "y"}, {"type", "space"}}, {{"name", "x"}, {"type", "space"}}}},
+            {"datasets", {level("0", {1, 1, 1}), level("1", scale)}}}}}});
+        return volume;
+    };
+    const auto tripled = placed("tripled.zarr", {3, 3, 3});
+    CHECK(run(tripled, 1, "--voxel-size 3.387" + um).status != 0);
+    const auto twoAtTriple = run(tripled, 1, "--voxel-size 2.258" + um);
+    CHECK(twoAtTriple.status == 0);
+    CHECK(warned(twoAtTriple));
+    const auto inPlane = run(placed("in-plane.zarr", {1, 2, 2}), 1, "--voxel-size 2.258" + um);
+    CHECK(inPlane.status == 0);
+    CHECK(warned(inPlane));
+    CHECK(run(placed("near.zarr", {2.019, 2, 2}), 1, "--voxel-size 2.300902" + um).status == 0);
+
+    // No usable record to compare with: the flag is used and nothing is said.
+    for (const auto* volume : {&noSize, &zeroSize, &textSize}) {
+        const auto unchecked = run(*volume, 1, "--voxel-size 2.258" + um);
+        CHECK(unchecked.status == 0);
+        CHECK(!warned(unchecked));
+        REQUIRE(unchecked.declared.has_value());
+        // known limit: without a recorded size the check cannot tell; not a goal
+        CHECK(*unchecked.declared == doctest::Approx(4.516));
+    }
+    std::error_code ignored;
+    fs::remove_all(root, ignored);
+}

@@ -802,6 +802,59 @@ static ResolvedVoxelSize resolveRenderVoxelSize(
     return {};
 }
 
+// An explicit --voxel-size is used as given, but a volume that records its own
+// size is a cheap cross-check: a value that differs by more than 1 % is warned
+// about. The usual cause is passing the size of the level being rendered, where
+// --voxel-size is the size of a level-0 voxel. When the rendered level is scaled
+// equally on every axis and the value is that level's size (within 1 %), the cause
+// is certain, so that case is refused unless the mismatch is allowed.
+static bool checkExplicitVoxelSize(
+    const std::filesystem::path& volPath,
+    const Volume* remoteVolume,
+    double explicitValue,
+    const std::string& explicitUnit,
+    int groupIdx,
+    const cv::Vec3f& levelScale,
+    bool allowMismatch)
+{
+    const auto cli = explicitMicrometerPerVoxel(explicitValue, explicitUnit);
+    const ResolvedVoxelSize own =
+        resolveRenderVoxelSize(volPath, remoteVolume, false, 0.0, {});
+    if (!cli || !own.isUsable() || std::abs(*cli / own.micrometerPerVoxel - 1.0) <= 0.01)
+        return true;
+
+    const double ratio = *cli / own.micrometerPerVoxel;
+    const double meanScale = (levelScale[0] + levelScale[1] + levelScale[2]) / 3.0;
+    const bool levelCause = std::abs(ratio * meanScale - 1.0) <= 0.01;
+    const bool equalAxes = levelScale[0] == levelScale[1] && levelScale[0] == levelScale[2];
+    if (levelCause && equalAxes && !allowMismatch) {
+        // The value to pass is the volume's own size in the caller's unit.
+        const double passValue = own.micrometerPerVoxel / (*explicitMicrometerPerVoxel(1.0, explicitUnit));
+        logPrintf(stderr,
+                  "Error: --voxel-size %g %s is %.4g times the volume's own recorded size (%g micrometer). "
+                  "--voxel-size is the size of a level-0 voxel; with --group-idx %d the renderer scales it "
+                  "itself. Pass --voxel-size %g --voxel-unit %s, or add --allow-voxel-size-mismatch if %g %s "
+                  "really is the level-0 size.\n",
+                  explicitValue, explicitUnit.c_str(), ratio, own.micrometerPerVoxel, groupIdx,
+                  passValue, explicitUnit.c_str(), explicitValue, explicitUnit.c_str());
+        return false;
+    }
+
+    char cause[200] = "";
+    if (levelCause)
+        std::snprintf(cause, sizeof(cause),
+                      " --voxel-size is the size of a level-0 voxel; with --group-idx %d "
+                      "the renderer scales it itself.", groupIdx);
+    else if (std::abs(ratio * 1000.0 - 1.0) <= 0.01 || std::abs(ratio / 1000.0 - 1.0) <= 0.01)
+        std::snprintf(cause, sizeof(cause),
+                      " A factor of 1000 is usually the unit: --voxel-unit is %s.", explicitUnit.c_str());
+    logPrintf(stderr,
+              "Warning: --voxel-size %g micrometer differs from the volume's own metadata "
+              "(%g micrometer) by a factor of %.4g.%s The command-line value is used.\n",
+              *cli, own.micrometerPerVoxel, ratio, cause);
+    return true;
+}
+
 // ============================================================
 // main
 // ============================================================
@@ -885,8 +938,9 @@ int main(int argc, char *argv[])
         ("pyramid", po::value<bool>()->default_value(true), "Build pyramid levels L1-L5 (default: true)")
         ("resume", po::bool_switch()->default_value(false), "Skip chunks that already exist on disk")
         ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
-        ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (reads from volume metadata if omitted)")
-        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Unit of the number given to --voxel-size (nanometer, micrometer, millimeter, meter). Sizes read from volume metadata are always declared in micrometer.");
+        ("voxel-size", po::value<double>(), "Physical size of one level-0 voxel of the source volume, whatever --group-idx is; the renderer scales it to the level and --scale it renders at when it writes the OME-Zarr scale metadata (reads from volume metadata if omitted)")
+        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Unit of the number given to --voxel-size (nanometer, micrometer, millimeter, meter). Sizes read from volume metadata are always declared in micrometer.")
+        ("allow-voxel-size-mismatch", po::bool_switch()->default_value(false), "Render with --voxel-size although, by the size the volume records, it is the rendered level's voxel size (normally refused: --voxel-size is the size of a level-0 voxel). VC3D allows it by setting VC_RENDER_ALLOW_VOXEL_SIZE_MISMATCH=1");
     StoreToolOptions::add(optional, "Object store holding the --surface to render; with --volume-uuid it is read in "
                                     "that volume's voxels through the store's view of it (its binding or a "
                                     "registration), replacing --affine and --scale-segmentation",
@@ -1264,6 +1318,13 @@ int main(int argc, char *argv[])
             voxel_unit);
 
         base_voxel_size = resolved.micrometerPerVoxel;
+        const char* allowEnv = std::getenv("VC_RENDER_ALLOW_VOXEL_SIZE_MISMATCH");
+        const bool allowMismatch = parsed["allow-voxel-size-mismatch"].as<bool>() ||
+                                   (allowEnv && std::string(allowEnv) == "1");
+        if (resolved.source == VoxelSizeSource::Cli &&
+            !checkExplicitVoxelSize(vol_path, remoteVolume.get(), explicitVoxelSize, voxel_unit,
+                                    group_idx, levelMap.scale, allowMismatch))
+            return EXIT_FAILURE;
 
         // Emit the number and the unit as a matched pair.
         //
@@ -1283,8 +1344,8 @@ int main(int argc, char *argv[])
         }
 
         if (resolved.isUsable()) {
-            // Log exactly what .zattrs will declare, so the log line can be
-            // checked against the output instead of needing its own conversion.
+            // Log the level-0 size in the unit .zattrs will use. What .zattrs
+            // declares for the rendered level is logged below, once it is known.
             logPrintf(stdout, "Voxel size (%s): %g %s\n",
                       voxelSizeSourceName(resolved.source), zarr_voxel_value,
                       zarr_voxel_unit.c_str());
@@ -1319,6 +1380,13 @@ int main(int argc, char *argv[])
         render_level_voxel_size = ds_scale > 0
             ? zarr_voxel_value / double(ds_scale)
             : zarr_voxel_value;
+
+        if (resolved.isUsable()) {
+            const double px = tgt_scale > 0 ? double(tgt_scale) : 1.0;
+            logPrintf(stdout, "Requested output pixel size (group %d, scale %g): %g %s\n",
+                      group_idx, double(tgt_scale), render_level_voxel_size / px,
+                      zarr_voxel_unit.c_str());
+        }
     }
 
     int rotQuadGlobal = -1;
