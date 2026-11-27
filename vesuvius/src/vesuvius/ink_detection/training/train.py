@@ -707,6 +707,8 @@ def _run_training(request: TrainingRequest) -> int:
             "sampling_observed=" + json.dumps(observed, sort_keys=True)
         )
 
+    periodic_checkpoints: list[Path] = []
+
     def save_checkpoint(
         step: int,
         *,
@@ -735,10 +737,20 @@ def _run_training(request: TrainingRequest) -> int:
             wandb_module=wandb_module,
             validation_metrics=validation_metrics,
         )
-        torch.save(
-            payload,
-            config.out_dir / (filename or f"ckpt_{step + 1:06}.pth"),
+        path = config.out_dir / (filename or f"ckpt_{step + 1:06}.pth")
+        # Files that predate this run may be newer, milestones under another
+        # config, or the configured checkpoint, so they are never pruned.
+        prunable = (
+            filename is None
+            and config.keep_last_checkpoints is not None
+            and step + 1 not in config.save_iterations
+            and not path.exists()
         )
+        torch.save(payload, path)
+        if prunable:
+            periodic_checkpoints.append(path)
+            if len(periodic_checkpoints) > config.keep_last_checkpoints:
+                periodic_checkpoints.pop(0).unlink(missing_ok=True)
 
     write_gradient_health()
     write_sampling_audit(start_step)
