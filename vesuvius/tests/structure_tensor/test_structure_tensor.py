@@ -67,6 +67,42 @@ def test_compute_eigenvectors_constant_block():
     assert torch.all(comps[2] == 0), "largest eigenvalue → z-axis (index 0)"
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs an Apple GPU")
+def test_compute_eigenvectors_on_mps_matches_cpu():
+    # MPS has no float64; the 3x3 solve must still run and give the CPU result on the block's device.
+    g = torch.Generator().manual_seed(0)
+    a = torch.randn((3, 3, 4, 5, 6), generator=g)
+    j = torch.einsum("ik...,jk...->ij...", a, a)  # symmetric positive semi-definite per voxel
+    block = torch.stack([j[0, 0], j[0, 1], j[0, 2], j[1, 1], j[1, 2], j[2, 2]])
+    block[:, 0, 0, 0] = 0.0  # one empty voxel stays zero
+
+    w_cpu, v_cpu = _compute_eigenvectors(block)
+    w_mps, v_mps = _compute_eigenvectors(block.to("mps"))
+
+    assert w_mps.device.type == "mps" and v_mps.device.type == "mps"
+    assert torch.equal(w_mps.cpu(), w_cpu)
+    assert torch.equal(v_mps.cpu(), v_cpu)
+
+
+def test_cli_default_device_runs_without_cuda(tmp_path, monkeypatch):
+    # Without --device, a machine with no CUDA (a Mac, a CPU-only box) must run, not stop at the first batch.
+    import sys
+    from vc_reader.reader import ZarrWriter, open_zarr
+    from vesuvius.structure_tensor import create_st
+
+    rng = np.random.default_rng(0)
+    vol = ZarrWriter.create(str(tmp_path / "vol.zarr"), shape=(32, 32, 32), chunks=(32, 32, 32), dtype="u1")
+    vol[...] = rng.integers(0, 256, size=(32, 32, 32), dtype=np.uint8)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(sys, "argv", ["create_st", "--input_dir", str(tmp_path / "vol.zarr"),
+                                      "--output_dir", str(tmp_path / "out"), "--sigma", "1"])
+
+    assert create_st.main() in (None, 0)
+    st = open_zarr(str(tmp_path / "out.zarr" / "structure_tensor"))
+    assert st.shape == (6, 32, 32, 32)
+    assert np.isfinite(st[...]).all() and np.abs(st[...]).max() > 0
+
+
 def test_border_trim_math_matches_patch_extent():
     """
     Regression test for border-aware trimming: when the padded read is clipped

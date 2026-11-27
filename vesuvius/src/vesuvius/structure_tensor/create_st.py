@@ -435,6 +435,11 @@ def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch
 
 
 def _compute_eigenvectors(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if block.device.type == "mps":
+        # Apple GPUs have no float64, which the batched 3x3 solve uses; solve on the CPU
+        # and return the results on the block's device.
+        eigvals, eigvecs = _compute_eigenvectors_impl(block.cpu())
+        return eigvals.to(block.device), eigvecs.to(block.device)
     return _compute_eigenvectors_impl(block)
 
 
@@ -756,8 +761,9 @@ def main():
                         help='Also keep raw eigenvectors/eigenvalues arrays.')
 
     # Other arguments
-    parser.add_argument('--device', type=str, default='cuda', 
-                        help='Device to use (cuda, cpu)')
+    parser.add_argument('--device', type=str,
+                        default='cuda' if torch.cuda.is_available() else 'cpu',
+                        help='Device to use (cuda, mps, cpu). Default: cuda if available, else cpu')
     parser.add_argument('--verbose', action='store_true', 
                         help='Enable verbose output')
     parser.add_argument('--zarr-compressor', type=str, default='zstd',
