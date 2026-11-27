@@ -1,5 +1,5 @@
 #pragma once
-#include <cuda_runtime.h>
+#include "../../gpu_runtime.hpp"
 #include <algorithm>
 #include <memory>
 #include <utility>
@@ -34,7 +34,7 @@ class BatchQueue {
             };
         }
     };
-    struct Retired { void* ptr; bool pooled; cudaStream_t stream; };
+    struct Retired { void* ptr; bool pooled; gpu::Stream stream; };
     std::vector<std::vector<std::unique_ptr<Command>>> lanes_;
     std::vector<Retired> retired_;
     // Scratch carved from shared pool chunks. The queue keeps every chunk until a flush has
@@ -44,7 +44,7 @@ class BatchQueue {
     std::shared_ptr<void> open_;
     std::byte* open_ptr_ = nullptr;
     std::size_t open_left_ = 0;
-    cudaStream_t open_stream_ = nullptr;
+    gpu::Stream open_stream_ = nullptr;
     int open_device_ = -1;
     std::size_t lane_ = 0;
     std::size_t allocated_bytes_ = 0;
@@ -53,10 +53,10 @@ class BatchQueue {
     void release() noexcept {
         chunks_.clear(); open_.reset(); open_ptr_ = nullptr; open_left_ = 0;
         for (auto p : retired_) {
-#if CUDART_VERSION >= 11020
-            if (p.pooled) cudaFreeAsync(p.ptr,p.stream); else
+#if defined(VC_READER_HIP) || CUDART_VERSION >= 11020
+            if (p.pooled) gpu::free_async(p.ptr,p.stream); else
 #endif
-            cudaFree(p.ptr);
+            gpu::free(p.ptr);
         }
         retired_.clear();
     }
@@ -73,21 +73,21 @@ public:
     template<class T> void append(T command) {
         lanes_[lane_].push_back(std::make_unique<Stored<T>>(std::move(command)));
     }
-    void retire(void* ptr, bool pooled, cudaStream_t stream) { retired_.push_back({ptr,pooled,stream}); }
-#if CUDART_VERSION >= 11020
+    void retire(void* ptr, bool pooled, gpu::Stream stream) { retired_.push_back({ptr,pooled,stream}); }
+#if defined(VC_READER_HIP) || CUDART_VERSION >= 11020
     // A 256-byte aligned slice of a pool chunk on `stream`/`device` (the current device).
-    std::pair<void*,std::shared_ptr<void>> carve(std::size_t bytes, cudaStream_t stream, int device) {
+    std::pair<void*,std::shared_ptr<void>> carve(std::size_t bytes, gpu::Stream stream, int device) {
         bytes = (bytes + 255) / 256 * 256;
         if (!open_ || open_left_ < bytes || stream != open_stream_ || device != open_device_) {
             const std::size_t size = std::max<std::size_t>(bytes, std::size_t(8) << 20);
             void* chunk = nullptr;
-            if (cudaMallocAsync(&chunk, size, stream) != cudaSuccess) throw std::runtime_error("CUDA transform: out of memory for batch scratch");
+            if (gpu::malloc_async(&chunk, size, stream) != gpu::success) throw std::runtime_error("CUDA transform: out of memory for batch scratch");
             open_ = std::shared_ptr<void>(chunk, [stream, device](void* q) {
                 int previous = 0;
-                if (cudaGetDevice(&previous) != cudaSuccess) return;
-                if (previous != device) cudaSetDevice(device);
-                cudaFreeAsync(q, stream);
-                if (previous != device) cudaSetDevice(previous);
+                if (gpu::get_device(&previous) != gpu::success) return;
+                if (previous != device) gpu::set_device(device);
+                gpu::free_async(q, stream);
+                if (previous != device) gpu::set_device(previous);
             });
             chunks_.push_back(open_);
             open_ptr_ = static_cast<std::byte*>(chunk); open_left_ = size; open_stream_ = stream; open_device_ = device;

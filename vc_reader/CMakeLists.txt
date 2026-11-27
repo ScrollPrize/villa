@@ -6,6 +6,7 @@ if(CMAKE_HOST_APPLE AND EXISTS /usr/bin/install_name_tool)
     set(CMAKE_INSTALL_NAME_TOOL /usr/bin/install_name_tool CACHE FILEPATH "Tool for install-time rpath changes")
 endif()
 project(vc_reader_extensions LANGUAGES C CXX)
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,10 +16,15 @@ endif()
 option(VC_READER_BUILD_PYTHON "Build Python extensions" ON)
 option(VC_READER_BUILD_READER "Build Zarr reading and sampling APIs" ON)
 option(VC_READER_BUILD_NATIVE_TESTS "Build native C++ API tests" OFF)
+# AMD GPUs: the CUDA backends compiled with HIP (ROCm), see cmake/Hip.cmake.
+option(VC_READER_ENABLE_HIP "Build the GPU backends for AMD GPUs with HIP instead of CUDA" OFF)
+if(VC_READER_ENABLE_HIP AND VC_READER_ENABLE_CUDA)
+    message(FATAL_ERROR "VC_READER_ENABLE_CUDA and VC_READER_ENABLE_HIP are mutually exclusive")
+endif()
 
 # Initialize CUDA architecture defaults before creating targets.
 # An explicit CPU build skips CUDA discovery entirely.
-if(NOT DEFINED VC_READER_ENABLE_CUDA OR VC_READER_ENABLE_CUDA)
+if(NOT VC_READER_ENABLE_HIP AND (NOT DEFINED VC_READER_ENABLE_CUDA OR VC_READER_ENABLE_CUDA))
     if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
         # Toolkit discovery also searches standard locations outside PATH.
         find_package(CUDAToolkit QUIET)
@@ -36,9 +42,15 @@ if(CMAKE_CUDA_COMPILER)
 endif()
 option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends"
     ${_vc_reader_cuda_default})
-if(VC_READER_ENABLE_CUDA)
+if(VC_READER_ENABLE_HIP)
+    include(cmake/Hip.cmake)
+    # The CUDA backends are described once and compiled by the HIP compiler.
+    set(VC_READER_ENABLE_CUDA ON)
+elseif(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    set(VC_READER_GPU_RUNTIME CUDA::cudart)
+    set(VC_READER_GPU_FFT CUDA::cufft)
 endif()
 
 
@@ -73,6 +85,9 @@ if(VC_READER_BUILD_READER)
     include(cmake/NativeReader.cmake)
 endif()
 include(cmake/InstallNative.cmake)
+if(VC_READER_ENABLE_HIP)
+    vc_reader_hip_finalize()
+endif()
 
 if(VC_READER_BUILD_NATIVE_TESTS)
     enable_testing()
@@ -315,6 +330,13 @@ endif()
 if(NOT VC_READER_BUILD_PYTHON)
     return()
 endif()
+set(_vc_rocm_init "${CMAKE_CURRENT_BINARY_DIR}/_rocm_init.py")
+if(VC_READER_ENABLE_HIP)
+    configure_file(cmake/rocm_init.py.in "${_vc_rocm_init}" @ONLY)
+    install(FILES "${_vc_rocm_init}" DESTINATION vc_reader)
+else()
+    file(REMOVE "${_vc_rocm_init}")
+endif()
 find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
 execute_process(COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
     OUTPUT_VARIABLE nanobind_ROOT OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
@@ -345,4 +367,12 @@ endif()
 if(WIN32)
     # Windows has no RPATH: a module loads the DLLs it links from its own directory.
     install(FILES $<TARGET_FILE:vc_reader_sftp> DESTINATION vc_reader)
+endif()
+
+if(VC_READER_ENABLE_HIP)
+    # Preserve the external runtime paths from the link, including hipFFT.
+    set_property(TARGET _thinning _transforms PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
+    if(TARGET _reader)
+        set_property(TARGET _reader PROPERTY INSTALL_RPATH_USE_LINK_PATH TRUE)
+    endif()
 endif()

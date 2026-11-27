@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+try:
+    from ._rocm_init import initialize as _initialize_rocm
+except ModuleNotFoundError as exc:
+    if exc.name != f"{__name__}._rocm_init":
+        raise
+else:
+    _initialize_rocm()
+    del _initialize_rocm
+
 from .catalog import DEFAULT_METADATA_URL, default_cache_dir
 from .affine import Affine
 from ._catalog import SshForward

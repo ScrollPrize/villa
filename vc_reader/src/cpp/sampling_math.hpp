@@ -90,6 +90,10 @@ VCR_SAMPLE_HD inline float pixelCenter(std::int64_t index, std::int64_t stored, 
 VCR_SAMPLE_HD inline float step(float value, float axis, float index) {
 #ifdef __CUDA_ARCH__
     return __fadd_rn(value,__fmul_rn(axis,index));
+#elif defined(__HIP_DEVICE_COMPILE__)
+    // HIP's __fadd_rn/__fmul_rn are plain operators that may be contracted into FMA.
+#pragma clang fp contract(off)
+    return value+axis*index;
 #else
     volatile float product=axis*index;
     return value+product;

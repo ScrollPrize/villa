@@ -1,0 +1,34 @@
+"""Select the bundled runtime used by a matching PyTorch ROCm wheel."""
+
+import ctypes
+from importlib.metadata import PackageNotFoundError, version
+from importlib.util import find_spec
+from pathlib import Path
+import sys
+
+
+def initialize():
+    if "torch" in sys.modules:
+        return
+    try:
+        local_version = version("torch").partition("+")[2]
+    except PackageNotFoundError:
+        return
+    # Reuse the wheel's runtime only when it matches this build's ROCm release.
+    release = "rocm@hip_VERSION_MAJOR@.@hip_VERSION_MINOR@"
+    if local_version != release and not local_version.startswith(release + "."):
+        return
+    spec = find_spec("torch")
+    if spec is None:
+        return
+    for directory in spec.submodule_search_locations or ():
+        runtime = Path(directory) / "lib" / "libamdhip64.so"
+        if runtime.is_file():
+            # The wheel can reopen the same file by its filename, and our
+            # extensions resolve it by its versioned SONAME.
+            try:
+                ctypes.CDLL(str(runtime), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                # The wheel is optional. Let the extensions load system ROCm.
+                continue
+            return

@@ -23,7 +23,12 @@ template<class T> __device__ void noise_kernel(KernelIndex vcr_launch, T* data, 
         if (rician) {
             const T re=add(data[i],a), im=T(sigma)*b;
             // hypot rescales its operands, avoiding overflow of re*re + im*im.
+#ifdef VC_READER_HIP
+            // ROCm's float hypot can round one step low (1e30 gives 9.999999e29): round from double.
+            data[i]=T(hypot(double(re),double(im)));
+#else
             data[i]=hypot(re,im);
+#endif
         } else {
             data[2*i]=add(data[2*i],a);
             if(2*i+1<n)data[2*i+1]=add(data[2*i+1],b);

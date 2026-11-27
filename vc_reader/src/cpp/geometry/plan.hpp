@@ -92,14 +92,14 @@ struct CudaCurves {
     explicit CudaCurves(const Curves& cpu,int id):device(id){
         device::Guard guard(id);
         auto upload=[&](const auto& v){using T=typename std::decay_t<decltype(v)>::value_type;auto p=device::allocate(v.size()*sizeof(T),id);storage.push_back(p);
-            if(!v.empty())device::check(cudaMemcpyAsync(p->ptr,v.data(),p->bytes,cudaMemcpyHostToDevice,device::stream()));return static_cast<const T*>(p->ptr);};
+            if(!v.empty())device::check(gpu::memcpy_async(p->ptr,v.data(),p->bytes,gpu::host_to_device,device::stream()));return static_cast<const T*>(p->ptr);};
         try {
             edges.points=upload(cpu.points);edges.arcs=upload(cpu.arcs);edges.offsets=upload(cpu.offsets);edges.owners=upload(cpu.owners);
             edges.curves=int(cpu.offsets.size()-1);vertices=edges;
             edges.nodes=upload(cpu.edges.nodes);edges.order=upload(cpu.edges.order);edges.roots=upload(cpu.edges.roots);edges.root=cpu.edges.root;
             vertices.nodes=upload(cpu.vertices.nodes);vertices.order=upload(cpu.vertices.order);vertices.roots=upload(cpu.vertices.roots);vertices.root=cpu.vertices.root;vertices.vertices=true;
             device::complete();
-        }catch(...){cudaStreamSynchronize(device::stream());throw;}
+        }catch(...){gpu::stream_synchronize(device::stream());throw;}
     }
 };
 struct CudaVoxels { VoxelGrid grid;device::Storage keys;std::size_t count;int device; };
@@ -121,7 +121,7 @@ template<class F> void on_device(int id,F f){
     if(id<0){f();return;}
 #ifdef VC_READER_CUDA
     device::Guard guard(id);
-    try{f();}catch(...){cudaStreamSynchronize(device::stream());throw;}
+    try{f();}catch(...){gpu::stream_synchronize(device::stream());throw;}
 #else
     throw std::runtime_error("geometry CUDA operations require a CUDA build");
 #endif

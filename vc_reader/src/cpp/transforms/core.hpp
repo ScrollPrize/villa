@@ -125,7 +125,11 @@ struct Choice { std::vector<double> values; };
 struct Named { std::string name; };
 using Scalar = std::variant<double, Uniform, Normal, Choice, Named>;
 using NamedValues = std::map<std::string, double>;
-inline const NamedValues*& named_values() { thread_local const NamedValues* values = nullptr; return values; }
+// g++ and clang mangle a thread_local whose type involves std::string differently
+// (clang adds an abi:cxx11 tag). HIP builds mix both compilers, which gave each
+// its own copy. A plain struct gets the same name from both, so there is one copy.
+struct NamedSlot { const NamedValues* values = nullptr; };
+inline const NamedValues*& named_values() { thread_local NamedSlot slot; return slot.values; }
 struct NamedScope {
     const NamedValues* previous;
     explicit NamedScope(const NamedValues* values) : previous(named_values()) { named_values() = values; }

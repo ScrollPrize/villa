@@ -107,7 +107,7 @@ if(VC_READER_ENABLE_CUDA)
         src/cpp/geometry/kernels.cu src/cpp/composite/kernels.cu src/cpp/grid/kernels.cu src/cpp/display/kernels.cu
         PROPERTIES COMPILE_OPTIONS "--fmad=false;$<$<CXX_COMPILER_ID:GNU,Clang>:-Xcompiler=-ffp-contract=off>")
     target_compile_definitions(vc_reader_reader_cuda PUBLIC VC_READER_CUDA=1)
-    target_link_libraries(vc_reader_reader_cuda PUBLIC vc_reader::headers CUDA::cudart)
+    target_link_libraries(vc_reader_reader_cuda PUBLIC vc_reader::headers ${VC_READER_GPU_RUNTIME})
     target_link_libraries(vc_reader_native PUBLIC vc_reader::reader_cuda)
 endif()
 

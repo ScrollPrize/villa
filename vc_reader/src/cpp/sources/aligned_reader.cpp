@@ -62,7 +62,7 @@ device::Storage upload(const void* data, std::size_t bytes, int id)
 {
     device::Guard guard(id);
     auto storage = device::allocate(bytes, id);
-    if (bytes) device::check(cudaMemcpyAsync(storage->ptr, data, bytes, cudaMemcpyHostToDevice, device::stream()));
+    if (bytes) device::check(gpu::memcpy_async(storage->ptr, data, bytes, gpu::host_to_device, device::stream()));
     device::complete();
     return storage;
 }

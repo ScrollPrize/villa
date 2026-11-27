@@ -845,7 +845,7 @@ device::Storage upload(const void* data, std::size_t bytes, int deviceId)
 {
     auto storage = device::allocate(std::max<std::size_t>(bytes, 16), deviceId);
     if (bytes)
-        device::check(cudaMemcpyAsync(storage->ptr, data, bytes, cudaMemcpyHostToDevice, device::stream()));
+        device::check(gpu::memcpy_async(storage->ptr, data, bytes, gpu::host_to_device, device::stream()));
     return storage;
 }
 
@@ -967,8 +967,8 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
                     lackingSet.count = reinterpret_cast<unsigned*>(base + table + std::size_t(kLackingCapacity) * sizeof(long long));
                     lackingSet.capacity = kLackingCapacity;
                 }
-                device::check(cudaMemsetAsync(lackingSet.table, 0xFF, table, device::stream()));
-                device::check(cudaMemsetAsync(lackingSet.count, 0, sizeof(unsigned), device::stream()));
+                device::check(gpu::memset_async(lackingSet.table, 0xFF, table, device::stream()));
+                device::check(gpu::memset_async(lackingSet.count, 0, sizeof(unsigned), device::stream()));
             }
             const auto table = upload(host.data(), host.size() * sizeof(cuda_detail::DeviceLevel), deviceId);
             cuda_detail::Params P = base;
@@ -998,13 +998,13 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
         constexpr int kLoads = 4;
         for (int loads = 0;; ++loads) {
             unsigned noted = 0;
-            device::check(cudaMemcpyAsync(&noted, lackingSet.count, sizeof(unsigned), cudaMemcpyDeviceToHost, device::stream()));
+            device::check(gpu::memcpy_async(&noted, lackingSet.count, sizeof(unsigned), gpu::device_to_host, device::stream()));
             device::complete();
             std::vector<std::int64_t> keys(std::min(noted, kLackingCapacity));
             if (keys.empty())
                 break;
-            device::check(cudaMemcpyAsync(keys.data(), lackingSet.keys, keys.size() * sizeof(long long),
-                                          cudaMemcpyDeviceToHost, device::stream()));
+            device::check(gpu::memcpy_async(keys.data(), lackingSet.keys, keys.size() * sizeof(long long),
+                                          gpu::device_to_host, device::stream()));
             device::complete();
             if (loads == kLoads)
                 throw std::runtime_error("a blocking request's bricks do not stay resident; increase the reader's budget");
@@ -1012,9 +1012,9 @@ Result sampleDevice(int width, int height, const Request& request, const std::ve
             pass();
         }
     }
-    device::check(cudaMemcpyAsync(result.values.data(), values->ptr, result.values.size() * sizeof(float),
-                                  cudaMemcpyDeviceToHost, device::stream()));
-    device::check(cudaMemcpyAsync(result.level.data(), levels->ptr, pixels, cudaMemcpyDeviceToHost, device::stream()));
+    device::check(gpu::memcpy_async(result.values.data(), values->ptr, result.values.size() * sizeof(float),
+                                  gpu::device_to_host, device::stream()));
+    device::check(gpu::memcpy_async(result.level.data(), levels->ptr, pixels, gpu::device_to_host, device::stream()));
     device::complete();
     return result;
 }

@@ -142,10 +142,11 @@ std::size_t label(const std::uint8_t* mask, std::span<const std::size_t> shape, 
     const auto stream = device::stream();
     // Labels hold the union-find parents until numbered; byte root flags scan into
     // ranks. One allocation holds ranks, flags and the scan's scratch.
+    // Each part is rounded to 256 bytes: hipCUB's scan miscounts when its scratch is misaligned.
     std::size_t scratch_bytes = 0;
     device::check(cub::DeviceScan::InclusiveScan(nullptr, scratch_bytes, static_cast<const std::uint8_t*>(nullptr),
                                                  static_cast<int*>(nullptr), ::cuda::std::plus<int>{}, int(n), stream));
-    const std::size_t rank_bytes = std::size_t(n) * sizeof(int), flag_bytes = (std::size_t(n) + 255) / 256 * 256;
+    const std::size_t rank_bytes = (std::size_t(n) * sizeof(int) + 255) / 256 * 256, flag_bytes = (std::size_t(n) + 255) / 256 * 256;
     device::Buffer work(rank_bytes + flag_bytes + scratch_bytes, gpu);
     auto* rank = static_cast<int*>(work.ptr);
     auto* root = static_cast<std::uint8_t*>(work.ptr) + rank_bytes;

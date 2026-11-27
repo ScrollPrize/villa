@@ -1,0 +1,3 @@
+// HIP stand-in for <cuda/std/tuple> in VC_READER_ENABLE_HIP builds (rocPRIM tuple).
+#pragma once
+#include "../../vcr_hip_cub.hpp"

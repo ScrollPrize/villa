@@ -37,7 +37,7 @@ class CMakeConfigureTests(unittest.TestCase):
             )
             if not success:
                 self.assertNotEqual(result.returncode, 0)
-                return
+                return result
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             cache = (Path(build_dir) / "CMakeCache.txt").read_text()
             self.assertIn(
@@ -56,11 +56,43 @@ class CMakeConfigureTests(unittest.TestCase):
         self.configure(True, "-DVC_READER_ENABLE_CUDA=ON",
                        "-DCMAKE_CUDA_COMPILER=NOTFOUND", success=False)
 
+    def test_hip_and_cuda_are_exclusive(self):
+        result = self.configure(False, "-DVC_READER_ENABLE_HIP=ON",
+                                "-DVC_READER_ENABLE_CUDA=ON", success=False)
+        self.assertIn("mutually exclusive", result.stdout + result.stderr)
+
+    def test_hip_rejects_rocm_6(self):
+        with tempfile.TemporaryDirectory(prefix="vc-reader-hip-package-") as directory:
+            package = Path(directory)
+            (package / "hip-config.cmake").touch()
+            (package / "hip-config-version.cmake").write_text('set(PACKAGE_VERSION "6.4.3")\n')
+            result = self.configure(False, "-DVC_READER_ENABLE_HIP=ON",
+                                    "-DCMAKE_HIP_ARCHITECTURES=gfx1100",
+                                    f"-Dhip_DIR={package}", success=False)
+        self.assertIn("requires ROCm 7.0 or newer (found HIP 6.4.3)", result.stdout + result.stderr)
+
     def cuda_compiler(self):
         compiler = os.environ.get("CUDACXX") or shutil.which("nvcc")
         if not compiler:
             self.skipTest("set CUDACXX or put nvcc on PATH")
         return compiler
+
+    def hip_toolkit(self):
+        root = Path(os.environ.get("ROCM_PATH", "/opt/rocm"))
+        if not (root / "llvm/bin/clang++").exists():
+            self.skipTest("set ROCM_PATH or install ROCm in /opt/rocm")
+        return root
+
+    def test_hip_accepts_wave32(self):
+        self.hip_toolkit()
+        self.configure(False, "-DVC_READER_ENABLE_HIP=ON",
+                       "-DCMAKE_HIP_ARCHITECTURES=gfx1200")
+
+    def test_hip_rejects_wave64(self):
+        self.hip_toolkit()
+        result = self.configure(False, "-DVC_READER_ENABLE_HIP=ON",
+                                "-DCMAKE_HIP_ARCHITECTURES=gfx906", success=False)
+        self.assertIn("wave32", result.stdout + result.stderr)
 
     def test_auto_with_compiler(self):
         compiler = self.cuda_compiler()

@@ -2,6 +2,7 @@
 #include "reader.hpp"
 #include "../cuda_available.hpp"
 #include "../cuda_stream.hpp"
+#include "../gpu_device.hpp"
 #include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 namespace vcr::reader_cuda {
@@ -11,7 +12,7 @@ namespace vcr::reader_cuda {
 struct Owned {
     device::Storage storage; std::size_t count; nb::dlpack::dtype dtype; int device;
     nb::object array(nb::handle self) const {
-        return nb::cast(nb::ndarray<nb::array_api, nb::device::cuda>(storage->ptr,1,&count,self,nullptr,dtype,nb::device::cuda::value,device));
+        return nb::cast(nb::ndarray<nb::array_api, vcr::GpuDevice>(storage->ptr,1,&count,self,nullptr,dtype,vcr::GpuDevice::value,device));
     }
 };
 inline nb::object owned(device::Storage storage, std::size_t count, nb::dlpack::dtype dtype, int device) {
@@ -29,12 +30,12 @@ inline nb::object outputs(Result result, int device) {
 }
 inline void bind(nb::module_& m) {
     using Host=nb::ndarray<nb::ro,nb::c_contig,nb::device::cpu>;
-    using Device=nb::ndarray<nb::array_api,nb::c_contig,nb::device::cuda>;
+    using Device=nb::ndarray<nb::array_api,nb::c_contig,vcr::GpuDevice>;
     m.def("reader_cuda_available",&vcr::cuda::available);
     nb::class_<Owned>(m,"CudaStorage")
         .def("array",[](nb::handle self) { return nb::cast<const Owned&>(self).array(self); })
         .def("export",[](Owned& o) { o.storage->exported=true; });
-    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : cudaStreamPerThread; });
+    m.def("_set_stream",[](std::uintptr_t handle) { device::current_stream()=handle ? device::stream_handle(handle) : gpu::per_thread_stream(); });
     m.def("_get_stream",[] { return reinterpret_cast<std::uintptr_t>(device::current_stream()); });
     m.def("_dlpack_stream",[] { return device::dlpack_handle(); });
     m.def("_set_pool_release_threshold",[](int id,std::uint64_t bytes) { device::set_pool_release_threshold(id,bytes); });
@@ -53,10 +54,10 @@ inline void bind(nb::module_& m) {
     m.def("_cuda_view",[](Device input,const std::vector<std::size_t>& shape,std::size_t offset) {
         std::size_t n=1; for (auto s:shape) { if (s && n>SIZE_MAX/s) throw nb::value_error("shape overflow"); n*=s; }
         if (offset>input.size() || n>input.size()-offset) throw nb::value_error("view exceeds storage");
-        return nb::ndarray<nb::array_api, nb::device::cuda>(static_cast<char*>(input.data())+offset*input.dtype().bits/8,
-            shape.size(),shape.data(),nb::cast(input,nb::rv_policy::reference),nullptr,input.dtype(),nb::device::cuda::value,input.device_id());
+        return nb::ndarray<nb::array_api, vcr::GpuDevice>(static_cast<char*>(input.data())+offset*input.dtype().bits/8,
+            shape.size(),shape.data(),nb::cast(input,nb::rv_policy::reference),nullptr,input.dtype(),vcr::GpuDevice::value,input.device_id());
     });
-    m.def("_cuda_describe",[](nb::ndarray<nb::ro,nb::device::cuda> input) {
+    m.def("_cuda_describe",[](nb::ndarray<nb::ro,vcr::GpuDevice> input) {
         if (input.size()) {
             std::int64_t stride=1;
             for (std::size_t a=input.ndim();a-->0;) {
@@ -74,12 +75,12 @@ inline void bind(nb::module_& m) {
     m.def("_cuda_download",[](Device input,Bytes out) {
         if (input.nbytes()!=out.nbytes()) throw nb::value_error("download size mismatch");
         nb::gil_scoped_release release; device::Guard guard(input.device_id());
-        if (out.nbytes()) { device::check(cudaMemcpyAsync(out.data(),input.data(),out.nbytes(),cudaMemcpyDeviceToHost,device::stream())); device::complete(); }
+        if (out.nbytes()) { device::check(gpu::memcpy_async(out.data(),input.data(),out.nbytes(),gpu::device_to_host,device::stream())); device::complete(); }
     });
     m.def("_cuda_upload",[](Host input,int id) {
         device::Storage storage;
         { nb::gil_scoped_release release; device::Guard guard(id); storage=device::allocate(input.nbytes(),id);
-          if (input.nbytes()) device::check(cudaMemcpyAsync(storage->ptr,input.data(),input.nbytes(),cudaMemcpyHostToDevice,device::stream())); device::complete(); }
+          if (input.nbytes()) device::check(gpu::memcpy_async(storage->ptr,input.data(),input.nbytes(),gpu::host_to_device,device::stream())); device::complete(); }
         std::size_t count=1; for (std::size_t a=0;a<input.ndim();++a) count*=input.shape(a);
         return owned(std::move(storage),count,input.dtype(),id);
     });
@@ -138,7 +139,7 @@ inline void bind(nb::module_& m) {
               catch (...) {
                   // Keep borrowed output storage alive until outstanding writes finish.
                   device::Guard guard(r.device_id());
-                  cudaStreamSynchronize(device::stream());
+                  gpu::stream_synchronize(device::stream());
                   throw;
               } }
             if (!out.is_none()) {

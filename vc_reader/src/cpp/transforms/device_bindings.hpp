@@ -1,6 +1,7 @@
 #pragma once
 #include "cuda/device_run.hpp"
-using DeviceInputArray = nb::ndarray<nb::array_api, nb::c_contig, nb::device::cuda>;
+#include "../gpu_device.hpp"
+using DeviceInputArray = nb::ndarray<nb::array_api, nb::c_contig, vcr::GpuDevice>;
 // A run's outputs, with the Python objects whose storage its arrays use.
 struct BoundOutputs {
     std::shared_ptr<cuda::DeviceOutputs> outputs;
@@ -28,7 +29,7 @@ static std::map<std::string,cuda::DeviceInput> device_inputs(const std::map<std:
     return out;
 }
 static nb::object device_array(void* data, const Shape& shape, char kind, std::size_t bytes, int device, nb::handle owner) {
-    return nb::cast(nb::ndarray<nb::array_api, nb::device::cuda>(data,shape.size(),shape.data(),owner,nullptr,dlpack_dtype(kind,bytes),nb::device::cuda::value,device));
+    return nb::cast(nb::ndarray<nb::array_api, vcr::GpuDevice>(data,shape.size(),shape.data(),owner,nullptr,dlpack_dtype(kind,bytes),vcr::GpuDevice::value,device));
 }
 static nb::tuple run_device(const Pipeline& pipeline, const std::map<std::string,DeviceInputArray>& inputs,
                            std::uint64_t seed, bool record, bool inplace, const Plan* plan=nullptr,

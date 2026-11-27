@@ -8,6 +8,7 @@
 #include <cstring>
 #ifdef VC_READER_CUDA
 #include "../cuda_buffer.hpp"
+#include "../gpu_device.hpp"
 #endif
 namespace nb=nanobind;
 using namespace nb::literals;
@@ -42,7 +43,7 @@ void skeletonInto(const Input& input,const Output& output,const std::string& alg
 #endif
     }
 #ifdef VC_READER_CUDA
-    else if(input.device_type()==nb::device::cuda::value && b==Backend::Cuda) {
+    else if(input.device_type()==vcr::GpuDevice::value && b==Backend::Cuda) {
         vcr::device::Guard guard(input.device_id());
         vcr::thinning::cuda::skeletonDevice(input.data(),output.data(),rows,cols,slices,m,border);return;
     }
@@ -85,7 +86,7 @@ NB_MODULE(_thinning,m) {
         if(input.ndim()!=2 || output.ndim()!=2 || input.shape(0)!=output.shape(0) || input.shape(1)!=output.shape(1))
             throw nb::value_error("expected matching 2D arrays");
 #ifdef VC_READER_CUDA
-        if(input.device_type()!=nb::device::cuda::value || output.device_type()!=input.device_type() || output.device_id()!=input.device_id())
+        if(input.device_type()!=vcr::GpuDevice::value || output.device_type()!=input.device_type() || output.device_id()!=input.device_id())
             throw nb::value_error("trace_ridges_into requires matching CUDA arrays");
         nb::gil_scoped_release release;vcr::device::Guard guard(input.device_id());
         vcr::thinning::cuda::traceDevice(input.data(),output.data(),input.shape(0),input.shape(1));

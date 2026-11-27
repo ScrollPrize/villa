@@ -14,6 +14,7 @@
 #ifdef VC_READER_CUDA
 #include "../../src/cpp/cuda_available.hpp"
 #include "../../src/cpp/cuda_buffer.hpp"
+#include <cuda_runtime.h>
 #endif
 
 namespace fs = std::filesystem;

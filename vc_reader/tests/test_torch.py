@@ -73,6 +73,30 @@ assert 'torch' not in sys.modules
         subprocess.run([sys.executable, "-c", code], check=True, timeout=30,
                        cwd=Path(__file__).resolve().parents[1])
 
+    @unittest.skipUnless(torch.version.hip and torch.cuda.is_available() and cuda._DEVICE_TYPE == 10,
+                         "ROCm PyTorch and a vc_reader HIP build/device required")
+    def test_rocm_gpu_modules_and_torch_import_in_either_order(self):
+        load_reader = """
+import sys
+sys.path.insert(0, 'tests')
+from build_support import load_build
+load_build()
+from vc_reader import cuda, transforms as A
+"""
+        exercise_gpu = """
+source = torch.ones((1, 3, 5), device='cuda')
+pipeline = A.Pipeline([A.BrightnessAdd(2.), A.GibbsRinging(cutoff=.6)], backend='cuda')
+result = pipeline({'image': cuda.wrap(source)}, seed=0)['image']
+torch.testing.assert_close(torch.from_dlpack(result), source + 2.)
+"""
+        for first, imports in (
+            ("vc_reader", load_reader + "assert 'torch' not in sys.modules\nimport torch\n"),
+            ("torch", "import torch\n" + load_reader),
+        ):
+            with self.subTest(first=first):
+                subprocess.run([sys.executable, "-c", imports + exercise_gpu], check=True, timeout=60,
+                               cwd=Path(__file__).resolve().parents[1])
+
 
 @unittest.skipUnless(torch.cuda.is_available() and A._transforms.cuda_available(), "CUDA build and device required")
 class BatchTests(unittest.TestCase):

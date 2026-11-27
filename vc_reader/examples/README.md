@@ -44,6 +44,52 @@ Use `VC_READER_ENABLE_CUDA=ON` to require CUDA and fail if it is unavailable.
 Explicit settings persist in the CMake build cache, so pass `ON` to enable
 CUDA after a previous CPU-only build.
 
+**AMD GPUs (ROCm).** To build for an AMD GPU, use ROCm 7.0 or newer and enable
+`VC_READER_ENABLE_HIP=ON`.
+It is off by default (unlike CUDA, which turns on by itself when it finds the
+NVIDIA compiler `nvcc`). Install the PyTorch build for your ROCm version first,
+for example ROCm 7.2, in place of any PyTorch already installed, so that
+`.[all]` keeps it:
+
+```bash
+python -m pip uninstall -y torch
+python -m pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+python -m pip install -e '.[all]' \
+  --config-settings=cmake.define.VC_READER_ENABLE_HIP=ON \
+  --config-settings=cmake.define.VC_READER_ENABLE_CUDA=OFF
+```
+
+Setting CUDA to `OFF` also clears any previous CUDA selection in the build cache.
+
+CMake looks for ROCm at its usual location, `/opt/rocm`. If ROCm is installed
+elsewhere, give it the path with `ROCM_PATH`. For a version-specific or
+multi-version ROCm installation, follow the
+[ROCm runtime setup instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.3/install/post-install.html)
+and include that installation's library directory in `LD_LIBRARY_PATH` before
+starting Python or Jupyter. If CMake cannot detect the GPU, set
+`CMAKE_HIP_ARCHITECTURES`, for example
+`--config-settings=cmake.define.CMAKE_HIP_ARCHITECTURES=gfx1200`.
+
+Only wave32 AMD GPUs (gfx10xx, gfx11xx, gfx12xx) are accepted. Wave64 GPUs (for
+example the MI50, gfx906) are refused, because some kernels use 32-bit masks, one
+bit per member of the warp: with 64 members, half would be left out and the
+results would be wrong.
+
+You cannot set `VC_READER_ENABLE_CUDA=ON` and `VC_READER_ENABLE_HIP=ON` together:
+your build targets one type of GPU (NVIDIA or AMD).
+
+Use `backend='cuda'` and PyTorch's `'cuda'` device name on AMD as well. Use a
+PyTorch ROCm wheel that matches the ROCm major and minor version used to build
+vc_reader. When that wheel ships a loadable `libamdhip64.so`, vc_reader loads it
+before its GPU extensions so either package can be imported first. Otherwise
+the extensions look for the system ROCm libraries.
+
+Native CMake targets can link a HIP build of vc_reader and NVIDIA's `CUDA::cudart`.
+Put code that includes the AMD and NVIDIA runtime headers in separate source
+files because the SDKs both declare vector types such as `float2`.
+
+Tested on an RX 9060 XT (gfx1200) with ROCm 7.2.4, under WSL2 (Ubuntu on Windows).
+
 This builds and installs the compiled extensions. The reader notebook needs NumPy
 and Pillow. The surface and training notebooks also need the `labels`
 dependencies (including tifffile),
