@@ -1048,6 +1048,16 @@ def save_overlay_and_print_satisfaction(
                     min(winding_range[0], patch_range[0]),
                     max(winding_range[1], patch_range[1]),
                 )
+        if (winding_range[0] == winding_range[1]
+                and cfg['shell_outer_winding_idx'] is not None
+                and cfg['shell_outer_winding_idx'] > cfg['output_first_winding']):
+            # No patch, PCL or track bounds the fitted windings (a fit on the
+            # dense Lasagna inputs alone): export every modelled winding up to
+            # the outer shell index instead of none.
+            winding_range = (cfg['output_first_winding'],
+                             cfg['shell_outer_winding_idx'])
+            print(f'no input bounds the windings; exporting windings '
+                  f'[{winding_range[0]}, {winding_range[1]})')
     if need_overlay:
         if progress is not None:
             progress.begin('finalizing', 'Rendering satisfaction overlay')
