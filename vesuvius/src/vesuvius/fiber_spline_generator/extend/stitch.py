@@ -17,6 +17,7 @@ from scipy.spatial import cKDTree
 from .candidates import bridge, collect
 from .catalog import Catalog, point_count
 from .expander import Expander
+from .overlap import MIN_OVERLAP
 
 RADIUS = 40
 MIN_SCORE = .9
@@ -25,47 +26,105 @@ MIN_LENGTH = 8.
 FAMILIES = {"V": 0, "H": 1}
 # A block's splines bend over their last few voxels where its border cuts a
 # fiber, enough to fail the overlap and duplicate tests of the catalogue.
-# Those ends are dropped where another block of the zone reads past the
-# border: it reads them with context on both sides. Half the CLI's
-# 32-voxel block margin, so neighbouring blocks still share 32 voxels of a
-# fiber crossing between them, above the catalogue's 24-voxel overlap.
+# Such an end is dropped where another block of the zone reads past the
+# border and has its own copy of the fiber there: a spline of the same family
+# within MATCH_RADIUS voxels of MATCH_SHARE of the dropped points. The end is
+# kept when no other block has such a copy, and when dropping the cut ends of
+# both copies would leave them less than KEEP_OVERLAP voxels of shared length,
+# so the trim never removes geometry or a join that main keeps. CUT_END is half
+# the CLI's 32-voxel block margin.
 CUT_END = 16.
+MATCH_RADIUS = 3.
+MATCH_SHARE = .8
+SHARED_RADIUS = 2.
+KEEP_OVERLAP = MIN_OVERLAP + 4.
 
 
 def _length(points):
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
 
 
+def _kept_range(absolute, low, high, reach_low, reach_high, distance):
+    """First and end index of the points kept when both cut ends of a spline read
+    from ``low`` to ``high`` (absolute ZYX) are dropped. An end at the zone's reach is kept."""
+    cut = np.zeros(len(absolute), dtype=bool)
+    outer = np.zeros(len(absolute), dtype=bool)
+    for axis in range(3):
+        if low[axis] > reach_low[axis]:
+            cut |= absolute[:, axis] - low[axis] < distance
+        else:
+            outer |= absolute[:, axis] - reach_low[axis] < 2
+        if high[axis] < reach_high[axis]:
+            cut |= high[axis] - 1 - absolute[:, axis] < distance
+        else:
+            outer |= reach_high[axis] - 1 - absolute[:, axis] < 2
+    kept = np.flatnonzero(~cut)
+    first = 0 if not cut[0] or outer[0] else (kept[0] if len(kept) else len(absolute))
+    last = len(absolute) if not cut[-1] or outer[-1] else (kept[-1] + 1 if len(kept) else 0)
+    return first, last
+
+
+def _shared_length(points, tree):
+    """Length of the polyline ``points`` whose segments lie within SHARED_RADIUS of ``tree``'s points."""
+    if len(points) < 2:
+        return 0.
+    near = np.isfinite(tree.query(points, distance_upper_bound=SHARED_RADIUS)[0])
+    steps = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    return float(steps[near[:-1] & near[1:]].sum())
+
+
 def trim_cut_ends(traces: Iterable[tuple[str, np.ndarray]], low_zyx: Sequence[int], high_zyx: Sequence[int],
                   reach_low_zyx: Sequence[int], reach_high_zyx: Sequence[int],
+                  neighbours: Iterable[tuple[str, np.ndarray, Sequence[int], Sequence[int]]] = (),
                   distance: float = CUT_END) -> list[tuple[str, np.ndarray]]:
-    """``traces`` of a block read from ``low_zyx`` to ``high_zyx``, in block-local
-    ZYX points, without the points at each end within ``distance`` voxels of a
-    border of the block that another block reads past. The zone's blocks read
-    from ``reach_low_zyx`` to ``reach_high_zyx`` together; an end at that border
-    is kept. Splines left shorter than MIN_LENGTH are dropped."""
+    """``traces`` of a block read from ``low_zyx`` to ``high_zyx``, in block-local ZYX points, with
+    the ends a border of the block bends dropped where a neighbouring block has its own copy (see
+    CUT_END). ``neighbours`` are the untrimmed splines of the zone's other blocks, each as family,
+    absolute ZYX points and the low and high ZYX corners of the box its block reads. The zone's
+    blocks read from ``reach_low_zyx`` to ``reach_high_zyx`` together. A trimmed spline left shorter
+    than MIN_LENGTH is kept whole."""
     low, high, reach_low, reach_high = (np.asarray(v, dtype=float)
                                         for v in (low_zyx, high_zyx, reach_low_zyx, reach_high_zyx))
+    others = {}
+    for family, points, other_low, other_high in neighbours:
+        points = np.asarray(points, dtype=np.float64)
+        first, last = _kept_range(points, np.asarray(other_low, float), np.asarray(other_high, float),
+                                  reach_low, reach_high, distance)
+        others.setdefault(family, []).append((points, points[first:last]))
+    trees = {}
+    for family, rows in others.items():
+        owner = np.concatenate([np.full(len(p), i) for i, (p, _) in enumerate(rows)])
+        trees[family] = (cKDTree(np.concatenate([p for p, _ in rows])), owner)
     result = []
     for family, line in traces:
         points = np.asarray(line, dtype=np.float64)
         absolute = points + low
-        cut = np.zeros(len(points), dtype=bool)
-        outer = np.zeros(len(points), dtype=bool)
-        for axis in range(3):
-            if low[axis] > reach_low[axis]:
-                cut |= absolute[:, axis] - low[axis] < distance
-            else:
-                outer |= absolute[:, axis] - reach_low[axis] < 2
-            if high[axis] < reach_high[axis]:
-                cut |= high[axis] - 1 - absolute[:, axis] < distance
-            else:
-                outer |= reach_high[axis] - 1 - absolute[:, axis] < 2
-        kept = np.flatnonzero(~cut)
-        first = 0 if not cut[0] or outer[0] else (kept[0] if len(kept) else len(points))
-        last = len(points) if not cut[-1] or outer[-1] else (kept[-1] + 1 if len(kept) else 0)
-        if last - first >= 2 and _length(points[first:last]) >= MIN_LENGTH:
-            result.append((family, points[first:last]))
+        first, last = _kept_range(absolute, low, high, reach_low, reach_high, distance)
+        if family not in trees or last - first < 2 or _length(points[first:last]) < MIN_LENGTH:
+            result.append((family, points))
+            continue
+        tree, owner = trees[family]
+        kept_tree = cKDTree(absolute[first:last])
+        keep = []
+        for dropped in (absolute[:first], absolute[last:][::-1]):
+            if len(dropped) == 0:
+                keep.append(False)
+                continue
+            dist, index = tree.query(dropped, distance_upper_bound=MATCH_RADIUS)
+            hit = np.isfinite(dist)
+            copy = False
+            for candidate in np.unique(owner[index[hit]]):
+                if np.mean(hit & (owner[np.minimum(index, len(owner) - 1)] == candidate)) < MATCH_SHARE:
+                    continue
+                _, other_kept = others[family][candidate]
+                if len(other_kept) >= 2 and min(_shared_length(other_kept, kept_tree),
+                                                _shared_length(absolute[first:last], cKDTree(other_kept))) >= KEEP_OVERLAP:
+                    copy = True
+                    break
+            keep.append(not copy)
+        start = 0 if keep[0] else first
+        stop = len(points) if keep[1] else last
+        result.append((family, points[start:stop]))
     return result
 
 

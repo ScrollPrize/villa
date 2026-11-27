@@ -63,50 +63,68 @@ def hooked(points, x, offset=1.6, over=4.):
     return bent
 
 
+# Two blocks of a zone filling the 320-voxel volume along x: block 0 owns x < 160 and reads x 0..192, block 1 owns
+# x >= 160 and reads x 128..320. Each block's splines are block-local ZYX; neighbours are absolute.
+READS = {"block-0": ((0, 0, 0), (96, 96, 192)), "block-1": ((0, 0, 128), (96, 96, 320))}
+REACH = ((0, 0, 0), (96, 96, 320))
+
+
+def trimmed(name, spline, other_name, other_spline):
+    """``spline`` (absolute ZYX) of block ``name``, trimmed against ``other_spline`` of the other block."""
+    low, high = READS[name]
+    other_low, other_high = READS[other_name]
+    (family, kept), = trim_cut_ends([("V", spline - np.asarray(low))], low, high, *REACH,
+                                    [("V", other_spline, other_low, other_high)])
+    return kept + np.asarray(low)
+
+
+def stitch(tmp_path, block0, block1):
+    stitcher = Stitcher(tmp_path)
+    try:
+        stitcher.add_block("block-0", [0, 0, 0], [192, 96, 96], [("V", block0)], (np.zeros(3), np.array([160, 96, 96])))
+        stitcher.add_block("block-1", [128, 0, 0], [192, 96, 96], [("V", block1 - [0, 0, 128])],
+                           (np.array([160, 0, 0]), np.array([320, 96, 96])))
+        return list(stitcher.chains())
+    finally:
+        stitcher.close()
+
+
 def test_a_fiber_bent_at_both_block_borders_becomes_one_fiber_once_the_cut_ends_are_trimmed(tmp_path):
-    blocks = [("block-0", [0, 0, 0], hooked(line(20, 191), 191), (np.zeros(3), np.array([160, 96, 96]))),
-              ("block-1", [128, 0, 0], hooked(line(1, 170), 1), (np.array([160, 0, 0]), np.array([320, 96, 96])))]
-    for trim, count in ((False, 2), (True, 1)):
-        stitcher = Stitcher(tmp_path / str(trim))
-        try:
-            for name, low, spline, core in blocks:
-                traces = [("V", spline)]
-                if trim:
-                    traces = trim_cut_ends(traces, low[::-1], np.add(low, [192, 96, 96])[::-1],
-                                           (0, 0, 0), SHAPE_XYZ[::-1])
-                stitcher.add_block(name, low, [192, 96, 96], traces, core)
-            fibers = list(stitcher.chains())
-        finally:
-            stitcher.close()
-        assert len(fibers) == count
+    a, b = hooked(line(20, 191), 191), hooked(line(129, 298), 129)
+    assert len(stitch(tmp_path / "main", a, b)) == 2
+    a2, b2 = trimmed("block-0", a, "block-1", b), trimmed("block-1", b, "block-0", a)
+    assert np.isclose(a2[:, 2].max(), 175) and np.isclose(b2[:, 2].min(), 144)
+    fibers = stitch(tmp_path / "trimmed", a2, b2)
+    assert len(fibers) == 1
     assert np.isclose(fibers[0]["points"][:, 0].min(), 20) and np.isclose(fibers[0]["points"][:, 0].max(), 298)
 
 
+def test_an_end_is_kept_when_trimming_would_leave_the_copies_too_little_overlap(tmp_path):
+    # Block 1's copy starts late, at x 160: untrimmed, the copies share 28 voxels and join, as on main. Trimming
+    # block 0's end at x 176 would leave them 15.5, under the catalogue's 24, so the end is kept.
+    a, b = line(20, 188), line(160, 298)
+    assert np.array_equal(trimmed("block-0", a, "block-1", b), a)
+    assert np.array_equal(trimmed("block-1", b, "block-0", a), b)
+    assert len(stitch(tmp_path, a, b)) == 1
+
+
+def test_an_end_no_neighbouring_block_detects_is_kept():
+    # Only block 0 sees this fiber's end in the cut band: block 1's spline runs 20 voxels away.
+    a, elsewhere = line(20, 190), line(130, 298, y=68.0)
+    assert np.array_equal(trimmed("block-0", a, "block-1", elsewhere), a)
+    # A trace lying wholly in the cut band, along the block face, is kept whatever the neighbour holds.
+    along = np.stack([np.full(125, 48.0), np.linspace(-0.5, 61.5, 125) + 17, np.full(125, 185.0)], axis=1)
+    assert np.array_equal(trimmed("block-0", along, "block-1", line(130, 298)), along)
+
+
 def test_only_ends_cut_by_a_border_another_block_reads_past_are_trimmed():
-    # The second block of a zone filling a 320-voxel volume reads x 128..320: another block reads past its low x border.
-    low, high, reach = (0, 0, 128), (96, 96, 320), ((0, 0, 0), (96, 96, 320))
-    (_, kept), = trim_cut_ends([("V", line(1, 191))], low, high, *reach)
-    assert np.isclose(kept[:, 2].min(), 16) and np.isclose(kept[:, 2].max(), 191)
-    # The end at the volume's border stays; so does a spline whose ends are away from every border.
-    (_, kept), = trim_cut_ends([("V", line(40, 191.5))], low, high, *reach)
-    assert np.isclose(kept[:, 2].min(), 40) and np.isclose(kept[:, 2].max(), 191.5)
-    # Nothing is left of a spline lying along the cut border.
-    assert trim_cut_ends([("V", line(0, 10))], low, high, *reach) == []
-
-
-def test_a_zone_of_one_block_inside_the_volume_is_not_trimmed():
+    # Block 1's low x end has block 0's copy beside it: trimmed. Its high x end lies at the volume's border: kept.
+    b = trimmed("block-1", line(129, 319), "block-0", line(20, 191))
+    assert np.isclose(b[:, 2].min(), 144) and np.isclose(b[:, 2].max(), 319)
     # A one-block zone at x 64..192 of a 320-voxel volume reads x 32..224: no other block reads past either border.
     low, high = (0, 0, 32), (96, 96, 224)
     (_, kept), = trim_cut_ends([("V", line(1, 191))], low, high, reach_low_zyx=low, reach_high_zyx=high)
     assert np.array_equal(kept, line(1, 191))
-    # The second block of a zone reading y 32..128 and x 0..320: an end beside the zone's own y border stays, as one
-    # beside the volume's border does, though another block reads past its low x border.
-    low, high, reach = (0, 32, 128), (96, 128, 320), ((0, 32, 0), (96, 128, 320))
-    (_, kept), = trim_cut_ends([("V", line(1, 191, y=1.0))], low, high, *reach)
-    assert np.isclose(kept[:, 2].min(), 1)
-    # And at the far borders: the first block, x 0..192, with a spline beside the zone's high y border.
-    (_, kept), = trim_cut_ends([("V", line(1, 191, y=94.0))], (0, 32, 0), (96, 128, 192), *reach)
-    assert np.isclose(kept[:, 2].max(), 191)
 
 
 def test_a_short_aligned_gap_is_joined_by_the_catalogue(tmp_path):

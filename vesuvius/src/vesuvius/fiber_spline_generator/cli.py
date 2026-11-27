@@ -373,9 +373,34 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     black = None
     if args.black_distance > 0:
         black = ExteriorBlack(reach_low, reach_high)
+    # Each block's splines wait, untrimmed, until every block whose read box meets its own has been
+    # fitted: trim_cut_ends drops a bent end only against a neighbour's copy of the fiber.
+    boxes = [(np.maximum(np.asarray(o) - BLOCK_MARGIN, 0), np.minimum(np.asarray(o) + np.asarray(s) + BLOCK_MARGIN, shape_xyz))
+             for o, s in blocks]
+    meets = [[j for j, (lo2, hi2) in enumerate(boxes) if j != i and np.all(lo2 < hi) and np.all(lo < hi2)]
+             for i, (lo, hi) in enumerate(boxes)]
+    ready_after = [max([i, *m]) for i, m in enumerate(meets)]
+    fitted: dict[int, list] = {}
     with tempfile.TemporaryDirectory(prefix="afv-stitch-") as scratch:
         stitcher = Stitcher(scratch)
+
+        def release(i: int) -> None:
+            low, high = boxes[i]
+            neighbours = [(family, np.asarray(points) + boxes[j][0][::-1], boxes[j][0][::-1], boxes[j][1][::-1])
+                          for j in meets[i] for family, points in fitted[j]]
+            traces = trim_cut_ends(fitted[i], low[::-1], high[::-1], reach_low[::-1], reach_high[::-1], neighbours)
+            report.emit("block", index=i, state="stitching")
+            stitcher.add_block(f"block-{i}", low.tolist(), (high - low).tolist(), traces,
+                               (np.asarray(blocks[i][0]), np.asarray(blocks[i][0]) + np.asarray(blocks[i][1])))
+            report.emit("block", index=i, state="stitched")
+            if args.preview_dir is not None:
+                preview = args.preview_dir.expanduser().absolute() / f"preview-{i + 1:04d}.vcobj"
+                shown = clean(stitcher.stitched(), args.max_join_angle, args.min_length)
+                write(preview, shown)
+                report.emit("preview", path=str(preview), fibers=len(shown))
+
         try:
+            released = 0
             for index, (origin, size) in enumerate(blocks):
                 label = f"Block {index + 1} of {count}"
 
@@ -405,19 +430,15 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
                     part = (0 if family == "V" else 1) + (done / total if total else 1)
                     step(0.85 + 0.05 * part, f"fitting {names[family]} fibers · {done} of {total} pieces")
 
-                traces = trim_cut_ends(extract_splines(probabilities, threshold, spline_progress),
-                                       low[::-1], high[::-1], reach_low[::-1], reach_high[::-1])
+                fitted[index] = extract_splines(probabilities, threshold, spline_progress)
                 del probabilities
-                report.emit("block", index=index, state="stitching")
-                step(0.95, f"joining {len(traces)} fibers to the neighbouring blocks")
-                stitcher.add_block(f"block-{index}", low.tolist(), (high - low).tolist(), traces,
-                                   (np.asarray(origin), np.asarray(origin) + np.asarray(size)))
-                report.emit("block", index=index, state="stitched")
-                if args.preview_dir is not None:
-                    preview = args.preview_dir.expanduser().absolute() / f"preview-{index + 1:04d}.vcobj"
-                    shown = clean(stitcher.stitched(), args.max_join_angle, args.min_length)
-                    write(preview, shown)
-                    report.emit("preview", path=str(preview), fibers=len(shown))
+                step(0.95, f"joining {len(fitted[index])} fibers to the neighbouring blocks")
+                while released < count and ready_after[released] <= index:
+                    release(released)
+                    released += 1
+                    for j in range(released):  # splines no block still waiting needs
+                        if j in fitted and all(k < released for k in [j, *meets[j]]):
+                            del fitted[j]
             del network
             if device.type == "cuda":
                 torch.cuda.empty_cache()
