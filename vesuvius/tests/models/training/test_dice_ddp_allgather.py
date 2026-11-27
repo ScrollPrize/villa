@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import faulthandler
+import os
+import sys
 import time
+import traceback
 from datetime import timedelta
 
 import pytest
@@ -53,6 +56,19 @@ def _model():
 
 def _worker(rank, name, init_file, out_prefix):
     faulthandler.dump_traceback_later(WORKER_TIMEOUT_S, exit=True)
+    try:
+        _run_worker(rank, name, init_file, out_prefix)
+    except BaseException:
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(1)
+    # Leave without interpreter finalization. On the Linux CI runners a worker
+    # sometimes hung after its Python code had returned: faulthandler showed
+    # "<no Python frame>" in its only Python thread.
+    os._exit(0)
+
+
+def _run_worker(rank, name, init_file, out_prefix):
     dist.init_process_group(
         "gloo", init_method=f"file://{init_file}", rank=rank, world_size=WORLD,
         timeout=timedelta(seconds=60),
