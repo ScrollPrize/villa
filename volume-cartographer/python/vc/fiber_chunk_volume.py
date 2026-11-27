@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from contextlib import contextmanager
-import fcntl
 import itertools
 import json
 import math
@@ -18,6 +17,12 @@ import subprocess
 import sys
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows has no fcntl; output_lock uses msvcrt there.
+    fcntl = None
+    import msvcrt
 
 from . import fiber_trace as ft
 from .fiber_evaluation import CHUNK_KEYS, _keys, _settings
@@ -86,8 +91,13 @@ def output_lock(output):
     # owners of different inodes. flock releases automatically even on a crash.
     with (output / ".writer.lock").open("a") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            if fcntl is not None:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                # One byte at offset 0; the OS drops it when the handle closes.
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
             raise RuntimeError(f"another writer owns {output}") from exc
         yield
 
