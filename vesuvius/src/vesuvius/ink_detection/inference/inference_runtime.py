@@ -12,6 +12,7 @@ from torch import nn
 from torch._dynamo.exc import BackendCompilerFailed
 from torch._inductor.exc import TritonMissing
 
+from vesuvius.ink_detection.models.conv3d_as_2d import split_conv3d_for_inference
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 from vesuvius.models.utilities.compilation import has_triton
 from vesuvius.models.utilities.get_accelerator import get_accelerator
@@ -232,8 +233,14 @@ def prepare_model_for_inference(
     compile_model: bool,
     compile_mode: str,
     device_type: str = "auto",
+    conv3d_as_2d: str = "off",
 ) -> tuple[nn.Module, torch.device]:
-    """Move, optionally wrap, and optionally compile an inference model."""
+    """Move, optionally wrap, and optionally compile an inference model.
+
+    ``conv3d_as_2d`` (``auto``, ``on`` or ``off``) runs 3D convolutions as
+    sums of 2D convolutions: ``on`` every plain ``Conv3d``, ``auto`` only the
+    depth-fusion stems of 3D-stem/2D models, and only on ROCm and MPS.
+    """
 
     requested = tuple(int(device_id) for device_id in gpu_ids)
     compile_enabled = bool(compile_model)
@@ -269,6 +276,13 @@ def prepare_model_for_inference(
     else:
         device = torch.device("cpu")
 
+    swapped = split_conv3d_for_inference(model, conv3d_as_2d, device)
+    if swapped:
+        LOGGER.info(
+            "Running %d Conv3d layers as sums of 2D convolutions (--conv3d-as-2d %s)",
+            swapped,
+            conv3d_as_2d,
+        )
     model = model.to(device)
     if len(requested) > 1:
         compile_enabled = False

@@ -467,6 +467,7 @@ the second output.
 | `--tta-batch-size` | Maximum mirror variants evaluated together. |
 | `--gpus` | Unique comma-separated CUDA IDs, for example `0,1`; omit for automatic CUDA/CPU selection. |
 | `--device` | `auto` (default), `cpu`, `mps` or `cuda`. `auto` picks CUDA, then MPS, then CPU; `--gpus` selects CUDA devices and cannot be combined with `cpu` or `mps`. |
+| `--conv3d-as-2d` | `auto` (default), `on` or `off`. Runs 3D convolutions as sums of 2D convolutions. `auto` does it only on ROCm (AMD), where MIOpen's 3D convolutions are slow, and on MPS (Apple), where PyTorch runs `Conv3d` as an explicit matrix product, and only for the 3D stem of 3D-stem/2D models; `on` rewrites every plain `Conv3d` on any device (it is slower on NVIDIA). Subclasses, padding modes other than `zeros`, string padding and dilation always keep the stock convolution. |
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
 
