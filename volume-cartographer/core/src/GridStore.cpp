@@ -306,6 +306,7 @@ public:
 
     bool is_remote() const { return remote_ != nullptr; }
 
+
     std::pair<const void*, size_t> raw_bytes() const {
         if (!mmapped_data_) return {nullptr, 0};
         return {mmapped_data_->data, mmapped_data_->size};
@@ -1045,6 +1046,8 @@ private:
                     // and after would mix two versions: reported as a failed
                     // read, so a trace using them is not saved.
                     const auto [bytes, size] = whole_->pimpl_->raw_bytes();
+                    // Also what this slice's earlier (evicted) stores were given.
+                    if (!remote_->checkLedger(bytes, size)) generation_.fetch_add(1, std::memory_order_acq_rel);
                     if (answered_ && !remote_->sameBytesAs(bytes, size)) {
                         generation_.fetch_add(1, std::memory_order_acq_rel);
                         RemoteGridFile::reportFailure(remote_->url() +
@@ -1111,6 +1114,12 @@ GridStore::GridStore(std::shared_ptr<RemoteGridFile> remote,
 
 uint64_t GridStore::generation() const {
     return pimpl_->generation();
+}
+
+std::pair<const char*, size_t> GridStore::fileBytes() const {
+    if (pimpl_->is_remote()) return {nullptr, 0};
+    const auto [bytes, size] = pimpl_->raw_bytes();
+    return {static_cast<const char*>(bytes), size};
 }
 
 GridStore::~GridStore() = default;

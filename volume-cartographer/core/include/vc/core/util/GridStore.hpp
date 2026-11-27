@@ -80,6 +80,8 @@ public:
     // constructor); constant for other stores. A caller that keeps results
     // reads it before its query and keeps them only while it is unchanged.
     uint64_t generation() const;
+    // The bytes of the file a store read whole maps (nullptr for other stores).
+    std::pair<const char*, size_t> fileBytes() const;
     CacheStats cacheStats() const;
     void resetCacheStats() const;
 

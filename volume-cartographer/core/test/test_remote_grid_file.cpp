@@ -973,6 +973,50 @@ TEST_CASE("Remote grid: readers appending to one pack together stay within its b
     }
 }
 
+TEST_CASE("Remote grid: a pack replayed while another reader appends to it is charged what it then holds")
+{
+    // As with two processes: the budget is not held while a write runs. The
+    // replaying reader measures the pack and pauses before its charge settles;
+    // the other reader's append waits for it (the pack is locked), so the
+    // charge settled last is what the pack holds.
+    Scratch s;
+    Remote remote;
+    remote.bytes = makeGrid(s.dir / "whole.grid", 31);
+    const auto local = s.dir / "m" / "000000.grid";
+    const fs::path pack = local.string() + ".ranges";
+    std::mutex mutex;
+    std::map<std::string, uint64_t> charged;
+    std::atomic<bool> pause{false}, paused{false};
+    std::thread::id pauser;
+    RemoteGridFile::Options options;
+    options.budgeted = [&](const std::string& path, const RemoteGridFile::Options::Write& write) {
+        const auto after = write([](uint64_t) { return true; });
+        if (std::this_thread::get_id() == pauser && pause) {
+            paused = true;
+            while (pause) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::lock_guard lock(mutex);
+        if (after) charged[path] = *after;
+        else charged.erase(path);
+    };
+    GridStore appender(open(remote, local, options));
+    (void)appender.get(cv::Rect(0, 0, 200, 200));  // the pack exists
+    pause = true;
+    std::shared_ptr<RemoteGridFile> replayed;
+    std::thread replay([&] {
+        pauser = std::this_thread::get_id();
+        replayed = open(remote, local, options);  // replays the pack, then charges it
+    });
+    while (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::thread grow([&] { (void)appender.get_all(); });  // appends meanwhile
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    pause = false;
+    replay.join();
+    grow.join();
+    std::lock_guard lock(mutex);
+    CHECK(charged[pack.string()] == fs::file_size(pack));
+}
+
 TEST_CASE("Remote grid: a stale pack that is replayed and discarded leaves no memory charged")
 {
     Scratch s;

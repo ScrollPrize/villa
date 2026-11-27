@@ -495,13 +495,13 @@ int main()
             });
             ::_exit(ok ? 0 : 1);
         }
-        int status = 0;
+        int status = 0, wrote = 0;
         ::waitpid(reconciler, &status, 0);
-        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
         c = 1;
-        CHECK(::write(reconciled[1], &c, 1) == 1);
-        ::waitpid(writer, &status, 0);
+        (void)!::write(reconciled[1], &c, 1);  // let the writer go on before any check
+        ::waitpid(writer, &wrote, 0);
         CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(WIFEXITED(wrote) && WEXITSTATUS(wrote) == 0);
         CHECK(fs::file_size(pack) == 103);  // published, never accounted by its writer
         bool published = false;
         std::thread next([&] {  // its own thread: a temporary not named like the forked writer's
@@ -518,6 +518,68 @@ int main()
             if (entry.is_regular_file()) onDisk += entry.file_size();
         CHECK(onDisk <= 200);
         for (int fd : {filled[0], filled[1], reconciled[0], reconciled[1]}) ::close(fd);
+    }
+
+    // An append in progress while another process opens the cache and
+    // rebuilds its index from the files (where the pack is still short): the
+    // growth the append was admitted for stays reserved, so the other process
+    // is not let into that space.
+    {
+        const auto liveRoot = root / "live";
+        fs::create_directories(liveRoot);
+        const auto make = [liveRoot](const std::string& location) {
+            zarr::OpenOptions options;
+            options.access = zarr::resolveAccess(location, zarr::AuthMode::Anonymous);
+            options.cacheDirs = {liveRoot.string()};
+            options.cacheMaxBytes = 300;
+            return options;
+        };
+        const auto base = zarr::decodedCachePath(liveRoot, server.url()).string();
+        const std::string pack = base + ".ranges", other = base + ".other.ranges";
+        fs::create_directories(fs::path(pack).parent_path());
+        { std::ofstream(pack, std::ios::binary) << std::string(10, 'p'); }
+        int admitted[2], reconciled[2];
+        CHECK(::pipe(admitted) == 0);
+        CHECK(::pipe(reconciled) == 0);
+        const pid_t appender = ::fork();
+        if (appender == 0) {
+            sources::EncodedFiles files(make);
+            files.writeFile(server.url(), pack, [&](const sources::EncodedFiles::Fits& fits) -> std::optional<std::int64_t> {
+                if (!fits(290)) ::_exit(2);
+                char c = 1;
+                (void)!::write(admitted[1], &c, 1);
+                (void)!::read(reconciled[0], &c, 1);  // another process opens the cache meanwhile
+                { std::ofstream(pack, std::ios::binary | std::ios::app) << std::string(280, 'p'); }
+                return static_cast<std::int64_t>(fs::file_size(pack));
+            });
+            ::_exit(0);
+        }
+        char c = 0;
+        CHECK(::read(admitted[0], &c, 1) == 1);
+        const pid_t other_process = ::fork();
+        if (other_process == 0) {
+            sources::EncodedFiles files(make);  // a new process: rebuilds the index from the disk
+            bool fit = false;
+            files.writeFile(server.url(), other, [&](const sources::EncodedFiles::Fits& fits) -> std::optional<std::int64_t> {
+                fit = fits(100);
+                if (fit) { std::ofstream(other, std::ios::binary) << std::string(100, 'o'); }
+                return fit ? std::optional<std::int64_t>(100) : std::nullopt;
+            });
+            ::_exit(fit ? 3 : 0);
+        }
+        int status = 0, appended = 0;
+        ::waitpid(other_process, &status, 0);
+        c = 1;
+        (void)!::write(reconciled[1], &c, 1);  // let the append finish before any check
+        ::waitpid(appender, &appended, 0);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);  // refused: 280 of the 300 are the append's
+        CHECK(WIFEXITED(appended) && WEXITSTATUS(appended) == 0);
+        std::uintmax_t onDisk = 0;
+        for (const auto& entry : fs::directory_iterator(fs::path(pack).parent_path()))
+            if (entry.is_regular_file()) onDisk += entry.file_size();
+        CHECK(onDisk <= 300);
+        CHECK(fs::file_size(pack) == 290);
+        for (int fd : {admitted[0], admitted[1], reconciled[0], reconciled[1]}) ::close(fd);
     }
 
     fs::remove_all(root);

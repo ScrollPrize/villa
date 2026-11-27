@@ -381,6 +381,51 @@ TEST_CASE("Range reads: when a grid's regions stop arriving, the grid is read wh
     CHECK(fs::is_regular_file(s.dir / "xy" / gridName(5)));
 }
 
+namespace {
+// Slice 5 is read by range, evicted, then (when `replace`) replaced on the
+// server and cached whole by a second reader, and read again by the first:
+// returns that reader's readFailures().
+uint64_t rereadAfterEviction(bool replace)
+{
+    Streamed s;
+    setenv("VC_GRID_CACHE_BYTES", "1", 1);  // every lookup evicts down to one slice
+    std::unique_ptr<NormalGridVolume> reader;
+    {
+        RangeReads on;
+        reader = std::make_unique<NormalGridVolume>(s.dir.string());
+    }
+    const auto first = reader->get_grid(0, 5);
+    REQUIRE(first != nullptr);
+    CHECK_FALSE(first->get(cv::Rect(0, 0, 100, 100)).empty());
+    CHECK(reader->get_grid(0, 2) != nullptr);  // slice 5 evicted
+    if (replace) {
+        // The same size and layout: only a point moves.
+        vc::core::util::GridStore gs(cv::Rect(0, 0, 100, 100), 10);
+        gs.add({cv::Point(0, 0), cv::Point(44, 5), cv::Point(10, 10)});
+        gs.save((s.store / "xy" / gridName(5)).string());
+    }
+    {
+        NormalGridVolume wholeReader(s.dir.string());  // reads it whole, into the shared cache
+        REQUIRE(wholeReader.get_grid(0, 5) != nullptr);
+    }
+    const auto again = reader->get_grid(0, 5);
+    REQUIRE(again != nullptr);
+    (void)again->get(cv::Rect(0, 0, 100, 100));
+    unsetenv("VC_GRID_CACHE_BYTES");
+    return reader->readFailures();
+}
+}  // namespace
+
+TEST_CASE("Range reads: a slice that changed on the server is counted when it is read again after eviction")
+{
+    CHECK(rereadAfterEviction(true) == 1);  // GrowPatch does not save a trace that saw both
+}
+
+TEST_CASE("Range reads: a slice read again after eviction, unchanged, is not counted")
+{
+    CHECK(rereadAfterEviction(false) == 0);
+}
+
 TEST_CASE("Range reads: a slice read whole after its regions stop arriving is charged to the grid cache")
 {
     // The whole copy a slice keeps after the fallback counts against

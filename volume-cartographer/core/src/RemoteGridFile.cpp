@@ -16,6 +16,62 @@
 
 namespace fs = std::filesystem;
 
+namespace vc::core::util {
+
+namespace {
+uint64_t pieceHash(const char* data, uint64_t n)
+{
+    uint64_t h = 1469598103934665603ull;  // FNV-1a
+    for (uint64_t i = 0; i < n; ++i) h = (h ^ static_cast<unsigned char>(data[i])) * 1099511628211ull;
+    return h;
+}
+}  // namespace
+
+SliceLedger::SliceLedger(std::string url, std::function<void()> diverged)
+    : url_(std::move(url)), diverged_(std::move(diverged))
+{
+}
+
+void SliceLedger::report(const std::string& why)
+{
+    // Caller holds mutex_.
+    if (reported_) return;
+    reported_ = true;
+    RemoteGridFile::reportFailure(url_ + ": " + why + "; a trace using it would mix two versions");
+    if (diverged_) diverged_();
+}
+
+bool SliceLedger::check(uint64_t offset, const char* data, uint64_t n)
+{
+    const uint64_t hash = pieceHash(data, n);
+    std::lock_guard lock(mutex_);
+    const auto [it, added] = pieces_.emplace(offset, std::make_pair(n, hash));
+    if (added || it->second.first != n) return true;  // new, or not the same piece
+    if (it->second.second == hash) return true;
+    report("changed on the server since it was first read");
+    return false;
+}
+
+bool SliceLedger::checkAll(const char* data, uint64_t size)
+{
+    std::lock_guard lock(mutex_);
+    for (const auto& [offset, piece] : pieces_) {
+        if (offset + piece.first > size || pieceHash(data + offset, piece.first) != piece.second) {
+            report("read whole, it is not the file read before");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SliceLedger::diverged() const
+{
+    std::lock_guard lock(mutex_);
+    return reported_;
+}
+
+}  // namespace vc::core::util
+
 #ifndef _WIN32
 
 #include <fcntl.h>
@@ -25,6 +81,7 @@ namespace fs = std::filesystem;
 #include <unistd.h>
 
 namespace vc::core::util {
+
 
 namespace {
 constexpr uint32_t kMagic = 0x56434753;  // "VCGS"
@@ -233,6 +290,7 @@ void RemoteGridFile::reportFailure(const std::string& what)
 RemoteGridFile::RemoteGridFile(std::string url, const std::string& local_path, RangeFetcher fetcher, const Options& options)
     : url_(std::move(url)), pack_path_(local_path + ".ranges"), fetch_(std::move(fetcher)), budgeted_(options.budgeted),
       publish_(options.publish),
+      ledger_(options.ledger),
       min_free_bytes_(options.min_free_bytes)
 {
     ++g_opens;
@@ -324,15 +382,34 @@ void RemoteGridFile::withPack(const Options::Write& write)
 // processes may have appended to it). When the budget would not take it, or
 // the disk is under its free-space floor, the pack stops growing (it is still
 // read as it is).
+namespace {
+// The pack opened and locked against the other readers that append to it, here
+// or in another process (-1: not there). Held until the budget has settled
+// what the pack holds, so a measurement is never overtaken by an append.
+int lockedPack(const std::string& path, int flags)
+{
+    const int fd = ::open(path.c_str(), flags | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (::flock(fd, LOCK_EX) != 0)
+        if (errno != EINTR) {
+            ::close(fd);
+            return -1;
+        }
+    return fd;
+}
+}  // namespace
+
 void RemoteGridFile::chargePack()
 {
     if (in_memory_) return;
     bool fits_now = false;
+    const int fd = lockedPack(pack_path_, O_RDONLY);  // measured and charged with no append between
     withPack([&](const Options::Fits& fits) {
         const auto size = fileSize(pack_path_);
         if (size) fits_now = fits(*size);
         return size;
     });
+    if (fd >= 0) ::close(fd);
     if (!fits_now) {
         std::lock_guard lock(pack_mutex_);
         pack_ino_ = 0;
@@ -590,8 +667,14 @@ bool RemoteGridFile::sameBytesAs(const void* data, size_t size)
     return true;
 }
 
+bool RemoteGridFile::checkLedger(const void* data, size_t size)
+{
+    return !ledger_ || ledger_->checkAll(static_cast<const char*>(data), size);
+}
+
 void RemoteGridFile::place(uint64_t offset, const char* bytes, uint64_t n)
 {
+    if (ledger_) (void)ledger_->check(offset, bytes, n);
     std::lock_guard lock(held_mutex_);
     for (const auto& [a, b] : addRange(held_, offset, offset + n)) {
         std::memcpy(static_cast<char*>(map_) + a, bytes + (a - offset), b - a);
@@ -640,20 +723,22 @@ void RemoteGridFile::commit(const Pieces& pieces, const std::string& tail)
             putData(out, a, bytes.data() + (a - offset), b - a);
     out += tail;
     if (out.empty()) return;
-    // With the budget held, so appends of other readers of this pack, here or
-    // in another process, are made and charged one at a time, each fitted to
-    // the size the pack has when it is made.
+    // Locked against the pack's other readers, here or in another process,
+    // from sizing the append until the budget has settled its charge: each
+    // append is fitted to the pack as it is, and what is charged is what the
+    // pack then holds. Its growth is reserved in the budget meanwhile.
     bool ok = false;
+    const int fd = lockedPack(pack_path_, O_RDWR | O_APPEND);
+    if (fd < 0) {
+        pack_ino_ = 0;  // evicted, or the disk is gone: nothing more to reuse
+        return;
+    }
     withPack([&](const Options::Fits& fits) -> std::optional<uint64_t> {
-        const int fd = ::open(pack_path_.c_str(), O_RDWR | O_APPEND | O_CLOEXEC);
-        if (fd < 0) return fileSize(pack_path_);  // evicted, or the disk is gone
-        // Readers of this pack in other processes take turns too: each append
-        // is sized, charged and written with the pack locked (the budget's
-        // charge commits before the write, so the lock spans both).
-        while (::flock(fd, LOCK_EX) != 0 && errno == EINTR) {}
-        struct stat st{};
+        struct stat st{}, at{};
         char identity[8];
         if (::fstat(fd, &st) == 0 && uint64_t(st.st_dev) == pack_dev_ && uint64_t(st.st_ino) == pack_ino_ &&
+            // still the file at the pack's path (not replaced by a rewrite)
+            ::stat(pack_path_.c_str(), &at) == 0 && at.st_ino == st.st_ino && at.st_dev == st.st_dev &&
             preadAll(fd, identity, 8, 16) && get(identity, 8) == pack_identity_ &&
             fits(uint64_t(st.st_size) + out.size())) {
             const ssize_t n = ::write(fd, out.data(), out.size());
@@ -661,12 +746,9 @@ void RemoteGridFile::commit(const Pieces& pieces, const std::string& tail)
             // A short write is cut off again: the pack holds only what was charged.
             if (!ok && n > 0 && ::ftruncate(fd, st.st_size) != 0) {}
         }
-        struct stat after{};
-        const bool sized = ::fstat(fd, &after) == 0;
-        ::close(fd);
-        if (!sized) return fileSize(pack_path_);
-        return uint64_t(after.st_size);
+        return fileSize(pack_path_);  // what the path holds is what is charged
     });
+    ::close(fd);
     if (!ok) pack_ino_ = 0;  // nothing more is appended; the pack is read as it is
 }
 
@@ -943,6 +1025,11 @@ RemoteGridFile::~RemoteGridFile() = default;
 void RemoteGridFile::ensureBuckets(int, int, int, int, bool)
 {
     throw std::logic_error("normal-grid range reads are not available on Windows");
+}
+
+bool RemoteGridFile::checkLedger(const void*, size_t)
+{
+    return true;
 }
 
 bool RemoteGridFile::sameBytesAs(const void*, size_t)

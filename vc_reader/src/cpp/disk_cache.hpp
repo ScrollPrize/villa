@@ -324,27 +324,27 @@ public:
     }
 
     // Runs `write` for a file its owner writes in place under the root (as
-    // account_file's) inside one transaction of the index, so no eviction, no
-    // publication and no other with_file of this budget, in any process, comes
-    // between the write and its accounting. `write(fits)` writes only after
-    // fits(total) accepts what the file will occupy: the floor and the budget
-    // less reservations, older files evicted to make room before it returns
-    // true, so the disk never holds more than the budget while it writes. It
-    // returns what the file occupies once done (nullopt: none there), which is
-    // charged as the newest entry. The file is registered, so a write cut off
-    // by an interruption is measured when the index is next reconciled.
+    // account_file's). `write(fits)` writes only after fits(total) accepts what
+    // the file will occupy (the floor, and the budget less reservations; older
+    // files are evicted to make room), and returns what the file occupies once
+    // done (nullopt: none there), which is then charged as the newest entry.
+    // The growth fits() accepts is held as a reservation, as a download's bytes
+    // are, until that charge is settled: a reservation is not rebuilt from the
+    // disk when another process reconciles the index (a file mid-write is
+    // still short there), and its lock file keeps it while the writer lives;
+    // when the writer is interrupted, the next cleanup releases it and charges
+    // the file as it was left. The owner keeps other writers of the file out
+    // until with_file returns (RemoteGridFile holds the pack's lock), so what
+    // is settled is what the file holds.
     void with_file(const std::string& path,
                    const std::function<std::optional<std::int64_t>(const std::function<bool(std::int64_t)>&)>& write)
     {
         check_path(path);
         std::lock_guard lock(mutex_);
         if (!reconciled_) transaction([&] { reconcile(); });
-        // Accepting a size charges it at once, in its own transaction, before
-        // anything is written: a writer interrupted after its bytes reach the
-        // disk leaves the file charged at least what it holds, so no other
-        // writer is admitted into that space. The charge is corrected to what
-        // the file holds once the write is done.
+        std::unique_ptr<AtomicFile> reservation;  // its temporary: `path`.tmp.*, never published
         const std::function<bool(std::int64_t)> fits = [&](std::int64_t total) {
+            if (reservation) return false;  // one write per call
             bool accepted = false;
             transaction([&] {
                 std::int64_t before = 0;
@@ -353,15 +353,21 @@ public:
                     s.text(1, path);
                     if (s.step()) before = sqlite3_column_int64(s.get(), 0);
                 }
-                const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
+                const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
+                const auto available = limit - reserved_bytes();
                 if (total < 0 || total > available) return;
-                const auto growth = total - before;
+                const auto growth = std::max<std::int64_t>(total - before, 0);
                 if (growth > 0 && !leaves_free_space(static_cast<std::size_t>(growth))) return;
-                record(path, std::max(before, total));  // the newest: room is made from older files
+                record(path, before);  // the newest: room is made from older files
                 Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
                 f.text(1, path);
                 f.step();
-                evict_to(available);
+                if (growth > 0) {
+                    reservation = std::make_unique<AtomicFile>(path);
+                    lock_file(reservation->fd());
+                    record_download(reservation->temporary_path(), static_cast<std::size_t>(growth));
+                    evict_to(available - growth);
+                }
                 accepted = true;
             });
             return accepted;
@@ -382,7 +388,6 @@ public:
                 Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
                 f.text(1, path);
                 f.step();
-                evict_to(number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes());
             } else {
                 Statement s(db_, "DELETE FROM chunks WHERE path=?");
                 s.text(1, path);
@@ -391,6 +396,11 @@ public:
                 f.text(1, path);
                 f.step();
             }
+            if (reservation) {
+                forget_download(reservation->temporary_path());
+                reservation.reset();  // removes its temporary
+            }
+            evict_to(number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes());
         });
     }
 
@@ -583,13 +593,13 @@ private:
         }
         for (const auto& path : paths) {
             check_path(path);
-            const bool missing = !std::filesystem::exists(std::filesystem::symlink_status(utf8Path(path)));
             if (!remove_abandoned(path)) continue;
             forget_download(path);
-            // Its temporary is gone: interrupted after the rename, the file it
-            // became is on disk, and is charged here (as it is when published).
+            // Its writer was interrupted: the file it wrote to (a download
+            // renamed into place, or a pack it was growing) is charged as it
+            // was left.
             const auto tmp = path.rfind(".tmp.");
-            if (!missing || tmp == std::string::npos) continue;
+            if (tmp == std::string::npos) continue;
             const auto published = path.substr(0, tmp);
             std::error_code ec;
             if (std::filesystem::is_regular_file(std::filesystem::symlink_status(utf8Path(published), ec)))
