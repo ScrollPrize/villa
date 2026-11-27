@@ -32,8 +32,8 @@ TEST_CASE("constraint inputs use edited geometry rather than ingest counts")
     for (const size_t count : {3u, 2u, 1u, 0u}) {
         vc::geometry::Fiber fiber{{{1,2,3},{5,2,3}}, {}};
         for (size_t i = 0; i < count; ++i) fiber.linePoints.push_back({1.0 + i, 2, 3});
-        RevisionSelection expected;
-        { auto txn = store.read(); expected[uuid] = store.currentObjectRevision(txn, uuid)->uuid; }
+        RecordSelection expected;
+        { auto txn = store.read(); expected[uuid] = store.currentObjectRevision(txn, uuid)->reference(); }
         { auto txn = store.write(expected);
           current = updateGeometryArrays(store, txn, uuid, vc::geometry::encode(fiber), current);
           txn.commit(); }

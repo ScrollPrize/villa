@@ -4,6 +4,7 @@
 #pragma once
 
 #include "lzw.hpp"
+#include "decoder_context.hpp"
 
 #include <blosc.h>
 #include <lz4.h>
@@ -102,12 +103,14 @@ inline void decode(Codec codec, const std::uint8_t* src, std::size_t n, std::uin
         if (nbytes != dst_n || cbytes > n)
             throw std::runtime_error("blosc chunk decodes to " + std::to_string(nbytes) + " bytes, expected " +
                                      std::to_string(dst_n));
-        if (blosc_decompress_ctx(src, dst, dst_n, 1) != static_cast<int>(dst_n))
+        auto scratch=workerScratch().lease();
+        if (scratch.resource<DecoderContexts>().decodeBlosc(src,n,dst,dst_n) != static_cast<int>(dst_n))
             throw std::runtime_error("blosc decode failed");
         return;
     }
     case Codec::Zstd: {
-        const auto size = ZSTD_decompress(dst, dst_n, src, n);
+        auto scratch=workerScratch().lease();
+        const auto size = ZSTD_decompressDCtx(scratch.resource<DecoderContexts>().zstdContext(),dst, dst_n, src, n);
         if (ZSTD_isError(size))
             throw std::runtime_error(std::string("zstd decode failed: ") + ZSTD_getErrorName(size));
         if (size != dst_n)
@@ -161,11 +164,15 @@ inline bool delta3d_lossless(const std::uint8_t* p, std::size_t n)
     return quant && *quant == vc_delta3d::kQuantizationLossless;
 }
 
+// Lossless Delta3D. `channels` > 0 codes that many Z/Y/X fields, each on its own, in `layout` order.
 inline std::vector<std::uint8_t> encode_delta3d(const std::uint8_t* src, std::size_t n,
-                                                const std::array<int, 3>& shape, std::size_t itemsize)
+                                                const std::array<int, 3>& shape, std::size_t itemsize, int channels = 0,
+                                                vc_delta3d::ChannelLayout layout = vc_delta3d::ChannelLayout::First)
 {
-    auto out = vc_delta3d::compress(std::span(reinterpret_cast<const std::byte*>(src), n), shape, itemsize,
-                                    vc_delta3d::kQuantizationLossless);
+    const auto input = std::span(reinterpret_cast<const std::byte*>(src), n);
+    const auto out = channels > 0 ? vc_delta3d::compressChannels(input, shape, channels, layout, itemsize,
+                                                                 vc_delta3d::kQuantizationLossless)
+                                  : vc_delta3d::compress(input, shape, itemsize, vc_delta3d::kQuantizationLossless);
     std::vector<std::uint8_t> bytes(out.size());
     std::memcpy(bytes.data(), out.data(), out.size());
     return bytes;
@@ -179,7 +186,16 @@ struct EncodeOptions {
     int blocksize = 0;          // blosc
     float q = 8.0f;             // volcomp quantiser step (0: lossless)
     bool checksum = false;     // zstd frame checksum
+    std::string channel_axis;   // vc-delta3d: "first" (CZYX) or "last" (ZYXC) for 4-D chunks, "" for 3-D ones
 };
+
+// Whether vc-delta3d stores chunks of this dimensionality with this channel axis (the numcodecs adapter's rule).
+inline bool delta3d_layout_supported(std::size_t dimensions, const std::string& channel_axis)
+{
+    if (dimensions == 4)
+        return channel_axis == "first" || channel_axis == "last";
+    return dimensions == 3 && channel_axis.empty();
+}
 
 // Encodes one decoded chunk of `itemsize`-byte elements and C-order `shape`.
 inline std::vector<std::uint8_t> encode(Codec codec, const EncodeOptions& o, const std::uint8_t* src, std::size_t n,
@@ -258,8 +274,15 @@ inline std::vector<std::uint8_t> encode(Codec codec, const EncodeOptions& o, con
     case Codec::Lzw:
         throw std::invalid_argument("LZW chunks can be read, not written");
     case Codec::Delta3d:
-        if (shape.size() != 3 || (itemsize != 1 && itemsize != 2))
-            throw std::invalid_argument("vc-delta3d stores 3-D uint8 or uint16 chunks");
+        if (!delta3d_layout_supported(shape.size(), o.channel_axis) || (itemsize != 1 && itemsize != 2))
+            throw std::invalid_argument("vc-delta3d stores 3-D, or 4-D with a channel_axis, uint8 or uint16 chunks");
+        if (shape.size() == 4) {
+            const bool last = o.channel_axis == "last";
+            const std::size_t z = last ? 0 : 1;
+            return encode_delta3d(src, n, {int(shape[z]), int(shape[z + 1]), int(shape[z + 2])}, itemsize,
+                                  int(shape[last ? 3 : 0]),
+                                  last ? vc_delta3d::ChannelLayout::Last : vc_delta3d::ChannelLayout::First);
+        }
         return encode_delta3d(src, n, {int(shape[0]), int(shape[1]), int(shape[2])}, itemsize);
     case Codec::Volcomp: {
         if (n != VOLCOMP_LIB_CHUNK_BYTES || itemsize != 1)

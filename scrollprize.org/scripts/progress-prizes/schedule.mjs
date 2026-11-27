@@ -26,7 +26,7 @@ export const SCHEDULE_OPERATIONS = Object.freeze({
   NONE: 'none',
   DRY_RUN: 'dry-run',
   PREPARE: 'prepare',
-  ACTIVATE: 'activate',
+  READY: 'ready',
 });
 
 export const SCHEDULE_REASONS = Object.freeze({
@@ -42,7 +42,7 @@ export const SCHEDULE_REASONS = Object.freeze({
 
 const ALLOWED_EVENTS = new Set(['schedule', 'workflow_dispatch']);
 const ALLOWED_CRONS = new Set(Object.values(SCHEDULE_CRONS));
-const ACTIVATION_CRONS = new Set([
+const READY_CRONS = new Set([
   SCHEDULE_CRONS.PRE_CUTOFF,
   SCHEDULE_CRONS.EARLY_RECOVERY,
   SCHEDULE_CRONS.LATE_RECOVERY,
@@ -190,7 +190,7 @@ function classifyObservedTime(observedAt, local, scheduledCron) {
       minute: 47,
     });
     return {
-      operation: SCHEDULE_OPERATIONS.ACTIVATE,
+      operation: SCHEDULE_OPERATIONS.READY,
       reason: observedAt < lateRecoveryAt
         ? SCHEDULE_REASONS.EARLY_RECOVERY
         : SCHEDULE_REASONS.LATE_RECOVERY,
@@ -218,7 +218,7 @@ function classifyObservedTime(observedAt, local, scheduledCron) {
 
   if (observedAt >= preCutoffAt && observedAt < sourceDeadline.cutoffAt) {
     return {
-      operation: SCHEDULE_OPERATIONS.ACTIVATE,
+      operation: SCHEDULE_OPERATIONS.READY,
       reason: SCHEDULE_REASONS.PRE_CUTOFF,
       sourceCycle,
       targetCycle,
@@ -265,8 +265,9 @@ function scheduledActivationIsDue({ scheduledCron, observedAt, local }) {
  * instant and its trusted GitHub trigger context.
  *
  * Schedule slots are intentionally not interchangeable: only the daily 06:17
- * slot can prepare. The pre-cutoff and 00:17 slots retain first-day recovery; the 06:47 slot retries
- * the previous month's incomplete rollover on days 1–7.
+ * slot can prepare. The 23:40 pre-cutoff slot marks the rollover page ready to
+ * merge; the 00:17 and 06:47 slots retry that on days 1–7 until the page is
+ * ready or merged.
  */
 export function planScheduleDispatch({
   now = new Date(),
@@ -279,7 +280,7 @@ export function planScheduleDispatch({
   const currentPacificCycle = formatCycle(local.year, local.month);
 
   // A manual scheduler run is a smoke test of the dispatch chain, never an
-  // authority to prepare or activate. It derives the current Pacific source
+  // authority to prepare or mark ready. It derives the current Pacific source
   // month and asks the production workflow for its independently guarded,
   // read-only dry-run.
   if (eventName === 'workflow_dispatch') {
@@ -326,14 +327,14 @@ export function planScheduleDispatch({
         });
       }
     } else if (
-      !ACTIVATION_CRONS.has(trustedCron)
+      !READY_CRONS.has(trustedCron)
       || !scheduledActivationIsDue({ scheduledCron: trustedCron, observedAt, local })
     ) {
       return noDispatch({
         eventName,
         scheduledCron: trustedCron,
         observedAt,
-        reason: ACTIVATION_CRONS.has(trustedCron)
+        reason: READY_CRONS.has(trustedCron)
           ? SCHEDULE_REASONS.SLOT_NOT_DUE
           : SCHEDULE_REASONS.WRONG_SLOT,
         sourceCycle: classified.sourceCycle,

@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,12 +24,16 @@ class Volume;
 namespace vc::project {
 
 inline constexpr std::string_view kFiberLasagnaTag = "vc-lasagna-fiber";
+inline constexpr std::string_view kPredictedFiberNormalsTag = "vc-fiber-normal-channels";
 inline constexpr std::string_view kAnonymousRemoteAuthTag =
     "vc-remote-auth:anonymous";
 
 struct Entry {
     std::string location;
     std::vector<std::string> tags;
+    // Optional named CZYX scalar display views, in storage channel order.
+    // The source is persisted once; all views share its caches and coordinates.
+    std::vector<std::string> channels;
     bool operator==(const Entry&) const = default;
 };
 
@@ -90,6 +95,7 @@ public:
         std::string location;
         std::vector<std::string> tags;
         std::shared_ptr<Volume> volume;
+        std::vector<std::string> channels;
     };
 
     static std::shared_ptr<VolumePkg> open(const std::filesystem::path& path,
@@ -135,8 +141,7 @@ public:
         const std::string& manifestLocation,
         std::vector<std::string> manifestTags,
         bool fiberInference,
-        const std::vector<PreparedVolumeAttachment>& preparedVolumes,
-        bool updateSelection = true);
+        const std::vector<PreparedVolumeAttachment>& preparedVolumes);
     bool removeEntry(const std::string& location);
     // Reopen a loaded remote volume at working level `level` (its entry's
     // #vc-base-scale), keeping its ID; false when it is already there.
@@ -145,9 +150,18 @@ public:
     [[nodiscard]] std::string selectedLasagnaDataset() const;
     void setSelectedLasagnaDataset(std::string location);
     void clearSelectedLasagnaDataset();
+    // The user's choice, else the first attached fiber dataset with predicted
+    // normals, else the first attached one.
     [[nodiscard]] std::string selectedFiberInferenceDataset() const;
     void setSelectedFiberInferenceDataset(std::string location);
     void clearSelectedFiberInferenceDataset();
+    [[nodiscard]] bool hasPredictedFiberNormals(const std::string& fiberDataset) const;
+
+    // "fiber" when the selected fiber dataset has predicted normals, unless the
+    // user explicitly chose Lasagna normals for it; "lasagna" otherwise. The
+    // choice is stored per fiber dataset; attaching or selecting never makes it.
+    [[nodiscard]] std::string annotationNormalSource() const;
+    void setAnnotationNormalSource(std::string source);
 
     // Viewer bbox in volume coordinates; disabling retains the saved limits.
     [[nodiscard]] std::optional<Rect3D> focusBounds() const { return focusBounds_; }
@@ -199,6 +213,8 @@ private:
     std::vector<vc::project::Entry> lasagnaDatasets_;
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
+    // Fiber datasets the user explicitly chose Lasagna normals for.
+    std::set<std::string> lasagnaNormalChoices_;
     std::optional<Rect3D> focusBounds_;
     bool focusBoundsEnabled_ = false;
     std::string currentVolumeId_;
@@ -209,6 +225,8 @@ private:
 
     void resolveAll();
     void resolveVolumeEntry(const vc::project::Entry& e);
+    bool registerVolumeViews(const std::shared_ptr<Volume>& volume, const vc::project::Entry& entry,
+                             bool replace = false);
     void resolveNormalGridEntry(const vc::project::Entry& e);
 
     // Read resources and view state from the document.

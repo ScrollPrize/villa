@@ -121,3 +121,58 @@ def test_missing_resolution_uses_node_error_when_listing_fails(monkeypatch):
     ).shape == (2, 2, 2)
 
 
+
+
+def test_batch_padded_reads_share_remote_chunks_and_preserve_fill(tmp_path):
+    """Batching shares HTTP chunk fetches without changing outside padding."""
+    from vc_reader.reader import ZarrReader
+
+    requests = []
+
+    class CountingHandler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            super().do_GET()
+
+        def log_message(self, format, *args):
+            pass
+
+    path = tmp_path / "batch.zarr"
+    values = np.arange(8**3, dtype=np.uint16).reshape(8, 8, 8)
+    writer = ZarrWriter.create(
+        path, shape=(16, 16, 16), chunks=(8, 8, 8),
+        dtype=values.dtype, fill_value=77, version=2,
+    )
+    writer[:8, :8, :8] = values
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), partial(CountingHandler, directory=str(tmp_path))
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        volume = ZarrReader.open(f"http://127.0.0.1:{server.server_port}/batch.zarr")
+        bboxes = [
+            (0, 0, 0, 4, 4, 4), (2, 2, 2, 6, 6, 6),
+            (-2, -2, -2, 2, 2, 2), (14, 14, 14, 18, 18, 18),
+            (20, 0, 0, 24, 4, 4), (-8, 0, 0, -4, 4, 4),
+        ]
+        requests.clear()
+        single = [volume_io.read_bbox_with_padding(volume, bbox) for bbox in bboxes]
+        assert requests.count("/batch.zarr/0.0.0") == 3
+        requests.clear()
+        batch = volume_io.read_bboxes_with_padding(volume, bboxes)
+        assert requests.count("/batch.zarr/0.0.0") == 1
+        for (actual, valid), (expected, expected_valid) in zip(batch, single):
+            np.testing.assert_array_equal(actual, expected)
+            assert valid == expected_valid
+        assert np.all(batch[3][0][:2, :2, :2] == 77)  # missing in-bounds chunk
+        assert np.all(batch[3][0][2:] == 0)  # outside padding stays zero
+        requests.clear()
+        assert volume_io.read_bboxes_with_padding(volume, []) == []
+        outside = volume_io.read_bboxes_with_padding(volume, bboxes[-2:])
+        assert all(valid is None and not crop.any() for crop, valid in outside)
+        assert requests == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)

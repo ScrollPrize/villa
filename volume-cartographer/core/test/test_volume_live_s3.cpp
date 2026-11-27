@@ -130,7 +130,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     CHECK(project->volumeEntries().front().location == url);
     CHECK(project->volume("20260102150214")->remotePersistentCachePath() == levelZeroCache);
 
-    // Optional read-only validation against a local replica of the PHerc0139 hub.
+    // Optional read-only validation against a converted copy of the PHerc0139 fiber store.
     if (const char* path = std::getenv("VC_TEST_CATALOG_FIBER_STORE")) {
         vc::objects::OpenOptions options;
         options.readOnly = true;
@@ -148,7 +148,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
         CHECK(store.unboundObjectCount(txn, "fiber", volume->id()) == 0);
         for (const auto& object : matched)
             CHECK(vc::objects::geometryScaleToVolume(nlohmann::json::parse(object.meta), volume->id()) == 1.0);
-        MESSAGE("Matched " << matched.size() << " real hub fibers to " << volume->id());
+        MESSAGE("Matched " << matched.size() << " real fibers to " << volume->id());
     }
 }
 

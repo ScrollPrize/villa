@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -20,7 +21,8 @@ from .reviewed_trace_selection import (
 
 
 def build_workload(template: dict, *, checkpoint: Path, output_root: Path,
-                   split_root: Path, devices: str, native_binary: Path) -> dict:
+                   split_root: Path, devices: str, native_binary: Path,
+                   presence_cutoff: float | None = None) -> dict:
     from lasagna.inference_provenance import sha256_file
     manifest = validate_failure_union(split_root, expected_count=32)
     counts: dict[str, int] = {}
@@ -36,6 +38,17 @@ def build_workload(template: dict, *, checkpoint: Path, output_root: Path,
     if {source["id"] for source in result["sources"]} != set(counts):
         raise ValueError("trace workload template does not cover the locked failure cohort")
     evaluation = result["evaluation"]
+    if presence_cutoff is not None:
+        if (isinstance(presence_cutoff, bool) or not isinstance(presence_cutoff, (int, float))
+                or not math.isfinite(presence_cutoff) or not 0 <= presence_cutoff <= 1):
+            raise ValueError("reviewed trace presence cutoff must be between 0 and 1")
+        args = evaluation.setdefault("trace_args", [])
+        for flag, value in (("--replay-presence-cutoff", str(presence_cutoff)),
+                            ("--replay-presence-mode", "modulated")):
+            if flag in args:
+                args[args.index(flag) + 1] = value
+            else:
+                args.extend((flag, value))
     evaluation["render"] = False
     evaluation["workers"] = min(int(evaluation["workers"]), 128)
     for key in ("input_workers", "flush_workers", "accumulator_workers"):
@@ -99,6 +112,7 @@ def run_job(job_path: Path, *, worker_factory=None, cancel_event=None, on_proces
         checkpoint=checkpoint, output_root=output,
         split_root=Path(job["split_root"]), devices=job["devices"],
         native_binary=Path(job["native_binary"]),
+        presence_cutoff=job.get("presence_cutoff", .25),
     )
     workload_path = output / "workload.json"
     workload_path.write_text(json.dumps(workload, indent=2) + "\n")

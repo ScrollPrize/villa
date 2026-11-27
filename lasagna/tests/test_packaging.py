@@ -11,8 +11,8 @@ def test_packaging_declares_requested_console_commands():
     assert '*sibling_dependencies("vesuvius", extra="models")' in source
     assert 'excluded = ("volume-cartographer", "torch", "cucim-cu13")' in source
     assert "lasagna-fit-service=fit_service:main" in source
-    assert "lasagna-download=lasagna.scripts.download_omezarr:main" in source
-    assert "lasagna-download-list=lasagna.scripts.download_volume_list:main" in source
+    assert "lasagna-prefill=lasagna.scripts.prefill_omezarr:main" in source
+    assert "lasagna-prefill-list=lasagna.scripts.prefill_volume_list:main" in source
     assert "lasagna-bootstrap=lasagna.scripts.bootstrap_venv:main" in source
     assert "lasagna-preprocess=preprocess_cos_omezarr:cli_main" in source
     assert "las_manager=lasagna.manager.cli:main" in source

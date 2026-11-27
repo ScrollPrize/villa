@@ -1,5 +1,7 @@
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
+find_package(Boost REQUIRED)
+find_package(concurrentqueue CONFIG REQUIRED)
 
 # Publish the Python-independent headers without maintaining copies. In the build
 # tree vc_reader/native is a link to src/cpp, so a source file may include a
@@ -17,7 +19,17 @@ if(NOT EXISTS "${_vc_native_link}")
 endif()
 foreach(header IN LISTS _vc_native_headers)
     if(NOT IS_SYMLINK "${_vc_native_link}")  # no symbolic links (e.g. Windows without developer mode)
-        configure_file("src/cpp/${header}" "include/vc_reader/native/${header}" COPYONLY)
+        # Forward to the file in src/cpp: a copy would be a second file to #pragma once.
+        # Written only when it changes, and written as it is: file(CONFIGURE) would
+        # substitute an @name@ segment of the checkout path.
+        set(_vc_forward "#include \"${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/${header}\"\n")
+        set(_vc_forwarded "")
+        if(EXISTS "${_vc_native_link}/${header}")
+            file(READ "${_vc_native_link}/${header}" _vc_forwarded)
+        endif()
+        if(NOT _vc_forwarded STREQUAL _vc_forward)
+            file(WRITE "${_vc_native_link}/${header}" "${_vc_forward}")
+        endif()
     endif()
     get_filename_component(directory "${header}" DIRECTORY)
     install(FILES "src/cpp/${header}" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/${directory}")
@@ -30,7 +42,14 @@ target_include_directories(vc_reader_headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(vc_reader_headers INTERFACE Threads::Threads)
+target_link_libraries(vc_reader_headers INTERFACE Threads::Threads Boost::headers concurrentqueue::concurrentqueue nlohmann_json::nlohmann_json)
+if(MSVC)  # the Microsoft C runtime headers (MSVC, clang-cl) have no <unistd.h>
+    target_compile_definitions(vc_reader_headers INTERFACE _CRT_NONSTDC_NO_WARNINGS)  # close, getpid, ...
+    target_include_directories(vc_reader_headers INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/msvc>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/msvc>)
+    install(FILES src/cpp/msvc/unistd.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vc_reader/native/msvc")
+endif()
 
 add_library(vc_reader_thinning STATIC
     src/cpp/thinning/trace.cpp src/cpp/thinning/history.cpp src/cpp/thinning/distance.cpp src/cpp/thinning/skeleton.cpp

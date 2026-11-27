@@ -165,6 +165,12 @@ jobs:
             const pulls = await github(
               `/repos/${owner}/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}&per_page=10`,
             );
+            if (Array.isArray(pulls) && pulls.length === 0) {
+              // The rollover PR is merged by hand; Vercel may still report a
+              // deployment for its last commit after the PR closed.
+              console.log('::notice::No open rollover pull request matches this deployment; nothing to verify.');
+              process.exit(0);
+            }
             const associated = Array.isArray(pulls)
               && pulls.length === 1
               && pulls[0].head?.sha === deployment.sha

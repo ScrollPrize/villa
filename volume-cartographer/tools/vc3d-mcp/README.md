@@ -217,11 +217,15 @@ Inline screenshots cross the local bridge as base64. For large captures, pass
 
 Tool names use a `vc3d_` prefix and snake_case. The surface includes:
 
-- project creation, attached volumes, and the Open Data catalog;
+- project creation and Save As, attached volumes, normal grids, Lasagna
+  datasets and umbilici, store attachment and routing, and the Open Data
+  catalog;
 - viewer navigation, screenshots, render settings, and volume overlays;
 - segment loading, growth, editing, refinement, and review;
 - points, tags, winding annotations, seeding, and push/pull;
 - fiber annotation and Lasagna workflows;
+- importing tifxyz surfaces, fibers and point collections into the project's
+  object stores, and exporting objects as native files;
 - tracing, flattening, rendering, jobs, progress, and cancellation.
 
 The MCP client displays each installed tool with its current description and
@@ -233,6 +237,127 @@ reference.
 RPC errors surface as MCP tool errors containing the bridge's JSON
 `{"code", "message", "data"}` object. Coordinates are volume-space voxels
 unless a tool takes an explicit `space`.
+
+### Importing and exporting objects
+
+Surfaces, fibers and point collections live in the project's `.vcobj` stores.
+`vc3d_get_state` lists the store references (`stores`) and the store each
+kind is shown from and edited in (`routes`).
+
+Load a folder of tifxyz segments onto the open volume:
+
+```text
+vc3d_import_objects(kind="surface", path="/data/paths", bind={"scale": 1}, wait=True)
+vc3d_list_segments()                    # rows carry id (UUID), store, writable
+vc3d_activate_segment(segment_id=<uuid>)
+vc3d_screenshot()
+```
+
+- Import copies the geometry into the store; the source files are not
+  referenced afterwards, so a large folder needs room for its copy.
+- `bind.scale` is stored units per *current-volume* voxel. There is no default
+  scale: without `bind`, sources keep the coordinates they declare, and a
+  source that declares none stays unbound and is not shown on a volume.
+- Import writes to the store routed for the kind unless `store` names another
+  attached, writable store, and never changes routing. The job result's
+  `store` says where the objects went; route that store for the kind before
+  listing, activating or editing them through the kind's tools. Edits of an
+  existing object always go to the store that holds it.
+- The job result lists the new `uuids`, identities that were `existing`
+  already, and `problems`. A finished import succeeds even when some sources
+  were problems; check the lists. `vc3d_cancel_job` stops an import between
+  objects, keeping what was committed.
+
+Sources without canonical UUIDs (VC3D-era tifxyz directories named like
+`auto_grown_...`, older fibers and point collections) need `uuid_namespace`:
+one fresh UUID per dataset, recorded and reused for every later import of the
+same files, so a retry reports the objects as `existing` instead of
+duplicating them. There is no default namespace, because the names identities
+are derived from repeat across datasets. A legacy `.volpkg`:
+
+```text
+vc3d_create_project(path="/work/p.vcproj", volume="<volpkg>/volumes/<volume>")
+vc3d_open_volume(path="/work/p.vcproj")
+vc3d_import_objects(kind="surface", path="<volpkg>/paths",
+                    uuid_namespace="<one fresh UUID for this volpkg>",
+                    bind={"scale": 1}, wait=True)
+```
+
+Export one object by UUID: a segment id from `vc3d_list_segments`, or the
+`uuid` that `vc3d_fiber_list` and `vc3d_list_points` report next to the
+numeric fiber and collection ids. Create or edit, list to learn the UUID and
+store, then export:
+
+```text
+vc3d_fiber_list()                       # {fiberId, uuid, store, ...}
+vc3d_export_object(uuid=<uuid>, path="/data/out/fiber.json", wait=True)
+```
+
+Export searches only stores attached to the project (read-only ones
+included); when the UUID is in more than one, pass `store`. A surface becomes
+a tifxyz directory, a fiber one fiber JSON, a point collection a
+`vc_pointcollections` JSON holding it; the parent directory must exist.
+Pending edits of the object are saved first. Files are written in the stored
+frame with the object's `uuid` and `coordinates: {volume_uuid,
+scale_factor}`: stored XYZ divided by `scale_factor` is voxels of that volume,
+and unknown values stay null. Importing the files again (without `bind` or
+`uuid_namespace`) keeps UUID and coordinates; an explicit `bind` that
+conflicts with them is reported as a problem and imports nothing for that
+source.
+
+`vc3d_fiber_import` was removed. Use
+`vc3d_import_objects(kind="fiber", path=...)`: fibers without a UUID need
+`uuid_namespace` (the bridge no longer names them after their file), and a
+fiber file that declares no coordinates stays unbound unless `bind` is given.
+`vc3d_fiber_export` still writes every fiber of the fiber store as one
+collection file; `vc3d_export_object` writes one fiber.
+
+### Projects, stores and resources
+
+A project can start without a volume:
+`vc3d_create_project(path=...)` reports `"volume": null`, and segments are
+listed and rendered once a volume is attached (`vc3d_attach_volume`).
+`vc3d_get_state` reports the project's `stores`, `routes`, its detachable
+`project.entries`, the current volume's `umbilicus`, and the `author` edits
+are recorded under (`authorConfigured` says whether the username setting
+names one).
+
+Use another store for one kind of object:
+
+```text
+vc3d_attach_store(path="/data/team.vcobj")            # or vc3d_create_store(path=...)
+vc3d_route_store(kind="surface", store_id=<storeId>)  # one kind per call
+vc3d_route_store(kind="surface", store_id=None)       # stop showing surfaces
+vc3d_detach_store(store_id=<storeId>)                 # drop the reference
+```
+
+Attaching and creating never change routing, and each route call persists
+on its own. Routing chooses what is shown and where new objects go; edits of
+an existing object stay in the store holding it. Route, detach and Save As
+first save pending edits (point collections, the open segment, idle fiber
+sessions) and are refused with -32004 while growth or a line optimization
+runs or a save fails; nothing changes then.
+
+Attach and detach project resources:
+
+```text
+vc3d_attach_normal_grid(location="/data/normal_grids")
+vc3d_attach_lasagna_manifest(location="s3://.../x.lasagna.json", role="fiber", wait=True)
+vc3d_get_state()                                       # project.entries: {kind, location, scope}
+vc3d_detach_project_entry(location=<an entries location>)
+vc3d_save_project_as(path="/work/copy.vcproj")         # shares the stores
+```
+
+Detaching an entry or a store removes the project's reference only: the
+volume, grid, dataset or `.vcobj` and its objects stay where they are.
+Removing an umbilicus is different:
+
+```text
+vc3d_import_umbilicus(path="/data/umbilicus.json")    # -32602 with data.inferred when the frame must be confirmed
+vc3d_import_umbilicus(path="/data/umbilicus.json", units_per_voxel=1, replace=True)
+vc3d_remove_umbilicus()                                # retires it in the store, for every project using it
+vc3d_route_store(kind="umbilicus", store_id=None)      # hide umbilici in this project only
+```
 
 ### Waiting for jobs
 

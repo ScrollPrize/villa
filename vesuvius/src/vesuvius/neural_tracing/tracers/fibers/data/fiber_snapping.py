@@ -169,8 +169,8 @@ def snap_native(polylines, presence, scale, offset, cfg, device, output_step):
 
 
 def snap_store(source, destination, presence, scale, offset, cfg, device, output_step, limit, provenance):
-    """A new fiber store of ``source``'s fibers (UUIDs, names, families and meta kept) with the snapped geometry and
-    the snapping parameters in each fiber's meta['snapping']."""
+    """New geometry retaining UUIDs, names, families and application metadata, not source extension/artifact
+    payloads or relationships. The selected source and geometry-only policy are recorded with snapping parameters."""
     from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_volume, read_polylines, write_fibers
     volume = fiber_volume(source)
     fibers = read_polylines(source, volume=volume)
@@ -179,8 +179,9 @@ def snap_store(source, destination, presence, scale, offset, cfg, device, output
     snapped = snap_native([p for _, p in fibers], presence, scale, offset, cfg, device, output_step)
     snapping = dict(provenance, snapped_from=str(Path(source).resolve()))
     result = write_fibers(destination, [(dict(id=row['id'], name=row['name'], family=row['family'],
-                                              meta=dict(row['meta'], snapping=snapping)), xyz)
-                                        for (row, _), xyz in zip(fibers, snapped)], volume=volume)
+                                              meta=dict(row['meta'], snapping=snapping), reference=row['reference']), xyz)
+                                        for (row, _), xyz in zip(fibers, snapped)], volume=volume,
+                          metadata_policy='geometry_only')
     return dict(fibers=result['fibers'], points=result['points'])
 
 

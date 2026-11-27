@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Registration Pairs</title>
+<link rel="stylesheet" href="/common.css">
+<style>
+.pair { margin-bottom: 12px; }
+.pair > summary { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; cursor: pointer;
+                  list-style: none; }
+.pair > summary::-webkit-details-marker { display: none; }
+.pair > summary::before { content: "▸"; color: var(--muted); width: 1em; }
+.pair[open] > summary::before { content: "▾"; }
+.pair[open] > summary { margin-bottom: 8px; }
+.pair-head h3 { margin: 0; font-size: 15px; }
+.overview { display: flex; gap: 3px; flex-wrap: wrap; }
+.filter { display: flex; gap: 5px; align-items: center; }
+.chip { width: 16px; height: 16px; border-radius: 4px; border: 1px solid var(--line); }
+.next { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 8px;
+        border: 1px solid var(--line); border-radius: 6px; margin-bottom: 8px; }
+.next .you { font-weight: 600; }
+button.primary { background: var(--accent); color: white; border-color: var(--accent); padding: 5px 14px; }
+button.primary:disabled { background: var(--bg); color: var(--muted); border-color: var(--line); }
+table.steps td { vertical-align: top; padding: 5px 6px; }
+.badge { display: inline-block; min-width: 64px; text-align: center; border-radius: 10px; padding: 0 7px;
+         font-size: 11px; border: 1px solid var(--line); }
+.done { border-color: var(--good); color: var(--good); }
+.chip.done { background: var(--good); }
+.waiting { border-color: var(--select); color: var(--ink); background: color-mix(in srgb, var(--select) 30%, transparent); }
+.chip.waiting { background: var(--select); }
+.running { border-color: var(--accent); color: var(--accent); }
+.chip.running { background: var(--accent); }
+.failed { border-color: var(--bad); color: var(--bad); }
+.chip.failed { background: var(--bad); }
+.ready, .stale { border-style: dashed; }
+.blocked { color: var(--muted); }
+.who { font-size: 11px; color: var(--muted); }
+.err { color: var(--bad); }
+.settings { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 3px; }
+.settings input { width: 5.5em; }
+.settings input.unapplied { outline: 2px solid var(--select); background: color-mix(in srgb, var(--select) 25%, transparent); }
+.settings .unapplied-note { color: var(--bad); font-size: 12px; }
+.settings button.unapplied { border-color: var(--select); font-weight: 600; }
+.revisit { border: 1px solid var(--select); border-radius: 6px; padding: 5px 8px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<header><h1>Registration pairs</h1><a href="/fits">all fits →</a><span id="who" class="muted"></span>
+  <label class="filter"><input type="checkbox" id="hide-done"> hide finished pairs <span id="hidden" class="muted"></span></label>
+  <span id="error"></span></header>
+<main class="single"><div id="pairs"></div></main>
+<script src="/common.js"></script>
+<script>
+const PAGE = {"judge-holdout": "holdout", "final-review": "blind"};
+const STATE_TEXT = {done: "done", stale: "to run again", ready: "ready to run", running: "running",
+                    failed: "failed", waiting: "waiting for you", blocked: "not yet"};
+const ago = at => { if (!at) return ""; const s = (Date.now() - Date.parse(at)) / 1000;
+  return s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 129600 ? `${Math.round(s / 3600)} h ago` : at.slice(0, 10); };
+let editing = false;      // a settings field has focus: do not redraw under the cursor
+
+// What a viewer chose to see is kept in this browser only: the filter, and which pairs are
+// open. A pair nobody opened or closed is open until it is finished.
+const remembered = (key, fallback) => { try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; } };
+const remember = (key, value) => { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} };
+const finished = p => p.stages.every(s => s.state === "done");
+const summary = p => {
+  const running = p.stages.filter(s => s.state === "running").map(s => s.name);
+  const yours = p.stages.filter(s => s.state === "waiting").map(s => s.title);
+  const failed = p.stages.filter(s => s.state === "failed").map(s => s.name);
+  if (finished(p)) return p.decision ? `finished: publish ${p.decision.publish} of ${p.decision.fit}` : "finished";
+  if (failed.length) return `<span class="err">${failed.join(", ")} failed</span>`;
+  if (yours.length) return `<b>your turn: ${yours.join(", ")}</b>`;
+  if (running.length) return `running: ${running.join(", ")}`;
+  return "ready to continue";
+};
+$("hide-done").checked = remembered("hide-done", true);
+$("hide-done").onchange = () => { remember("hide-done", $("hide-done").checked); load(); };
+
+// The bar's minimum, beside the count rather than as its denominator.
+const needed = (have, target) => have >= target ? `${target} needed ✓` : `${target} needed, ${target - have} to go`;
+
+function detail(p, s) {
+  const link = `/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name] || ""}`;
+  if (s.name === "judge-holdout" && p.holdout) {
+    const left = p.holdout.stretches.reduce((a, x) => a + x.left, 0);
+    const answered = p.holdout.stretches.reduce((a, x) => a + x.answered, 0);
+    return `${p.holdout.lines_up} of ${answered} answered line up · ${needed(p.holdout.lines_up, p.target)} · ${left} left to answer` +
+      (s.state !== "blocked" ? ` · <a href="${link}">judge →</a>` : "");
+  }
+  if (s.name === "final-review") {
+    const d = p.decision;
+    if (d) return `publish ${d.publish} of ${d.fit}${d.override ? ` <span class="err">(override: misses ${d.override.bar_missed.join(", ")})</span>` : ""} · <a href="${link}">open →</a>`;
+    return s.state !== "blocked" ? `<a href="${link}">blind round and decision →</a>` : "after the blind round is drawn";
+  }
+  return s.finished && s.state !== "running" ? `<span class="muted">last run ${ago(s.finished)}</span>` : "";
+}
+
+// Values typed but not applied yet, by pair/stage/key; kept across the page's refreshes.
+const pending = {};
+const pendingKey = (pair, stage, key) => `${pair}/${stage}/${key}`;
+
+function settings(p, s) {
+  if (!s.settings.length) return "";
+  let dirty = false;
+  const fields = s.settings.map(x => {
+    const typed = pending[pendingKey(p.name, s.name, x.key)];
+    const changed = typed !== undefined && Number(typed) !== x.value;
+    dirty ||= changed;
+    return `<label>${x.label} <input type="number" min="${x.min}" data-stage="${s.name}" data-key="${x.key}"
+      data-applied="${x.value}" value="${changed ? typed : x.value}" class="${changed ? "unapplied" : ""}"
+      title="${x.min > 1 ? `can only grow: ${x.min} now` : ""}"></label>`;
+  }).join("");
+  return `<div class="settings">${fields}
+    <button data-apply="${s.name}" class="${dirty ? "unapplied" : ""}">Apply</button>
+    <span class="unapplied-note" ${dirty ? "" : "hidden"}>not applied</span></div>`;
+}
+
+async function load() {
+  if (editing) return;
+  const state = await call("/api/pairs");
+  $("who").textContent = `reviewing as ${state.reviewer.handle}`;
+  const shown = $("hide-done").checked ? state.pairs.filter(p => !finished(p)) : state.pairs;
+  const hidden = state.pairs.length - shown.length;
+  $("hidden").textContent = hidden ? `(${hidden} hidden)` : "";
+  $("pairs").innerHTML = shown.map(p => {
+    const runnable = p.stages.filter(s => !s.human && (s.state === "ready" || s.state === "stale")).map(s => s.name);
+    const running = p.stages.filter(s => s.state === "running").map(s => s.name);
+    const yours = p.stages.filter(s => s.state === "waiting");
+    const failed = p.stages.filter(s => s.state === "failed");
+    const open = remembered(`open:${p.name}`, !finished(p));
+    return `<details class="pair section" id="${escapeHtml(p.name)}" data-name="${escapeHtml(p.name)}" ${open ? "open" : ""}>
+      <summary class="pair-head"><h3>${escapeHtml(p.name)}</h3>
+        <div class="overview">${p.stages.map(s => `<div class="chip ${s.state}" title="${s.name}: ${STATE_TEXT[s.state]}"></div>`).join("")}</div>
+        <span>${summary(p)}</span><span class="muted">${escapeHtml(p.pair)}</span></summary>
+      ${(p.revisit || []).map(text => `<div class="revisit"><b>Open question</b> · ${escapeHtml(text)}</div>`).join("")}
+      <div class="next">
+        <button class="primary" data-act="continue" ${runnable.length ? "" : "disabled"}>Continue</button>
+        <span>${runnable.length ? `starts: ${runnable.join(", ")}` :
+                running.length ? `running: ${running.join(", ")}` :
+                failed.length ? `<span class="err">stopped: ${failed.map(s => s.name).join(", ")} failed</span>` :
+                "nothing to run"}</span>
+        ${yours.map(s => `<span class="you">· your turn: <a href="/pairs/${encodeURIComponent(p.name)}/${PAGE[s.name]}">${s.title} →</a></span>`).join("")}
+      </div>
+      <table class="steps"><tbody>${p.stages.map(s => `<tr>
+        <td><span class="badge ${s.state}">${STATE_TEXT[s.state]}</span></td>
+        <td><b>${s.title}</b><div class="who">${s.human ? "you" : "automatic"} · ${s.name}</div></td>
+        <td>${detail(p, s)}${s.error ? `<div class="err">${escapeHtml(s.error)}</div>` : ""}${settings(p, s)}</td>
+        <td>${s.human ? "" : `<button data-redo="${s.name}" ${["blocked", "running"].includes(s.state) ? "disabled" : ""}
+             title="Mark this step and the ones after it to run again">Redo</button>`}</td>
+      </tr>`).join("")}</tbody></table>
+    </details>`;
+  }).join("") || `<p class="muted">${hidden ? "Every pair is finished." : "No pairs with a pipeline under this folder."}</p>`;
+
+  for (const box of document.querySelectorAll(".pair")) {
+    box.ontoggle = () => remember(`open:${box.dataset.name}`, box.open);
+    const api = `/api/pairs/${encodeURIComponent(box.dataset.name)}`;
+    const act = async (path, body) => {
+      try { await call(`${api}/${path}`, body); $("error").textContent = ""; }
+      catch (e) { $("error").textContent = e.message; }
+      editing = false; await load();
+    };
+    box.querySelector('[data-act="continue"]').onclick = () => act("run", {});
+    for (const b of box.querySelectorAll("[data-redo]")) b.onclick = () => {
+      if (confirm(`Run "${b.dataset.redo}" and the steps after it again?`)) act("redo", {stage: b.dataset.redo});
+    };
+    for (const b of box.querySelectorAll("[data-apply]")) b.onclick = () => {
+      const values = {};
+      for (const input of box.querySelectorAll(`input[data-stage="${b.dataset.apply}"]`)) values[input.dataset.key] = Number(input.value);
+      for (const key of Object.keys(values)) delete pending[pendingKey(box.dataset.name, b.dataset.apply, key)];
+      act("params", {stage: b.dataset.apply, values});
+    };
+    for (const input of box.querySelectorAll(".settings input")) {
+      input.oninput = () => {
+        const key = pendingKey(box.dataset.name, input.dataset.stage, input.dataset.key);
+        const changed = input.value !== "" && Number(input.value) !== Number(input.dataset.applied);
+        if (changed) pending[key] = input.value; else delete pending[key];
+        input.classList.toggle("unapplied", changed);
+        const row = input.closest(".settings");
+        const dirty = [...row.querySelectorAll("input")].some(i => i.classList.contains("unapplied"));
+        row.querySelector("button").classList.toggle("unapplied", dirty);
+        row.querySelector(".unapplied-note").hidden = !dirty;
+      };
+    }
+    for (const input of box.querySelectorAll("input")) {
+      input.onfocus = () => { editing = true; };
+      input.onblur = () => { setTimeout(() => { if (!box.contains(document.activeElement) || document.activeElement.tagName !== "INPUT") editing = false; }, 200); };
+    }
+  }
+}
+load().catch(e => { $("error").textContent = e.message; });
+setInterval(() => load().catch(() => {}), 5000);
+</script>
+</body>
+</html>

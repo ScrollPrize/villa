@@ -23,6 +23,7 @@ _this package is in active development_
 
 | Name                          | Script                             | Description                                                                                                                                                                                               |
 | ----------------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vc_wgraph` | `wgraph` | [imports fibers, extracts constraints and runs reusable winding-graph stages](docs/wgraph.md) with named profiles or JSON settings and input/output overrides |
 | `vesuvius.predict`            | `models.run.inference`             | outputs logits from a pretrained nnUNet-v2 model or one trained within the Vesuvius training framework; currently only works on Zarr data and can be fully distributed with `--num_parts` and `--part_id` |
 | `vesuvius.blend_logits`       | `models.run.blending`              | blends the logits from `vesuvius.predict` using Gaussian blending                                                                                                                                         |
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
@@ -32,7 +33,6 @@ _this package is in active development_
 | `vesuvius.voxelize_obj`       | `label_processing.voxelize_objs`     | voxelizes tifxyz surfaces with bicubic interpolation into OME-Zarr pyramids or TIFF stacks |
 | `vesuvius.refine_labels`      | `label_processing.refine_labels`  | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
 | `vesuvius.train`              | `models.training.train`            | main entry point for training models                                                                                                                                                                      |
-| `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
 | `vesuvius.blend_and_finalize` | `models.run.blending`              | fused `vesuvius.blend_logits` + `vesuvius.finalize_outputs` in a single pass |
 | `vesuvius.find_patches`       | `models.preprocessing.patches.cli` | scans a Zarr dataset and writes the valid-patch cache used by training |
 
@@ -94,10 +94,22 @@ To get started, we recommend these notebooks that jump right in:
 
 ## Installation
 
-`vesuvius` can be installed with `pip`.
+`vesuvius` on `main` requires Python 3.14 and reads data through `vc-reader`,
+which is built from this monorepo (it is not on PyPI yet). The first two notebooks
+above need only `vc-reader` (CPU-only build):
 ```sh
-$ pip install vesuvius
+$ pip install "vc-reader @ git+https://github.com/ScrollPrize/villa.git#subdirectory=vc_reader" \
+    --config-settings=cmake.define.VC_READER_ENABLE_CUDA=OFF
 ```
+`vc-reader` needs its native libraries first (Ubuntu/Debian: `libblosc-dev libblosc2-dev
+libboost-dev libconcurrentqueue-dev libzstd-dev liblz4-dev libsqlite3-dev nlohmann-json3-dev
+libcurl4-openssl-dev zlib1g-dev libtiff-dev libpng-dev libjpeg-dev pkg-config`). With
+`vc-reader` installed, install `vesuvius` from the monorepo:
+```sh
+$ pip install "vesuvius[volume-only] @ git+https://github.com/ScrollPrize/villa.git#subdirectory=vesuvius"
+```
+The `vesuvius` release on PyPI (0.2.x) predates the `vc-reader` migration and has a
+different API.
 
 For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
 `uv sync --all-extras` build the local `volume-cartographer` and `vc-object-store`

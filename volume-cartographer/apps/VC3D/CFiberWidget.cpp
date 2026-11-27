@@ -3,6 +3,7 @@
 #include "FiberLengthDisplay.hpp"
 #include "FiberNameDisplay.hpp"
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationCsplineOnly.hpp"
 
 #include <QAbstractItemView>
 #include <QAction>
@@ -162,10 +163,10 @@ QString metricTooltip(const CFiberWidget::FiberEntry::AlignmentMetrics& metric,
                       bool showMetrics)
 {
     if (!showMetrics) {
-        return QObject::tr("Enable Calc metrics to sample Lasagna normal alignment errors.");
+        return QObject::tr("Enable Calc metrics to sample alignment errors using the annotation normal source.");
     }
     if (metric.pending) {
-        return QObject::tr("Sampling Lasagna normals.");
+        return QObject::tr("Sampling annotation normals.");
     }
     if (!metric.error.empty()) {
         return QString::fromStdString(metric.error);
@@ -372,8 +373,22 @@ void CFiberWidget::setupUi()
     _calcMetricsCheckBox = new QCheckBox(tr("Calc metrics"), mainWidget);
     _calcMetricsCheckBox->setObjectName(QStringLiteral("fiberCalcMetricsCheckBox"));
     _calcMetricsCheckBox->setToolTip(
-        tr("Sample Lasagna normal alignment errors for the listed fibers."));
+        tr("Sample normal alignment errors for the listed fibers using the annotation normal source."));
     layout->addWidget(_calcMetricsCheckBox);
+
+    auto* csplineOnlyCheckBox = new QCheckBox(tr("Cspline only (no Lasagna / predictions)"), mainWidget);
+    csplineOnlyCheckBox->setObjectName(QStringLiteral("fiberCsplineOnlyCheckBox"));
+    csplineOnlyCheckBox->setToolTip(
+        tr("Line annotation interpolates each span it solves with a cubic spline "
+           "through the control points and draws straight rays past the end points. "
+           "Spans of a reopened fiber keep their geometry until they are edited. No "
+           "Lasagna dataset, fiber predictions or fiber-follow model is opened. Applies "
+           "from the next solve; set it before opening Line Annotation for a clean session."));
+    csplineOnlyCheckBox->setChecked(vc3d::line_annotation::csplineOnlyAnnotationEnabled());
+    layout->addWidget(csplineOnlyCheckBox);
+    connect(csplineOnlyCheckBox, &QCheckBox::toggled, this, [](bool checked) {
+        vc3d::line_annotation::setCsplineOnlyAnnotationEnabled(checked);
+    });
     connect(_calcMetricsCheckBox, &QCheckBox::toggled, this, [this](bool checked) {
         refreshMetricDisplays();
         if (checked) {

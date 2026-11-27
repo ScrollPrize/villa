@@ -20,6 +20,7 @@ add_library(vc_core
         src/Volume.cpp
         src/VolumePkg.cpp
         src/ProjectDocument.cpp
+        src/ProjectCreation.cpp
         src/SurfaceQuerySet.cpp
         src/Logging.cpp
         src/CrashHandler.cpp

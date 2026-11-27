@@ -695,7 +695,10 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--devices` | Multi-GPU selection: `all` visible GPUs or a comma-separated subset such as `cuda:0,cuda:2`. Cannot be combined with `--device`. |
 | `--prefetch-workers` | CPU/Zarr tile readers. `0` selects a bounded automatic count. |
 | `--slots-per-gpu` | Fixed shared-memory input/result pipeline slots per GPU (default 2). |
-| `--download-workers` | Parallel automatic S3 chunk transfers (default 64); independent of inference and pyramid workers. |
+| `--input-disk-cache-dir` | vc_reader disk cache for a remote `--input`; chunks are kept decoded there across runs. |
+| `--input-disk-cache-gib` | Bound on that cache in GiB; least recently used chunks are removed past it. |
+| `--input-connections` | Parallel remote input reads (default 64); independent of inference and pyramid workers. |
+| `--read-ahead-tiles` | Tiles of a remote input read ahead into the caches (default 10000). |
 | `--chunk-z` | Zarr chunk size along Z in the output (default 32). |
 | `--chunk-yx` | Zarr chunk size along Y and X in the output (default 32). |
 

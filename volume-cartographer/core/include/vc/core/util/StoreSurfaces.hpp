@@ -26,8 +26,8 @@ double parseVoxelScale(const std::string& value);
 
 // Surface objects for command-line tools as QuadSurfaces: `--store PATH` with
 // `--surface UUID` inputs and new surface outputs that record their
-// provenance. The store's ToolObjects keeps what was read, decides frames and
-// pins, and waits for the hub (objects().finish()).
+// provenance. The store's ToolObjects keeps what was read and decides frames
+// and pins; objects().finish() drains its writes.
 class StoreSurfaces {
 public:
     StoreSurfaces(const std::filesystem::path& store, const std::string& tool);
@@ -52,9 +52,10 @@ public:
                        const std::vector<std::string>& sources = {}, const std::vector<std::string>& tags = {},
                        const std::optional<vc::objects::VolumeVoxels>& volume = std::nullopt);
     // Publish the edited vertices of a surface this tool loaded, checked against
-    // the revision it loaded; relationships are kept as recorded. The grid must
-    // keep its size. Returns the new geometry revision.
-    std::string update(const std::string& uuid, QuadSurface& surface);
+    // the version it loaded; relationships are kept as recorded. The grid must
+    // keep its size. Returns the object's numbered version afterwards (the
+    // loaded one when nothing changed).
+    int64_t update(const std::string& uuid, QuadSurface& surface);
 
     vc::objects::ToolObjects& objects() { return objects_; }
 

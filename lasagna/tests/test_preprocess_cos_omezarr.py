@@ -27,12 +27,19 @@ train_stub = types.ModuleType("train_unet_3d")
 train_stub.build_model = None
 sys.modules.setdefault("train_unet_3d", train_stub)
 
+
+def _train_module():
+	"""The module predict3d imports build_model from: the stub, or the real one when
+	another test imported train_unet_3d first (the suite order must not matter)."""
+	return sys.modules["train_unet_3d"]
+
 from preprocess_cos_omezarr import (
 	LasagnaCosPredict3DAdapter,
 	_grad_mag_factor_from_input_sd,
 	cli_main,
 	run_preprocess_3d,
 )
+from input_level import InputLevel
 from tiled_predict3d import (
 	DEFAULT_FLUSH_WORKERS,
 	DEFAULT_ACCUMULATOR_WORKERS,
@@ -294,13 +301,12 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			for prefetch in (1, 2):
 				adapter = _IdentityProductAdapter(product)
 				output = Output()
-				with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-					run_tiled_inference_3d(
-						adapter.load_model(device=torch.device("cpu")), open_zarr(path),
-						model_adapter=adapter, output_adapter=output,
-						input_zarr_path=str(path),
-						prefetch_tiles_per_gpu=prefetch, **common,
-					)
+				run_tiled_inference_3d(
+					adapter.load_model(device=torch.device("cpu")), open_zarr(path),
+					model_adapter=adapter, output_adapter=output,
+						
+					prefetch_tiles_per_gpu=prefetch, **common,
+				)
 				outputs.append(output.chunks)
 			self.assertEqual(set(outputs[0]), set(outputs[1]))
 			for origin in outputs[0]:
@@ -367,18 +373,6 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				resolve_inference_devices(auto_mps=True, cuda_available=True, cuda_count=2),
 				(torch.device("cuda:0"),),
 			)
-
-	def test_shared_auto_download_forwards_workers_to_input_and_pred_dt(self):
-		with mock.patch.object(shared_predict3d, "_download_one_path") as download_one:
-			shared_predict3d._auto_download(
-				"input.zarr/1", (1, 2, 3, 4, 5, 6), "pred.zarr/1", download_workers=321,
-			)
-		self.assertEqual(download_one.call_args_list, [
-			mock.call("input.zarr/1", (1, 2, 3, 4, 5, 6), 321),
-			mock.call("pred.zarr/1", (1, 2, 3, 4, 5, 6), 321),
-		])
-		with self.assertRaisesRegex(ValueError, "positive integer"):
-			shared_predict3d._auto_download("input.zarr", None, download_workers=0)
 
 	def test_shared_tile_events_are_lazy_and_mark_row_flushes(self):
 		events = shared_predict3d._iter_canonical_tile_events((0, 4), (0, 4), (0, 4), 8)
@@ -576,22 +570,23 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			def cancel(self):
 				return False
 
-		class LiveCache:
-			lookahead_tiles = 10
+		class RemoteInputLevel:
+			shape = (16, 8, 8)
+			remote = True
+			read_ahead_tiles = 10
 
-			def __init__(self, level_path):
+			def __init__(self):
 				self.requests = []
-				self.source = type("Source", (), {"level_path": Path(level_path)})()
 
 			def request_region(self, bounds):
 				self.requests.append(bounds)
 				return DelayedCacheTask(1 + len(self.requests) % 3)
 
-			def region_has_remote_chunks(self, bounds):
+			def region_has_chunks(self, bounds):
 				return True
 
 			def snapshot(self):
-				return {}
+				return {"remote": True}
 
 		common = dict(
 			crop_slices=(0, 16, 0, 8, 0, 8), device=torch.device("cpu"),
@@ -600,35 +595,32 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			overlap=0, border=0, product_accumulator_dtype="float16",
 		)
 		with tempfile.TemporaryDirectory() as td:
-			live_input_path = Path(td) / "live-input.zarr"
-			live_cache = LiveCache(live_input_path)
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				serial_adapter = _IdentityProductAdapter(product)
+			remote_input = RemoteInputLevel()
+			serial_adapter = _IdentityProductAdapter(product)
+			run_tiled_inference_3d(
+				serial_adapter.load_model(device=torch.device("cpu")), volume,
+				model_adapter=serial_adapter, output_adapter=serial_output,
+				tmp_dir=td, **common,
+			)
+			for label, selected_input in (("local", None), ("live", remote_input)):
+				parallel_root = Path(td) / f"parallel-output-{label}"
+				parallel_output = SpawnFileOutputAdapter(str(parallel_root), delay_s=0.01)
+				parallel_adapter = SpawnIdentityAdapter(product, delay_zero_origin=True)
 				run_tiled_inference_3d(
-					serial_adapter.load_model(device=torch.device("cpu")), volume,
-					model_adapter=serial_adapter, output_adapter=serial_output,
-					tmp_dir=td, **common,
+					None, volume, model_adapter=parallel_adapter,
+					output_adapter=parallel_output, tmp_dir=td,
+					devices=(torch.device("cpu"), torch.device("cpu")),
+					slots_per_gpu=1, prefetch_workers=2, prefetch_tiles_per_gpu=1,
+					accumulator_workers=2, flush_workers=2,
+					input_level=selected_input, **common,
 				)
-				for label, selected_live_cache in (("local", None), ("live", live_cache)):
-					parallel_root = Path(td) / f"parallel-output-{label}"
-					parallel_output = SpawnFileOutputAdapter(str(parallel_root), delay_s=0.01)
-					parallel_adapter = SpawnIdentityAdapter(product, delay_zero_origin=True)
-					run_tiled_inference_3d(
-						None, volume, model_adapter=parallel_adapter,
-						output_adapter=parallel_output, tmp_dir=td,
-						devices=(torch.device("cpu"), torch.device("cpu")),
-						slots_per_gpu=1, prefetch_workers=2, prefetch_tiles_per_gpu=1,
-						accumulator_workers=2, flush_workers=2,
-						live_cache=selected_live_cache, **common,
-						input_zarr_path=str(live_input_path),
-					)
-					self.assertEqual(
-						len(list(parallel_root.glob("chunk_*.npy"))), len(serial_output.chunks),
-					)
-					for origin, expected in serial_output.chunks.items():
-						path = parallel_root / ("chunk_" + "_".join(str(v) for v in origin) + ".npy")
-						np.testing.assert_array_equal(expected, np.load(path))
-		self.assertEqual(len(live_cache.requests), 16)
+				self.assertEqual(
+					len(list(parallel_root.glob("chunk_*.npy"))), len(serial_output.chunks),
+				)
+				for origin, expected in serial_output.chunks.items():
+					path = parallel_root / ("chunk_" + "_".join(str(v) for v in origin) + ".npy")
+					np.testing.assert_array_equal(expected, np.load(path))
+		self.assertEqual(len(remote_input.requests), 16)
 
 	def test_shared_runner_composes_native_and_requested_output_stride(self):
 		product = OutputProductSpec(
@@ -650,8 +642,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		adapter = _NativeStrideProductAdapter(product, native_output_stride=4)
 		output = Output()
 		with tempfile.TemporaryDirectory() as td:
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True), \
-					mock.patch(f"{run_tiled_inference_3d.__module__}._accumulator_native_module", return_value=None):
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._accumulator_native_module", return_value=None):
 				run_tiled_inference_3d(
 					adapter.load_model(device=torch.device("cpu")), volume,
 					crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"),
@@ -711,18 +702,17 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			for devices in ((torch.device("cpu"),), (torch.device("cpu"), torch.device("cpu"))):
 				output = Output()
 				adapter = SpawnIdentityAdapter(product)
-				with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-					run_tiled_inference_3d(
-						adapter.load_model(device=torch.device("cpu")) if len(devices) == 1 else None,
-						open_zarr(path), crop_slices=(0, 8, 0, 4, 0, 4),
-						device=torch.device("cpu"), model_adapter=adapter, output_adapter=output,
-						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
-						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
-						overlap=0, border=0, tmp_dir=td,
-						devices=devices, slots_per_gpu=1,
-						input_zarr_path=str(path),
-						prefetch_tiles_per_gpu=2,
-					)
+				run_tiled_inference_3d(
+					adapter.load_model(device=torch.device("cpu")) if len(devices) == 1 else None,
+					open_zarr(path), crop_slices=(0, 8, 0, 4, 0, 4),
+					device=torch.device("cpu"), model_adapter=adapter, output_adapter=output,
+					products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+					full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+					overlap=0, border=0, tmp_dir=td,
+					devices=devices, slots_per_gpu=1,
+						
+					prefetch_tiles_per_gpu=2,
+				)
 				outputs.append(output.chunks)
 			self.assertEqual(set(outputs[0]), set(outputs[1]))
 			for origin in outputs[0]:
@@ -743,18 +733,17 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 		with tempfile.TemporaryDirectory() as td:
 			stream = io.StringIO()
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				with mock.patch("sys.stdout", stream):
-					run_tiled_inference_3d(
-						None, np.ones((8, 4, 4), dtype=np.uint8),
-						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
-						model_adapter=SpawnIdentityAdapter(product), output_adapter=Output(),
-						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
-						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
-						overlap=0, border=0, tmp_dir=td,
-						devices=(torch.device("cpu"), torch.device("cpu")),
-						slots_per_gpu=1, prefetch_workers=2, profile_pipeline=True,
-					)
+			with mock.patch("sys.stdout", stream):
+				run_tiled_inference_3d(
+					None, np.ones((8, 4, 4), dtype=np.uint8),
+					crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+					model_adapter=SpawnIdentityAdapter(product), output_adapter=Output(),
+					products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+					full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+					overlap=0, border=0, tmp_dir=td,
+					devices=(torch.device("cpu"), torch.device("cpu")),
+					slots_per_gpu=1, prefetch_workers=2, profile_pipeline=True,
+				)
 			text = stream.getvalue()
 		self.assertIn("[predict3d:profile] loader reads=2", text)
 		self.assertIn("effective_request_concurrency=", text)
@@ -775,18 +764,17 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				raise AssertionError("a crashed worker must not produce output")
 
 		with tempfile.TemporaryDirectory() as td:
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				with self.assertRaisesRegex(RuntimeError, "exited unexpectedly with code 23"):
-					run_tiled_inference_3d(
-						None, np.ones((4, 4, 4), dtype=np.uint8),
-						crop_slices=(0, 4, 0, 4, 0, 4), device=torch.device("cpu"),
-						model_adapter=SpawnHardExitAdapter(product), output_adapter=Output(),
-						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 4, 4, 4)},
-						full_output_shapes_zyx={"identity": (4, 4, 4)}, tile_size=4,
-						overlap=0, border=0, tmp_dir=td,
-						devices=(torch.device("cpu"), torch.device("cpu")),
-						slots_per_gpu=1, prefetch_workers=1,
-					)
+			with self.assertRaisesRegex(RuntimeError, "exited unexpectedly with code 23"):
+				run_tiled_inference_3d(
+					None, np.ones((4, 4, 4), dtype=np.uint8),
+					crop_slices=(0, 4, 0, 4, 0, 4), device=torch.device("cpu"),
+					model_adapter=SpawnHardExitAdapter(product), output_adapter=Output(),
+					products=(product,), output_regions_zyx={"identity": (0, 0, 0, 4, 4, 4)},
+					full_output_shapes_zyx={"identity": (4, 4, 4)}, tile_size=4,
+					overlap=0, border=0, tmp_dir=td,
+					devices=(torch.device("cpu"), torch.device("cpu")),
+					slots_per_gpu=1, prefetch_workers=1,
+				)
 
 	def test_predict3d_has_no_legacy_inference_entry_point(self):
 		self.assertFalse(hasattr(shared_predict3d, "_infer_tiled_3d"))
@@ -1065,7 +1053,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		gpu_pause_stub = types.ModuleType("gpu_pause")
 		gpu_pause_stub.gpu_pause_context = lambda: None
 		with mock.patch.dict(sys.modules, {"gpu_pause": gpu_pause_stub}):
-			with mock.patch.object(train_stub, "build_model", side_effect=_StopAfterManifest):
+			with mock.patch.object(_train_module(), "build_model", side_effect=_StopAfterManifest):
 				with self.assertRaises(_StopAfterManifest):
 					run_preprocess_3d(
 						input_path=str(input_path),
@@ -1120,7 +1108,6 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					raise PermissionError("test must not change process OOM policy")
 				return real_open(path, *positional, **keywords)
 			with mock.patch("builtins.open", side_effect=deny_proc_adjustment), \
-				 mock.patch("preprocess_cos_omezarr._shared_auto_download") as auto_download, \
 				 mock.patch("preprocess_cos_omezarr.run_preprocess_3d", side_effect=fake_run) as run:
 				self.assertEqual(cli_main(args), 0)
 			manifest = Path(args[args.index("--output") + 1])
@@ -1129,7 +1116,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertEqual(provenance["checkpoint"]["name"], checkpoint.name)
 			self.assertEqual(len(provenance["checkpoint"]["sha256"]), 64)
 			self.assertTrue(provenance["artifacts"])
-			return run, auto_download
+			return run
 
 	def test_predict3d_cli_dispatch_preserves_legacy_args(self):
 		args = [
@@ -1156,11 +1143,9 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--base-scale", "1",
 			"--levels", "3",
 			"--ome-chunk", "32",
-			"--no-download",
 		]
-		run, auto_download = self._dispatch_predict3d_fixture(args)
+		run = self._dispatch_predict3d_fixture(args)
 
-		auto_download.assert_not_called()
 		run.assert_called_once()
 		kwargs = run.call_args.kwargs
 		self.assertEqual(kwargs["input_path"], "in.zarr")
@@ -1175,7 +1160,9 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["prefetch_tiles_per_gpu"], 4)
 		self.assertEqual(kwargs["input_cache_gib"], 4.0)
 		self.assertEqual(kwargs["input_io_threads"], 16)
-		self.assertEqual(kwargs["download_workers"], 64)
+		self.assertEqual(kwargs["input_connections"], 64)
+		self.assertIsNone(kwargs["input_disk_cache_dir"])
+		self.assertIsNone(kwargs["input_disk_cache_gib"])
 		self.assertEqual(kwargs["crop_xyzwhd"], (1, 2, 3, 4, 5, 6))
 		self.assertEqual(kwargs["tile_size"], 64)
 		self.assertEqual(kwargs["overlap"], 8)
@@ -1193,25 +1180,25 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["base_scale"], 1)
 		self.assertEqual(kwargs["n_levels"], 3)
 		self.assertEqual(kwargs["ome_chunk"], 32)
-		self.assertEqual(kwargs["ome_compressor"], "blosc-zstd")
+		self.assertIsNone(kwargs["ome_compressor"])
 
 	def test_predict3d_cli_forwards_shared_multi_gpu_pipeline_options(self):
 		args = [
 			"predict3d", "--input", "in.zarr", "--output", "out.lasagna.json",
 			"--unet-checkpoint", "model.pt", "--tile-size", "64",
 			"--devices", "cuda:0,cuda:2", "--prefetch-workers", "6",
-			"--slots-per-gpu", "3", "--no-download",
+			"--slots-per-gpu", "3",
 			"--flush-workers", "6",
 			"--accumulator-workers", "9",
 			"--prefetch-tiles-per-gpu", "7",
 			"--input-cache-gib", "2.5", "--input-io-threads", "11",
 			"--profile-pipeline",
 			"--product-accumulator-dtype", "float32",
-			"--download-workers", "123",
+			"--input-connections", "123", "--input-disk-cache-dir", "cache",
+			"--input-disk-cache-gib", "1.5", "--read-ahead-tiles", "77",
 			"--ome-compressor", "none",
 		]
-		run, auto_download = self._dispatch_predict3d_fixture(args)
-		auto_download.assert_not_called()
+		run = self._dispatch_predict3d_fixture(args)
 		kwargs = run.call_args.kwargs
 		self.assertIsNone(kwargs["device"])
 		self.assertEqual(kwargs["devices"], "cuda:0,cuda:2")
@@ -1224,7 +1211,11 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["input_io_threads"], 11)
 		self.assertTrue(kwargs["profile_pipeline"])
 		self.assertEqual(kwargs["product_accumulator_dtype"], "float32")
-		self.assertEqual(kwargs["download_workers"], 123)
+		self.assertEqual(kwargs["input_connections"], 123)
+		self.assertEqual(kwargs["input_disk_cache_dir"], "cache")
+		self.assertEqual(kwargs["input_disk_cache_gib"], 1.5)
+		self.assertEqual(kwargs["read_ahead_tiles"], 77)
+		self.assertIsNotNone(kwargs["input_level"])
 		self.assertEqual(kwargs["ome_compressor"], "none")
 
 	def test_predict3d_overall_eta_uses_processed_counts_for_dense_work(self):
@@ -1294,7 +1285,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 			with mock.patch.dict(sys.modules, {"gpu_pause": gpu_pause_stub}):
 				with mock.patch.object(
-					train_stub,
+					_train_module(),
 					"build_model",
 					return_value=(_ConstantPredict3dModel(), None, None, False),
 				):
@@ -1675,16 +1666,15 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			marker = str(Path(td) / "next-band-started")
 			adapter = SpawnIdentityAdapter(product, marker_on_second_call=marker)
 			output = SpawnFileOutputAdapter(td, wait_for_marker=marker)
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				run_tiled_inference_3d(
-					adapter.load_model(device=torch.device("cpu")), np.ones((12, 4, 4), dtype=np.uint8),
-					crop_slices=(0, 12, 0, 4, 0, 4), device=torch.device("cpu"),
-					model_adapter=adapter, output_adapter=output, products=(product,),
-					output_regions_zyx={"identity": (0, 0, 0, 12, 4, 4)},
-					full_output_shapes_zyx={"identity": (12, 4, 4)},
-					output_scaledown_base=1, tile_size=4, overlap=0, border=0,
-					tmp_dir=td, progress=progress, flush_workers=1,
-				)
+			run_tiled_inference_3d(
+				adapter.load_model(device=torch.device("cpu")), np.ones((12, 4, 4), dtype=np.uint8),
+				crop_slices=(0, 12, 0, 4, 0, 4), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=output, products=(product,),
+				output_regions_zyx={"identity": (0, 0, 0, 12, 4, 4)},
+				full_output_shapes_zyx={"identity": (12, 4, 4)},
+				output_scaledown_base=1, tile_size=4, overlap=0, border=0,
+				tmp_dir=td, progress=progress, flush_workers=1,
+			)
 			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
 			self.assertEqual(
 				{path.stem.removeprefix("chunk_") for path in Path(td).glob("chunk_*.npy")},
@@ -1701,16 +1691,15 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		)
 		with tempfile.TemporaryDirectory() as td:
 			adapter = SpawnIdentityAdapter(product)
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				with self.assertRaisesRegex(RuntimeError, "forced process flush failure"):
-					run_tiled_inference_3d(
-						adapter.load_model(device=torch.device("cpu")), np.ones((8, 4, 4), dtype=np.uint8),
-						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
-						model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, fail=True),
-						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
-						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
-						overlap=0, border=0, tmp_dir=td, flush_workers=1,
-					)
+			with self.assertRaisesRegex(RuntimeError, "forced process flush failure"):
+				run_tiled_inference_3d(
+					adapter.load_model(device=torch.device("cpu")), np.ones((8, 4, 4), dtype=np.uint8),
+					crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, fail=True),
+					products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+					full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+					overlap=0, border=0, tmp_dir=td, flush_workers=1,
+				)
 			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
 
 	def test_shared_runner_detects_hard_process_flush_exit_and_cleans_mmaps(self):
@@ -1720,16 +1709,15 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		)
 		with tempfile.TemporaryDirectory() as td:
 			adapter = SpawnIdentityAdapter(product)
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				with self.assertRaisesRegex(RuntimeError, "flush worker 0 exited unexpectedly with code 24"):
-					run_tiled_inference_3d(
-						adapter.load_model(device=torch.device("cpu")), np.ones((8, 4, 4), dtype=np.uint8),
-						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
-						model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, hard_exit=True),
-						products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
-						full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
-						overlap=0, border=0, tmp_dir=td, flush_workers=1,
-					)
+			with self.assertRaisesRegex(RuntimeError, "flush worker 0 exited unexpectedly with code 24"):
+				run_tiled_inference_3d(
+					adapter.load_model(device=torch.device("cpu")), np.ones((8, 4, 4), dtype=np.uint8),
+					crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, hard_exit=True),
+					products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+					full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+					overlap=0, border=0, tmp_dir=td, flush_workers=1,
+				)
 			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
 
 	def test_shared_runner_flushes_distinct_chunks_in_multiple_processes(self):
@@ -1739,15 +1727,14 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		)
 		with tempfile.TemporaryDirectory() as td:
 			adapter = SpawnIdentityAdapter(product)
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				run_tiled_inference_3d(
-					adapter.load_model(device=torch.device("cpu")), np.ones((4, 8, 8), dtype=np.uint8),
-					crop_slices=(0, 4, 0, 8, 0, 8), device=torch.device("cpu"),
-					model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, delay_s=0.1),
-					products=(product,), output_regions_zyx={"identity": (0, 0, 0, 4, 8, 8)},
-					full_output_shapes_zyx={"identity": (4, 8, 8)}, tile_size=4,
-					overlap=0, border=0, tmp_dir=td, flush_workers=2,
-				)
+			run_tiled_inference_3d(
+				adapter.load_model(device=torch.device("cpu")), np.ones((4, 8, 8), dtype=np.uint8),
+				crop_slices=(0, 4, 0, 8, 0, 8), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=SpawnFileOutputAdapter(td, delay_s=0.1),
+				products=(product,), output_regions_zyx={"identity": (0, 0, 0, 4, 8, 8)},
+				full_output_shapes_zyx={"identity": (4, 8, 8)}, tile_size=4,
+				overlap=0, border=0, tmp_dir=td, flush_workers=2,
+			)
 			pids = {path.read_text() for path in Path(td).glob("chunk_*.pid")}
 			self.assertEqual(len(list(Path(td).glob("chunk_*.npy"))), 4)
 			self.assertEqual(len(pids), 2)
@@ -1776,16 +1763,15 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				raise OSError("forced asynchronous write failure")
 
 		with tempfile.TemporaryDirectory() as td:
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				with self.assertRaisesRegex(OSError, "forced asynchronous write failure"):
-					run_tiled_inference_3d(
-						object(), np.ones((8, 4, 4), dtype=np.uint8),
-						crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
-						model_adapter=Adapter(), output_adapter=FailingOutput(), products=(product,),
-						output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
-						full_output_shapes_zyx={"identity": (8, 4, 4)},
-						tile_size=4, overlap=0, border=0, tmp_dir=td,
-					)
+			with self.assertRaisesRegex(OSError, "forced asynchronous write failure"):
+				run_tiled_inference_3d(
+					object(), np.ones((8, 4, 4), dtype=np.uint8),
+					crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
+					model_adapter=Adapter(), output_adapter=FailingOutput(), products=(product,),
+					output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
+					full_output_shapes_zyx={"identity": (8, 4, 4)},
+					tile_size=4, overlap=0, border=0, tmp_dir=td,
+				)
 			self.assertEqual(list(Path(td).glob(".predict3d_*.tmp")), [])
 
 	def test_shared_runner_ring_survives_initial_noop_flushes(self):
@@ -1817,7 +1803,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				model_adapter=adapter, output_adapter=output, products=(product,),
 				output_regions_zyx={"identity": (1, 0, 0, 5, 4, 4)},
 				full_output_shapes_zyx={"identity": (6, 6, 6)},
-				input_zarr_path=str(input_path), tile_size=16, overlap=8, border=4,
+				tile_size=16, overlap=8, border=4,
 				tmp_dir=td,
 			)
 
@@ -1861,16 +1847,15 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		adapter = Adapter()
 		output = Output()
 		with tempfile.TemporaryDirectory() as td:
-			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
-				run_tiled_inference_3d(
-					object(), np.ones((8, 8, 8), dtype=np.uint8),
-					crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"),
-					model_adapter=adapter, output_adapter=output,
-					products=(fine, coarse),
-					output_regions_zyx={"fine": (0, 0, 0, 8, 8, 8), "coarse": (0, 0, 0, 4, 4, 4)},
-					full_output_shapes_zyx={"fine": (8, 8, 8), "coarse": (4, 4, 4)},
-					tile_size=4, overlap=0, border=0, tmp_dir=td,
-				)
+			run_tiled_inference_3d(
+				object(), np.ones((8, 8, 8), dtype=np.uint8),
+				crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"),
+				model_adapter=adapter, output_adapter=output,
+				products=(fine, coarse),
+				output_regions_zyx={"fine": (0, 0, 0, 8, 8, 8), "coarse": (0, 0, 0, 4, 4, 4)},
+				full_output_shapes_zyx={"fine": (8, 8, 8), "coarse": (4, 4, 4)},
+				tile_size=4, overlap=0, border=0, tmp_dir=td,
+			)
 		self.assertEqual(adapter.calls, 8)
 		self.assertEqual(len([key for key in output.complete if key[0] == "fine"]), 64)
 		self.assertEqual(len([key for key in output.complete if key[0] == "coarse"]), 8)
@@ -1889,7 +1874,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 			with mock.patch.dict(sys.modules, {"gpu_pause": gpu_pause_stub}):
 				with mock.patch.object(
-					train_stub,
+					_train_module(),
 					"build_model",
 					return_value=(_OnesPredict3dModel(), None, None, False),
 				):
@@ -1955,15 +1940,15 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			input_path = Path(td) / "input.zarr"
 			arr = ZarrWriter.create(input_path, shape=(4, 8, 8), chunks=(4, 4, 4), dtype="uint8", overwrite=True)
 			arr[0:4, 0:4, 0:4] = 1
-			with mock.patch.object(_CircularZBand, "clear", new=spy_clear):
+			with mock.patch.object(_CircularZBand, "clear", new=spy_clear), InputLevel(input_path) as input_level:
 				run_tiled_inference_3d(
-					object(), open_zarr(input_path),
+					object(), input_level.reader,
 					crop_slices=(0, 4, 0, 8, 0, 8), device=torch.device("cpu"),
 					model_adapter=adapter, output_adapter=output, products=(product,),
 					output_regions_zyx={"identity": (0, 0, 0, 4, 8, 8)},
 					full_output_shapes_zyx={"identity": (4, 8, 8)},
-					input_zarr_path=str(input_path), tile_size=4, overlap=0, border=0,
-					tmp_dir=td,
+					tile_size=4, overlap=0, border=0,
+					tmp_dir=td, input_level=input_level,
 				)
 		self.assertEqual(output.written, [(0, 0, 0)])
 		# Clearing belongs to the flush task, never the coordinator's band objects.
@@ -1992,15 +1977,16 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				chunks=(8, 8, 8), dtype="uint8", overwrite=True)
 			arr[8:16, 8:16, 8:16] = 1
 			output = Output()
-			run_tiled_inference_3d(
-				object(), open_zarr(input_path),
-				crop_slices=(8, 16, 8, 16, 8, 16), device=torch.device("cpu"),
-				model_adapter=adapter, output_adapter=output, products=(product,),
-				output_regions_zyx={"identity": (2, 2, 2, 4, 4, 4)},
-				full_output_shapes_zyx={"identity": (4, 4, 4)},
-				input_zarr_path=str(input_path), tile_size=8, overlap=0, border=0,
-				tmp_dir=td,
-			)
+			with InputLevel(input_path) as input_level:
+				run_tiled_inference_3d(
+					object(), input_level.reader,
+					crop_slices=(8, 16, 8, 16, 8, 16), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output, products=(product,),
+					output_regions_zyx={"identity": (2, 2, 2, 4, 4, 4)},
+					full_output_shapes_zyx={"identity": (4, 4, 4)},
+					tile_size=8, overlap=0, border=0,
+					tmp_dir=td, input_level=input_level,
+				)
 
 		self.assertGreater(adapter.calls, 0)
 		self.assertEqual(output.written, [(2, 2, 2)])
@@ -2027,15 +2013,16 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			ZarrWriter.create(input_path, shape=(16, 16, 16),
 				chunks=(8, 8, 8), dtype="uint8", overwrite=True)
 			output = Output()
-			run_tiled_inference_3d(
-				object(), open_zarr(input_path),
-				crop_slices=(8, 16, 8, 16, 8, 16), device=torch.device("cpu"),
-				model_adapter=adapter, output_adapter=output, products=(product,),
-				output_regions_zyx={"identity": (2, 2, 2, 4, 4, 4)},
-				full_output_shapes_zyx={"identity": (4, 4, 4)},
-				input_zarr_path=str(input_path), tile_size=8, overlap=0, border=0,
-				tmp_dir=td,
-			)
+			with InputLevel(input_path) as input_level:
+				run_tiled_inference_3d(
+					object(), input_level.reader,
+					crop_slices=(8, 16, 8, 16, 8, 16), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output, products=(product,),
+					output_regions_zyx={"identity": (2, 2, 2, 4, 4, 4)},
+					full_output_shapes_zyx={"identity": (4, 4, 4)},
+					tile_size=8, overlap=0, border=0,
+					tmp_dir=td, input_level=input_level,
+				)
 
 		self.assertEqual(adapter.calls, 0)
 		self.assertEqual(output.written, [])
@@ -2116,7 +2103,6 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					products=model_adapter.output_products,
 					output_regions_zyx={product.name: output_region_zyx},
 					full_output_shapes_zyx={product.name: (16, 16, 16)},
-					input_zarr_path=str(input_path),
 					tile_size=8,
 					overlap=4,
 					border=0,
@@ -2252,12 +2238,13 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				}), encoding="utf-8")
 
 			with mock.patch.object(preprocess_wrapper, "run_preprocess_3d", side_effect=fake_run), \
-				 mock.patch.object(preprocess_wrapper, "open_zarr", return_value=types.SimpleNamespace(shape=(8, 8, 8))), \
+				 mock.patch.object(preprocess_wrapper, "InputLevel", return_value=types.SimpleNamespace(
+					 shape=(8, 8, 8), remote=False, reader=None, close=lambda: None, snapshot=lambda: {})), \
 				 mock.patch.object(preprocess_wrapper, "_resolve_base_shape", return_value=(16, 16, 16)), \
 				 mock.patch.object(preprocess_wrapper, "_predict3d_repository_state", return_value={"revision": "abc", "dirty": False}):
 				result = preprocess_wrapper.main_predict3d([
 					"--input", str(input_path), "--output", str(output),
-					"--unet-checkpoint", str(checkpoint), "--no-download",
+					"--unet-checkpoint", str(checkpoint),
 					"--provenance-context", str(context),
 				])
 
@@ -2271,6 +2258,35 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertEqual(provenance["product"]["groups"]["cos"]["scaledown"], 2)
 			self.assertEqual(provenance["atlas_model_identity"]["model_id"], "20260806123000")
 			self.assertEqual(provenance["artifacts"][1]["path"], "result_cos.ome.zarr")
+
+
+	def test_base_shape_of_a_remote_level(self):
+		"""A URL must not pass through pathlib, which turns s3:// into s3:/."""
+		import functools
+		from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+		import preprocess_cos_omezarr as preprocess_wrapper
+
+		class Quiet(SimpleHTTPRequestHandler):
+			def log_message(self, *args):
+				pass
+
+		with tempfile.TemporaryDirectory() as td:
+			group = Path(td) / "volume.zarr"
+			for level, shape in ((0, (17, 33, 31)), (2, (5, 9, 8))):
+				ZarrWriter.create(group / str(level), shape=shape, chunks=(8, 8, 8), dtype="uint8")
+			server = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=td))
+			thread = threading.Thread(target=server.serve_forever, daemon=True)
+			thread.start()
+			try:
+				url = f"http://127.0.0.1:{server.server_port}/volume.zarr/2"
+				for location in (url, url + "/", str(group / "2")):
+					self.assertEqual(
+						preprocess_wrapper._resolve_base_shape(location, None, None), (17, 33, 31),
+					)
+			finally:
+				server.shutdown()
+				thread.join()
+				server.server_close()
 
 
 if __name__ == "__main__":

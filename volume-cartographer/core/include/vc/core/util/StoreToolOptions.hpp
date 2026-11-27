@@ -1,6 +1,6 @@
 #pragma once
 // Store mode of the command-line tools: one contract for all of them.
-//   --store PATH        the object store (local or a hosted replica)
+//   --store PATH        the object store file
 //   --volume-uuid ID    stored surfaces are read in that volume's voxels, through
 //                       the store's view of them (their binding or a
 //                       registration), and new surfaces are bound to it; none:

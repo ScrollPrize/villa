@@ -92,7 +92,7 @@ QJsonObject AgentBridgeServer::handleSegmentsReview(const QJsonValue& params)
         if (fPartialReview && !tags.value("partial_review").toBool())
             continue;
 
-        QJsonObject seg = surfaceRowJson(row, activeId);
+        QJsonObject seg = surfaceRowJson(row, activeId, *_window->_state);
         seg["review"] = tags;
         seg["reviewState"] = reviewStateOf(tags);
         segments.push_back(seg);

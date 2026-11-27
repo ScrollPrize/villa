@@ -24,12 +24,12 @@ public:
     // max_bytes -1 keeps the limit stored in the root, unlimited for a new root;
     // anything else replaces it. Only a limit ever evicts.
     DiskCache(const std::string& root, std::int64_t max_bytes)
-        : root_(std::filesystem::weakly_canonical(root))
+        : root_(std::filesystem::weakly_canonical(utf8Path(root)))
     {
         if (max_bytes < -1)
             throw std::invalid_argument("invalid cache_max_bytes");
         std::filesystem::create_directories(root_);
-        const auto path = (root_ / ".vc_reader_cache.sqlite3").string();
+        const auto path = utf8String(root_ / ".vc_reader_cache.sqlite3");  // SQLite takes UTF-8
         if (sqlite3_open_v2(path.c_str(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
                             SQLITE_OPEN_FULLMUTEX, nullptr) != SQLITE_OK) {
             const std::string error = db_ ? sqlite3_errmsg(db_) : "cannot open disk cache index";
@@ -84,7 +84,7 @@ public:
     // Persist its namespace so crash reconciliation also counts these chunks.
     void adopt_chunks(const std::string& path)
     {
-        const auto canonical=std::filesystem::weakly_canonical(path).string();
+        const auto canonical=utf8String(std::filesystem::weakly_canonical(utf8Path(path)));
         check_path(canonical);
         std::lock_guard lock(mutex_);
         transaction([&] {
@@ -96,7 +96,7 @@ public:
             if (!reconciled_) return;  // no limit: the walk waits until one needs the index
             using Entry=std::tuple<std::filesystem::file_time_type,std::string,std::int64_t>;
             std::vector<Entry> files;
-            scan(canonical,files);
+            scan(utf8Path(canonical),files);
             std::sort(files.begin(),files.end());
             for (const auto& [time,file,size] : files) record(file,size);
             evict();
@@ -125,7 +125,9 @@ public:
         min_free_bytes_.store(bytes, std::memory_order_relaxed);
     }
 
-    void write(const std::string& path, const std::uint8_t* data, std::size_t size)
+    // owned_file also registers non-Zarr payloads for startup reconciliation.
+    // They share the same budget and atomic publication as numeric chunks.
+    void write(const std::string& path, const std::uint8_t* data, std::size_t size, bool owned_file = false)
     {
         check_path(path);
         if (!leaves_free_space(size))
@@ -142,6 +144,10 @@ public:
             evict_to(available - static_cast<std::int64_t>(size));
             file.publish();
             record(path, static_cast<std::int64_t>(size));
+            if (owned_file) {
+                Statement owned(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                owned.text(1, path); owned.step();
+            }
             evict();
         });
     }
@@ -186,7 +192,7 @@ public:
     std::pair<int, std::size_t> open_file(const std::string& path, const std::string& url, const Auth& auth)
     {
         check_path(path);
-        if (int fd = platform::open_file(path, O_RDONLY); fd >= 0 || errno != ENOENT) {
+        if (int fd = platform::open_file(utf8Path(path), O_RDONLY); fd >= 0 || errno != ENOENT) {
             if (fd < 0) throw std::system_error(errno, std::generic_category(), "open " + path);
             platform::FileStat st;
             if (platform::fstat(fd, st) != 0 || !st.regular) {
@@ -203,7 +209,7 @@ public:
         File object_lock(platform::open_file(lock_path, O_RDWR | O_CREAT, 0644));
         if (!object_lock) throw std::system_error(errno, std::generic_category(), "open cache file lock");
         lock_file(object_lock.fd());
-        if (int fd = platform::open_file(path, O_RDONLY); fd >= 0)
+        if (int fd = platform::open_file(utf8Path(path), O_RDONLY); fd >= 0)
             return {fd, 0};  // another owner published it while we waited
         int fd = -1;
         std::unique_ptr<AtomicFile> output;
@@ -259,7 +265,7 @@ public:
                     record(path, static_cast<std::int64_t>(received));
                     Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
                     f.text(1, path); f.step();
-                    fd = platform::open_file(path, O_RDONLY);
+                    fd = platform::open_file(utf8Path(path), O_RDONLY);
                     if (fd < 0) throw std::system_error(errno, std::generic_category(), "open " + path);
                 }
                 output.reset();
@@ -368,7 +374,7 @@ private:
             if (errno == EWOULDBLOCK || errno == EAGAIN) return false;
             throw std::system_error(errno, std::generic_category(), "check download lock");
         }
-        std::filesystem::remove(path);
+        std::filesystem::remove(utf8Path(path));
         return true;
     }
 
@@ -479,7 +485,7 @@ private:
                 path = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
             }
             check_path(path);
-            std::filesystem::remove(path);  // unlink, never truncate a mapped file
+            std::filesystem::remove(utf8Path(path));  // unlink, never truncate a mapped file
             Statement s(db_, "DELETE FROM chunks WHERE path=?");
             s.text(1, path);
             s.step();
@@ -507,7 +513,7 @@ private:
     {
         throw zarr::LowDiskSpace(url + ": caching it would leave under " +
                                  std::to_string(min_free_bytes_.load(std::memory_order_relaxed)) +
-                                 " bytes free on the disk of " + root_.string() +
+                                 " bytes free on the disk of " + utf8String(root_) +
                                  "; not cached, and nothing cached was removed");
     }
 
@@ -520,7 +526,7 @@ private:
         }
         const bool enough = std::filesystem::space(root_).available >= wanted + size;
         if (!enough && !low_space_warned_.exchange(true, std::memory_order_relaxed))
-            std::cerr << "vc_reader: under " << wanted << " bytes free on the disk of " << root_.string()
+            std::cerr << "vc_reader: under " << wanted << " bytes free on the disk of " << utf8String(root_)
                       << "; no longer caching chunks there (reads continue from the network)\n";
         low_space_.store(!enough, std::memory_order_relaxed);
         return enough;
@@ -528,7 +534,7 @@ private:
 
     void check_path(const std::string& path)
     {
-        const auto rel = std::filesystem::path(path).lexically_relative(root_);
+        const auto rel = utf8Path(path).lexically_relative(root_);
         if (rel.empty() || rel.is_absolute() || *rel.begin() == "..")
             throw std::runtime_error("disk cache entry outside its root: " + path);
     }
@@ -552,18 +558,19 @@ private:
             while (adopted.step()) {
                 const std::string path=reinterpret_cast<const char*>(sqlite3_column_text(adopted.get(),0));
                 check_path(path);
-                if (std::filesystem::is_directory(path) && !std::filesystem::is_symlink(path))
-                    scan(path,files);
+                const auto directory = utf8Path(path);
+                if (std::filesystem::is_directory(directory) && !std::filesystem::is_symlink(directory))
+                    scan(directory,files);
             }
         }
         {
             Statement owned(db_, "SELECT path FROM files");
             while (owned.step()) {
-                const std::filesystem::path path = reinterpret_cast<const char*>(sqlite3_column_text(owned.get(), 0));
-                check_path(path.string());
+                const auto path = utf8Path(reinterpret_cast<const char*>(sqlite3_column_text(owned.get(), 0)));
+                check_path(utf8String(path));
                 std::error_code ec;
                 if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)))
-                    files.emplace_back(std::filesystem::last_write_time(path), path.string(),
+                    files.emplace_back(std::filesystem::last_write_time(path), utf8String(path),
                                        std::filesystem::file_size(path));
             }
         }
@@ -593,11 +600,11 @@ private:
                 }
                 if (!chunk->is_regular_file())
                     continue;
-                const auto key = chunk->path().lexically_relative(array).generic_string();
+                const auto key = utf8GenericString(chunk->path().lexically_relative(array));
                 if (key.empty() || key.front() < '0' || key.front() > '9' ||
                     key.find_first_not_of("0123456789./") != std::string::npos)
                     continue;
-                files.emplace_back(chunk->last_write_time(), chunk->path().string(), chunk->file_size());
+                files.emplace_back(chunk->last_write_time(), utf8String(chunk->path()), chunk->file_size());
             }
         }
     }

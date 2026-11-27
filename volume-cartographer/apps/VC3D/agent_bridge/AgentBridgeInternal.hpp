@@ -19,6 +19,7 @@
 
 #include "agent_bridge/AgentBridgeError.hpp"       // AgentBridgeError
 #include "segmentation/tools/ManualAddTool.hpp"   // ManualAddTool enums
+#include "CState.hpp"
 #include "SurfaceCatalog.hpp"
 
 #include <QJsonArray>
@@ -170,7 +171,14 @@ inline const SurfaceCatalog::Row& writableCatalogRow(SurfaceCatalog* catalog, co
     return row;
 }
 
-inline QJsonObject surfaceRowJson(const SurfaceCatalog::Row& row, const std::string& activeId)
+// The project store reference id of an attachment, or null for one the project does not reference.
+inline QJsonValue storeReferenceJson(const CState& state, const vc::objects::AttachmentIdentity& attachment)
+{
+    const auto id = state.storeReferenceId(attachment);
+    return id ? QJsonValue(QString::fromStdString(*id)) : QJsonValue(QJsonValue::Null);
+}
+
+inline QJsonObject surfaceRowJson(const SurfaceCatalog::Row& row, const std::string& activeId, const CState& state)
 {
     QJsonArray tags;
     for (const auto& tag : row.record.tags) tags.append(QString::fromStdString(tag));
@@ -181,5 +189,8 @@ inline QJsonObject surfaceRowJson(const SurfaceCatalog::Row& row, const std::str
     o["catalog"] = row.fromCatalog();
     o["bound"] = row.bound();
     o["active"] = row.record.uuid == activeId;
+    // The store it is in, by project reference, and whether this session may change it.
+    o["store"] = storeReferenceJson(state, row.source);
+    o["writable"] = state.objectStoreSession()->writable(row.source);
     return o;
 }

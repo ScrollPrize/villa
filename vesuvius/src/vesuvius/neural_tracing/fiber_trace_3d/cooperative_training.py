@@ -261,14 +261,13 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         nonlocal maintenance_owner, maintenance_token, maintenance_attempt
         nonlocal maintenance_attempt_index
         from .train import _reviewed_trace_test_config
-        from .reviewed_trace_selection import freeze_raw_checkpoint
+        from .reviewed_trace_selection import freeze_trace_checkpoint
         trace = _reviewed_trace_test_config(training)
         if trace is None:
             raise RuntimeError("reviewed trace boundary has no configured test")
         step = int(request["step"])
-        checkpoint = snapshot_dir / "current.pt"
-        if not checkpoint.is_file():
-            checkpoint = snapshot_dir / "best.pt"
+        weights = trace.get("weights", "ema_0p999")
+        checkpoint = snapshot_dir / ("current.pt" if weights == "raw" else "current_ema_0p999.pt")
         if not checkpoint.is_file():
             raise RuntimeError(f"reviewed trace checkpoint is missing: {checkpoint}")
         root = run_dir / "reviewed_trace_test"
@@ -278,16 +277,18 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         maintenance_attempt_index += 1
         attempt = root / f".step_{step:08d}.attempt-{os.getpid()}-{maintenance_attempt_index}"
         attempt.mkdir(parents=True, exist_ok=False)
-        frozen = attempt / "evaluated_raw.pt"
-        checkpoint_sha256 = freeze_raw_checkpoint(
+        frozen = attempt / f"evaluated_{weights}.pt"
+        checkpoint_sha256 = freeze_trace_checkpoint(
             checkpoint, frozen, step=step,
-            samples_seen=int(request["samples_seen"]),
+            samples_seen=int(request["samples_seen"]), weights=weights,
         )
         job = {
             "step": step,
             "samples_seen": int(request["samples_seen"]),
             "checkpoint": str(frozen),
             "checkpoint_sha256": checkpoint_sha256,
+            "weights": weights,
+            "presence_cutoff": trace.get("presence_cutoff", .25),
             "output_root": str(attempt),
             "template": str(Path(trace["template"]).expanduser().resolve()),
             "split_root": str(Path(trace["split_root"]).expanduser().resolve()),
@@ -321,6 +322,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         maintenance_thread = threading.Thread(target=evaluate, name="training-trace")
         maintenance_thread.start()
         print(f"fiber cooperative: resident reviewed trace started step={step} "
+              f"weights={weights} presence_cutoff={job['presence_cutoff']} "
               f"output={attempt} generation={token[1]}", flush=True)
 
     def finish_reviewed_trace(request):
@@ -365,7 +367,8 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         except BaseException as error:
             print(f"fiber cooperative: cancelled trace: {type(error).__name__}: {error}", flush=True)
         if maintenance_attempt is not None and maintenance_attempt.exists():
-            (maintenance_attempt / "evaluated_raw.pt").unlink(missing_ok=True)
+            for name in ("evaluated_raw.pt", "evaluated_ema_0p999.pt"):
+                (maintenance_attempt / name).unlink(missing_ok=True)
             maintenance_attempt.rename(maintenance_attempt.with_name(
                 maintenance_attempt.name + f".revoked-{time.time_ns()}"))
         maintenance_mailbox.end_attempt(maintenance_token)

@@ -64,6 +64,12 @@ struct SurfaceOptions {
     // Negate the patch normals (a grid whose rows and columns are mirrored against the
     // convention). Vertex normals given in `Vertices` keep their sign.
     bool flipNormals = false;
+    // Vertex rows [core[0], core[1]) and columns [core[2], core[3]) the surface is used for, when it was
+    // given more vertices around them as context (all zero: none). Bicubic patches then take the sign
+    // of their normal from the surface made of the core vertices alone, so a render never changes which
+    // side of the mesh a signed offset samples with the context around the core, while positions and the
+    // size of the normal still come from the whole surface. Ignored with vertex normals and in linear mode.
+    std::array<int, 4> core{0, 0, 0, 0};
 };
 
 // A raster laid over the grid: pixel (i, j) sits at grid column x0 + i * sx + j * kx,
@@ -134,9 +140,13 @@ struct Level {
     ElementType type;
     std::array<double, 3> scale{1, 1, 1}, offset{0, 0, 0};
     std::optional<std::array<double, 9>> linear;
-    // The level's CUDA reader (uint8 3-D CT), when a request may sample it on the GPU;
+    // The level's scalar uint8 CUDA reader, when a request may sample it on the GPU;
     // null samples on the CPU. Builds without CUDA have none.
     reader_cuda::Reader* cuda = nullptr;
+    // Select a scalar channel of a CZYX array. Unset requires a ZYX array.
+    // Packed chunks remain shared in the array cache; no extracted volume is made.
+    // A CUDA reader must select this same array/channel.
+    std::optional<std::int64_t> channel;
 };
 
 // A level placed by a row-major 3x4 map, index (ZYX) = linear * p (XYZ) + offset: the
@@ -180,7 +190,7 @@ struct Result {
     // (see sample); empty otherwise.
     std::string cudaFailure;
     // Cached-only requests sampled on the CPU: per request level, the chunks (keys
-    // (z * grid[1] + y) * grid[2] + x over the level's chunk grid, ascending) a sample
+    // C-order flattened indices over the level's full chunk grid, ascending) a sample
     // needed and no cache held. Empty otherwise.
     std::vector<std::vector<std::int64_t>> missingChunks;
 };

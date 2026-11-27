@@ -3170,8 +3170,6 @@ class Model3D(nn.Module):
 		if tuple(source_cell_valid.shape) != (max(0, int(uv_yx.shape[0]) - 1), max(0, int(uv_yx.shape[1]) - 1)):
 			raise ValueError("forward flatten source_cell_valid shape does not match UV map")
 
-		from concurrent.futures import ThreadPoolExecutor
-
 		import numpy as np
 
 		device = uv_yx.device
@@ -3272,173 +3270,160 @@ class Model3D(nn.Module):
 		if out_w > extent_w:
 			lo[1] -= 0.5 * float(out_w - extent_w)
 
-		centers = 0.25 * (q00 + q10 + q01 + q11)
-		k = max(1, min(int(k_candidates), int(centers.shape[0])))
-		try:
-			from scipy.spatial import cKDTree
-			tree = cKDTree(centers)
-			use_tree = True
-		except Exception:
-			tree = None
-			use_tree = False
-			if int(centers.shape[0]) * int(out_h) * int(out_w) > 20_000_000:
-				raise RuntimeError("scipy.spatial.cKDTree is required for large forward-flatten export")
-
-		# Vectorized triangle barycentric solve. Only the KDTree candidate search
-		# stays on CPU. Float64 keeps shared-edge and overlapping-cell tie behavior
-		# stable across CPU and CUDA.
-		# Keep the immutable cell table in host memory. Only the k candidates for
-		# the current output chunk are staged on the compute device below.
+		# Rasterize the retained source triangles onto the output grid. Each
+		# fixed-diagonal UV triangle only tests the output pixels inside its own
+		# bounding box, so the work scales with the number of source triangles
+		# (a few pixels each) instead of output pixels times k candidate cells,
+		# needs no spatial index, and cannot miss a containing cell that is not
+		# among the k nearest cell centres. The barycentric solve, the inside
+		# test and the output weights are the same expressions as before.
+		del k_candidates  # kept for call compatibility; rasterization needs no k
+		n_cells = int(rows.shape[0])
 		tri0_s_cell = q10 - q00
 		tri0_t_cell = q01 - q00
 		tri1_u_cell = q11 - q10
 		tri1_v_cell = q01 - q10
-		# One packed per-cell table so each chunk gathers and uploads its
-		# candidates in a single pass instead of six; the staged values are
-		# the same float64 bits either way.
-		cell_table = np.concatenate([
-			q00, tri0_s_cell, tri0_t_cell,
-			q10, tri1_u_cell, tri1_v_cell,
-		], axis=1)
-		del q00, q10, q01, q11
-		del tri0_s_cell, tri0_t_cell, tri1_u_cell, tri1_v_cell
-		# Zero-copy torch view of the cell table: torch's CPU index_select
-		# gathers candidate rows on all cores and without holding the GIL,
-		# copying exactly the bits numpy fancy indexing would.
-		cell_table_t = torch.from_numpy(cell_table)
+		centers64 = (0.25 * (q00 + q10 + q01 + q11)).astype(np.float64, copy=False)
+		lo64 = np.asarray(lo, dtype=np.float64)
+		# Upper bound on candidate (pixel, triangle) pairs processed at once.
+		budget = max(4096, 8 * int(chunk_points))
+		cell_block = 131072
 
-		def _gather_staged(cand: np.ndarray) -> torch.Tensor:
-			return cell_table_t.index_select(
-				0, torch.from_numpy(cand.reshape(-1)),
-			).view(int(cand.shape[0]), int(cand.shape[1]), -1)
-		if not use_tree:
-			centers_c = torch.as_tensor(centers, dtype=torch_float_hi, device=device)
+		def _solve(points: np.ndarray, base: np.ndarray, e_a: np.ndarray, e_b: np.ndarray):
+			rhs = points - base
+			det = e_a[:, 0] * e_b[:, 1] - e_a[:, 1] * e_b[:, 0]
+			a = (rhs[:, 0] * e_b[:, 1] - e_b[:, 0] * rhs[:, 1]) / det
+			b = (e_a[:, 0] * rhs[:, 1] - rhs[:, 0] * e_a[:, 1]) / det
+			resid = a[:, None] * e_a + b[:, None] * e_b - rhs
+			res2 = (resid * resid).sum(axis=-1)
+			inside = (
+				np.isfinite(res2)
+				& (a >= -1.0e-4)
+				& (b >= -1.0e-4)
+				& (a + b <= 1.0 + 1.0e-4)
+				& (res2 <= 1.0e-5)
+			)
+			return a, b, res2, inside
 
 		out_map_t = torch.zeros((out_h * out_w, 2), dtype=torch.float32, device=result_device)
 		out_xyz_t = torch.zeros((out_h * out_w, 3), dtype=torch.float32, device=result_device)
 		out_mask_t = torch.zeros((out_h * out_w,), dtype=torch.bool, device=result_device)
-
-		total = int(out_h) * int(out_w)
 		chunk = max(1, int(chunk_points))
-		starts = list(range(0, total, chunk))
+		# Output points are rounded to numpy_float_hi before the solve.
+		point_eps = np.finfo(numpy_float_hi).eps * (np.abs(lo64) + np.array([out_h, out_w], dtype=np.float64))
+		# Winner state covers one stripe of output rows so it does not grow with the canvas.
+		stripe_rows = max(1, 64 * chunk // int(out_w))
+		for r0 in range(0, int(out_h), stripe_rows):
+			r1 = min(int(out_h), r0 + stripe_rows)
+			n_pix = (r1 - r0) * int(out_w)
+			best_res2 = np.full(n_pix, np.inf, dtype=numpy_float_hi)
+			best_dist2 = np.zeros(n_pix, dtype=np.float64)
+			best_tri = np.zeros(n_pix, dtype=np.int8)
+			best_cell_all = np.zeros(n_pix, dtype=np.int64)
+			best_a = np.zeros(n_pix, dtype=numpy_float_hi)
+			best_b = np.zeros(n_pix, dtype=numpy_float_hi)
+			with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+				for c0 in range(0, n_cells, cell_block):
+					c1 = min(n_cells, c0 + cell_block)
+					cells = np.arange(c0, c1, dtype=np.int64)
+					# Triangle 0 is (p00, p10, p01); triangle 1 is (p10, p11, p01).
+					tri_cell = np.concatenate([cells, cells])
+					tri_id = np.concatenate([
+						np.zeros(cells.shape[0], dtype=np.int8),
+						np.ones(cells.shape[0], dtype=np.int8),
+					])
+					va = np.concatenate([q00[c0:c1], q10[c0:c1]]).astype(np.float64)
+					vb = np.concatenate([q10[c0:c1], q11[c0:c1]]).astype(np.float64)
+					vc = np.concatenate([q01[c0:c1], q01[c0:c1]]).astype(np.float64)
+					tmin = np.minimum(np.minimum(va, vb), vc) - lo64
+					tmax = np.maximum(np.maximum(va, vb), vc) - lo64
+					# Generous margin: the inside test below decides; the margin only
+					# guarantees every pixel the tolerance could accept is tested.
+					margin = 1.0e-3 * (tmax - tmin).max(axis=1, keepdims=True) + 1.0e-3 + point_eps
+					y0 = np.clip(np.ceil(tmin[:, 0] - margin[:, 0]), r0, r1).astype(np.int64)
+					y1 = np.clip(np.floor(tmax[:, 0] + margin[:, 0]), r0 - 1, r1 - 1).astype(np.int64)
+					x0 = np.clip(np.ceil(tmin[:, 1] - margin[:, 1]), 0, out_w).astype(np.int64)
+					x1 = np.clip(np.floor(tmax[:, 1] + margin[:, 1]), -1, out_w - 1).astype(np.int64)
+					ny = np.maximum(0, y1 - y0 + 1)
+					nx = np.maximum(0, x1 - x0 + 1)
+					counts = ny * nx
+					keep = counts > 0
+					if not bool(keep.any()):
+						continue
+					tri_cell, tri_id = tri_cell[keep], tri_id[keep]
+					y0, x0, ny, nx = y0[keep], x0[keep], ny[keep], nx[keep]
+					# Split triangles whose box exceeds the budget into row bands so a
+					# runaway (huge) UV triangle cannot allocate an unbounded batch.
+					band = np.maximum(1, budget // nx)
+					pieces = (ny + band - 1) // band
+					if bool((pieces > 1).any()):
+						piece_of = np.repeat(np.arange(pieces.shape[0], dtype=np.int64), pieces)
+						piece_k = np.arange(piece_of.shape[0], dtype=np.int64) - np.repeat(np.cumsum(pieces) - pieces, pieces)
+						tri_cell, tri_id = tri_cell[piece_of], tri_id[piece_of]
+						y0 = y0[piece_of] + piece_k * band[piece_of]
+						ny = np.minimum(band[piece_of], ny[piece_of] - piece_k * band[piece_of])
+						x0, nx = x0[piece_of], nx[piece_of]
+					counts = ny * nx
+					ends = np.cumsum(counts)
+					t_start = 0
+					while t_start < int(counts.shape[0]):
+						done = int(ends[t_start - 1]) if t_start > 0 else 0
+						t_stop = int(np.searchsorted(ends, done + budget, side="right"))
+						t_stop = max(t_start + 1, t_stop)
+						sl = slice(t_start, t_stop)
+						cnt = counts[sl]
+						total = int(cnt.sum())
+						owner = np.repeat(np.arange(t_stop - t_start, dtype=np.int64), cnt)
+						first = np.cumsum(cnt) - cnt
+						local = np.arange(total, dtype=np.int64) - np.repeat(first, cnt)
+						nx_o = nx[sl][owner]
+						oy = y0[sl][owner] + local // nx_o
+						ox = x0[sl][owner] + local % nx_o
+						cell = tri_cell[sl][owner]
+						tri = tri_id[sl][owner]
+						points64 = np.stack([lo[0] + oy.astype(numpy_float_hi), lo[1] + ox.astype(numpy_float_hi)], axis=-1)
+						points = points64.astype(numpy_float_hi, copy=False)
+						is1 = tri == 1
+						base = np.where(is1[:, None], q10[cell], q00[cell])
+						e_a = np.where(is1[:, None], tri1_u_cell[cell], tri0_s_cell[cell])
+						e_b = np.where(is1[:, None], tri1_v_cell[cell], tri0_t_cell[cell])
+						a, b, res2, inside = _solve(points, base, e_a, e_b)
+						if bool(inside.any()):
+							d = points64[inside].astype(np.float64, copy=False) - centers64[cell[inside]]
+							pix = (oy[inside] - r0) * int(out_w) + ox[inside]
+							res2, dist2 = res2[inside], (d * d).sum(axis=-1)
+							tri, cell, a, b = tri[inside], cell[inside], a[inside], b[inside]
+							# Lowest residual, then nearest cell centre, then triangle 0; earlier hits win exact ties.
+							order = np.lexsort((tri, dist2, res2, pix))
+							first = np.ones(order.shape[0], dtype=bool)
+							first[1:] = pix[order[1:]] != pix[order[:-1]]
+							sel = order[first]
+							p = pix[sel]
+							cur_res2, cur_dist2 = best_res2[p], best_dist2[p]
+							better = (res2[sel] < cur_res2) | ((res2[sel] == cur_res2) & (
+								(dist2[sel] < cur_dist2) | ((dist2[sel] == cur_dist2) & (tri[sel] < best_tri[p]))))
+							sel, p = sel[better], p[better]
+							best_res2[p] = res2[sel]
+							best_dist2[p] = dist2[sel]
+							best_tri[p] = tri[sel]
+							best_cell_all[p] = cell[sel]
+							best_a[p] = a[sel]
+							best_b[p] = b[sel]
+						t_start = t_stop
 
-		def _chunk_points(start: int) -> tuple[np.ndarray, np.ndarray]:
-			stop = min(total, start + chunk)
-			flat_idx = np.arange(start, stop, dtype=np.int64)
-			oy = flat_idx // int(out_w)
-			ox = flat_idx - oy * int(out_w)
-			points = np.stack([lo[0] + oy.astype(numpy_float_hi), lo[1] + ox.astype(numpy_float_hi)], axis=-1)
-			return flat_idx, points
-
-		def _stage_chunk(start: int):
-			"""CPU stage of one chunk: output points, k-NN cells, staged rows.
-
-			This runs one chunk ahead on a worker thread so the KDTree query
-			and the host-side candidate gather overlap the previous chunk's
-			device solve. Every chunk is computed exactly as before and chunks
-			write disjoint output rows, so pipelining changes no results.
-			"""
-			flat_idx, points = _chunk_points(start)
-			_dist, cand = tree.query(points, k=k, workers=-1)
-			cand = np.asarray(cand, dtype=np.int64)
-			if cand.ndim == 1:
-				cand = cand[:, None]
-			return flat_idx, points, cand, _gather_staged(cand)
-
-		prefetcher = None
-		pending = None
-		if use_tree and len(starts) > 1:
-			prefetcher = ThreadPoolExecutor(
-				max_workers=1, thread_name_prefix="flatten-invert-prefetch")
-			pending = prefetcher.submit(_stage_chunk, starts[0])
-		try:
-			for index, start in enumerate(starts):
-				if pending is not None:
-					flat_idx, points, cand, staged = pending.result()
-					pending = (
-						prefetcher.submit(_stage_chunk, starts[index + 1])
-						if index + 1 < len(starts) else None)
-				elif use_tree:
-					flat_idx, points, cand, staged = _stage_chunk(start)
-				else:
-					flat_idx, points = _chunk_points(start)
-					pts_bf = torch.as_tensor(points, dtype=torch_float_hi, device=device)
-					d2 = ((pts_bf[:, None, :] - centers_c[None, :, :]) ** 2).sum(dim=-1)
-					cand = torch.topk(
-						d2, min(k, int(centers_c.shape[0])), dim=1, largest=False,
-					).indices.detach().cpu().numpy()
-					staged = _gather_staged(cand)
-
-				pts_t = torch.as_tensor(points, dtype=torch_float_hi, device=device)
-				cand_table = torch.as_tensor(
-					staged, dtype=torch_float_hi, device=device)
-				del staged
-				q00_c = cand_table[..., 0:2]
-				e0s = cand_table[..., 2:4]
-				e0t = cand_table[..., 4:6]
-
-				# Triangle 0: q00 + s*(q10-q00) + t*(q01-q00).
-				rhs0 = pts_t[:, None, :] - q00_c
-				del q00_c
-				det0_c = e0s[..., 0] * e0t[..., 1] - e0s[..., 1] * e0t[..., 0]
-				s0 = (rhs0[..., 0] * e0t[..., 1] - e0t[..., 0] * rhs0[..., 1]) / det0_c
-				t0 = (e0s[..., 0] * rhs0[..., 1] - rhs0[..., 0] * e0s[..., 1]) / det0_c
-				resid0 = s0[..., None] * e0s + t0[..., None] * e0t - rhs0
-				res20 = (resid0 * resid0).sum(dim=-1)
-				inside0 = (
-					torch.isfinite(res20)
-					& (s0 >= -1.0e-4)
-					& (t0 >= -1.0e-4)
-					& (s0 + t0 <= 1.0 + 1.0e-4)
-					& (res20 <= 1.0e-5)
-				)
-				inf = torch.full_like(res20, float("inf"))
-				score0 = torch.where(inside0, res20, inf)
-				del rhs0, e0s, e0t, det0_c, resid0, res20, inside0
-
-				# Triangle 1: q10 + u*(q11-q10) + v*(q01-q10).
-				q10_c = cand_table[..., 6:8]
-				e1u = cand_table[..., 8:10]
-				e1v = cand_table[..., 10:12]
-				rhs1 = pts_t[:, None, :] - q10_c
-				del q10_c
-				det1_c = e1u[..., 0] * e1v[..., 1] - e1u[..., 1] * e1v[..., 0]
-				u1 = (rhs1[..., 0] * e1v[..., 1] - e1v[..., 0] * rhs1[..., 1]) / det1_c
-				v1 = (e1u[..., 0] * rhs1[..., 1] - rhs1[..., 0] * e1u[..., 1]) / det1_c
-				resid1 = u1[..., None] * e1u + v1[..., None] * e1v - rhs1
-				res21 = (resid1 * resid1).sum(dim=-1)
-				inside1 = (
-					torch.isfinite(res21)
-					& (u1 >= -1.0e-4)
-					& (v1 >= -1.0e-4)
-					& (u1 + v1 <= 1.0 + 1.0e-4)
-					& (res21 <= 1.0e-5)
-				)
-				score1 = torch.where(inside1, res21, inf)
-				del rhs1, e1u, e1v, det1_c, resid1, res21, inside1, inf, cand_table
-				use_tri1 = score1 < score0
-				score = torch.minimum(score0, score1)
-				# Deterministic argmin matching numpy: lowest candidate position among
-				# minimal scores (torch.min's tie-break is unspecified on CUDA).
-				best_score = score.min(dim=1, keepdim=True).values
-				positions = torch.arange(score.shape[1], device=device)
-				tie_pos = torch.where(score == best_score, positions, score.shape[1])
-				best_pos = tie_pos.min(dim=1).values
-				best_score = best_score.squeeze(1)
-				good = torch.isfinite(best_score)
-				if not bool(good.any()):
-					continue
-				ar = torch.arange(cand.shape[0], device=device)
-				best_tri1 = use_tri1[ar, best_pos][good]
-				best_s0 = s0[ar, best_pos][good]
-				best_t0 = t0[ar, best_pos][good]
-				best_u1 = u1[ar, best_pos][good]
-				best_v1 = v1[ar, best_pos][good]
-				best_pos_np = best_pos.detach().cpu().numpy()
-				good_np = good.detach().cpu().numpy()
-				best_cell = cand[np.arange(cand.shape[0]), best_pos_np][good_np]
-				del score0, score1, score, best_score, tie_pos, best_pos, good
-				del s0, t0, u1, v1, use_tri1
+			filled = np.flatnonzero(np.isfinite(best_res2))
+			for start in range(0, int(filled.shape[0]), chunk):
+				flat_idx = filled[start:start + chunk]
+				best_cell = best_cell_all[flat_idx]
+				best_tri1_np = best_tri[flat_idx] == 1
+				a_sel = best_a[flat_idx]
+				b_sel = best_b[flat_idx]
+				zero_np = np.zeros_like(a_sel)
+				best_tri1 = torch.from_numpy(best_tri1_np)
+				best_s0 = torch.from_numpy(np.where(best_tri1_np, zero_np, a_sel))
+				best_t0 = torch.from_numpy(np.where(best_tri1_np, zero_np, b_sel))
+				best_u1 = torch.from_numpy(np.where(best_tri1_np, a_sel, zero_np))
+				best_v1 = torch.from_numpy(np.where(best_tri1_np, b_sel, zero_np))
 
 				# Clamp tiny shared-edge tolerances, then renormalize barycentric
 				# weights so source coordinates and sampled xyz use the same point.
@@ -3449,38 +3434,28 @@ class Model3D(nn.Module):
 				w11 = torch.where(best_tri1, best_u1, zero)
 				weights = torch.stack((w00, w10, w01, w11), dim=-1).clamp_min(0.0)
 				weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+
 				def _selected_tensor(values: np.ndarray) -> torch.Tensor:
 					return torch.as_tensor(
 						np.ascontiguousarray(values[best_cell]),
 						dtype=torch_float_hi,
-						device=device,
 					)
 
 				best_rows = _selected_tensor(rows_float)
 				best_cols = _selected_tensor(cols_float)
-				x00_c = _selected_tensor(x00)
-				x10_c = _selected_tensor(x10)
-				x01_c = _selected_tensor(x01)
-				x11_c = _selected_tensor(x11)
-				flat_out = torch.as_tensor(
-					flat_idx[good_np], dtype=torch.long, device=result_device)
 				src_r = best_rows + weights[:, 1] + weights[:, 3]
 				src_c = best_cols + weights[:, 2] + weights[:, 3]
 				sampled = (
-					weights[:, 0, None] * x00_c
-					+ weights[:, 1, None] * x10_c
-					+ weights[:, 2, None] * x01_c
-					+ weights[:, 3, None] * x11_c
+					weights[:, 0, None] * _selected_tensor(x00)
+					+ weights[:, 1, None] * _selected_tensor(x10)
+					+ weights[:, 2, None] * _selected_tensor(x01)
+					+ weights[:, 3, None] * _selected_tensor(x11)
 				)
+				flat_out = torch.as_tensor(flat_idx + r0 * int(out_w), dtype=torch.long, device=result_device)
 				out_map_t[flat_out, 0] = src_r.to(device=result_device, dtype=torch.float32)
 				out_map_t[flat_out, 1] = src_c.to(device=result_device, dtype=torch.float32)
 				out_xyz_t[flat_out] = sampled.to(device=result_device, dtype=torch.float32)
 				out_mask_t[flat_out] = True
-		finally:
-			if prefetcher is not None:
-				if pending is not None:
-					pending.cancel()
-				prefetcher.shutdown(wait=True)
 
 		# out_xyz_t is zero-initialized and written only at filled pixels, so it is
 		# already zero everywhere out_mask is False.

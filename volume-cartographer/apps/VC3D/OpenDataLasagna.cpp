@@ -47,12 +47,11 @@ std::optional<vcr::catalog::OpenDataVolumeView> lasagnaCatalogView(
     const std::filesystem::path& projectPath, const std::shared_ptr<const vcr::catalog::OpenDataManifest>& catalog, const vc::project::Entry& entry)
 {
     if (!catalog || vcr::zarr::isRemote(entry.location)) return std::nullopt;
-    const auto marker = vc::project::resolveLocalPath(entry.location, projectPath.parent_path()).parent_path() /
-                        vc::lasagna::kLasagnaRemoteMarker;
-    std::error_code ec;
-    if (!std::filesystem::is_regular_file(marker, ec)) return std::nullopt;
     try {
-        return catalog->volumeAt(nlohmann::json::parse(std::ifstream(marker)).value("artifact_url", std::string{}), 0);
+        const auto copy = vc::lasagna::lasagnaRemoteCopy(
+            vc::project::resolveLocalPath(entry.location, projectPath.parent_path()));
+        if (!copy) return std::nullopt;
+        return catalog->volumeAt(nlohmann::json::parse(std::ifstream(copy->marker)).value("artifact_url", std::string{}), 0);
     } catch (const std::exception&) {
         return std::nullopt;
     }
@@ -104,8 +103,7 @@ OpenDataLasagnaPreparation prepareOpenDataLasagna(const vcr::catalog::OpenDataSa
                 OpenDataLasagnaPreparation::Dataset dataset{
                     cached.manifest.string(), cached.kind == vc::lasagna::CatalogDatasetKind::FiberInference, {}};
                 for (auto& prepared : vc::lasagna::prepareLasagnaProjectVolumes(cached.dataset, dataset.manifest)) {
-                    dataset.volumes.push_back(
-                        {std::move(prepared.location), std::move(prepared.tags), std::move(prepared.volume)});
+                    dataset.volumes.push_back(std::move(prepared));
                 }
                 preparation.datasets.push_back(std::move(dataset));
             } catch (const std::exception& error) {
@@ -164,7 +162,7 @@ std::optional<ResolvedOpenDataLasagna> resolveLasagnaForView(
     const std::optional<vcr::catalog::OpenDataVolumeView>& view,
     const std::optional<std::array<int, 3>>& workingShape)
 {
-    return resolveLasagnaSnapshot({pkg.path(), pkg.lasagnaDatasetEntries(), pkg.selectedLasagnaDataset(), pkg.catalog(), view, workingShape});
+    return resolveLasagnaSnapshot({pkg.path(), pkg.lasagnaDatasetEntries(), pkg.selectedLasagnaDataset(), pkg.catalog(), view, workingShape, pkg.fiberInferenceDatasetEntries()});
 }
 
 LasagnaResolutionSnapshot snapshotLasagnaForVolume(const VolumePkg& pkg, const std::string& volumeId)
@@ -172,7 +170,7 @@ LasagnaResolutionSnapshot snapshotLasagnaForVolume(const VolumePkg& pkg, const s
     const auto volume = pkg.volume(volumeId);
     if (!volume)
         throw std::runtime_error("Active volume is unavailable for Lasagna");
-    return {pkg.path(), pkg.lasagnaDatasetEntries(), pkg.selectedLasagnaDataset(), pkg.catalog(), pkg.catalogView(volumeId), volume->shape()};
+    return {pkg.path(), pkg.lasagnaDatasetEntries(), pkg.selectedLasagnaDataset(), pkg.catalog(), pkg.catalogView(volumeId), volume->shape(), pkg.fiberInferenceDatasetEntries()};
 }
 
 std::optional<ResolvedOpenDataLasagna> resolveLasagnaSnapshot(const LasagnaResolutionSnapshot& snapshot)
@@ -222,10 +220,17 @@ std::optional<ResolvedOpenDataLasagna> resolveLasagnaSnapshot(const LasagnaResol
                 true};
         }
         const auto* volume = snapshot.catalog->findSample(view->sampleId)->findVolume(view->volumeId);
-        if (volume && !vc::lasagna::catalogArtifacts(*volume).empty()) {
-            throw std::runtime_error(
-                "The manifest declares Lasagna for the active catalog volume, "
-                "but its validated local cache entry is unavailable");
+        if (volume) {
+            // Attached fiber predictions are no missing normals.
+            std::set<std::string> fiberUrls;
+            for (const auto& entry : snapshot.fiberEntries)
+                if (const auto cached = lasagnaCatalogView(snapshot.projectPath, snapshot.catalog, entry))
+                    fiberUrls.insert(cached->artifact->url());
+            for (const auto index : vc::lasagna::catalogArtifacts(*volume))
+                if (!fiberUrls.contains(volume->artifacts[index].url()))
+                    throw std::runtime_error(
+                        "The manifest declares Lasagna for the active catalog volume, "
+                        "but its validated local cache entry is unavailable");
         }
     }
 

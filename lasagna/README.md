@@ -38,8 +38,8 @@ packaged by the sibling Volume Cartographer Python distribution:
 
 ```bash
 lasagna-fit-service --help
-lasagna-download --help
-lasagna-download-list --help
+lasagna-prefill --help
+lasagna-prefill-list --help
 lasagna-preprocess --help
 lasagna-preprocess integrate --help
 lasagna-preprocess predict3d --help
@@ -152,10 +152,13 @@ and managed Lasagna inference write portable provenance.
 
 New Fiber and Lasagna outputs default to the [compact schema v3](docs/volume_schema_v3.md):
 one Zarr store, an embedded manifest, and resolution-based full-channel chunks.
-Existing sidecar outputs remain resumable. Fiber additionally defaults to
-blanking auxiliary channels at zero presence and rounding/clamping width to
-uint8 base-volume voxels; `--no-blank-invalid` and `--no-width-uint8-base`
-disable those changes independently.
+Existing sidecar outputs remain resumable; Fiber outputs written before stores
+recorded their tiling resume only with `--adopt-unrecorded-tiling`, to be passed
+only when they were predicted with the same tiling. Fiber output declares
+`validity_channel: chunks` (every stored chunk is a complete prediction; the
+input region is widened to the output chunk grid) and rounds/clamps width to
+uint8 base-volume voxels; `--blank-invalid` additionally zeroes the other
+channels at zero presence, and `--no-width-uint8-base` keeps float widths.
 
 Atlas/catalogue publication and manager Fiberlet discovery still require
 legacy output until their v3 integration is available. For those workflows,
@@ -186,32 +189,32 @@ directory is therefore not yet a supported standalone installation. On Linux,
 the bootstrap selects an available GCC 13 or newer for that C++23 build unless
 `CC` or `CXX` is already set.
 
-### Batch-download the PHerc scale-0 volumes
+### Prefill the PHerc scale-0 volumes
 
-Pass a one-S3-URI-per-line list from the directory that should contain the
-scroll directories:
+Volumes are not copied; their chunks are fetched into the vc_reader disk cache
+that inference and the manager read through (`<cache_dir>/volumes` for a
+managed setup). Pass a one-S3-URI-per-line list and the cache directory:
 
 ```bash
-cd /path/to/scrolls
-lasagna-download-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt
+lasagna-prefill-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt /path/to/cache/volumes
 ```
 
-This processes one volume at a time and uses 512 parallel chunk-transfer
-workers inside each volume. The resulting layout is:
+This processes one volume at a time with 64 parallel reads inside each volume
+(`--connections`). A cancelled run resumes. The cache layout is vc_reader's:
 
 ```text
-scrolls/
-  PHerc0125/
-    info.json
-    volumes/
-      20250821151825-9.362um-1.2m-113keV-masked.zarr/
+cache/volumes/
+  s3/vesuvius-challenge-open-data/PHerc0125/volumes/
+    20250821151825-9.362um-1.2m-113keV-masked.zarr/0/...
 ```
 
-Use `--dry-run` to inspect a run without writing anything:
+`lasagna-prefill` does the same for one volume, any set of levels and an
+optional base-voxel region (`--bbox`, `--center`/`--radius`, `--zrange`).
+Use `--dry-run` to inspect a list run without fetching:
 
 ```bash
-lasagna-download-list /path/to/other-volumes.txt
-lasagna-download-list /ephemeral/hendrik/las_volumes/pherc_volumes.txt --dry-run
+lasagna-prefill-list /path/to/other-volumes.txt /path/to/cache/volumes --dry-run
+lasagna-prefill s3://vesuvius-challenge-open-data/PHerc0125/volumes/example.zarr /path/to/cache/volumes --scales 0,1 --anon
 ```
 
 CuPy remains an optional acceleration path and is not required for the
@@ -343,11 +346,15 @@ runner:
 lasagna-preprocess predict3d ... --devices all
 ```
 
-New Fiber and Lasagna `predict3d` OME-Zarr arrays use the same Zarr-v2
-Blosc/Zstd compressor (`clevel=3`, byte shuffle) at every pyramid level.
-Existing arrays keep their compressor when inference resumes; a mismatch is
-reported. Use `--ome-compressor none` only when uncompressed compatibility
-output is required.
+New packed Fiber and Lasagna `predict3d` uint8 arrays use lossless Delta3D
+(`vc-delta3d`, its `fast` preset) at every pyramid level. It is smaller but
+slower to write and read than Blosc/Zstd (`clevel=3`, byte shuffle), which
+float32 arrays (Fiber `--no-width-uint8-base`) and `--output-format legacy`
+use unless `--ome-compressor` says otherwise. Existing arrays keep their
+compressor when inference resumes; for unpacked arrays a mismatch with
+`--ome-compressor` is reported, and a packed output rejects it. Use
+`--ome-compressor none` only when uncompressed compatibility output is
+required.
 
 Use a subset with `--devices cuda:0,cuda:2`. Input tiles are read in the
 background through `vc_reader` outside GPU workers. The tile Cartesian product
@@ -397,29 +404,28 @@ the synchronous A/B baseline. The native `accumulator_add` module runtime-
 dispatches an AVX-512F+F16C row kernel where available and uses a portable
 fallback elsewhere; the package is never globally compiled for AVX-512.
 
-Automatic S3 chunk fetching defaults to 64 transfer threads. Set it separately
-from inference prefetch with, for example, `--download-workers 256`. Interrupted
-or malformed `.dl_cache/*.noremote.json` files are advisory: they are ignored
-with a warning and rewritten atomically rather than aborting inference.
-
-For full-volume inference when one selected input scale is too large to keep,
-enable the shared rolling disk cache:
+The input is opened through `vc_reader`, so `--input` may be a local level
+directory or a remote OME-Zarr level URL (`s3://bucket/volume.zarr/1`,
+`https://.../volume.zarr/1`); there is no separate download step. A remote
+level's chunks are cached decoded in `--input-disk-cache-dir` and reused by
+later runs. `--input-disk-cache-gib` bounds that cache (least recently used
+chunks are removed), which is how a full volume too large to keep is processed:
 
 ```bash
-lasagna-preprocess predict3d ... --input /cache/volume.zarr/0 --live-fetch
+lasagna-preprocess predict3d ... --input s3://bucket/volume.zarr/0 \
+  --input-disk-cache-dir /cache --input-disk-cache-gib 10240
 python -m vesuvius.neural_tracing.fiber_trace_3d.infer ... \
-  --input /cache/volume.zarr/0 --live-fetch
+  --input s3://bucket/volume.zarr/0 --input-disk-cache-dir /cache
 ```
 
-The local OME root must contain `_download` S3 metadata. The defaults are a
-10 TiB selected-scale target (`--live-cache-gib 10240`) and 10,000 lazy tile
-descriptors (`--live-fetch-ahead-tiles 10000`); this read-ahead is separate
-from the much smaller `--prefetch-tiles-per-gpu` array window. Chunks are read
-through `vc_reader` into `<ome root>/.live_cache`, decoded; past the target its
-least recently used chunks are removed. Chunks a plain download left in the
-level are not used. Live mode is intentionally full-volume only, conflicts with
-`--no-download`, and currently rejects a separately remote Lasagna `--pred-dt`.
-Interrupted runs keep the cache and can be rerun directly.
+Remote tiles are read ahead into the caches on `--input-connections` parallel
+reads (default 64), up to `--read-ahead-tiles` (default 10,000) canonical tiles
+ahead of the GPU; this read-ahead is separate from the much smaller
+`--prefetch-tiles-per-gpu` array window. Sparse volumes are handled from a
+per-z-plane chunk listing of the level (local directories and S3 alike), so
+empty regions are skipped without reading them. Crops work with remote input;
+only the crop's chunks are read. Interrupted runs keep the cache and can be
+rerun directly.
 
 ### Multi-axis processing
 

@@ -1153,7 +1153,7 @@ def _stored_to_full_bounds(tgt_segment, stored_bounds):
 
 def _initialize_window_state(tgt_segment, full_bounds):
     r0_full, r1_full, c0_full, c1_full = full_bounds
-    xyz, valid = tgt_segment.resample_full((r0_full, c0_full), (r1_full - r0_full, c1_full - c0_full), interpolation="smooth")
+    xyz, valid = tgt_segment.resample_full((r0_full, c0_full), (r1_full - r0_full, c1_full - c0_full), interpolation="bicubic")
     window_zyxs = np.where(valid[..., None], xyz[..., ::-1], -1.0).astype(np.float32)
     return window_zyxs, valid, (r0_full, c0_full)
 

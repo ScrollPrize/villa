@@ -19,18 +19,20 @@ class _CatalogResources(TypedDict, total=False):
 @mcp.tool()
 async def vc3d_create_project(
     path: str,
-    volume: str,
+    volume: Optional[str] = None,
     name: Optional[str] = None,
     tags: Optional[list[str]] = None,
     overwrite: bool = False,
     store: Optional[str] = None,
     new_store: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Create a .vcproj project that references one local zarr volume or
-    remote .zarr URL.
+    """Create a .vcproj project, optionally referencing one local zarr volume
+    or remote .zarr URL.
     This writes the project but does not open it; call vc3d_open_volume with the
     returned path when it should become the active project. Remote availability
-    is checked when the project is opened.
+    is checked when the project is opened. Without a volume the result reports
+    "volume": null; segments are listed and rendered only once a volume is
+    attached (vc3d_attach_volume).
 
     path must be an absolute output path on the filesystem where VC3D runs.
     volume must be an absolute local zarr path on that same filesystem, or a
@@ -40,7 +42,8 @@ async def vc3d_create_project(
     name and tags customize the project entry; overwrite must be true to
     replace an existing project file. Use store to reference an existing .vcobj,
     or new_store to create one; omitted, a sibling .vcobj is created. Stores are
-    never overwritten by project overwrite.
+    never overwritten by project overwrite; an existing store this user cannot
+    write is recorded read-only.
     """
     return await _call(
         "project.create",
@@ -60,7 +63,11 @@ async def vc3d_create_project(
 
 @mcp.tool()
 async def vc3d_open_volume(path: str, volume_id: Optional[str] = None) -> dict[str, Any]:
-    """Open a project (.vcproj) and optionally select a volume id."""
+    """Open a project (.vcproj) and optionally select a volume id.
+
+    Despite the name this opens a project file; its volumes, store references
+    and routes are then listed by vc3d_get_state. A failed open keeps the
+    current project."""
     return await _call("volume.open", _strip_none({"path": path, "volumeId": volume_id}))
 
 

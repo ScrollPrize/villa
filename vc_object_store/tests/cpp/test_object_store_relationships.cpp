@@ -34,20 +34,25 @@ try {
     }
     const auto heads = [&] {
         auto txn = db.read();
-        return RevisionSelection{{a, db.currentObjectRevision(txn, a)->uuid}, {b, db.currentObjectRevision(txn, b)->uuid}};
+        return VersionSelection{{a, db.currentVersion(txn, a)}, {b, db.currentVersion(txn, b)}};
     };
     const auto component = [&](const std::string& uuid, std::optional<bool> adjacent, bool applicableOnly) {
         auto txn = db.read();
         return db.componentOf(txn, uuid, {}, nullptr, false, adjacent, applicableOnly);
     };
     const auto selected = heads();
+    const auto pinned = [&] {
+        auto txn = db.read();
+        return std::vector<ObjectVersion>{db.currentObjectRevision(txn, a)->reference(),
+                                          db.currentObjectRevision(txn, b)->reference()};
+    }();
     require(component(a, false, true) == std::vector<std::string>{a, b}, "same-winding component");
     require(component(a, true, false) == std::vector<std::string>{a}, "adjacent filter");
     require([&] { auto txn = db.read(); return db.neighbours(txn, a); }() == std::vector<std::string>{b}, "neighbours");
 
     // An action that changes an endpoint it did not pin rolls back entirely.
     mustFail([&] {
-        auto txn = db.write({{a, selected.at(a)}});
+        auto txn = db.writeNumbered({{a, selected.at(a)}});
         db.setMeta(txn, a, "rollback", "true");
         db.removeEdge(txn, edge);
         txn.commit();
@@ -64,7 +69,7 @@ try {
         second = db.editGeometry(txn, a, edits, first, [&](const std::vector<EdgeRecord>& affected) {
             std::vector<GeometryEdgeEdit> decisions;
             for (const auto& record : affected) {
-                GeometryEdgeEdit decision; decision.edgeUuid = record.uuid; decision.expectedGeneration = record.generation;
+                GeometryEdgeEdit decision; decision.edgeUuid = record.uuid; decision.expectedVersion = record.version.value();
                 decision.action = "keep_recorded";
                 decision.aRevision = db.currentGeometry(txn, record.aUuid)->uuid;
                 decision.bRevision = db.currentGeometry(txn, record.bUuid)->uuid;
@@ -77,24 +82,26 @@ try {
     require(component(a, std::nullopt, true) == std::vector<std::string>{a}, "kept as recorded: not applicable now");
     {
         auto txn = db.read();
-        const auto at = db.relationshipsAt(txn, selected);
+        const auto at = db.relationshipsAt(txn, pinned);
         require(at.size() == 1 && at[0].applicable, "applicable at the pinned revisions");
     }
-    { auto txn = db.write(heads()); db.retainRelationship(txn, edge); txn.commit(); }
-    require(component(a, std::nullopt, true) == std::vector<std::string>{a, b}, "retained: applicable again");
+    { auto txn = db.writeNumbered(heads());
+      db.retainRelationship(txn, edge);txn.commit(); }
+    require(component(a, std::nullopt, true) == std::vector<std::string>{a, b}, "explicitly retained: applicable again");
     for (const bool retire : {true, false}) {
-        auto txn = db.write(heads());
-        if (retire) { db.retireObject(txn, a); db.keepRecordedRelationship(txn, edge); }
-        else { db.restoreObject(txn, a); db.keepRecordedRelationshipsOf(txn, a); }
+        auto txn = db.writeNumbered(heads());
+        if (retire) db.retireObject(txn, a);
+        else db.restoreObject(txn, a);
         txn.commit();
         auto read = db.read();
         require(db.currentGeometry(read, a)->uuid == second, "lifecycle keeps the geometry");
         require(db.componentOf(read, b, {}, nullptr, false, std::nullopt, true) == std::vector<std::string>{b},
-                "a lifecycle change needs revalidation");
+                "retirement removes current relations and restoration does not revive them");
+        require(!db.edgeByUuid(read,edge),"retired relationship is absent from current graph");
     }
     auto txn = db.read();
     require(!db.objectByUuid(txn, a)->retired, "restored");
-    require(db.objectRevision(txn, *selected.at(a))->geometryRevision == first, "history keeps the pinned geometry");
+    require(db.objectAtVersion(txn, pinned[0])->geometryRevision == first, "history keeps the pinned geometry");
     std::cout << "relationship decisions passed\n";
     return 0;
 } catch (const std::exception& error) {

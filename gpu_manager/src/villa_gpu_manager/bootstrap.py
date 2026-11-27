@@ -90,6 +90,7 @@ def ensure_manager(path=None, *, timeout=20.0):
     root = str(Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
     with log.open("ab") as output:
+        log_start = output.tell()
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output,
                                  stderr=subprocess.STDOUT, env=env, start_new_session=True)
     print(f"gpu manager: starting socket={path} log={log}", flush=True)
@@ -100,8 +101,16 @@ def ensure_manager(path=None, *, timeout=20.0):
         except OSError as exc:
             if exc.errno not in (errno.ENOENT, errno.ECONNREFUSED):
                 raise
-        # A concurrent winner may still be binding after this starter lost the lock.
-        child.poll()
+        code = child.poll()
+        if code is not None:
+            with log.open("rb") as output:
+                output.seek(max(log_start, log.stat().st_size - 8192))
+                detail = output.read().decode("utf-8", errors="replace").strip()
+            # A competing starter can lose the singleton lock while the winner
+            # is still doing recovery. Its failure is not the service's failure.
+            if not detail.splitlines() or not detail.splitlines()[-1].startswith("BlockingIOError"):
+                raise RuntimeError(f"manager startup failed (exit={code}) at {path}; "
+                                   f"journal retained; log={log}\n{detail}")
         time.sleep(0.1)
     raise RuntimeError(f"manager did not start at {path}; inspect {log} (no fallback or journal reset)")
 

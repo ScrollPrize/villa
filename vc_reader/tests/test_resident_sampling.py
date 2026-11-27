@@ -138,3 +138,30 @@ def test_nearest_just_below_half_does_not_round_up(device):
     half = np.float32(.5)
     points = torch.tensor([[[0., np.nextafter(half, np.float32(0))], [0., half]]], device=device)
     torch.testing.assert_close(torch_sample(values, points, order=0), torch.tensor([[[2., 5.]]], device=device))
+
+
+def test_cuda_without_native_backend_stages_through_cpu(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA required')
+    import vc_reader.torch as vc_torch
+    monkeypatch.setattr(vc_torch, '_NATIVE_CUDA', False)
+    values = torch.arange(125, device='cuda', dtype=torch.float32).reshape(1, 1, 5, 5, 5).requires_grad_()
+    points = torch.tensor([[[1.25, 2.5, 3.75]]], device='cuda', requires_grad=True)
+    result = torch_sample(values, points)
+    result.sum().backward()
+    torch.testing.assert_close(result, torch.tensor([[[47.5]]], device='cuda'))
+    torch.testing.assert_close(points.grad, torch.tensor([[[25., 5., 1.]]], device='cuda'))
+
+    r, c = torch.meshgrid(torch.arange(5., device='cuda'), torch.arange(6., device='cuda'), indexing='ij')
+    xyz = torch.stack((c, r, 10 + r * r), -1)[None]
+    mask = torch.ones(xyz.shape[:-1], device='cuda', dtype=torch.bool)
+    rc = torch.tensor([[[1.25, 2.5]]], device='cuda')
+    derivs_gpu = vc_torch.surface_derivatives(xyz, mask)
+    assert derivs_gpu.device.type == 'cuda'
+    p_cpu, row_cpu, col_cpu, ok_cpu = surface_points(xyz.cpu(), mask.cpu(), rc.cpu())
+    def _unexpected_recompute(*args, **kwargs):
+        raise AssertionError('surface_derivatives should not be recomputed when derivatives are provided')
+    monkeypatch.setattr(vc_torch, 'surface_derivatives', _unexpected_recompute)
+    p_gpu, row_gpu, col_gpu, ok_gpu = surface_points(xyz, mask, rc, derivatives=derivs_gpu)
+    for a, b in zip((p_gpu, row_gpu, col_gpu, ok_gpu), (p_cpu, row_cpu, col_cpu, ok_cpu)):
+        torch.testing.assert_close(a.cpu(), b)

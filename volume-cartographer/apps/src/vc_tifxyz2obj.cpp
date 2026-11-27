@@ -16,6 +16,7 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <vc_object_store/Uuid.hpp>
 #include <limits>
 
 
@@ -161,12 +162,13 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
     // Apply decimation if requested: one pass, stride derived from the
     // requested keep fraction (decimationStride: round(1/sqrt(p))). Skip
     // when keep_percent >= 100 (no decimation).
+    int stride = 1;
     if (keep_percent > 0.0f && keep_percent < 100.0f) {
         std::cout << "Original grid: " << points.rows << " x " << points.cols
                   << " (" << (points.rows * points.cols) << " points)" << std::endl;
         const float ratio = keep_percent / 100.0f;
         const int rows = points.rows, cols = points.cols;
-        const int stride = vc::meshing::decimationStride(ratio);
+        stride = vc::meshing::decimationStride(ratio);
         points = vc::meshing::decimateGrid(points, stride);
         float actual_ratio = float(points.rows * points.cols) / float(rows * cols);
         std::cout << "Decimation with ratio " << ratio << " (stride=" << stride << "): "
@@ -205,13 +207,15 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
 
     // Derive UV scale from meta: surf->scale() is typically micrometers-per-pixel (or similar).
     // You asked to use the reciprocal (1/scale) as the multiplier.
+    // A decimated cell (r, c) sits at (r, c) * stride in the source grid: the
+    // stride keeps a decimated export's UVs in the units of a full one.
     cv::Vec2f s = surf->scale();           // [sx, sy]
-    float uv_fac_x = (std::isfinite(s[0]) && s[0] > 0.f) ? 1.0f / s[0] : 1.0f;
-    float uv_fac_y = (std::isfinite(s[1]) && s[1] > 0.f) ? 1.0f / s[1] : 1.0f;
+    float uv_fac_x = float(stride) * ((std::isfinite(s[0]) && s[0] > 0.f) ? 1.0f / s[0] : 1.0f);
+    float uv_fac_y = float(stride) * ((std::isfinite(s[1]) && s[1] > 0.f) ? 1.0f / s[1] : 1.0f);
     if (normalize_uv) {
         std::cout << "UVs: normalized to [0,1]\n";
     } else {
-        std::cout << "UVs: scaled by 1/scale from meta.json  (u*= " << uv_fac_x
+        std::cout << "UVs: scaled by stride/scale from meta.json  (u*= " << uv_fac_x
                   << ", v*= " << uv_fac_y << " )\n";
         std::cout << "      (meta scale = [" << s[0] << ", " << s[1] << "])\n";
     }
@@ -326,17 +330,22 @@ int main(int argc, char *argv[])
 
     std::unique_ptr<QuadSurface> surf;
     std::filesystem::path obj_path;
+    std::unique_ptr<StoreSurfaces> store;
+    std::filesystem::path scratch;
     if (store_options) {
         const std::filesystem::path name = *store_options->name;
         const auto& uuid = store_options->surfaces.front();
         if (name.has_parent_path() || name.empty()) {
-            std::cerr << "error: --name is a file name inside the artifact directory\n";
+            std::cerr << "error: --name is the artifact's file name, without directories\n";
             return EXIT_FAILURE;
         }
         try {
-            StoreSurfaces store(store_options->store, "vc_tifxyz2obj");
-            surf = store.load(uuid, true, store_options->volume);
-            obj_path = store.objects().session()->artifactDirectory(store.objects().attachment(), uuid) / name;
+            store = std::make_unique<StoreSurfaces>(store_options->store, "vc_tifxyz2obj");
+            surf = store->load(uuid, true, store_options->volume);
+            // Written here, then published as an artifact of the surface version read.
+            scratch = std::filesystem::temp_directory_path() / ("vc_tifxyz2obj-" + vc::objects::util::newUuid());
+            std::filesystem::create_directories(scratch);
+            obj_path = scratch / name;
         } catch (const std::exception& error) {
             std::cerr << "error when loading " << uuid << ": " << error.what() << std::endl;
             return EXIT_FAILURE;
@@ -354,7 +363,23 @@ int main(int argc, char *argv[])
     }
 
     surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes);
-    if (store_options) std::cout << "obj: " << obj_path.string() << std::endl;
+    if (store_options) {
+        int status = EXIT_SUCCESS;
+        try {
+            const auto& uuid = store_options->surfaces.front();
+            const auto receipt = store->objects().publishArtifacts(uuid, {{*store_options->name, obj_path}});
+            store->objects().finish();
+            // The artifact's name, and the surface version that holds it.
+            std::cout << "obj: " << *store_options->name << std::endl;
+            std::cout << "artifact_version: " << receipt.objects.at(vc::objects::util::canonicalUuid(uuid)).value_or(0) << std::endl;
+        } catch (const std::exception& error) {
+            std::cerr << "error when publishing the OBJ: " << error.what() << std::endl;
+            status = EXIT_FAILURE;
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(scratch, ignored);
+        return status;
+    }
 
     return EXIT_SUCCESS;
 }

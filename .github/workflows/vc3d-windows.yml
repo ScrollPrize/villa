@@ -82,6 +82,10 @@ jobs:
       - name: Reset compiler cache statistics
         run: '"${SCCACHE_PATH}" --zero-stats'
 
+      - name: Install additional reader dependencies
+        # These dependencies are not included in the pinned prebuilt bundle.
+        run: pacman -S --needed --noconfirm mingw-w64-ucrt-x86_64-concurrentqueue mingw-w64-ucrt-x86_64-blosc2
+
       - name: Configure
         run: >-
           cmake --preset ci-windows-mingw
@@ -164,6 +168,17 @@ jobs:
       - name: Report compiler cache statistics
         if: always()
         run: '"${SCCACHE_PATH}" --show-stats'
+
+      # The test step above reconfigured this tree with VC_TESTING=ON and built
+      # only one test, so its install rules may name targets that were never
+      # built (#2526: vc_object_import_afv). Package the configuration that the
+      # Build step built in full; ninja is a no-op unless the test config
+      # changed something.
+      - name: Restore packaging configuration
+        if: github.event_name != 'pull_request'
+        run: |
+          cmake --preset ci-windows-mingw -DVC_USE_SCCACHE=ON -DSCCACHE_PROGRAM="${SCCACHE_PATH}" -DVC_TESTING=OFF
+          ninja -C build/ci-windows-mingw
 
       - name: Package (NSIS installer + ZIP)
         if: github.event_name != 'pull_request'

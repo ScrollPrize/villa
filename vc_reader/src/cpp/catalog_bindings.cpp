@@ -11,6 +11,8 @@
 #include "vc_reader/catalog.hpp"
 #include "vc_reader/registrations.hpp"
 #include "vc_reader/sources.hpp"
+#include "vc_reader/native/utf8_path.hpp"
+#include "vc_reader/sftp.hpp"
 #include "catalog_io.hpp"
 namespace nb = nanobind;
 using namespace vcr::catalog;
@@ -239,7 +241,7 @@ Catalog loadCatalogFrom(nb::handle source, nb::handle cacheDir, bool useCache, d
 {
     const auto location = fspath(source);
     CatalogLoadOptions options;
-    if (useCache) options.cacheFile = catalogCacheFile(location, cacheDir.is_none() ? std::filesystem::path{} : std::filesystem::path(fspath(cacheDir)));
+    if (useCache) options.cacheFile = catalogCacheFile(location, cacheDir.is_none() ? std::filesystem::path{} : vcr::utf8Path(fspath(cacheDir)));
     options.refresh = refresh;
     options.maxAgeSeconds = maxAge;
     options.timeoutSeconds = timeout;
@@ -259,6 +261,9 @@ Catalog catalogFrom(nb::handle data, nb::handle source)
 } // namespace
 
 NB_MODULE(_catalog, m) {
+    nb::class_<vcr::sftp::Forward>(m, "SshForward")
+        .def(nb::init<const std::string&>(), nb::arg("endpoint"), nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("endpoint", &vcr::sftp::Forward::endpoint);
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
             std::rethrow_exception(p);
@@ -420,7 +425,7 @@ NB_MODULE(_catalog, m) {
         }, nb::arg("rows"), nb::arg("derivation_path") = nb::none())
         .def_static("identity", [] { return VolumeTransform{}; })
         .def_static("load_transform_json", [](const std::string& path, bool allowSingular) {
-            return VolumeTransform{Affine::loadTransformJson(path, allowSingular), {}};
+            return VolumeTransform{Affine::loadTransformJson(vcr::utf8Path(path), allowSingular), {}};
         }, nb::arg("path"), nb::arg("allow_singular")=false)
         .def_static("scale", [](double s) { return VolumeTransform{Affine::scale(s), {}}; }, "Uniform scale about the origin. Pyramid levels use block_reduced.")
         .def_static("block_reduced", [](double s) { return VolumeTransform{Affine::blockReduced(s), {}}; },
@@ -779,7 +784,7 @@ NB_MODULE(_catalog, m) {
                     nb::arg("max_age") = 3600., nb::arg("refresh") = false, nb::arg("timeout") = 60.,
                     "Load from an http(s) URL (cached on disk) or a local file (plain or gzipped JSON).")
         .def_static("cache_file", [](nb::handle source, nb::handle cacheDir) {
-            return catalogCacheFile(fspath(source), cacheDir.is_none() ? std::filesystem::path{} : std::filesystem::path(fspath(cacheDir)));
+            return catalogCacheFile(fspath(source), cacheDir.is_none() ? std::filesystem::path{} : vcr::utf8Path(fspath(cacheDir)));
         }, nb::arg("source") = std::string(kDefaultManifestUrl), nb::arg("cache_dir") = nb::none(), "Where load caches a manifest.")
         .def_prop_ro("raw", [](const Catalog& c) { return pyJson(c.manifest().raw); })
         .def_prop_ro("source", [](const Catalog& c) { return noneIfEmpty(c.source()); })

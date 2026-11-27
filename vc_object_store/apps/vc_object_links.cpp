@@ -53,9 +53,12 @@ void usage()
         << "  --link-fiber-surfaces            link stored fibers to stored surfaces\n"
         << "  --strip-cache <dir>             optional disposable fiber-strip cache\n"
         << "  --rebuild-fiber-strips          refresh strip caches (e.g. after CT voxel edits)\n"
-        << "  --ct <path>                     uint8 CT volume for linking (default normal source)\n"
-        << "  --ct-level <level>              CT pyramid level (default 0)\n"
-        << "  --ct-to-base-scale <factor>     selected CT voxel size in base units (default 1)\n"
+        << "  --ct <path>                     uint8 CT volume; structure-tensor strip normals\n"
+        << "  --normal-x <path> --normal-y <path>  uint8 lasagna nx/ny volumes for strip normals\n"
+        << "  --normal-pool <dir>             resident-pool pack of those normals (meta.json, table.npy, channel_*.u8)\n"
+        << "                                  (none of these: centerline-only linking)\n"
+        << "  --ct-level <level>              CT or lasagna pyramid level/group (default 0)\n"
+        << "  --ct-to-base-scale <factor>     selected CT/lasagna voxel size in base units (default 1)\n"
         << "  --fiber-scale <factor>           fiber XYZ -> working XYZ (default 1)\n"
         << "  --surface-scale <factor>           surface XYZ -> working XYZ (default 1)\n"
         << "  --working-to-base-scale <factor> working voxel size in common base units (default 1)\n"
@@ -126,6 +129,9 @@ try {
         else if (arg == "--link-fiber-surfaces") linkFibers = true;
         else if (arg == "--rebuild-fiber-strips") fiberSurfaceParams.rebuildStrips = true;
         else if (arg == "--ct") ctVolume = next(arg.c_str());
+        else if (arg == "--normal-x") fiberSurfaceParams.normalXVolume = next(arg.c_str());
+        else if (arg == "--normal-y") fiberSurfaceParams.normalYVolume = next(arg.c_str());
+        else if (arg == "--normal-pool") fiberSurfaceParams.normalPool = next(arg.c_str());
         else if (arg == "--ct-level") fiberSurfaceParams.ctLevel = std::stoi(next(arg.c_str()));
         else if (arg == "--ct-to-base-scale") fiberSurfaceParams.ctToBaseScale = std::stod(next(arg.c_str()));
         else if (arg == "--fiber-scale") fiberSurfaceParams.fiberScale = std::stod(next(arg.c_str()));
@@ -145,8 +151,6 @@ try {
         return 2;
     }
 
-    if ((linkFibers || linkTrackSurfaces) && ctVolume.empty())
-        throw std::runtime_error("surface linking requires --ct");
     pclParams.surfaceScale = fiberSurfaceParams.surfaceScale;
 
     static_cast<vc::object_links::LineSurfaceParams&>(trackSurfaceParams) = fiberSurfaceParams;

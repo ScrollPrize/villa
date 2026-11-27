@@ -470,29 +470,6 @@
         "type": "object"
       }
     },
-    "fiber.import": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010,
-        -32007,
-        -32005
-      ],
-      "mcp": {
-        "tool": "vc3d_fiber_import"
-      },
-      "params": {
-        "properties": {
-          "path": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "path"
-        ],
-        "type": "object"
-      }
-    },
     "fiber.launch": {
       "errors": [
         -32602,
@@ -991,6 +968,113 @@
         },
         "required": [
           "mode"
+        ],
+        "type": "object"
+      }
+    },
+    "objects.export": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "validOnly": "valid_only"
+        },
+        "tool": "vc3d_export_object"
+      },
+      "params": {
+        "properties": {
+          "overwrite": {
+            "default": false,
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          },
+          "store": {
+            "type": "string"
+          },
+          "uuid": {
+            "type": "string"
+          },
+          "validOnly": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "uuid",
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "objects.import": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32009,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "paramRenames": {
+          "uuidNamespace": "uuid_namespace"
+        },
+        "tool": "vc3d_import_objects"
+      },
+      "params": {
+        "properties": {
+          "bind": {
+            "properties": {
+              "scale": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              }
+            },
+            "required": [
+              "scale"
+            ],
+            "type": "object"
+          },
+          "kind": {
+            "enum": [
+              "surface",
+              "fiber",
+              "point_collection"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "store": {
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "uuidNamespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "path"
         ],
         "type": "object"
       }
@@ -1562,6 +1646,61 @@
         "type": "object"
       }
     },
+    "project.attach_lasagna_manifest": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "extraParams": [
+          "wait"
+        ],
+        "tool": "vc3d_attach_lasagna_manifest"
+      },
+      "params": {
+        "properties": {
+          "location": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "regular",
+              "fiber"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "location",
+          "role"
+        ],
+        "type": "object"
+      }
+    },
+    "project.attach_normal_grid": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_attach_normal_grid"
+      },
+      "params": {
+        "properties": {
+          "location": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "type": "object"
+      }
+    },
     "project.create": {
       "errors": [
         -32602,
@@ -1604,8 +1743,52 @@
           }
         },
         "required": [
-          "path",
-          "volume"
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "project.detach_entry": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_detach_project_entry"
+      },
+      "params": {
+        "properties": {
+          "location": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "location"
+        ],
+        "type": "object"
+      }
+    },
+    "project.save_as": {
+      "errors": [
+        -32602,
+        -32000,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_save_project_as"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
         ],
         "type": "object"
       }
@@ -2632,6 +2815,121 @@
         "type": "object"
       }
     },
+    "stores.attach": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "readOnly": "read_only"
+        },
+        "tool": "vc3d_attach_store"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "readOnly": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "stores.create": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_create_store"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "stores.detach": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "storeId": "store_id"
+        },
+        "tool": "vc3d_detach_store"
+      },
+      "params": {
+        "properties": {
+          "storeId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "storeId"
+        ],
+        "type": "object"
+      }
+    },
+    "stores.route": {
+      "errors": [
+        -32602,
+        -32000,
+        -32007,
+        -32004,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "storeId": "store_id"
+        },
+        "tool": "vc3d_route_store"
+      },
+      "params": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "surface",
+              "fiber",
+              "point_collection",
+              "umbilicus",
+              "volume_transform"
+            ],
+            "type": "string"
+          },
+          "storeId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "storeId"
+        ],
+        "type": "object"
+      }
+    },
     "tags.set": {
       "errors": [
         -32602,
@@ -2723,6 +3021,57 @@
         "required": [
           "segmentId"
         ],
+        "type": "object"
+      }
+    },
+    "umbilicus.import": {
+      "errors": [
+        -32602,
+        -32000,
+        -32001,
+        -32007,
+        -32009,
+        -32005
+      ],
+      "mcp": {
+        "paramRenames": {
+          "unitsPerVoxel": "units_per_voxel"
+        },
+        "tool": "vc3d_import_umbilicus"
+      },
+      "params": {
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "replace": {
+            "default": false,
+            "type": "boolean"
+          },
+          "unitsPerVoxel": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      }
+    },
+    "umbilicus.remove": {
+      "errors": [
+        -32000,
+        -32001,
+        -32007,
+        -32009,
+        -32005
+      ],
+      "mcp": {
+        "tool": "vc3d_remove_umbilicus"
+      },
+      "params": {
+        "properties": {},
         "type": "object"
       }
     },

@@ -64,6 +64,16 @@
 
 namespace {
 
+// A fiber's object identity beside its numeric editing id: its store UUID and
+// the project store reference of the fiber store it is read from.
+void addFiberIdentity(QJsonObject& o, const CState& state, const LineAnnotationController& ctrl, uint64_t fiberId)
+{
+    const auto uuid = ctrl.fiberUuidForId(fiberId);
+    o["uuid"] = uuid.empty() ? QJsonValue(QJsonValue::Null) : QJsonValue(QString::fromStdString(uuid));
+    const auto store = state.storeFor("fiber");
+    o["store"] = store ? storeReferenceJson(state, *store) : QJsonValue(QJsonValue::Null);
+}
+
 template <typename Operation>
 QString captureFiberError(LineAnnotationController* controller, Operation&& operation)
 {
@@ -215,6 +225,7 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
     for (const auto& s : ctrl->fiberSummaries(std::nullopt)) {
         QJsonObject f;
         f["fiberId"] = QString::number(s.id);
+        addFiberIdentity(f, *_window->_state, *ctrl, s.id);
         f["name"] = QString::fromStdString(s.name);
         f["controlPointCount"] = s.controlPointCount;
         f["linePointCount"] = s.linePointCount;
@@ -321,6 +332,7 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
     QJsonObject result;
     result["opened"] = true;
     result["fiberId"] = QString::number(fiberId);
+    addFiberIdentity(result, *_window->_state, *ctrl, fiberId);
     return result;
 }
 
@@ -481,43 +493,5 @@ QJsonObject AgentBridgeServer::handleFiberExport(const QJsonValue& params)
     QJsonObject result;
     result["exported"] = exported;
     result["path"] = pathStr;
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handleFiberImport(const QJsonValue& params)
-{
-    LineAnnotationController* ctrl = fiberController();
-    const QJsonObject p = params.toObject();
-
-    const QString pathStr = p.value("path").toString();
-    if (pathStr.isEmpty()) {
-        QJsonObject data;
-        data["param"] = "path";
-        throw AgentBridgeError{-32602, "path is required", data};
-    }
-
-    const std::filesystem::path importPath(pathStr.toStdString());
-    std::error_code ec;
-    if (!std::filesystem::exists(importPath, ec)) {
-        QJsonObject data;
-        data["kind"] = "path";
-        data["path"] = pathStr;
-        throw AgentBridgeError{-32007, "Import path does not exist", data};
-    }
-
-    QString err;
-    int imported = 0;
-    int skipped = 0;
-    if (!ctrl->importFibersFromPath(importPath, &err, &imported, &skipped)) {
-        QJsonObject data;
-        data["detail"] = err;
-        data["skipped"] = skipped;
-        throw AgentBridgeError{-32005, "fiber.import failed", data};
-    }
-
-    QJsonObject result;
-    result["imported"] = imported;
-    result["skipped"] = skipped;
     return result;
 }

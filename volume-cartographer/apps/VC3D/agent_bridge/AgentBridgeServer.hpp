@@ -25,6 +25,8 @@
 #include "MenuActionController.hpp"
 #include "VolumeAttachmentController.hpp"
 
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
+
 #include "agent_bridge/AgentBridgeError.hpp"  // AgentBridgeError
 #include "agent_bridge/AgentBridgeMethod.hpp"
 
@@ -34,6 +36,7 @@ class QTimer;
 class CWindow;
 class VolumeViewerBase;
 struct CommandLaunchError;
+struct StoreImportOutcome;
 
 namespace vcr::catalog { struct OpenDataManifest; }
 
@@ -85,6 +88,7 @@ private:
     void registerPointsHandlers();
     void registerSeedingHandlers();
     void registerSurfaceOpsHandlers();
+    void registerStoresHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -232,7 +236,23 @@ private:
     QJsonObject handleFiberDelete(const QJsonValue& params);
     QJsonObject handleFiberSetTag(const QJsonValue& params);
     QJsonObject handleFiberExport(const QJsonValue& params);
-    QJsonObject handleFiberImport(const QJsonValue& params);
+    // Object stores (AgentBridgeHandlers_stores.cpp): importing source files
+    // into a project store and exporting one object as native files, as jobs.
+    QJsonObject handleObjectsImport(const QJsonValue& params);
+    QJsonObject handleObjectsExport(const QJsonValue& params);
+    void completeImportJob(const StoreImportOutcome& outcome);
+    // Store references and routing, Save As, and the project's resource
+    // entries (AgentBridgeHandlers_stores.cpp).
+    QJsonObject handleStoresAttach(const QJsonValue& params);
+    QJsonObject handleStoresCreate(const QJsonValue& params);
+    QJsonObject handleStoresDetach(const QJsonValue& params);
+    QJsonObject handleStoresRoute(const QJsonValue& params);
+    QJsonObject handleProjectSaveAs(const QJsonValue& params);
+    QJsonObject handleProjectAttachNormalGrid(const QJsonValue& params);
+    QJsonObject handleProjectAttachLasagnaManifest(const QJsonValue& params);
+    QJsonObject handleProjectDetachEntry(const QJsonValue& params);
+    QJsonObject handleUmbilicusImport(const QJsonValue& params);
+    QJsonObject handleUmbilicusRemove(const QJsonValue& params);
     // Tags, seeding, push/pull, and tracing.
     QJsonObject handleTagsSet(const QJsonValue& params);
     QJsonObject handleSeedingSetWindingAnnotationMode(const QJsonValue& params);
@@ -304,6 +324,9 @@ private:
         // Additive terminal result body. Empty => "result": null on
         // the wire; catalog and volume-attachment jobs carry structured bodies.
         QJsonObject resultJson;
+        // Latest {completed, total, detail} of a job that counts its work;
+        // empty => "progress": null.
+        QJsonObject progress;
     };
     void subscribeJobSignals();
     // Per-source running check: true when a bridge JobRecord for `source` is
@@ -401,6 +424,8 @@ private:
     // completeCatalogOpenJob to build the result body. Single-threaded GUI, at
     // most one "catalog" job, so a scalar is race-free.
     QString _catalogOpenSampleId;
+    // Attachments bridge export workers are reading; a detach waits for none of them.
+    std::vector<vc::objects::AttachmentIdentity> _exportTargets;
 
     // Deferred-response bookkeeping and the per-request context dispatch() sets
     // before invoking a handler (so a handler can stash the caller).

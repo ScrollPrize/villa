@@ -23,6 +23,8 @@ function(vc_find_reader)
 endfunction()
 vc_find_reader()
 
+option(VC_OBJECT_STORE_PYTHON "Also build the sibling vc_object_store Python package (development)" OFF)
+
 # Prefer an installed package, otherwise build the sibling store and native formats.
 # No installation, FetchContent, or dependency download is performed here.
 function(vc_find_object_store)
@@ -37,9 +39,10 @@ function(vc_find_object_store)
             message(FATAL_ERROR "Install vc_object_store or set VC_OBJECT_STORE_SOURCE to its checkout")
         endif()
         set(VC_OBJECT_STORE_BUILD_ADAPTERS ON)
-        set(VC_OBJECT_STORE_BUILD_LINKING OFF)
+        # The store's Python package needs its relationship detectors.
+        set(VC_OBJECT_STORE_BUILD_LINKING ${VC_OBJECT_STORE_PYTHON})
         set(VC_OBJECT_STORE_BUILD_TOOLS OFF)
-        set(VC_OBJECT_STORE_BUILD_PYTHON OFF)
+        set(VC_OBJECT_STORE_BUILD_PYTHON ${VC_OBJECT_STORE_PYTHON})
         set(VC_OBJECT_STORE_BUILD_TESTS ${VC_TESTING})
         # Each vc_* DLL would otherwise embed and re-export its own copy of the
         # static store, and PE has no symbol interposition to merge them.

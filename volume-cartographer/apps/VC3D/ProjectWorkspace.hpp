@@ -13,6 +13,7 @@
 
 class CState;
 class MenuActionController;
+class ProjectStoreCounts;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -23,15 +24,12 @@ class QTimer;
 class QTreeWidget;
 class QTreeWidgetItem;
 
-// One line on a hosted replica's sync state ("synced 12:03:04", "2 pending", ...).
-QString hubStatusSummary(const vc::objects::HubSessionStatus& status);
-
 // The Project tab: an overview of the project file and its attached stores
 // (paths, access, hosting, object counts), and which store
 // each kind is kept in; its volumes, normal grids and Lasagna datasets (where
 // they are, who sees them, their disk cache); and the chunk and surface caches'
 // use against their limits. Attaching and detaching goes through the File
-// menu's actions; store routes and sync through CState and the session.
+// menu's actions; store routes through CState and the session.
 class ProjectWorkspace : public QWidget
 {
     Q_OBJECT
@@ -47,8 +45,6 @@ signals:
     // View this project volume in the main workspace.
     void volumeActivationRequested(const QString& volumeId);
     void projectRenamed();
-    // A hosted store sync was started from the tab.
-    void hubSyncRequested();
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -58,6 +54,7 @@ private:
     void rebuild();
     void rebuildProject();
     void rebuildStores();
+    void updateStoreCounts();
     void rebuildRoutes();
     void rebuildResources();
     void updateCaches();
@@ -84,8 +81,8 @@ private:
 
     // Stores
     QTreeWidget* _stores = nullptr;
+    ProjectStoreCounts* _storeCounts = nullptr;
     QPushButton* _detachStore = nullptr;
-    QPushButton* _syncStores = nullptr;
     QPushButton* _revealStore = nullptr;
     QPushButton* _replaceStore = nullptr;
     QWidget* _routesPanel = nullptr;

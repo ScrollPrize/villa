@@ -391,18 +391,18 @@ def test_folder_mode_logs_existing_prediction_and_summary(
 
 
 def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path, caplog):
-    config_mapping = config_mapping(
+    mapping = config_mapping(
         "vesuvius_unet_2p5d", depth=3, side=16
     )
-    config_mapping["image_normalization"] = "robust_mad"
-    config = InkConfig.from_mapping(config_mapping)
+    mapping["image_normalization"] = "robust_mad"
+    config = InkConfig.from_mapping(mapping)
     model = make_model(config)
     with torch.no_grad():
         for value in model.state_dict().values():
             if torch.is_floating_point(value):
                 value.zero_()
     checkpoint = tmp_path / "model.pth"
-    torch.save({"config": config_mapping, "model": model.state_dict()}, checkpoint)
+    torch.save({"config": mapping, "model": model.state_dict()}, checkpoint)
     input_path = tmp_path / "surface.zarr"
     array = ZarrWriter.create(
         input_path,
@@ -479,18 +479,18 @@ def test_flat_inference_ignores_embedded_io_paths_and_keeps_reference_defaults(
 
     blocker = tmp_path / "embedded-io-blocker"
     blocker.write_bytes(b"")
-    config_mapping = config_mapping("vesuvius_unet_2p5d", depth=3, side=16)
-    config_mapping["volume_cache_dir"] = str(blocker / "cache")
-    config_mapping["volume_cache_max_gb"] = 120.0
-    config_mapping["volume_auth_json"] = str(blocker / "auth.json")
-    config = InkConfig.from_mapping(config_mapping)
+    mapping = config_mapping("vesuvius_unet_2p5d", depth=3, side=16)
+    mapping["volume_cache_dir"] = str(blocker / "cache")
+    mapping["volume_cache_max_gb"] = 120.0
+    mapping["volume_auth_json"] = str(blocker / "auth.json")
+    config = InkConfig.from_mapping(mapping)
     model = make_model(config)
     with torch.no_grad():
         for value in model.state_dict().values():
             if torch.is_floating_point(value):
                 value.zero_()
     checkpoint = tmp_path / "model.pth"
-    torch.save({"config": config_mapping, "model": model.state_dict()}, checkpoint)
+    torch.save({"config": mapping, "model": model.state_dict()}, checkpoint)
     input_path = tmp_path / "surface.zarr"
     array = ZarrWriter.create(
         input_path,

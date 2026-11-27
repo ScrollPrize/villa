@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Final Review</title>
+<link rel="stylesheet" href="/common.css">
+<style>
+#decision-box textarea { display: block; width: 100%; margin: 6px 0; }
+#decision-box .choices { display: flex; gap: 6px; flex-wrap: wrap; }
+.revisit { border: 1px solid var(--select); border-radius: 6px; padding: 6px 8px; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/">← pairs</a>
+  <h1 id="title">Final review</h1>
+  <span id="count" class="muted"></span>
+  <span id="error"></span>
+</header>
+<main>
+  <section>
+    <h2 id="item-title">Blind round</h2>
+    <div class="row" id="options"></div>
+    <div class="row" id="modes"></div>
+    <canvas id="strip" class="strip"></canvas>
+    <div class="labels"><span>xy (mid z)</span><span>xz (mid y)</span><span>yz (mid x)</span></div>
+    <p class="muted"><kbd>1</kbd>/<kbd>2</kbd> show an option · <kbd>space</kbd> flip with coarse ·
+      <kbd>Enter</kbd> pick the one shown · <kbd>x</kbd> can't tell them apart · <kbd>n</kbd> neither fits ·
+      <kbd>j</kbd>/<kbd>k</kbd> next / previous. Which option is the bend stays hidden until every patch is answered.</p>
+  </section>
+  <section>
+    <div id="revisit"></div>
+    <h2>Round</h2>
+    <div id="round"></div>
+    <div id="decision-box" hidden>
+      <h2 style="margin-top:10px">Decision</h2>
+      <div id="scores"></div>
+      <div class="choices">
+        <button data-publish="bend">Publish with the bend</button>
+        <button data-publish="affine">Publish the affine only</button>
+        <button data-publish="nothing">Publish nothing</button>
+      </div>
+      <textarea id="reason" rows="3" placeholder="why (needed when what you publish misses the bar)"></textarea>
+    </div>
+    <div id="decided"></div>
+  </section>
+</main>
+<script src="/common.js"></script>
+<script>
+const API = `/api/pairs/${encodeURIComponent(PAIR)}`;
+let state = null, index = 0, shown = 0, mode = "overlay", flipped = false, images = {};
+const pickName = c => c === null ? "–" : c === "unsure" ? "can't tell" : c === "none" ? "neither fits" : LETTERS[c];
+
+async function load() {
+  state = await call(`${API}/blind`);
+  $("title").textContent = `Final review · ${state.pair ?? PAIR}`;
+  $("revisit").innerHTML = (state.revisit || []).map(r =>
+    `<div class="revisit"><b>Open question</b> · ${escapeHtml(r.text)}</div>`).join("");
+  if (!state.round) { $("round").innerHTML = `<p class="muted">No blind round yet: it is drawn once the fit is scored.</p>`; return; }
+  const items = state.round.items, answered = items.filter(i => i.choice !== null).length;
+  $("count").textContent = `${answered} of ${items.length} answered`;
+  $("round").innerHTML = `<table><tbody>${items.map((item, i) => `<tr data-i="${i}" style="cursor:pointer">
+      <td>${i + 1}</td><td>${item.patch}</td><td>${pickName(item.choice)}</td>
+      ${state.done ? `<td class="muted">${item.revealed.map((o, k) => `${LETTERS[k]} = ${o.join(", ")}`).join(" · ")}</td>` : ""}</tr>`).join("")}
+    </tbody></table>` + (state.done ? `<p><b>Tally</b> · ${Object.entries(state.tally).map(([c, n]) => `${escapeHtml(c)} ${n}`).join(" · ")}</p>` : "");
+  for (const row of $("round").querySelectorAll("tr")) row.onclick = () => { index = Number(row.dataset.i); shown = 0; showItem(); };
+  $("decision-box").hidden = !state.done || !state.scores;
+  if (state.done && state.scores) showScores();
+  const d = state.decision;
+  $("decided").innerHTML = d ? `<p><b>Decided:</b> publish ${d.publish} of ${d.fit}${d.override ? ` <span class="fail">(override: misses ${d.override.bar_missed.join(", ")})</span>` : ""}<br>
+    <span class="muted">${escapeHtml(d.reason || "")} · ${d.by?.handle ?? ""} ${d.at ?? ""}</span></p>` : "";
+}
+
+function showScores() {
+  const s = state.scores;
+  $("scores").innerHTML = barTable(s) +
+    (s.drift ? `<div class="${s.drift.judge_again.length ? "fail" : "muted"}">hold-out positions measured again under the fit move
+      ${fmt(s.drift.median)} median, ${fmt(s.drift.max)} at most${s.drift.judge_again.length ? ` · ${s.drift.judge_again.length} lining-up patches worth judging again` : ""}</div>` : "") +
+    `<p class="muted">A bend is kept only if it wins its blind round; you may still keep a barely visible bend out.</p>`;
+}
+
+async function showItem() {
+  if (!state.round) return;
+  const items = state.round.items, item = items[index];
+  $("item-title").textContent = `Patch ${item.patch} · ${index + 1} of ${items.length} · your pick: ${pickName(item.choice)}`;
+  $("options").innerHTML = [...Array(item.options).keys()].map(k =>
+    `<button data-k="${k}" class="${k === shown ? "on" : ""}"><kbd>${k + 1}</kbd> ${LETTERS[k]}</button>`).join("");
+  for (const b of $("options").children) b.onclick = () => showOption(Number(b.dataset.k));
+  const tag = `${state.round.id}/${index}`;
+  if (images.tag === tag) { showOption(shown); return; }
+  images = {tag};
+  $("strip").classList.add("loading");
+  try {
+    const base = `/img/${PAIR}/blind/${state.round.id}/${index}`;
+    const [coarse, ...options] = await Promise.all([`${base}/coarse.png`,
+      ...[...Array(item.options).keys()].map(k => `${base}/${k}.png`)].map(picture));
+    if (images.tag !== tag) return;
+    images = {tag, coarse, options};
+    render();
+    $("strip").classList.remove("loading");
+  } catch (e) { $("error").textContent = `${item.patch}: the pictures did not load`; }
+}
+
+function showOption(k) {
+  if (!state.round || k >= state.round.items[index].options) return;
+  shown = k; render();
+  for (const b of $("options").children) b.classList.toggle("on", Number(b.dataset.k) === k);
+}
+
+function render() {
+  if (!images.options) return;
+  const view = mode === "flip" ? (flipped ? "fine" : "coarse") : mode;
+  drawStrip($("strip"), images.coarse, images.options[shown], view, 3);
+  modeButtons($("modes"), mode, flipped, view, m => { mode = m; render(); });
+}
+
+async function pick(choice) {
+  if (!images.options) { $("error").textContent = "still loading this patch: nothing recorded"; return; }
+  try {
+    await call(`${API}/pick`, {round: state.round.id, index, choice});
+    await load();
+    const items = state.round.items;
+    const next = items.findIndex((item, i) => i > index && item.choice === null);
+    const any = items.findIndex(item => item.choice === null);
+    index = next >= 0 ? next : any >= 0 ? any : index; shown = 0;
+    $("error").textContent = "";
+    await showItem();
+  } catch (e) { $("error").textContent = e.message; }
+}
+
+for (const b of document.querySelectorAll("[data-publish]")) b.onclick = async () => {
+  try {
+    await call(`${API}/decide`, {publish: b.dataset.publish, reason: $("reason").value.trim()});
+    $("error").textContent = ""; await load();
+  } catch (e) { $("error").textContent = e.message; }
+};
+
+document.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey || e.target.tagName === "TEXTAREA") return;
+  if (/^[1-8]$/.test(e.key)) showOption(Number(e.key) - 1);
+  else if (e.key === "Enter") pick(shown);
+  else if (e.key === "x") pick("unsure");
+  else if (e.key === "n") pick("none");
+  else if (e.key === "j" || e.key === "k") {
+    index = Math.max(0, Math.min(state.round.items.length - 1, index + (e.key === "j" ? 1 : -1)));
+    shown = 0; showItem();
+  }
+  else if (e.key === " ") { e.preventDefault(); if (mode !== "flip") mode = "flip"; flipped = !flipped; render(); }
+  else if (e.key === "m") { mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length]; render(); }
+});
+load().then(() => {
+  if (!state.round) return;
+  const open = state.round.items.findIndex(item => item.choice === null);
+  index = open < 0 ? 0 : open; showItem();
+}).catch(e => { $("error").textContent = e.message; });
+</script>
+</body>
+</html>

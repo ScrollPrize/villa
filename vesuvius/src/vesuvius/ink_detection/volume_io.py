@@ -107,6 +107,29 @@ def read_bbox_with_padding(
     fill_value: int | float = 0,
 ) -> tuple[np.ndarray, tuple[slice, slice, slice] | None]:
     """Read a positive ZYX bbox, padding only outside the array bounds."""
+    output, destination, region = _padded_bbox(volume, bbox_zyx, fill_value)
+    if region is not None:
+        start, size = region
+        selection = tuple(slice(a, a + n) for a, n in zip(start, size))
+        output[destination] = np.asarray(volume[selection])
+    return output, destination
+
+
+def read_bboxes_with_padding(volume, bboxes_zyx, *, fill_value=0):
+    """Read padded crops together through vc_reader's shared-chunk batch API."""
+    plans = [_padded_bbox(volume, bbox, fill_value) for bbox in bboxes_zyx]
+    regions = [region for _, _, region in plans if region is not None]
+    outputs = [
+        output[destination] for output, destination, region in plans
+        if region is not None
+    ]
+    if regions:
+        volume.read_regions(regions, out=outputs)
+    return [(output, destination) for output, destination, _ in plans]
+
+
+def _padded_bbox(volume, bbox_zyx, fill_value):
+    """Allocate a crop and plan its in-bounds destination and source region."""
     z0, y0, x0, z1, y1, x1 = (int(value) for value in bbox_zyx)
     expected_shape = z1 - z0, y1 - y0, x1 - x0
     if any(size <= 0 for size in expected_shape):
@@ -116,18 +139,11 @@ def read_bbox_with_padding(
     stops = min(shape[0], z1), min(shape[1], y1), min(shape[2], x1)
     output = np.full(expected_shape, fill_value, dtype=np.dtype(volume.dtype))
     if any(stop <= start for start, stop in zip(starts, stops)):
-        return output, None
-    crop = np.asarray(
-        volume[
-            starts[0] : stops[0],
-            starts[1] : stops[1],
-            starts[2] : stops[2],
-        ]
-    )
+        return output, None, None
+    size = tuple(stop - start for start, stop in zip(starts, stops))
     destination_starts = starts[0] - z0, starts[1] - y0, starts[2] - x0
     destination = tuple(
-        slice(start, start + size)
-        for start, size in zip(destination_starts, crop.shape)
+        slice(start, start + length)
+        for start, length in zip(destination_starts, size)
     )
-    output[destination] = crop
-    return output, destination
+    return output, destination, (starts, size)

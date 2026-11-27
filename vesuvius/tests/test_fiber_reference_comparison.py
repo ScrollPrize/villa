@@ -5,6 +5,27 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_reference_comparison import (
     surface_edges,discrete_winding)
 
 
+def test_metrics_only_uses_each_saved_solution_provenance(tmp_path, monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as ref
+    tensor = tmp_path / 'tensors.npz'
+    np.savez(tensor, source_id=['source'])
+    np.savez(tmp_path / 'solution.npz', state=[1], widths=[2])
+    summary = dict(config=dict(tensor_cache=str(tensor)), input=dict(signature=dict(fibers='saved')))
+    (tmp_path / 'summary.json').write_text(json.dumps(summary))
+    def verified(saved):
+        assert saved == summary
+        return ('saved', {'commit': 7})
+    def projection(path, d, config, *, source):
+        assert source == ('saved', {'commit': 7})
+        return None
+    monkeypatch.setattr(ref, '_verified_run_source', verified)
+    monkeypatch.setattr(ref, 'load_metric_projection', projection)
+    monkeypatch.setattr(ref, 'reference_winding_metrics', lambda *args: dict(loss=0))
+    assert ref.metric_report(dict(output_root=tmp_path, projection_cache='fixture',
+                                  solutions=[dict(run_root=tmp_path, label='saved')])) == {
+                                      'solutions': [dict(label='saved', loss=0)]}
+
+
 def test_reference_width_units_offsets_and_coverage(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_reference_comparison import reference_interval_widths,reference_width_metrics
     meta=tmp_path/'meta.json'
@@ -153,7 +174,9 @@ def test_end_to_end_and_projection_cache(tmp_path,monkeypatch):
     import json
     import tifffile
     from vesuvius.neural_tracing.fiber_trace_3d import fiber_reference_comparison as module
-    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import write_fibers
+    from vc_object_store import ObjectStore
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import (
+        fibers_digest, fiber_source_version, write_fibers)
     root=tmp_path/'reference';root.mkdir()
     r,c=np.indices((7,16))
     for name,array in zip('xyz',(c*10,r*10,np.full(r.shape,100))):
@@ -168,7 +191,8 @@ def test_end_to_end_and_projection_cache(tmp_path,monkeypatch):
            node_ds=np.array([[0.,15.,30.]]*2),lengths=np.full(2,30.),phase=np.array([.1,.7]),z=np.full(2,20.))
     np.savez(tensors,**d)
     cfg=dict(fibers=str(original),tensor_cache=str(tensors),layout_mode='shared_anchor',broken_threshold=.5)
-    (source/'summary.json').write_text(json.dumps(dict(config=cfg)))
+    (source/'summary.json').write_text(json.dumps(dict(config=cfg, input=dict(signature=dict(
+        fibers=fibers_digest(original),fiber_source=fiber_source_version(original))))))
     state=np.zeros((2,12));state[:,:4]=[5,-5,-5,-10]
     np.savez(source/'solution.npz',state=state,widths=np.full(3,50.),**{k:d[k] for k in ('source_id','start','end','family')})
     out=tmp_path/'out'
@@ -183,7 +207,8 @@ def test_end_to_end_and_projection_cache(tmp_path,monkeypatch):
     with tifffile.TiffFile(out/'toy'/'reference_fit_detail.tif') as detail:
         assert detail.pages[0].compression.name=='LZW'
     assert not list(out.rglob('*.png'))
-    monkeypatch.setattr(module,'samples',lambda *args: (_ for _ in ()).throw(AssertionError('cache not used')))
+    original_samples=module.samples
+    monkeypatch.setattr(module,'samples',lambda *args,**kwargs: (_ for _ in ()).throw(AssertionError('cache not used')))
     module.run(settings)
     settings['projection_cache_root']=str(out)
     settings['output_root']=str(tmp_path/'second')
@@ -193,6 +218,16 @@ def test_end_to_end_and_projection_cache(tmp_path,monkeypatch):
     settings['max_distance_base']=123
     with pytest.raises(ValueError,match='External projection cache'):
         module.run(settings)
+    with ObjectStore.open(str(original),author='editor') as db:
+        moved=np.array([[15.,22.,100.],[75.,22.,100.]],dtype='<f8')
+        db.edit_geometry(fid,[dict(array='line_points',element_offset=0,data=moved.tobytes())],
+                         db.current_version(fid))
+    settings.pop('projection_cache_root')
+    settings['output_root']=str(tmp_path/'after-move')
+    monkeypatch.setattr(module,'samples',original_samples)
+    module.run(settings)
+    with np.load(tmp_path/'after-move'/'projection.npz') as projection:
+        np.testing.assert_array_equal(projection['xyz'][:,1],20.)
 
 
 def test_detail_migration(tmp_path):

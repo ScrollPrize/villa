@@ -100,6 +100,7 @@ public:
     /// opened, or selection is locked while growth runs.
     bool activateSurfaceById(const std::string& surfaceId,
                              QString* errorMessage = nullptr);
+    void setSelectionChangeGuard(std::function<bool()> guard) { _selectionChangeGuard = std::move(guard); }
     void resetTagUi();
 
     bool isCurrentOnlyFilterEnabled() const;
@@ -125,7 +126,7 @@ public:
     // Make object revision `revision` of a surface in a writable store its
     // current one (a new revision with its content); the open surface reopens
     // from the commit. False with a reason when it cannot.
-    bool restoreRevision(const std::string& id, const std::string& revision, QString* errorMessage = nullptr);
+    bool restoreRevision(const std::string& id, const vc::objects::ObjectVersion& version, QString* errorMessage = nullptr);
     // Restore an imported catalog surface's catalog version: its first revision.
     bool resetToCatalogVersion(const std::string& id, QString* errorMessage = nullptr);
 
@@ -167,7 +168,8 @@ private:
     SurfaceTreeWidgetItem* itemFor(const std::string& id) const;
     // Open the selected surface and announce it.
     // Opens the surface (unless `opened` already holds it) and announces it.
-    void activate(const std::string& id, bool preserveEditing, std::optional<SurfaceCatalog::Opened> opened = std::nullopt);
+    bool activate(const std::string& id, bool preserveEditing, std::optional<SurfaceCatalog::Opened> opened = std::nullopt);
+    bool prepareSelectionChange();
     void fetchThenActivate(const std::string& id, bool preserveEditing);
 
     void connectFilterSignals();
@@ -201,6 +203,7 @@ private:
     bool cycleVisibleSegment(int direction);
 
     UiRefs _ui;
+    std::function<bool()> _selectionChangeGuard;
     CState* _state{nullptr};
     SurfaceCatalog* _catalog{nullptr};
     ViewerManager* _viewerManager{nullptr};

@@ -7,8 +7,17 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <cstdint>
 
 namespace vc::objects::util {
+
+// Stable FNV-1a over the canonical UUID bytes, shared by routing and bulk joins.
+inline std::uint64_t uuidHash64(const std::array<unsigned char,16>& bytes)
+{
+    std::uint64_t hash=UINT64_C(14695981039346656037);
+    for(const auto byte:bytes){hash^=byte;hash*=UINT64_C(1099511628211);}
+    return hash;
+}
 
 inline bool isUuid(const std::string& value)
 {
@@ -25,8 +34,18 @@ inline bool isUuid(const std::string& value)
 
 inline std::string canonicalUuid(std::string value)
 {
-    if (!isUuid(value)) throw std::invalid_argument("invalid UUID: " + value);
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    // UUIDs contain ASCII hex, not locale-dependent text. Validate and lower
+    // in one pass rather than two ctype calls for every character of every key.
+    const auto invalid=[&]{throw std::invalid_argument("invalid UUID: " + value);};
+    if(value.size()!=36)invalid();
+    for(size_t i=0;i<value.size();++i){
+        auto& c=value[i];
+        if(i==8||i==13||i==18||i==23){if(c!='-')invalid();}
+        else if(c>='0'&&c<='9'){}
+        else if(c>='a'&&c<='f'){}
+        else if(c>='A'&&c<='F')c=char(c+('a'-'A'));
+        else invalid();
+    }
     return value;
 }
 
@@ -59,5 +78,6 @@ inline std::string newUuid()
 std::string nameUuid(std::string_view name);
 // The same in another namespace (a UUID), e.g. one shared with other tools.
 std::string nameUuid(const std::string& namespaceUuid, std::string_view name);
+std::string nameUuid(const std::array<unsigned char,16>& namespaceUuid, std::string_view name);
 
 } // namespace vc::objects::util

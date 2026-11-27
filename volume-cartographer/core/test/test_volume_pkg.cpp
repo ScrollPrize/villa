@@ -2,6 +2,7 @@
 // (open/reopen), entry add/remove, validators, and the free vc::project helpers.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <vc_object_store/Uuid.hpp>
 #include <doctest/doctest.h>
 
 #include "vc/core/types/VolumePkg.hpp"
@@ -134,6 +135,25 @@ TEST_CASE("A new project is empty")
     CHECK(p->name() == "test");
 }
 
+TEST_CASE("Project store entries: hosted ones name an http(s) endpoint, files do not")
+{
+    const auto store = vc::test::createTestProject();
+    auto p = store.open();
+    auto& document = p->document();
+    const auto with = [&](nlohmann::json entry) {
+        auto data = document.data();
+        data["stores"].push_back(std::move(entry));
+        return data;
+    };
+    const auto id = [] { return vc::objects::util::newUuid(); };
+    document.replace(with({{"id", id()}, {"location", "http://127.0.0.1:8750"}, {"hosted", true}, {"read_only", false}}));
+    CHECK(vc::project::ProjectDocument::hostedStore(document.data()["stores"].back()));
+    CHECK_THROWS(document.replace(with({{"id", id()}, {"location", "elsewhere.vcobj"}, {"hosted", true}})));
+    CHECK_THROWS(document.replace(with({{"id", id()}, {"location", "http://127.0.0.1:8751"}})));
+    CHECK_THROWS(document.replace(with({{"id", id()}, {"location", "http://127.0.0.1:8750"}, {"hosted", true}}))); // duplicate
+    CHECK(store.open()->document().data()["stores"].size() == 2);
+}
+
 TEST_CASE("VolumePkg: setName persists in the project file")
 {
     const auto store = vc::test::createTestProject();
@@ -262,8 +282,8 @@ TEST_CASE("VolumePkg stores regular and fiber Lasagna entries in one resource ki
     REQUIRE(pkg->addLasagnaDatasetEntry("fiber.lasagna.json", {"model:v1", std::string(vc::project::kFiberLasagnaTag)}));
     pkg->setSelectedLasagnaDataset("regular.lasagna.json");
     pkg->setSelectedFiberInferenceDataset("fiber.lasagna.json");
-    store.session->read(store.attachment, [](const auto& db, const auto& txn, const auto&) {
-        CHECK(vc::objects::projectResources(db, txn, vc::objects::kLasagnaDatasetResource).empty());
+    store.session->readStore(store.attachment, [](const vc::objects::StoreReader& reader, const auto&) {
+        CHECK(vc::objects::projectResources(reader, vc::objects::kLasagnaDatasetResource).empty());
     });
 
     vc::project::LoadOptions options;

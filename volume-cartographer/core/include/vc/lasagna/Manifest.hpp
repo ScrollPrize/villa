@@ -64,6 +64,15 @@ struct LasagnaDatasetManifest {
 
     nlohmann::json raw = nlohmann::json::object();
 
+    // The manifest's validity_channel: the channel whose stored zero marks a voxel
+    // without data, or kValidityByChunks (a voxel is valid iff the chunk of its
+    // group's finest level that holds it is stored). A legacy manifest without the
+    // field keeps its historical channel: grad_mag when present, else presence;
+    // empty when neither exists.
+    static constexpr std::string_view kValidityByChunks = "chunks";
+    std::string validityChannel;
+    [[nodiscard]] bool validityByChunks() const noexcept { return validityChannel == kValidityByChunks; }
+
     [[nodiscard]] bool hasNormalSource() const noexcept;
     [[nodiscard]] const LasagnaChannelGroup* groupForChannel(std::string_view channel) const noexcept;
     [[nodiscard]] std::vector<std::string> fiberPredictionPrefixes() const;
@@ -94,7 +103,9 @@ struct LasagnaDatasetManifest {
     int maximumAbsoluteLevel = 30);
 
 
-// Alias predicted sheet_* heads as normals without changing packed channel indices.
+// Alias the predicted sheet_nx/sheet_ny heads as nx/ny without changing packed
+// channel indices. The result keeps the prediction's validity declaration (chunk
+// existence, or a channel such as presence) and carries no winding density.
 [[nodiscard]] LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest&);
 
 } // namespace vc::lasagna

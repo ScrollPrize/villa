@@ -13,6 +13,7 @@
 #include <QMessageBox>
 #include <QClipboard>
 #include <QApplication>
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 #include <cmath>
 #include <utility>
@@ -492,12 +493,31 @@ QString CommandLineToolRunner::getOutputPath() const
 {
     switch (_currentTool) {
         case Tool::RenderTifXYZ: return QFileInfo(_outputPattern).dir().path();
-        case Tool::tifxyz2obj: return _exportedObj;
+        case Tool::tifxyz2obj: return exportedObjCopy();
         // An in-place refinement creates nothing: the source changed.
         case Tool::AlphaCompRefine: return _createdSurfaces.isEmpty() ? _surfaceUuid : _createdSurfaces.join('\n');
         case Tool::CustomCommand: return QString();
         default: return _createdSurfaces.join('\n');
     }
+}
+
+QString CommandLineToolRunner::exportedObjCopy() const
+{
+    // The tool published the OBJ as an artifact of the surface; a copy goes
+    // to the surface's export directory for the user (and agents).
+    if (_exportedObj.isEmpty() || _storePath.isEmpty() || _surfaceUuid.isEmpty()) return {};
+    try {
+        vc::objects::ObjectStoreSession session;
+        vc::objects::OpenOptions options;
+        options.readOnly = true;
+        const auto store = session.attach(_storePath.toStdString(), options);
+        const auto directory = std::filesystem::path(vc3d::surfaceExportDirectory(_surfaceUuid).toStdString());
+        for (const auto& file : session.materializeArtifacts(store, _surfaceUuid.toStdString(), directory))
+            if (file.name == _exportedObj.toStdString()) return QString::fromStdString((directory / file.name).string());
+    } catch (const std::exception& error) {
+        _consoleOutput->appendOutput(tr("Cannot copy the exported OBJ: %1\n").arg(QString::fromUtf8(error.what())));
+    }
+    return {};
 }
 
 void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,

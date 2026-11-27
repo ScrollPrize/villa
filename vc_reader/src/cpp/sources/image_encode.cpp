@@ -1,5 +1,6 @@
 #include "vc_reader/image_write.hpp"
 #include "vc_reader/zarr.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include <png.h>
 #include <cstdio>
 #include <jpeglib.h>
@@ -66,7 +67,7 @@ std::vector<std::uint8_t> encodeJpeg(ImageView image,int quality) {
     return {state.bytes,state.bytes+state.size};
 }
 void writeImage(const std::filesystem::path& path,ImageView image,int quality) {
-    auto suffix=path.extension().string();
+    auto suffix=utf8String(path.extension());
     std::transform(suffix.begin(),suffix.end(),suffix.begin(),[](unsigned char c){return char(std::tolower(c));});
     if(suffix==".tif" || suffix==".tiff") {writeTiff(path,image);return;}
     const auto bytes=suffix==".png"?encodePng(image):suffix==".jpg" || suffix==".jpeg"?encodeJpeg(image,quality):

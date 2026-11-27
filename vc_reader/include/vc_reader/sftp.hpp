@@ -2,12 +2,12 @@
 
 // SFTP v3 client over the system OpenSSH `ssh` program (`ssh -s HOST sftp`).
 // OpenSSH alone handles configuration, keys, the agent, ProxyJump and host
-// verification; no SSH library is linked. Ordinary access uses the subsystem;
-// process-locked hubs run a quoted remote command around sftp-server. Without an
+// verification; no SSH library is linked. Without an
 // authenticator ssh runs in batch mode and never prompts. With one, every ssh
 // prompt (password, key passphrase, one-time code, new host key) is answered by
 // the application through SSH_ASKPASS (Linux and macOS).
 
+#include "vc_reader/exception_type.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -64,16 +64,26 @@ struct Options {
     // waiting for the user to answer a prompt does not count.
     std::chrono::milliseconds idleTimeout{30000};
     std::function<bool()> cancelled;  // polled while waiting
-    // Hub-only: run the existing remote sftp-server under a process-owned
-    // flock on this file. Requires SSH command execution, flock and timeout.
-    // Empty keeps ordinary SFTP subsystem access (e.g. remote volumes).
-    std::string processLock;
-    // Server-side hard deadline, including lock acquisition. Killing the
-    // writer releases its lock even if the connection silently disappears.
-    std::chrono::seconds processLifetime{1800};
-    // Share an application-private SSH transport on POSIX clients. Sessions
-    // and their server locks remain independent. Ignored on Windows.
-    bool shareConnection = false;
+};
+
+// A hosted-service address: ssh://[user@]host:SERVICE_PORT (sftp:// is an alias).
+// The port is the remote loopback service port, not the SSH login port. SSH's
+// own port, keys and ProxyJump come from OpenSSH configuration. No file path.
+Url parseForwardUrl(std::string_view endpoint);
+
+// Owns a loopback-only local TCP forward and the ssh process for its lifetime.
+// Uses setAuthenticator like Session. OpenSSH must be installed. Disconnects
+// fail existing requests; create a new Forward to reconnect.
+class Forward {
+public:
+    explicit Forward(const std::string& endpoint, Options options = {});
+    ~Forward();
+    Forward(const Forward&) = delete;
+    Forward& operator=(const Forward&) = delete;
+    const std::string& endpoint() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 enum Status : uint32_t {
@@ -81,7 +91,7 @@ enum Status : uint32_t {
     NoConnection = 6, ConnectionLost = 7, OpUnsupported = 8,
 };
 // The server answered with an error status; the session remains usable.
-struct StatusError : std::runtime_error {
+struct VCR_EXCEPTION_TYPE StatusError : std::runtime_error {
     uint32_t status;
     StatusError(uint32_t status, const std::string& message);
 };

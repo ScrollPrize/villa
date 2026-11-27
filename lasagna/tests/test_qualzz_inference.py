@@ -106,7 +106,7 @@ def test_tiled_engine_and_resume(tmp_path, flush_workers):
             model_adapter=adapter, output_adapter=writer, products=(product,),
             output_regions_zyx={"semantic": (0,0,0,*shape)},
             full_output_shapes_zyx={"semantic": shape}, tile_size=8, overlap=4, border=2,
-            input_zarr_path=str(tmp_path / "ct.zarr/0"),
+
             tmp_dir=str(tmp_path), progress=progress, product_accumulator_dtype="float32",
             flush_workers=flush_workers)
     run()

@@ -1,5 +1,5 @@
 {
-  "dataset_path": "/home/paul/projects/vesuvius-scrolls/spiral/dataset",
+  "inputs": "/home/paul/projects/vesuvius-scrolls/spiral/dataset/spiral-inputs.json",
   "z_begin": 10000,
   "z_end": 11000,
   "iterations": 401,

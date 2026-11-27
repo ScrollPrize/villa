@@ -377,6 +377,21 @@ def test_mps_cache_is_released_on_rebuild_and_preview_export(monkeypatch):
     assert released == ['mps', 'mps']
 
 
+def test_a_model_rebuild_keeps_the_session_device():
+    # The session chooses its device once; releasing it with the model stage
+    # left rebuild_model_state() reading None.device.
+    import types
+    from fit_spiral import FitContext
+    assert 'device' not in FitContext._MODEL_STAGE_ATTRIBUTES
+    built = []
+    session = types.SimpleNamespace(
+        device=torch.device('cpu'), profiler=None,
+        _MODEL_STAGE_ATTRIBUTES=FitContext._MODEL_STAGE_ATTRIBUTES,
+        _build_model_state=lambda: built.append(session.device))
+    FitContext.rebuild_model_state(session)
+    assert built == [torch.device('cpu')]
+
+
 @pytest.mark.parametrize('device,bits', [
     ('cpu', '32'), pytest.param('mps', '64', marks=pytest.mark.skipif(
         not torch.backends.mps.is_available(), reason='needs MPS'))])

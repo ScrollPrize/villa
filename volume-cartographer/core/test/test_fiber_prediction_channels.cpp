@@ -322,7 +322,9 @@ TEST_CASE("dense ROI respects packed channel offsets and missing chunks") {
     detail::FiberChunkTensor dense(field,normals,{0,0,0},{3,3,7});
     std::vector<unsigned char> bytes;std::vector<float> widths;dense.packGpu(bytes,widths);
     REQUIRE(bytes.size()==6*128);REQUIRE(widths.size()==128);
-    const std::array<int,6> order{0,1,2,6,4,5};
+    // Channel 3 of the dense tensor is the normals' validity: the prediction's
+    // presence channel (old data, sheet_grad_mag unused).
+    const std::array<int,6> order{0,1,2,0,4,5};
     for(size_t i=0;i<128;++i){
         for(size_t c=0;c<6;++c)CHECK(bytes[i*6+c]==(i<64?constants[order[c]]:0));
         CHECK(widths[i]==(i<64?40:0));

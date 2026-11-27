@@ -99,13 +99,14 @@ loading.
   atomic chunk writes.
 - Common tiled arguments are `--input`, `--output`, `--checkpoint`,
   `--tile-size`, `--overlap`, `--border`, `--inference-scaledown-power`, `--crop`,
-  `--device`, `--devices`, `--download-workers`, `--no-download`, `--levels`, `--ome-chunk`, and
+  `--device`, `--devices`, `--input-disk-cache-dir`, `--input-disk-cache-gib`,
+  `--input-connections`, `--read-ahead-tiles`, `--levels`, `--ome-chunk`, and
   `--pyramid-workers`.
 - Use all visible GPUs with `--devices all`, or select a subset such as
   `--devices cuda:0,cuda:2`. `--device` retains the single-device/CPU path and
   cannot be combined with `--devices`.
-- `--download-workers` controls parallel automatic S3 chunk transfers and
-  defaults to 64. It is separate from CPU tile `--prefetch-workers`, GPU
+- `--input-connections` controls parallel remote input reads and defaults to
+  64. It is separate from CPU tile `--prefetch-workers`, GPU
   `--slots-per-gpu`, and output `--pyramid-workers`.
 - Fiber defaults to `--inference-scaledown-power 2`: filtered factor-4 output,
   or 0.25x per axis relative to the selected input. Power 0 keeps full input
@@ -156,15 +157,16 @@ The reader's memory cache and threads are explicit. Single-device inference
 keeps the same bounded canonical window of background reads before synchronous
 model forwards.
 
-For volumes too large to retain locally, both entry points can pass
-`--live-fetch`. `lasagna.live_omezarr_cache` validates the selected local
-numeric level against its S3 source and reads it through a `vc_reader` reader
-whose disk cache (`<ome root>/.live_cache`, default target 10 TiB) removes its
-least recently used chunks. At most 10,000 cheap canonical tile descriptors are
-read ahead, and only completed reads are admitted to the independently bounded
-tile-array window.
-Remote listings are authoritative;
-`.noremote` remains advisory and eviction never records remote absence.
+Both entry points open `--input` through `lasagna.input_level.InputLevel`, a
+`vc_reader` reader over a local level directory or a remote OME-Zarr level URL.
+Remote chunks are cached decoded in `--input-disk-cache-dir`; with
+`--input-disk-cache-gib` the cache removes its least recently used chunks past
+the bound, which is how volumes too large to retain locally are processed. At
+most `--read-ahead-tiles` (default 10,000) cheap canonical tile descriptors are
+read ahead on `--input-connections` reads, and only completed reads are
+admitted to the independently bounded tile-array window. Sparse support comes
+from a per-z-plane chunk listing of the level (`vc_reader` `ObjectStore`);
+stores that cannot be listed read every region.
 
 The shared multi-device runner's opt-in `--profile-pipeline` diagnostics use
 streaming aggregates and callbacks bounded by that prefetch window. They report
