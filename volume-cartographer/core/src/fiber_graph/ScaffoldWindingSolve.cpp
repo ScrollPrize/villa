@@ -391,43 +391,48 @@ std::vector<ScaffoldConstraint> scaffoldLinkConstraints(const ScaffoldGraph& gra
         const auto refined =
             fiber_tracer::refineFiberCrossing(lineOf(link.a), lineOf(link.b), projectedA.arc, projectedB.arc, refinement);
         const bool sameFamily = fiberA.family == fiberB.family;
-        if (!refined.accepted) {
+        // The refinement found the encounter the link states when it accepted
+        // one and the geometry's verdict is the families'. Where it did not,
+        // a manual link is the annotator's statement and is taken where it was
+        // placed - a link at a fiber's end has no fiber on one side to certify
+        // it, and that end is what it links. An automatic link was placed by
+        // a tool at a pass of two fibers, so one without that pass asserts
+        // nothing.
+        const bool encounter = refined.accepted && refined.parallel == sameFamily;
+        if (!encounter && link.autoLink) {
             const auto& why = refined.failure;
-            if (why.find("orientation") != std::string::npos) ++report.skippedAngle;
+            if (refined.accepted || why.find("orientation") != std::string::npos) ++report.skippedAngle;
             else if (why.find("support") != std::string::npos) ++report.skippedEndSupport;
             else if (why.find("distance") != std::string::npos) ++report.skippedDistance;
             else ++report.skippedConsistency;
-            if (link.adjacent) --report.adjacent; else --report.ordinary;
+            drop();
             continue;
         }
-        // The geometry's verdict has to be the families': as for a crossing.
-        if (refined.parallel != sameFamily) {
-            ++report.skippedAngle;
-            if (link.adjacent) --report.adjacent; else --report.ordinary;
-            continue;
-        }
+        const double arcA = encounter ? refined.arcA : projectedA.arc;
+        const double arcB = encounter ? refined.arcB : projectedB.arc;
         // Neither the stated anchors nor the refined encounter may lie on a
         // gap span, or closer to one than the encounter needs fiber.
         {
-            const double support = refined.parallel ? kScaffoldParallelSupport : kScaffoldPerpendicularSupport;
+            const double support = sameFamily ? kScaffoldParallelSupport : kScaffoldPerpendicularSupport;
             const auto a = std::size_t(link.a), b = std::size_t(link.b);
             if (geometry.nearGap(a, projectedA.arc, 0.) || geometry.nearGap(b, projectedB.arc, 0.) ||
-                geometry.nearGap(a, refined.arcA, support) || geometry.nearGap(b, refined.arcB, support)) {
+                geometry.nearGap(a, arcA, support) || geometry.nearGap(b, arcB, support)) {
                 ++report.skippedGap;
                 drop();
                 continue;
             }
         }
-        report.maxRefinementShift = std::max({report.maxRefinementShift, std::abs(refined.arcA - projectedA.arc),
-                                              std::abs(refined.arcB - projectedB.arc)});
+        if (!encounter) ++report.asPlaced;
+        report.maxRefinementShift = std::max({report.maxRefinementShift, std::abs(arcA - projectedA.arc),
+                                              std::abs(arcB - projectedB.arc)});
 
         ScaffoldConstraint constraint;
-        constraint.kind = refined.parallel ? ScaffoldConstraintKind::Parallel : ScaffoldConstraintKind::Perpendicular;
+        constraint.kind = sameFamily ? ScaffoldConstraintKind::Parallel : ScaffoldConstraintKind::Perpendicular;
         constraint.link = std::int64_t(index);
         constraint.a = link.a;
         constraint.b = link.b;
-        constraint.arcA = refined.arcA;
-        constraint.arcB = refined.arcB;
+        constraint.arcA = arcA;
+        constraint.arcB = arcB;
         constraint.step = step;
         constraint.weight = options.weight;
         constraints.push_back(constraint);

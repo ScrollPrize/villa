@@ -195,18 +195,18 @@ TEST_CASE("a frustrated triangle names the cycle its violation lies on")
     ScaffoldSolveOptions options;
     const auto result = solveScaffoldWinding(builder.graph, geometry, options);
     CHECK(result.linkReport.used == 3);
-    CHECK(result.objective == doctest::Approx(1.));
+    CHECK(result.objective == doctest::Approx(100.));
     CHECK(result.maxResidual == doctest::Approx(1.));
     CHECK(result.violatedConstraints == 1);
     CHECK(result.violatedArcs == 1);
     REQUIRE(result.residuals.size() == 1);
     const auto& residual = result.residuals.front();
     CHECK(residual.residual == doctest::Approx(1.));
-    CHECK(residual.cost == doctest::Approx(1.));
+    CHECK(residual.cost == doctest::Approx(100.));
     // The cycle is the triangle: three constraints, one stretch per fiber.
     CHECK(residual.cycleHops == 3);
     CHECK(residual.redundancy == 1);
-    CHECK(residual.joint == doctest::Approx(1. / 3.));
+    CHECK(residual.joint == doctest::Approx(100. / 3.));
     REQUIRE(residual.pieces.size() == 3);
     std::vector<std::int64_t> fibers;
     for (const auto& piece : residual.pieces) fibers.push_back(piece.fiber);
@@ -300,7 +300,7 @@ TEST_CASE("nothing is held rigid: approved links are ordinary constraints")
     // Two approved links that contradict each other cost one winding; the
     // run does not stop.
     const auto result = solveScaffoldWinding(builder.graph, geometry);
-    CHECK(result.objective == doctest::Approx(1.));
+    CHECK(result.objective == doctest::Approx(100.));
     CHECK(result.residuals.size() == 1);
 }
 
@@ -430,28 +430,44 @@ TEST_CASE("a link is refined onto the encounter of its two fibers")
     CHECK(report.maxRefinementShift == doctest::Approx(30.));
 }
 
-TEST_CASE("a link the refinement rejects asserts nothing")
+TEST_CASE("a manual link without an encounter is taken where it was placed, an automatic one asserts nothing")
 {
-    Builder builder;
-    const auto h = builder.fiber(ScaffoldFamily::Horizontal, 100.);
-    const auto other = builder.fiber(ScaffoldFamily::Horizontal, 110.);
-    const auto v = builder.fiber(ScaffoldFamily::Vertical, 120.);
-    const auto far = builder.fiber(ScaffoldFamily::Horizontal, 700.);
-    // At the fibers' first points: nothing on one side to certify it.
-    builder.link(h, other, false, "approved", -195., -195.);
-    // Tagged as two H fibers, but they cross at a right angle.
-    builder.graph.fibers[v].family = ScaffoldFamily::Horizontal;
-    builder.link(h, v);
-    // Side by side, 600 voxels apart.
-    builder.link(h, far);
-    const ScaffoldGeometry geometry(builder.graph);
-    ScaffoldLinkReport report;
-    const auto constraints = scaffoldLinkConstraints(builder.graph, geometry, ScaffoldLinkArcOptions{}, report);
-    CHECK(constraints.empty());
-    CHECK(report.used == 0);
-    CHECK(report.skippedEndSupport == 1);
-    CHECK(report.skippedAngle == 1);
-    CHECK(report.skippedDistance == 1);
+    for (const bool automatic : {false, true}) {
+        Builder builder;
+        const auto h = builder.fiber(ScaffoldFamily::Horizontal, 100.);
+        const auto other = builder.fiber(ScaffoldFamily::Horizontal, 110.);
+        const auto v = builder.fiber(ScaffoldFamily::Vertical, 120.);
+        const auto far = builder.fiber(ScaffoldFamily::Horizontal, 700.);
+        // At the fibers' first points: nothing on one side to certify it.
+        builder.link(h, other, false, "approved", -195., -195., automatic);
+        // Tagged as two H fibers, but they cross at a right angle.
+        builder.graph.fibers[v].family = ScaffoldFamily::Horizontal;
+        builder.link(h, v, false, "approved", 5., 5., automatic);
+        // Side by side, 600 voxels apart.
+        builder.link(h, far, false, "approved", 5., 5., automatic);
+        const ScaffoldGeometry geometry(builder.graph);
+        ScaffoldLinkArcOptions options;
+        options.includeAuto = true;
+        ScaffoldLinkReport report;
+        const auto constraints = scaffoldLinkConstraints(builder.graph, geometry, options, report);
+        if (automatic) {
+            CHECK(constraints.empty());
+            CHECK(report.used == 0);
+            CHECK(report.asPlaced == 0);
+            CHECK(report.skippedEndSupport == 1);
+            CHECK(report.skippedAngle == 1);
+            CHECK(report.skippedDistance == 1);
+        } else {
+            // Each at its own anchors, of the kind its families state.
+            REQUIRE(constraints.size() == 3);
+            CHECK(report.used == 3);
+            CHECK(report.asPlaced == 3);
+            CHECK(report.skippedEndSupport + report.skippedAngle + report.skippedDistance == 0);
+            for (const auto& constraint : constraints) CHECK(constraint.kind == ScaffoldConstraintKind::Parallel);
+            CHECK(constraints[0].arcA == doctest::Approx(geometry.project(h, *builder.graph.links[0].anchorA).arc));
+            CHECK(constraints[0].arcB == doctest::Approx(geometry.project(other, *builder.graph.links[0].anchorB).arc));
+        }
+    }
 }
 
 TEST_CASE("a link on a tail or on a gap span asserts nothing")

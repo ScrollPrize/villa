@@ -89,17 +89,22 @@ struct ScaffoldLinkArcOptions {
     // approval states remain an error, so a misconfigured state list cannot
     // silently become a linkless run.
     bool useLinks = true;
-    // Record approval states to use; the Python stage's default is approved only.
-    std::vector<std::string> approvalStates{"approved"};
+    // Record approval states to use. A pending link is an annotator's link
+    // nobody reviewed yet, and most of a scaffold's links are: it counts.
+    std::vector<std::string> approvalStates{"approved", "pending"};
     bool includeAuto = false;
     // Anchors farther than this from their fiber polyline fail the run: a
     // coordinate-frame guard, not a tolerance to widen silently.
     double maxAnchorDistance = 5.0;
-    double weight = 1.0;
+    // A manual link is the annotator's statement: it outweighs a measured
+    // crossing (equation at most 1, sign 3).
+    double weight = 100.0;
     // A link is refined onto the encounter of its two fibers with the
     // crossing extraction's own refinement and acceptance rules (angle
-    // tolerance, fiber support on both sides), seeded at its anchors. This is
-    // the farthest the two refined points may lie apart, in voxels.
+    // tolerance, fiber support on both sides), seeded at its anchors. A manual
+    // link without such an encounter is taken where it was placed; an
+    // automatic one asserts nothing. This is the farthest the two refined
+    // points may lie apart, in voxels.
     double refineMaximumDistance = 512.0;
     // A measured crossing of the same pair within this arc distance of a
     // refined link, on both fibers, is the same encounter: the link is kept
@@ -112,7 +117,10 @@ struct ScaffoldLinkReport {
                  skippedEndpoint = 0, skippedSelfLink = 0, skippedAdjacentSameFamily = 0, skippedMissingAnchor = 0,
                  skippedUntagged = 0;
     double maxAnchorDistance = 0;
-    // Links the refinement rejected, by the rule that rejected them: the two
+    // Manual links the refinement found no encounter for, used at their own
+    // anchors (among `used`).
+    std::int64_t asPlaced = 0;
+    // Automatic links the refinement rejected, by the rule that rejected them: the two
     // fibers do not meet at the angle their families state (or at no clear
     // angle), a fiber ends too close to the encounter to certify it, the
     // refined points lie farther apart than the limit, or another

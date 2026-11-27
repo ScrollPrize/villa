@@ -242,6 +242,7 @@ ScaffoldRunRows scaffoldSolveRunRows(const ScaffoldGraph& graph, const ScaffoldS
     // relation, how many the refinement rejected and why, and how many
     // measured crossings they replaced.
     count("link_constraints", result.linkConstraints, "constraints");
+    count("links_as_placed", result.linkReport.asPlaced, "links");
     count("links_rejected_angle", result.linkReport.skippedAngle, "links");
     count("links_rejected_end_support", result.linkReport.skippedEndSupport, "links");
     count("links_rejected_distance", result.linkReport.skippedDistance, "links");

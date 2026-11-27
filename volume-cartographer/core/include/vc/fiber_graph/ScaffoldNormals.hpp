@@ -181,7 +181,7 @@ struct ScaffoldNormalOptions {
     // Weight every anchor enters the strip solve's orientation vote with.
     double anchorWeight = 1.0;
     // Record approval states whose adjacent links may anchor a normal.
-    std::vector<std::string> linkApprovalStates{"approved"};
+    std::vector<std::string> linkApprovalStates{"approved", "pending"};
     bool includeAutoLinks = false;
     std::size_t workers = 1;
     // Reuse: the normals of a fiber whose version and input digest are

@@ -195,11 +195,6 @@ ScaffoldSolveController::ScaffoldSolveController(CState* state, QObject* parent)
 
 ScaffoldSolveController::~ScaffoldSolveController() = default;
 
-std::filesystem::path ScaffoldSolveController::neighbourNormalsPath(const std::filesystem::path& fiberStore)
-{
-    return fiberStore.string() + ".neighbour_normals.vcstrip";
-}
-
 void ScaffoldSolveController::setWindingSampler(WindingSamplerResolver resolver)
 {
     _windingSampler = std::move(resolver);
@@ -604,14 +599,14 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
     // What a measured run reads is captured here and opened on the worker:
     // opening a dataset (a remote manifest, say) must never block the GUI.
     ScaffoldSolveController::WindingSamplerOpener openSampler;
-    if (request.measureCrossings && request.measureWindingDistances && _windingSampler) openSampler = _windingSampler();
+    if (request.profile.measureCrossings && request.profile.events.measureWindingDistances && _windingSampler) openSampler = _windingSampler();
     ScaffoldSolveController::AxisSamplerOpener openAxes;
-    if (request.measureCrossings && request.normalSource == "fused" && _axisSampler) openAxes = _axisSampler();
+    if (request.profile.measureCrossings && request.profile.normalSource == "fused" && _axisSampler) openAxes = _axisSampler();
     _job = std::make_shared<SolveJob>();
     _job->openSampler = std::move(openSampler);
     _job->openAxes = std::move(openAxes);
-    if (request.measureCrossings && request.normalSource == "neighbours") {
-        _job->neighbourPath = neighbourNormalsPath(session->path(*store));
+    if (request.profile.measureCrossings && request.profile.normalSource == "neighbours") {
+        _job->neighbourPath = vc::fiber_graph::scaffoldNeighbourNormalsPath(session->path(*store));
         _job->neighbours = _neighbours;
     }
     if (const auto path = session->path(*store); !_kept || _kept->store != path) {
@@ -656,10 +651,10 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             // A run that measures separations needs the density to measure
             // them on, and a fused run its prediction: both are opened here,
             // and a run that cannot have them stops before it reads a fiber.
-            if (job->request.measureCrossings &&
-                (job->request.measureWindingDistances || job->request.normalSource != "geometry")) {
+            if (job->request.profile.measureCrossings &&
+                (job->request.profile.events.measureWindingDistances || job->request.profile.normalSource != "geometry")) {
                 job->monitor.enter("opening the datasets");
-                if (job->request.measureWindingDistances) {
+                if (job->request.profile.events.measureWindingDistances) {
                     QString error;
                     if (job->openSampler) job->sampler = job->openSampler(&error);
                     if (!job->sampler)
@@ -671,7 +666,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                                  "cannot measure a winding separation.");
                 }
                 job->monitor.checkpoint();
-                if (job->request.normalSource == "fused") {
+                if (job->request.profile.normalSource == "fused") {
                     QString error;
                     if (job->openAxes) job->axes = job->openAxes(&error, &job->predictionIdentity);
                     if (!job->axes)
@@ -680,7 +675,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                             : error.toStdString());
                 }
                 job->monitor.checkpoint();
-                if (job->request.normalSource == "neighbours") {
+                if (job->request.profile.normalSource == "neighbours") {
                     // Read once and kept: the file is the whole volume's
                     // normals, and a second run reads the same one.
                     std::error_code missing;
@@ -705,17 +700,13 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
             }
             job->cacheSink.author = job->session->newRequest(*job->attachment).author;
             job->cacheSink.computedAt = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
-            const bool opens = job->request.measureCrossings &&
-                               (job->request.measureWindingDistances || job->request.normalSource != "geometry");
-            job->monitor.expectStages((job->request.measureCrossings
-                                           ? (job->request.normalSource != "geometry" ? 13 : 12)
+            const bool opens = job->request.profile.measureCrossings &&
+                               (job->request.profile.events.measureWindingDistances || job->request.profile.normalSource != "geometry");
+            job->monitor.expectStages((job->request.profile.measureCrossings
+                                           ? (job->request.profile.normalSource != "geometry" ? 13 : 12)
                                            : 4) + (opens ? 1 : 0));
-            ScaffoldSolveOptions options;
-            options.links.useLinks = job->request.useLinks;
-            options.links.approvalStates = job->request.approvalStates;
-            options.links.includeAuto = job->request.includeAuto;
-            options.links.weight = job->request.manualWeight;
-            options.flow.backend = vc::geometry::parseWindingFlowBackend(job->request.lemonBackend);
+            const auto& profile = job->request.profile;
+            ScaffoldSolveOptions options = profile.solve;
             options.workers = std::max<std::size_t>(1, job->request.workers);
             options.monitor = &job->monitor;
 
@@ -738,10 +729,10 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                 std::optional<ScaffoldNormals> normals;
                 std::vector<ScaffoldEvent> events;
                 std::vector<ScaffoldConstraint> measured;
-                ScaffoldNormalOptions normalOptions;
-                ScaffoldEventOptions eventOptions;
-                ScaffoldMeasuredOptions measuredOptions;
-                ScaffoldSignOptions signOptions;
+                ScaffoldNormalOptions normalOptions = profile.normals;
+                ScaffoldEventOptions eventOptions = profile.events;
+                ScaffoldMeasuredOptions measuredOptions = profile.measured;
+                ScaffoldSignOptions signOptions = profile.sign;
                 ScaffoldEventReport eventReport;
                 ScaffoldMeasuredReport measuredReport;
                 ScaffoldSignResult signs;
@@ -749,7 +740,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                 vc::fiber_graph::ScaffoldFacingReport facing;
                 std::vector<ScaffoldCrossing> crossings;
                 ScaffoldRunStages stages;
-                if (job->request.measureCrossings) {
+                if (job->request.profile.measureCrossings) {
                     if (neighbourOpening.valid()) job->neighbourSource = neighbourOpening.get();
                     lap("full-volume normals");
                     normalOptions.cache = &cache;
@@ -760,23 +751,10 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     normalOptions.neighbours.volume = job->neighbourSource.volume;
                     eventOptions.cache = &cache;
                     eventOptions.sink = &job->cacheSink;
-                    normalOptions.linkApprovalStates = job->request.approvalStates;
-                    normalOptions.includeAutoLinks = job->request.includeAuto;
                     normalOptions.workers = options.workers;
                     normalOptions.monitor = &job->monitor;
-                    eventOptions.measureWindingDistances = job->request.measureWindingDistances;
                     eventOptions.workers = options.workers;
                     eventOptions.monitor = &job->monitor;
-                    // The dock only ever rounds: an approval is a statement
-                    // about an integer winding relation.
-                    measuredOptions.separations = ScaffoldSeparationMode::Rounded;
-                    measuredOptions.perpendicularWeight = job->request.perpendicularWeight;
-                    measuredOptions.parallelWeight = job->request.parallelWeight;
-                    measuredOptions.enclosureWeight = job->request.enclosureWeight;
-                    measuredOptions.signWeight = job->request.signWeight;
-                    signOptions.sign.backend = job->request.signBackend == "ceres"
-                                                   ? vc::fiber_tracer::FiberSignBackend::Ceres
-                                                   : vc::fiber_tracer::FiberSignBackend::Irls;
                     signOptions.sign.threads = int(options.workers);
                     signOptions.monitor = &job->monitor;
                     // One crossing, one confidence: the winding weights take the sign stage's own term.
@@ -843,7 +821,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                                    .arg(result.brokenContinuations)
                                    .arg(result.continuationLinks)
                                    .arg(result.seconds, 0, 'f', 3);
-                if (job->request.measureCrossings)
+                if (job->request.profile.measureCrossings)
                     job->summary += QObject::tr("; %1 crossings, %2 measured relations, %3 enclosures, %4 signs from \n"
                                                 "crossings")
                                         .arg(eventReport.events)
@@ -868,7 +846,7 @@ void ScaffoldSolveController::startSolve(const ScaffoldSolveRequest& request)
                     job->summary += QObject::tr("; %1 normals approvals are stale or carry no stored normals \n"
                                                 "and were not used: approve those stretches again")
                                         .arg(normals->report().staleNormalApprovals);
-                if (job->request.measureCrossings && measuredReport.skippedFamilyMismatch > 0)
+                if (job->request.profile.measureCrossings && measuredReport.skippedFamilyMismatch > 0)
                     job->summary += QObject::tr("; %1 crossings dropped where the pair's geometry and their H/V \n"
                                                 "tags disagree")
                                         .arg(measuredReport.skippedFamilyMismatch);
@@ -1304,23 +1282,10 @@ void ScaffoldSolverPanel::updateEnabled()
 
 ScaffoldSolveRequest ScaffoldSolverPanel::request() const
 {
-    // The one profile, "default scaffold".
+    // The one profile, the default scaffold solve.
     ScaffoldSolveRequest request;
-    request.approvalStates.clear();
-    request.useLinks = false;
-    request.includeAuto = false;
-    request.manualWeight = 1.0;
-    request.lemonBackend = "cost_scaling";
     request.volume = _volume;
     request.fallbackHandedness = _fallbackHandedness;
-    request.measureCrossings = true;
-    request.measureWindingDistances = true;
-    request.perpendicularWeight = 1.0;
-    request.parallelWeight = 0.0;
-    request.enclosureWeight = 0.0;
-    request.signWeight = 3.0;
-    request.normalSource = "neighbours";
-    request.signBackend = "irls";
     request.workers = std::size_t(std::max(1, QThread::idealThreadCount()));
     request.restricted = false;
     return request;

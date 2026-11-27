@@ -21,6 +21,7 @@
 #include <vc_object_store/objects/FiberGraphSolveExtension.hpp>
 #include <vc_object_store/objects/FiberConstraintGraph.hpp>
 #include "vc/fiber_graph/ScaffoldFieldComparison.hpp"
+#include "vc/fiber_graph/ScaffoldSolveProfile.hpp"
 #include "vc/fiber_graph/ScaffoldSolveRuns.hpp"
 #include "vc/fiber_graph/ScaffoldWindingSolve.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -92,10 +93,33 @@ ScaffoldLoadOptions loadOptionsFrom(const Json& cfg)
     return options;
 }
 
+// The default scaffold solve every option below starts from; the solver dock
+// runs the same one (vc/fiber_graph/ScaffoldSolveProfile.hpp).
+const vc::fiber_graph::ScaffoldSolveProfile kProfile = vc::fiber_graph::scaffoldSolveProfile();
+
+bool measureFrom(const Json& cfg)
+{
+    return cfg.value("constraints", Json::object()).value("enabled", kProfile.measureCrossings);
+}
+
+std::string normalSourceFrom(const Json& cfg)
+{
+    return cfg.value("normals", Json::object()).value("source", kProfile.normalSource);
+}
+
+// The signed strip samples a `neighbours` run reads: `neighbours.samples`, or
+// the file beside the store under the name the dock looks for.
+std::string neighbourSamplesFrom(const Json& cfg)
+{
+    const auto section = cfg.value("neighbours", Json::object());
+    if (section.contains("samples")) return section.at("samples").get<std::string>();
+    return vc::fiber_graph::scaffoldNeighbourNormalsPath(cfg.at("store").get<std::string>()).string();
+}
+
 ScaffoldNormalOptions normalOptionsFrom(const Json& cfg)
 {
     const auto section = cfg.value("normals", Json::object());
-    ScaffoldNormalOptions options;
+    ScaffoldNormalOptions options = kProfile.normals;
     options.strip.twistWeight = section.value("twist_weight", options.strip.twistWeight);
     options.strip.lateralWeight = section.value("lateral_weight", options.strip.lateralWeight);
     options.strip.smoothingSigma = section.value("smoothing_sigma", options.strip.smoothingSigma);
@@ -125,7 +149,7 @@ ScaffoldNormalOptions normalOptionsFrom(const Json& cfg)
 ScaffoldEventOptions eventOptionsFrom(const Json& cfg)
 {
     const auto section = cfg.value("constraints", Json::object());
-    ScaffoldEventOptions options;
+    ScaffoldEventOptions options = kProfile.events;
     options.resampleSpacing = section.value("resample_spacing", options.resampleSpacing);
     options.maximumDistance = section.value("maximum_distance", options.maximumDistance);
     options.tangentWindow = section.value("tangent_window", options.tangentWindow);
@@ -147,7 +171,7 @@ ScaffoldMeasuredOptions measuredOptionsFrom(const Json& cfg)
 {
     const auto weights = cfg.value("weights", Json::object());
     const auto section = cfg.value("constraints", Json::object());
-    ScaffoldMeasuredOptions options;
+    ScaffoldMeasuredOptions options = kProfile.measured;
     options.perpendicularWeight = weights.value("perpendicular", options.perpendicularWeight);
     options.parallelWeight = weights.value("parallel", options.parallelWeight);
     options.enclosureWeight = weights.value("enclosure", options.enclosureWeight);
@@ -159,12 +183,14 @@ ScaffoldMeasuredOptions measuredOptionsFrom(const Json& cfg)
     options.windingScale = section.value("winding_scale", options.windingScale);
     options.enclosures = section.value("enclosures", options.enclosures);
     options.crossingFilter = section.value("crossing_filter", options.crossingFilter);
-    // "split" (the automatic stage's two weighted integers) or "rounded" (one
-    // constraint at the nearer integer, what the scaffold dock runs).
-    const auto separations = section.value("separations", std::string{"split"});
-    if (separations == "rounded") options.separations = ScaffoldSeparationMode::Rounded;
-    else if (separations != "split")
-        throw std::invalid_argument("constraints.separations must be \"split\" or \"rounded\"");
+    // "split" (two weighted integers around a fractional separation) or
+    // "rounded" (one constraint at the nearer integer).
+    if (section.contains("separations")) {
+        const auto separations = section.at("separations").get<std::string>();
+        if (separations == "rounded") options.separations = ScaffoldSeparationMode::Rounded;
+        else if (separations == "split") options.separations = ScaffoldSeparationMode::Split;
+        else throw std::invalid_argument("constraints.separations must be \"split\" or \"rounded\"");
+    }
     return options;
 }
 
@@ -172,17 +198,21 @@ ScaffoldSignOptions signOptionsFrom(const Json& cfg)
 {
     using namespace vc::fiber_tracer;
     const auto section = cfg.value("sign", Json::object());
-    ScaffoldSignOptions options;
+    ScaffoldSignOptions options = kProfile.sign;
     options.solve = section.value("solve", options.solve);
     options.crossingFilter = cfg.value("constraints", Json::object()).value("crossing_filter", options.crossingFilter);
-    const auto backend = section.value("backend", std::string{"irls"});
-    if (backend == "irls") options.sign.backend = FiberSignBackend::Irls;
-    else if (backend == "ceres") options.sign.backend = FiberSignBackend::Ceres;
-    else throw std::invalid_argument("sign.backend must be irls or ceres");
-    const auto distance = section.value("winding_distance_weight", std::string{"inverse_square"});
-    if (distance == "inverse_square") options.sign.distanceWeight = FiberSignDistanceWeight::InverseSquare;
-    else if (distance == "none") options.sign.distanceWeight = FiberSignDistanceWeight::None;
-    else throw std::invalid_argument("sign.winding_distance_weight must be inverse_square or none");
+    if (section.contains("backend")) {
+        const auto backend = section.at("backend").get<std::string>();
+        if (backend == "irls") options.sign.backend = FiberSignBackend::Irls;
+        else if (backend == "ceres") options.sign.backend = FiberSignBackend::Ceres;
+        else throw std::invalid_argument("sign.backend must be irls or ceres");
+    }
+    if (section.contains("winding_distance_weight")) {
+        const auto distance = section.at("winding_distance_weight").get<std::string>();
+        if (distance == "inverse_square") options.sign.distanceWeight = FiberSignDistanceWeight::InverseSquare;
+        else if (distance == "none") options.sign.distanceWeight = FiberSignDistanceWeight::None;
+        else throw std::invalid_argument("sign.winding_distance_weight must be inverse_square or none");
+    }
     options.sign.dotWeightPower = section.value("normal_dot_weight_power", options.sign.dotWeightPower);
     options.sign.priorWeight = section.value("prior_weight", options.sign.priorWeight);
     options.sign.fixedSignWeight = section.value("fixed_sign_weight", options.sign.fixedSignWeight);
@@ -212,24 +242,25 @@ std::int64_t unixSecondsNow()
 
 ScaffoldSolveOptions solveOptionsFrom(const Json& cfg)
 {
-    ScaffoldSolveOptions options;
+    ScaffoldSolveOptions options = kProfile.solve;
     const auto links = cfg.value("links", Json::object());
     if (links.contains("approval_states"))
         options.links.approvalStates = links.at("approval_states").get<std::vector<std::string>>();
-    options.links.useLinks = links.value("use_links", true);
-    options.links.includeAuto = links.value("include_auto", false);
-    options.links.maxAnchorDistance = links.value("max_anchor_distance", 5.0);
+    options.links.useLinks = links.value("use_links", options.links.useLinks);
+    options.links.includeAuto = links.value("include_auto", options.links.includeAuto);
+    options.links.maxAnchorDistance = links.value("max_anchor_distance", options.links.maxAnchorDistance);
     options.links.refineMaximumDistance = links.value("refine_maximum_distance", options.links.refineMaximumDistance);
     options.links.deduplicateArc = links.value("deduplicate_arc", options.links.deduplicateArc);
-    options.links.weight = cfg.value("weights", Json::object()).value("manual", 1.0);
+    options.links.weight = cfg.value("weights", Json::object()).value("manual", options.links.weight);
     const auto lemon = cfg.value("lemon", Json::object());
-    options.flow.backend = vc::geometry::parseWindingFlowBackend(lemon.value("backend", std::string{"network_simplex"}));
-    options.flow.capacityScale = lemon.value("capacity_scale", std::int64_t{1000});
+    if (lemon.contains("backend"))
+        options.flow.backend = vc::geometry::parseWindingFlowBackend(lemon.at("backend").get<std::string>());
+    options.flow.capacityScale = lemon.value("capacity_scale", options.flow.capacityScale);
     const auto continuation = cfg.value("continuation", Json::object());
     options.continuation.enabled = continuation.value("enabled", options.continuation.enabled);
     options.continuation.weight = continuation.value("weight", options.continuation.weight);
     options.continuation.intervalVx = continuation.value("interval_vx", options.continuation.intervalVx);
-    options.maxAlternativePaths = cfg.value("max_alternative_paths", std::int64_t{4});
+    options.maxAlternativePaths = cfg.value("max_alternative_paths", options.maxAlternativePaths);
     options.workers = cfg.value("workers", std::size_t{1});
     return options;
 }
@@ -248,6 +279,7 @@ Json linkReportJson(const ScaffoldLinkReport& report)
                 {"skipped_missing_anchor", report.skippedMissingAnchor},
                 {"skipped_untagged", report.skippedUntagged},
                 {"max_anchor_distance_vx", report.maxAnchorDistance},
+                {"as_placed", report.asPlaced},
                 {"rejected_angle", report.skippedAngle},
                 {"rejected_end_support", report.skippedEndSupport},
                 {"rejected_distance", report.skippedDistance},
@@ -325,13 +357,11 @@ int run(const std::string& configPath)
         return cache;
     });
     std::future<vc::fiber_graph::ScaffoldNeighbourSource> neighbourOpening;
-    if (cfg.value("constraints", Json::object()).value("enabled", false) &&
-        cfg.value("normals", Json::object()).value("source", std::string{"geometry"}) == "neighbours" &&
-        cfg.value("neighbours", Json::object()).contains("samples"))
+    if (measureFrom(cfg) && normalSourceFrom(cfg) == "neighbours")
         neighbourOpening = std::async(std::launch::async, [&] {
             const auto started = Clock::now();
             auto source = vc::fiber_graph::openScaffoldNeighbourSource(
-                cfg.at("neighbours").at("samples").get<std::string>(), ScaffoldNormalOptions{}.neighbours.variant.radius);
+                neighbourSamplesFrom(cfg), kProfile.normals.neighbours.variant.radius);
             neighbourSeconds = seconds(started);
             return source;
         });
@@ -355,7 +385,7 @@ int run(const std::string& configPath)
     const double geometrySeconds = seconds(geometryStarted);
 
     const auto options = solveOptionsFrom(cfg);
-    const bool measure = cfg.value("constraints", Json::object()).value("enabled", false);
+    const bool measure = measureFrom(cfg);
     std::optional<ScaffoldNormalOptions> normalOptions;
     std::optional<ScaffoldEventOptions> eventOptions;
     std::optional<ScaffoldMeasuredOptions> measuredOptions;
@@ -428,7 +458,7 @@ int run(const std::string& configPath)
         // The annotation's anchors still win at the nodes they fix.
         ScaffoldAxisSampler axisSampler;
         vc::fiber_graph::ScaffoldNeighbourSource neighbourSource;
-        const auto normalSource = cfg.value("normals", Json::object()).value("source", std::string{"geometry"});
+        const auto normalSource = normalSourceFrom(cfg);
         std::shared_ptr<vc::lasagna::LasagnaDataset> predictionDataset, sheetDataset;
         std::shared_ptr<vc::lasagna::LasagnaNormalSampler> sheetSampler;
         std::shared_ptr<vc::lasagna::LasagnaGroupArrays> predictionArrays;
@@ -477,8 +507,6 @@ int run(const std::string& configPath)
         } else if (normalSource == "neighbours") {
             // The signed normals of a resolved fiber volume, around every fiber.
             const auto section = cfg.value("neighbours", Json::object());
-            if (!section.contains("samples"))
-                throw std::invalid_argument("normals.source neighbours needs neighbours.samples");
             auto& neighbour = normalOptions->neighbours;
             neighbour.weight = section.value("weight", neighbour.weight);
             neighbour.sigma = section.value("sigma", neighbour.sigma);
@@ -729,8 +757,7 @@ int run(const std::string& configPath)
                                   {"adjacent_link_anchors", normalReport.adjacentLinkAnchors},
                                   {"degenerate_anchors", normalReport.degenerateAnchors},
                                   {"skipped_links", normalReport.skippedLinks},
-                                  {"source", cfg.value("normals", Json::object()).value("source",
-                                                                                        std::string{"geometry"})},
+                                  {"source", normalSourceFrom(cfg)},
                                   {"predicted_vertices", normalReport.predictedVertices},
                                   {"vertices_with_axis", normalReport.verticesWithAxis},
                                   {"chain_nodes", normalReport.chainNodes},

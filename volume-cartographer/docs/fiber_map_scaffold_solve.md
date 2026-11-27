@@ -64,10 +64,10 @@ coordinate-frame guard rather than a tolerance to widen. Identical
 ### Links are refined onto their encounter
 
 A link is one statement about one encounter of two fibers, and so is a
-measured crossing. Before a link constrains anything it is brought onto that
-encounter by the crossing extraction's own refinement, seeded at the link's two
-anchors (`refineFiberCrossing`, `vc/fiber_tracer/FiberTraceConstraints.hpp`),
-and it has to pass the extraction's acceptance rules. This is not optional:
+measured crossing. A link is brought onto that encounter by the crossing
+extraction's own refinement, seeded at the link's two anchors
+(`refineFiberCrossing`, `vc/fiber_tracer/FiberTraceConstraints.hpp`), under
+the extraction's acceptance rules:
 
 - the two fibers must meet at the angle their families state - perpendicular
   for an H and a V fiber, parallel for two of the same family, within the
@@ -90,13 +90,19 @@ own end rule), is kept (`crossings_rejected_gap`), and a link whose anchor or
 refined point lies there asserts nothing (`links_rejected_gap`). A gap at a
 fiber's end is simply part of what is ignored.
 
-A link that fails asserts nothing. The run counts them by rule
-(`links_rejected_angle`, `links_rejected_end_support`,
-`links_rejected_distance`, `links_rejected_consistency`) and records the
-farthest a refinement moved an anchor (`link_refinement_max_shift`). An
-accepted link is a constraint of the geometry's own kind, `perpendicular` or
-`parallel`, whose source is the map link (`ScaffoldConstraint::link`, the
-`edge_uuid` of a stored residual): there is no separate link kind.
+A **manual** link the refinement finds no such encounter for is the
+annotator's statement all the same and is taken where it was placed, at its
+two anchors (`links_as_placed`): a link at a fiber's end - where one sheet's H
+fiber ends at a kollesis and the next sheet's begins - has no fiber on one
+side to certify it, and that end is what it links. An **automatic** link
+(`meta.auto`, placed by the map's Link gesture at a pass of two fibers) that
+fails asserts nothing; the run counts those by rule (`links_rejected_angle`,
+`links_rejected_end_support`, `links_rejected_distance`,
+`links_rejected_consistency`). The run records the farthest a refinement
+moved an anchor (`link_refinement_max_shift`). A link is a constraint of the
+kind its two families state, `perpendicular` or `parallel`, whose source is
+the map link (`ScaffoldConstraint::link`, the `edge_uuid` of a stored
+residual): there is no separate link kind.
 
 A measured crossing of the same pair within `links.deduplicate_arc` (default
 64 voxels of arc, on both fibers) of a refined link is the same encounter. The
@@ -104,9 +110,8 @@ link is kept, with its own step, and the crossing's relation is dropped
 (`links_with_crossing`, `crossings_replaced_by_links`), so an encounter is
 never stated twice and a link cannot close a cycle with its own crossing. An
 enclosure is a statement about the pair, not about one encounter, and stays.
-On the PHerc0332 scaffold 244 of the 281 links are accepted (13 fail the
-angle, 24 the end support), 239 of them have a crossing, and 256 crossings are
-replaced.
+On the PHerc0332 scaffold 230 of the 232 manual links are used (2 lie on a
+gap), 34 of them as placed; the 49 automatic links are left out by default.
 
 ### Normal flips
 
@@ -231,7 +236,13 @@ library states those exactly as the automatic pipeline does
 
 The defaults are the scaffold workflow's run: no parallel and no enclosure
 relations, perpendicular weight 1, sign weight 3, crossing confidence on;
-the dock starts with no link state ticked and the crossings measured.
+the manual links (approved and pending) at weight 100 beside the measured
+crossings, split separations, neighbour normals, the cost-scaling flow
+backend. That run is stated once, in `vc/fiber_graph/ScaffoldSolveProfile.hpp`
+(`scaffoldSolveProfile()`): the solver dock runs it as it is and
+`vc_scaffold_solve` starts from it before its configuration overrides
+anything, so a default changed there changes both and neither states one of
+its own.
 
 Every kind lands in the same constraint list, so the solve and the residual
 analysis treat a crossing exactly like a link.
@@ -479,13 +490,13 @@ vc_scaffold_solve config.json
 | `volume`, `scale` | the fibers' declared frame, 1 | target frame |
 | `handedness` | the umbilicus meta | `+1` or `-1`, overrides the store |
 | `family_source` | `any` | `any`, `manual` or `automatic` record families |
-| `links.approval_states` | `["approved"]` | link record states to use |
+| `links.approval_states` | `["approved", "pending"]` | link record states to use |
 | `links.include_auto` | `false` | also use `meta.auto` links |
 | `links.max_anchor_distance` | `5` | voxels, a hard guard |
 | `links.refine_maximum_distance` | `512` | voxels between a link's two refined points |
 | `links.deduplicate_arc` | `64` | voxels of arc within which a crossing is the link's own encounter |
-| `weights.manual` | `1` | weight per map link arc |
-| `constraints.enabled` | `false` | also measure the scaffold's own crossings |
+| `weights.manual` | `100` | weight per map link arc: an annotator's link outweighs a measured crossing (equation at most 1, sign 3) |
+| `constraints.enabled` | `true` | also measure the scaffold's own crossings |
 | `constraints.resample_spacing`, `.maximum_distance`, `.tangent_window` | `32`, `128`, `32` | voxels, the extraction's geometry |
 | `constraints.relax_endpoint_certification` | `false` | accept crossings near a hand-drawn fiber's ends |
 | `constraints.winding_distances` | `true` | measure each connector's separation |
@@ -502,8 +513,8 @@ vc_scaffold_solve config.json
 | `normals.twist_weight`, `.lateral_weight`, `.smoothing_sigma`, `.resample_spacing` | `300`, `1`, `64`, `64` | the strip solve, at the whole-volume pipeline's settings |
 | `normals.manual_display_normals`, `.approved_pieces` | `true` | which annotated normals are held as axes |
 | `normals.adjacent_links` | `true` | whether adjacent links fix a fiber's facing |
-| `normals.source` | `geometry` | `geometry` (variant A), `fused` (variant B) or `neighbours` |
-| `neighbours.samples` | — | the signed strip samples a `neighbours` run reads |
+| `normals.source` | `neighbours` | `geometry` (variant A), `fused` (variant B) or `neighbours` |
+| `neighbours.samples` | `<store>.neighbour_normals.vcstrip` | the signed strip samples a `neighbours` run reads; by default the file beside the store that the dock reads too. A missing file fails the run |
 | `neighbours.weight`, `.sigma`, `.minimum_coverage` | `300`, `32`, `0.25` | the signed target's weight, its arc sigma, and the share of a fiber the field must cover to face it |
 | `normals.axis_weight`, `.presence_floor`, `.presence_full` | `100`, `0`, `128` | the fused axis term and its presence mapping |
 | `prediction.manifest`, `prediction.remote_cache` | — | the fiber-inference dataset a fused run reads |
@@ -511,7 +522,7 @@ vc_scaffold_solve config.json
 | `normals.prediction_chunk` | `65536` | vertices per call into the prediction sampler; changes no result |
 | `include_untagged` | `false` | load the fibers without an H/V tag too |
 | `fibers` | all of them | restrict the run to these fiber UUIDs (the dock's scope) |
-| `lemon.backend`, `lemon.capacity_scale` | `network_simplex`, `1000` | flow backend |
+| `lemon.backend`, `lemon.capacity_scale` | `cost_scaling`, `1000` | flow backend |
 | `continuation.enabled`, `.weight`, `.interval_vx` | `true`, `10`, `2000` | continuation links: a fiber may break at the ends of its approved stretches and about every interval between them |
 | `max_alternative_paths` | `4` | redundancy cap |
 | `workers` | `1` | geometry packing threads |
@@ -562,9 +573,9 @@ between them has zero length. Nothing can be edited or approved to fix that.
 `ScaffoldSeparationMode` keeps both rules, as the Python reference stage does:
 `Split` is the automatic stage's, `Rounded` states one constraint at the
 nearer integer with the event's whole weight (exactly one half rounds down).
-The CLI chooses with `constraints.separations` (`"split"`, the default, or
-`"rounded"`); the scaffold dock always runs `Rounded`, because an approval is
-a statement about an integer relation. A run records which it used
+The default scaffold solve runs `Split`, in the dock and on the command line;
+the CLI can choose with `constraints.separations` (`"split"` or `"rounded"`).
+A run records which it used
 (`separations_rounded`) and how many crossings were fractional
 (`measured_fractional_separations`).
 

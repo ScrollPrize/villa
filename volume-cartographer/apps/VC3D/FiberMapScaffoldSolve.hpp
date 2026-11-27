@@ -19,6 +19,7 @@
 
 #include <vc/fiber_graph/ScaffoldNormals.hpp>
 #include <vc/fiber_graph/ScaffoldRunMonitor.hpp>
+#include <vc/fiber_graph/ScaffoldSolveProfile.hpp>
 
 #include <vc_object_store/objects/FiberConstraintApprovalExtension.hpp>
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
@@ -55,37 +56,16 @@ template <class T> class QFutureWatcher;
 namespace vc3d::fiber_map
 {
 
-// What the solver dock asks for. The frame and the fallback handedness come
-// from the map's own snapshot: the solve must run in the frame the fibers are
-// drawn in, and the store is the first authority on the scroll's winding
-// sense.
+// What the solver dock asks for: the default scaffold solve
+// (vc/fiber_graph/ScaffoldSolveProfile.hpp, the one `vc_scaffold_solve` starts
+// from too) and what belongs to this run. The frame and the fallback
+// handedness come from the map's own snapshot: the solve must run in the
+// frame the fibers are drawn in, and the store is the first authority on the
+// scroll's winding sense.
 struct ScaffoldSolveRequest {
-    // With no link state selected the run solves on the measured constraints
-    // alone; the dock only offers that while it is measuring crossings.
-    bool useLinks = true;
-    std::vector<std::string> approvalStates{"approved"};
-    bool includeAuto = false;
-    double manualWeight = 1.0;
-    std::string lemonBackend = "cost_scaling";
+    vc::fiber_graph::ScaffoldSolveProfile profile = vc::fiber_graph::scaffoldSolveProfile();
     std::string volume;
     std::optional<int> fallbackHandedness;
-    // Also measure the scaffold's own crossings: strip normals from the
-    // annotation, their signs from the crossings, and the perpendicular,
-    // parallel and enclosure relations they assert.
-    bool measureCrossings = false;
-    double perpendicularWeight = 1.0, parallelWeight = 0.0, enclosureWeight = 0.0;
-    // Weight of the local sign constraint every signed perpendicular crossing
-    // states (ScaffoldMeasuredOptions::signWeight); zero states none.
-    double signWeight = 3.0;
-    // Measure each connector's winding separation on the bound normal
-    // dataset. Off keeps the crossings as enclosure evidence only.
-    bool measureWindingDistances = true;
-    // "geometry": the fibers' own strip normals. "fused": those pulled
-    // towards the sheet axis the package's fiber-inference prediction states.
-    // "neighbours": those pulled towards, and faced by, the signed normals of
-    // a resolved fiber volume (ScaffoldSolveController::neighbourNormalsPath).
-    std::string normalSource = "geometry";
-    std::string signBackend = "irls";
     std::size_t workers = 1;
     // Scope: with `restricted` set, only `fiberSubset` is loaded and solved
     // (the dock's scope selector fills it from the map's selected network).
@@ -194,7 +174,6 @@ public:
     // next to the fiber store (`vc_fiber_constraints`,
     // `signed_strip_samples_output`). Fixed for now; the run is refused when
     // the file is missing.
-    [[nodiscard]] static std::filesystem::path neighbourNormalsPath(const std::filesystem::path& fiberStore);
     // The opened file, kept between runs and re-read when it changed.
     struct NeighbourNormals {
         std::mutex mutex;

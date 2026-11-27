@@ -959,7 +959,7 @@ TEST_CASE("the winding solve takes measured constraints beside the links")
     CHECK(result.winding[vertical] == 0);
     // One encounter, one relation: the arc carries the link's weight alone.
     REQUIRE(result.arcs.size() == 1);
-    CHECK(result.arcs.front().weight == doctest::Approx(1.));
+    CHECK(result.arcs.front().weight == doctest::Approx(100.));
 }
 
 TEST_CASE("a link whose order the normals contradict accuses both fibers of a flip")

@@ -18,6 +18,7 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QDockWidget>
 #include <QElapsedTimer>
 #include <QPushButton>
 #include <QSettings>
@@ -179,8 +180,8 @@ int runFiberMapBenchmark(const QString& project, bool followSolve, int runs, con
                          });
         for (int run = 1; run <= runs; ++run) {
             auto request = panel->request();
-            request.measureCrossings = true;
-            request.normalSource = solveNormals.toStdString();
+            request.profile.measureCrossings = true;
+            request.profile.normalSource = solveNormals.toStdString();
             QElapsedTimer timer, stageTimer;
             timer.start();
             controller->startSolve(request);
@@ -221,6 +222,31 @@ int runFiberMapBenchmark(const QString& project, bool followSolve, int runs, con
         std::cout << "bench run " << run << " of " << runs << ": "
                   << (followSolve ? "following a solve" : "the map's own evidence") << ", "
                   << timer.elapsed() << " ms wall" << std::endl;
+    }
+    // BENCH_DUMP_FIBERS="<text>": the fiber list's rows after the rebuild -
+    // how many there are and those containing the text, with whether the
+    // list's filter hides them - for checking the list against the store.
+    if (const auto wanted = qEnvironmentVariable("BENCH_DUMP_FIBERS"); !wanted.isEmpty()) {
+        auto* dock = map->findChild<QDockWidget*>(QStringLiteral("fiberMapFiberDock"));
+        auto* list = dock ? dock->findChild<QTreeWidget*>() : nullptr;
+        if (list == nullptr) {
+            std::cerr << "bench: no fiber list" << std::endl;
+            return 2;
+        }
+        int rows = 0, fibers = 0;
+        const std::function<void(QTreeWidgetItem*, const QString&)> walk = [&](QTreeWidgetItem* item, const QString& under) {
+            ++rows;
+            QStringList columns;
+            for (int column = 0; column < list->columnCount(); ++column) columns << item->text(column);
+            const auto line = columns.join(QStringLiteral(" | "));
+            if (item->childCount() == 0) ++fibers;
+            if (line.contains(wanted))
+                std::cout << "  fiber list row" << (item->isHidden() ? " (HIDDEN)" : "") << " under '" << under.toStdString()
+                          << "': " << line.toStdString() << std::endl;
+            for (int child = 0; child < item->childCount(); ++child) walk(item->child(child), item->text(0));
+        };
+        for (int row = 0; row < list->topLevelItemCount(); ++row) walk(list->topLevelItem(row), QString());
+        std::cout << "fiber list: " << rows << " rows, " << fibers << " without children" << std::endl;
     }
     return 0;
 }
