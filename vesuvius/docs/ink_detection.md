@@ -462,7 +462,7 @@ the second output.
 | `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. The window is clamped to the source depth, and if nothing is left of it (empty, inverted, or entirely out of range) the full depth is used instead and a warning is logged. |
 | `--batch-size` | Batch size per selected device, default `1`. |
 | `--direction` | `forward`, `reverse`, or `both`; default `forward`. |
-| `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |
+| `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. On CPU, only `bf16` enables autocast, and it falls back to fp32 with a warning when the CPU lacks native bf16 convolution support. |
 | `--tta-mirror` | Average valid mirror variants. |
 | `--tta-batch-size` | Maximum mirror variants evaluated together. |
 | `--gpus` | Unique comma-separated CUDA IDs, for example `0,1`; omit for automatic CUDA/CPU selection. |

@@ -945,6 +945,8 @@ def run_block_inference(
     autocast = (
         torch.autocast("cuda", dtype=amp_dtype)
         if device.type == "cuda"
+        else torch.autocast("cpu", dtype=torch.bfloat16)
+        if device.type == "cpu" and amp_dtype == torch.bfloat16
         else nullcontext()
     )
     with torch.inference_mode(), autocast:
@@ -1430,6 +1432,20 @@ def infer_single_zarr(
                 output_blocks, chunk_shape=accumulation_chunks
             ),
         )
+        amp_dtype = configured_model.amp_dtype
+        if device.type == "cpu" and args.amp_dtype != "bf16":
+            amp_dtype = None
+        elif device.type == "cpu" and not (
+            torch.backends.mkldnn.is_available()
+            and torch.ops.mkldnn._is_mkldnn_bf16_supported()
+        ):
+            # Without oneDNN bf16, conv3d falls back to a slow path whose
+            # workspace can exhaust memory.
+            LOGGER.warning(
+                "This CPU has no native bf16 convolution support; "
+                "running fp32 instead of --amp-dtype bf16"
+            )
+            amp_dtype = None
         if blocks:
             run_block_inference(
                 loader=loader,
@@ -1438,7 +1454,7 @@ def infer_single_zarr(
                 weight_map=weight_map,
                 mask=mask,
                 device=device,
-                amp_dtype=configured_model.amp_dtype,
+                amp_dtype=amp_dtype,
                 tta_axes=tta_axes,
                 tta_batch_size=args.tta_batch_size,
                 roi_bounds=roi_bounds,
