@@ -340,6 +340,15 @@ def resolve_checkpoint(checkpoint) -> str:
     return str(found[0])
 
 
+def default_device():
+    """cuda if available, else an Apple GPU (mps), else cpu."""
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', default=DEFAULT_CHECKPOINT,
@@ -362,10 +371,12 @@ def main(argv=None):
                     help='trace a seed row of more than N points as overlapping N-point pieces (off by default)')
     ap.add_argument('--piece-stride', type=int, default=2, metavar='S',
                     help='with --piece-points: a piece starts every S points (default 2)')
-    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--device', default=None, help='torch device (default: cuda, else mps, else cpu)')
     ap.add_argument('--voxel-size', type=float, help="level-0 voxel size (um) of --volume for area_cm2 (default: "
                                                      "its meta.json voxelsize, else the checkpoint's)")
     args = ap.parse_args(argv)
+    if args.device is None:
+        args.device = default_device()
     if args.piece_points is not None and args.piece_points < 3:
         ap.error('--piece-points must be at least 3')
     if args.piece_points is not None and not 1 <= args.piece_stride < args.piece_points:

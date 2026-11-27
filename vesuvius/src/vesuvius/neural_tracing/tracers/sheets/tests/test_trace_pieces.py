@@ -87,3 +87,25 @@ def test_merge_drops_drifted_seams_and_keeps_confident_overlap():
     b[1][1, 4] = .3
     rows, confs = inference.merge_pieces([a, b], [0, 6], 19, .4, 10.)
     assert confs[1, 9] > .4
+
+
+@pytest.mark.parametrize('cuda, mps, expected', [(True, True, 'cuda'), (False, True, 'mps'), (False, False, 'cpu')])
+def test_default_device_prefers_cuda_then_mps(monkeypatch, cuda, mps, expected):
+    monkeypatch.setattr(inference.torch.cuda, 'is_available', lambda: cuda)
+    monkeypatch.setattr(inference.torch.backends.mps, 'is_available', lambda: mps)
+    assert inference.default_device() == expected
+
+
+def test_main_uses_default_device_when_none_given(monkeypatch):
+    seen = {}
+
+    def stop(path, device):
+        seen['device'] = device
+        raise SystemExit(0)
+    monkeypatch.setattr(inference.torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(inference.torch.backends.mps, 'is_available', lambda: True)
+    monkeypatch.setattr(inference, 'load_checkpoint', stop)
+    monkeypatch.setattr(inference, 'resolve_checkpoint', lambda value: value)
+    with pytest.raises(SystemExit):
+        inference.main(['--checkpoint', 'x.pt', '--out', 'unused'])
+    assert seen['device'] == 'mps'
