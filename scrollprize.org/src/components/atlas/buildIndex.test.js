@@ -617,3 +617,105 @@ test("(m) REGRESSION (PHerc0814 46527_2um_try2): a um tag in the segment FOLDER 
     [1.129, 2.399] // NOT [2, 2]
   );
 });
+
+// Mark `entry` as superseded by the artifact at `path`, the way the atlas does
+// (properties.superseded_by). `full` adds the fields only the full
+// metadata.json carries; the min projection keeps just {path}.
+function supersede(entry, path, { full = false } = {}) {
+  entry.properties = {
+    superseded_by: full
+      ? {
+          path,
+          parameters: { ...entry.parameters, transform_revision: "2" },
+          date: "2026-11-11T10:58:41+00:00",
+          reason: "Derived through an earlier registration of the volumes.",
+          retain_until: "2027-02-09",
+        }
+      : { path },
+  };
+  return entry;
+}
+
+// PHerc1667 after the 2026-11-11 re-registration: the old render and its
+// "-t2-" replacement share target_volume AND model_id, the old one listed first.
+function reRegisteredSegment({ full = false, withReplacement = true } = {}) {
+  const dir = "PHerc1667/segments/20251212185248-w029/";
+  const oldInk = `${dir}ink-detection/w029-2.399um-volume-20251217075048-20260417190342-x.tif`;
+  const newInk = `${dir}ink-detection/w029-2.399um-volume-20251217075048-t2-20260417190342-x.tif`;
+  const oldDs = `${dir}ink-detection/downsampled/w029-2.399um-volume-20251217075048-20260417190342-x-ds8.jpg`;
+  const newDs = `${dir}ink-detection/downsampled/w029-2.399um-volume-20251217075048-t2-20260417190342-x-ds8.jpg`;
+  const oldLayers = `${dir}surface-volumes/2.399um-volume-20251217075048.zarr/`;
+  const newLayers = `${dir}surface-volumes/2.399um-volume-20251217075048-t2.zarr/`;
+  const common = { targetVolume: "20251217075048", modelId: "20260417190342" };
+  const data = [
+    supersede(mkEntry({ ...common, type: "layers-zarr", path: oldLayers }), newLayers, { full }),
+    supersede(mkEntry({ ...common, path: oldInk }), newInk, { full }),
+    supersede(mkEntry({ ...common, type: "ink-detection-downsampled", path: oldDs }), newDs, { full }),
+  ];
+  if (withReplacement) {
+    data.push(
+      // Another volume's layers listed between old and new must not take over.
+      mkEntry({
+        type: "layers-zarr",
+        targetVolume: "20260323082859",
+        path: `${dir}surface-volumes/1.129um-volume-20260323082859.zarr/`,
+      }),
+      mkEntry({ ...common, type: "layers-zarr", path: newLayers }),
+      mkEntry({ ...common, path: newInk }),
+      mkEntry({ ...common, type: "ink-detection-downsampled", path: newDs })
+    );
+  }
+  return mkSamples("PHerc1667", {
+    volumes: { "20251217075048": { properties: { pixel_size_um: 2.399, energy_keV: 78 } } },
+    segments: { seg: { suffix: "20251212185248-w029", data } },
+  });
+}
+
+for (const full of [false, true]) {
+  test(`(n) REGRESSION (PHerc1667 t2 re-renders, ${full ? "full metadata.json" : "metadata.min.json"}): a superseded render sharing model_id with its listed replacement is never shown`, () => {
+    const seg = firstSegment(reRegisteredSegment({ full }), "PHerc1667");
+    assert.ok(seg.full.includes("-t2-"), seg.full);
+    assert.ok(seg.down.includes("-t2-"), seg.down);
+    assert.ok(seg.layers.includes("20251217075048-t2"), seg.layers);
+    assert.strictEqual(seg.renders, undefined); // one variant, not old + new
+  });
+}
+
+test("(o) a superseded render whose replacement is not listed is still shown", () => {
+  const seg = firstSegment(reRegisteredSegment({ withReplacement: false }), "PHerc1667");
+  assert.ok(seg.full && !seg.full.includes("-t2-"), seg.full);
+  assert.ok(seg.down && !seg.down.includes("-t2-"), seg.down);
+});
+
+test("(p) a superseded volume stays listed, marked, after its successor (PHerc0139 remask)", () => {
+  const vol = (id, extra = {}) => ({
+    scan_id: "scan1",
+    properties: { pixel_size_um: 2.399, energy_keV: 78, ...extra },
+    data: [
+      {
+        type: "ome-zarr",
+        origins: [{ access_roots: [{ url: "s3://b" }], path: `PHerc0139/volumes/${id}.zarr/` }],
+      },
+    ],
+  });
+  const samples = mkSamples("PHerc0139", {
+    volumes: {
+      // The older id sorts first by id; the mark must move it behind.
+      "20260102150214": vol("20260102150214", {
+        superseded_by: { volume_id: "20260930100252" },
+      }),
+      "20260930100252": vol("20260930100252"),
+    },
+  });
+  samples.PHerc0139.scans = { scan1: {} };
+  const scroll = buildIndex(samples, OPTS).scrolls.find((s) => s.id === "PHerc0139");
+  const scan = scroll.scans[0];
+  const marks = (vs) => vs.map((v) => [v.id, v.supersededBy]);
+  const expected = [
+    ["20260930100252", undefined],
+    ["20260102150214", "20260930100252"],
+  ];
+  assert.deepStrictEqual(marks(scan.volumes), expected);
+  assert.ok(scan.volume.includes("20260930100252"), scan.volume);
+  assert.deepStrictEqual(marks(scroll.ctVolumes), expected);
+});
