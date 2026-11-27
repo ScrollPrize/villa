@@ -565,7 +565,7 @@ void CState::restoreStoreRoutes()
                     : prepareStore(_vpkg->document().resolve(entry.at("location")), storeAuthor(), entry.value("read_only", false));
             } catch (const std::exception& error) {
                 if (vc::project::ProjectDocument::hostedStore(entry) || entry.value("read_only", false) ||
-                    !_vpkg->writable() || !QString::fromUtf8(error.what()).contains(": convert it with vc_object_convert)")) throw;
+                    !_vpkg->writable() || !QString::fromUtf8(error.what()).contains("unsupported database schema (convert upstream stores with vc_object_convert)")) throw;
                 // Reuse the offline converter; retain the original and its relative references.
                 const auto source = _vpkg->document().resolve(entry.at("location"));
                 const auto destination = source.parent_path() / (source.stem().string() + "-upgraded-" + vc::objects::util::newUuid() + ".vcobj");
