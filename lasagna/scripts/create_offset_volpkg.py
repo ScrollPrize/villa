@@ -57,7 +57,22 @@ def discover_scales(zarr_path: Path) -> list[int]:
 def make_relative_symlink(target: Path, link: Path) -> None:
     """Create a relative symlink from link → target."""
     rel = os.path.relpath(target.resolve(), link.parent.resolve())
-    os.symlink(rel, link)
+    try:
+        os.symlink(rel, link)
+    except OSError as exc:
+        if os.name != "nt":
+            raise
+        # Windows symlinks need developer mode or an elevated shell. A
+        # directory junction needs neither and reads the same; it takes an
+        # absolute target. Scale groups are full-resolution data, so do not
+        # fall back to copying them.
+        try:
+            import _winapi
+            _winapi.CreateJunction(str(target.resolve()), str(link))
+        except Exception:
+            raise OSError(
+                f"cannot link {link} -> {target}: enable Windows developer mode "
+                f"or run from an elevated shell ({exc})") from exc
 
 
 def read_json(path: Path) -> dict:
