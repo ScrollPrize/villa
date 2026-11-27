@@ -24,8 +24,8 @@ def parse_args():
         help="Regularization strength ξ"
     )
     p.add_argument(
-        '--device', default='cuda',
-        help="Torch device (e.g. cpu or cuda:0)"
+        '--device', default=None,
+        help="Torch device (e.g. cpu or cuda:0). Default: cuda if available, else cpu"
     )
     p.add_argument(
         '--output-zarr', required=True,
@@ -74,7 +74,7 @@ def main():
     codec = {"cname": args.cname, "level": args.clevel, "shuffle": 1}
 
     # set up device
-    device = torch.device(args.device)
+    device = torch.device(args.device) if args.device else None  # None: VectorFieldComputer picks cuda, else cpu
 
     # instantiate and run
     computer = VectorFieldComputer(
