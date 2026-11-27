@@ -28,6 +28,10 @@ extern "C" {
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 namespace igl {
 
 class Pastix6LLT {
@@ -45,15 +49,11 @@ public:
         // hwloc and picks physical cores only (8 on a 16-logical box). The
         // SLIM factorisation does not actually saturate physical cores in
         // practice (observed ~50% per-core utilisation), so SMT threads
-        // contribute real wallclock speedup here. Default to
-        // hardware_concurrency() (logical cores). PASTIX_NUM_THREADS env var
-        // wins if set; setThreads() also overrides post-construction.
-        int nthreads = static_cast<int>(std::thread::hardware_concurrency());
-        if (const char* e = std::getenv("PASTIX_NUM_THREADS")) {
-            int v = std::atoi(e);
-            if (v > 0) nthreads = v;
-        }
-        if (nthreads <= 0) nthreads = 1;
+        // contribute real wallclock speedup here. Default to the logical
+        // cores this process may run on (defaultThreadCount()).
+        // PASTIX_NUM_THREADS env var wins if set; setThreads() also overrides
+        // post-construction.
+        const int nthreads = defaultThreadCount();
         iparm_[IPARM_THREAD_NBR]    = nthreads;
         // When asking for more threads than physical cores, PaStiX's default
         // hwloc-based core binding fails ("unable to get the core of index N"
@@ -74,6 +74,27 @@ public:
     Pastix6LLT& operator=(const Pastix6LLT&) = delete;
 
     void setThreads(int n) { iparm_[IPARM_THREAD_NBR] = n; }
+
+    // PASTIX_NUM_THREADS if set, else the logical cores this process may run
+    // on. On Linux, hardware_concurrency() counts every core of the machine,
+    // also when the process is restricted to fewer (a Slurm job, a container
+    // cpuset, taskset), so the affinity mask caps it.
+    static int defaultThreadCount() {
+        if (const char* e = std::getenv("PASTIX_NUM_THREADS")) {
+            int v = std::atoi(e);
+            if (v > 0) return v;
+        }
+        int n = static_cast<int>(std::thread::hardware_concurrency());
+#if defined(__linux__)
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+            const int count = CPU_COUNT(&allowed);
+            if (count > 0 && (n <= 0 || count < n)) n = count;
+        }
+#endif
+        return n > 0 ? n : 1;
+    }
 
     // analyze + numfact in one call, like Eigen's compute().
     Pastix6LLT& compute(const SparseMatrix& L) {
