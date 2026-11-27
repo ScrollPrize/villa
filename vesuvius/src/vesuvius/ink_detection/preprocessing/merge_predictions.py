@@ -118,6 +118,10 @@ def parse_prediction_direction(path: Path) -> str | None:
     return None
 
 
+def is_off_surface_prediction(path: Path) -> bool:
+    return "_offsurface_" in path.stem.lower()
+
+
 def is_supported_prediction_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
 
@@ -149,8 +153,10 @@ def build_output_path(
     direction: str,
     merge_method: str,
     suffix: str,
+    off_surface: bool = False,
 ) -> Path:
-    return preds_dir / f"{MERGED_FILE_PREFIX}{merge_method}_{direction}{suffix}"
+    mode = "_offsurface" if off_surface else ""
+    return preds_dir / f"{MERGED_FILE_PREFIX}{merge_method}{mode}_{direction}{suffix}"
 
 
 def normalize_prediction_array(array: np.ndarray, *, path: Path) -> np.ndarray:
@@ -404,21 +410,29 @@ def process_preds_folder(
             )
             continue
 
-        output_suffix = choose_output_suffix(matched_files)
-        output_path = build_output_path(
-            preds_dir,
-            direction=direction,
-            merge_method=merge_method,
-            suffix=output_suffix,
-        )
-        merge_prediction_files(matched_files, output_path, merge_method=merge_method)
-        direction_results.append(
-            DirectionResult(
+        for off_surface in (False, True):
+            mode_files = [
+                path for path in matched_files
+                if is_off_surface_prediction(path) == off_surface
+            ]
+            if not mode_files:
+                continue
+            output_suffix = choose_output_suffix(mode_files)
+            output_path = build_output_path(
+                preds_dir,
                 direction=direction,
-                matched_files=len(matched_files),
-                output_path=str(output_path),
+                merge_method=merge_method,
+                suffix=output_suffix,
+                off_surface=off_surface,
             )
-        )
+            merge_prediction_files(mode_files, output_path, merge_method=merge_method)
+            direction_results.append(
+                DirectionResult(
+                    direction=direction,
+                    matched_files=len(mode_files),
+                    output_path=str(output_path),
+                )
+            )
 
     return FolderResult(preds_dir=str(preds_dir), directions=tuple(direction_results))
 

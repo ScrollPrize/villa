@@ -633,11 +633,13 @@ class FlatBlockDataset(Dataset):
         blocks: Sequence[Block],
         patch_size: int,
         preprocessing: str,
+        emit_surface_pixels: bool = False,
     ) -> None:
         self.reader = reader
         self.blocks = tuple(blocks)
         self.patch_size = int(patch_size)
         self.preprocessing = str(preprocessing)
+        self.emit_surface_pixels = bool(emit_surface_pixels)
 
     def __len__(self) -> int:
         return len(self.blocks)
@@ -652,7 +654,12 @@ class FlatBlockDataset(Dataset):
         )
         # Measure occupancy before normalization because robust normalization
         # maps an all-zero patch to nonzero values.
-        nonempty = int(patch_HWZ.any())
+        if self.emit_surface_pixels:
+            # A rendered pixel off the surface is zero in every selected layer.
+            surface_pixels = patch_HWZ.any(axis=-1)
+            nonempty = int(surface_pixels.any())
+        else:
+            nonempty = int(patch_HWZ.any())
         patch_ZYX = np.moveaxis(patch_HWZ, -1, 0)
         patch_ZYX = normalize_flat_patch(patch_ZYX, self.preprocessing)
         image_CZYX = torch.from_numpy(patch_ZYX).unsqueeze(0)
@@ -660,6 +667,8 @@ class FlatBlockDataset(Dataset):
             [block.y0, block.x0, block.valid_h, block.valid_w, nonempty],
             dtype=torch.int64,
         )
+        if self.emit_surface_pixels:
+            return image_CZYX, metadata, torch.from_numpy(surface_pixels)
         return image_CZYX, metadata
 
 
@@ -904,11 +913,11 @@ class ThreadedBatchLoader:
             self.dataset[index]
             for index in range(start, min(len(self.dataset), start + self.batch_size))
         ]
-        images, metadata = zip(*items)
+        images, *rest = zip(*items)
         images_BCZYX = torch.stack(images)
         if torch.cuda.is_available():
             images_BCZYX = images_BCZYX.pin_memory()
-        return images_BCZYX, torch.stack(metadata)
+        return (images_BCZYX, *(torch.stack(column) for column in rest))
 
     def __iter__(self):
         starts = iter(range(0, len(self.dataset), self.batch_size))
@@ -939,7 +948,12 @@ def run_block_inference(
     tta_batch_size: int | None,
     roi_bounds: tuple[int, int, int, int] | None = None,
 ) -> None:
-    """Forward nonempty flat patches and feed their weighted probabilities."""
+    """Forward nonempty flat patches and feed their weighted probabilities.
+
+    A loader may yield a third per-batch tensor, a boolean (B, H, W) map of the
+    pixels that have surface data. Pixels outside it get zero blend weight, so
+    the output stays empty where the model had nothing to read.
+    """
 
     mask_f32 = None if mask is None else mask.astype(np.float32, copy=False)
     autocast = (
@@ -948,7 +962,17 @@ def run_block_inference(
         else nullcontext()
     )
     with torch.inference_mode(), autocast:
-        for images_BCZYX, metadata in loader:
+        for batch in loader:
+            images_BCZYX, metadata = batch[0], batch[1]
+            surface_pixels = batch[2] if len(batch) > 2 else None
+            if surface_pixels is not None and (
+                surface_pixels.dtype != torch.bool
+                or surface_pixels.shape != images_BCZYX.shape[:1] + images_BCZYX.shape[-2:]
+            ):
+                raise TypeError(
+                    "The third loader column must be a boolean (B, H, W) surface "
+                    f"map, got {surface_pixels.dtype} {tuple(surface_pixels.shape)}"
+                )
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
@@ -974,6 +998,11 @@ def run_block_inference(
                 device, non_blocking=device.type == "cuda"
             )
             metadata = metadata[keep]
+            surface_np = (
+                None
+                if surface_pixels is None
+                else surface_pixels[keep].numpy().astype(np.float32, copy=False)
+            )
             if tta_axes:
                 probabilities = predict_with_mirror_tta(
                     model,
@@ -987,10 +1016,14 @@ def run_block_inference(
                     image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
                 )
             probabilities_np = probabilities.cpu().numpy()[:, 0]
-            for probability, values in zip(probabilities_np, metadata.numpy()):
+            for index, (probability, values) in enumerate(
+                zip(probabilities_np, metadata.numpy())
+            ):
                 y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
                 tile = probability[:valid_h, :valid_w]
                 weights = weight_map[:valid_h, :valid_w]
+                if surface_np is not None:
+                    weights = weights * surface_np[index, :valid_h, :valid_w]
                 if mask_f32 is not None:
                     weights = weights * mask_f32[
                         y0 : y0 + valid_h, x0 : x0 + valid_w
@@ -1359,6 +1392,7 @@ def infer_single_zarr(
         blocks=blocks,
         patch_size=patch_size,
         preprocessing=configured_model.preprocessing,
+        emit_surface_pixels=args.mask_off_surface,
     )
     effective_batch_size = args.batch_size * max(1, len(args.gpu_ids))
     loader_kwargs: dict[str, Any] = {
@@ -1542,6 +1576,8 @@ def infer_folder(
     checkpoint_stem = Path(args.checkpoint).stem
     if checkpoint_count > 1:
         checkpoint_stem = f"{checkpoint_stem}_ens{checkpoint_count}"
+    if args.mask_off_surface:
+        checkpoint_stem = f"{checkpoint_stem}_offsurface"
     date = datetime.now().strftime("%d%m%y")
     prefix = f"{args.output_prefix}_" if args.output_prefix else ""
     ran_count = 0
@@ -1649,6 +1685,12 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--output-prefix", default="")
     parser.add_argument("--mask-path", type=Path)
+    parser.add_argument(
+        "--mask-off-surface",
+        action="store_true",
+        help="Leave empty the pixels that are zero in every selected layer (no "
+        "surface). By default a scheduled tile is written in full.",
+    )
     parser.add_argument(
         "--roi", nargs=4, type=int,
         metavar=("ROW_START", "ROW_STOP", "COL_START", "COL_STOP"),

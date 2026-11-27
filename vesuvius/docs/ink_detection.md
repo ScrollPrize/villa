@@ -214,8 +214,10 @@ reference spelling. The commands have these persistent-state guarantees:
   in place, and a completed rerun is reported as skipped unless `--overwrite`
   is supplied.
 - `merge_predictions` merges every non-merged prediction image found for each
-  requested direction. An invocation that writes no merged output fails
-  instead of reporting success; decoded floating predictions must be finite.
+  requested direction. Predictions named with `_offsurface_` merge separately
+  into `merged_<method>_offsurface_<direction>`. An invocation that writes no
+  merged output fails instead of reporting success; decoded floating
+  predictions must be finite.
 - `composite_from_zarr` publishes each TIFF only after all projected tiles are
   written. Existing outputs fail unless `--overwrite` is supplied.
 - `download_required_zarr_chunks` writes an explicit Zarr-v2 sparse output
@@ -442,6 +444,9 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer \
 
 Folder mode writes dated TIFFs below each segment's `preds/` directory and
 skips a segment/direction when a matching dated prediction already exists.
+With `--mask-off-surface` the filenames add `_offsurface` after the checkpoint
+name, so masked and unmasked predictions neither satisfy each other nor merge
+together.
 Single mode writes the requested path; `--direction both` adds `_reverse` to
 the second output.
 
@@ -452,6 +457,7 @@ the second output.
 | `--checkpoint-path` | Explicit checkpoint, useful in folder mode; overrides the positional checkpoint. |
 | `--output-prefix` | Folder-mode filename prefix, default empty. |
 | `--mask-path` | Optional 2D TIFF; nonzero pixels limit scheduled output. |
+| `--mask-off-surface` | Leave empty the pixels that are zero in every selected layer, which have no surface. By default a scheduled tile is written in full, including its margin off the mesh. |
 | `--resolution` | Zarr pyramid key, default `0`; bare arrays require level 0. |
 | `--num-workers`, `--workers` | DataLoader workers, default `4`. |
 | `--prefetch-factor` | Per-worker prefetch factor, default `2`. |
