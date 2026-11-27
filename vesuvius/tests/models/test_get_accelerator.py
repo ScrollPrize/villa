@@ -83,9 +83,39 @@ def test_rocm_builds_are_not_second_guessed(monkeypatch):
         assert ga.get_accelerator() == torch.device("cuda")
 
 
-def test_arch_suffixes_are_understood(monkeypatch):
+@pytest.mark.parametrize(
+    "capability, archs, expected",
+    [
+        ((9, 0), ["sm_80", "sm_90a"], True),     # sm_90a runs on exactly 9.0
+        ((10, 0), ["sm_90a", "sm_100a"], True),  # sm_100a runs on exactly 10.0
+        ((10, 3), ["sm_100a"], False),           # 'a' cubins are not forward compatible, even within 10.x
+        ((10, 0), ["compute_90a"], False),       # 'a' PTX is not forward compatible either
+        ((9, 0), ["compute_90a"], True),
+        ((10, 3), ["sm_100f"], True),            # 'f' (family) cubins run on the same major, equal or higher minor
+        ((12, 1), ["compute_120f"], True),
+        ((12, 0), ["sm_100f"], False),           # a family never crosses a major version
+        ((10, 0), ["sm_103f"], False),           # nor runs on a lower minor
+    ],
+)
+def test_arch_suffixes_are_understood(monkeypatch, capability, archs, expected):
     monkeypatch.setattr(torch.version, "hip", None, raising=False)
-    fake_cuda(monkeypatch, (9, 0), ["sm_80", "sm_90a"])
+    fake_cuda(monkeypatch, capability, archs)
+    assert ga.cuda_device_supported(0)[0] is expected
+
+
+@pytest.mark.parametrize("cuda_version, expected", [("13.0", False), ("13.2", True)])
+def test_jetson_exceptions_follow_torchs_table(monkeypatch, cuda_version, expected):
+    # Desktop sm_80/sm_86 cubins do not run on an 8.7 Jetson Orin before CUDA 13.2.
+    if not hasattr(torch.cuda, "_code_compatible_with_device"):
+        pytest.skip("this torch has no compatibility table")
+    fake_cuda(monkeypatch, (8, 7), ["sm_80", "sm_86"])
+    monkeypatch.setattr(torch.version, "cuda", cuda_version, raising=False)
+    assert ga.cuda_device_supported(0)[0] is expected
+
+
+def test_without_torchs_table_the_documented_rule_applies(monkeypatch):
+    fake_cuda(monkeypatch, (6, 1), ["sm_60"])
+    monkeypatch.delattr(torch.cuda, "_code_compatible_with_device", raising=False)
     assert ga.cuda_device_supported(0)[0] is True
-    fake_cuda(monkeypatch, (10, 0), ["sm_90a", "sm_100a"])
-    assert ga.cuda_device_supported(0)[0] is True
+    fake_cuda(monkeypatch, (6, 1), ["sm_75", "sm_80"])
+    assert ga.cuda_device_supported(0)[0] is False
