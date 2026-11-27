@@ -171,7 +171,8 @@ the downloads finish. Interrupted workers' reservations are reclaimed using
 file locks, without removing live workers' temporary files.
 
 A remote image file is cached at its URL's bucket path
-(`<cache_dir>/<scheme>/<host or bucket>/<path>`, the decoded-chunk layout), so
+(`<cache_dir>/<scheme>/<host or bucket>/<path>`, the decoded-chunk layout; on
+Windows `:` is written `%3A`, as in `127.0.0.1%3A9000`), so
 mirrors laid out by bucket path are read in place. Cached files are trusted like
 chunks and never revalidated; files found in place are used but not evicted.
 Decoded keys include content identity. Repeated reads use pinned file handles

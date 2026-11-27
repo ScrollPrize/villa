@@ -7,6 +7,7 @@ import http.server
 import json
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import pickle
 import sqlite3
@@ -339,6 +340,12 @@ class StorageTests(FixtureCase):
         array(child, np.zeros((4, 5), 'u1'), attrs)
         with self.assertRaisesRegex(ValueError, 'same_grid shape'):
             source.open()
+
+    def test_decoded_cache_path_keeps_a_port_inside_the_cache(self):
+        # Windows file names cannot hold ':'.
+        host = '127.0.0.1%3A9000' if os.name == 'nt' else '127.0.0.1:9000'
+        self.assertEqual(Path(decoded_cache_path(self.root, 'http://127.0.0.1:9000/bucket/volume.zarr')),
+                         self.root/'http'/host/'bucket'/'volume.zarr')
 
     def test_tiff_tiles_strips_and_separate_channel_encoding(self):
         for kwargs in ({'tile': (16, 16)}, {'rowsperstrip': 5}):
