@@ -84,6 +84,8 @@ def test_pascal_volta_hint_names_an_available_cu126_build(monkeypatch, torch_ver
     # Reinstalling only torch and torchvision keeps the locked NumPy/Numba pair intact.
     assert "--reinstall-package torch --reinstall-package torchvision" in message
     assert "--reinstall " not in message and "numpy" not in message
+    # On Linux the CUDA 12 libraries overwrite the locked CUDA 13 files, so not into .venv.
+    assert "uv pip install --python .venv-cu126" in message
     # A plain `uv run` would re-sync the lock and restore the CUDA 13 build.
     assert "uv run --no-sync" in message
 
@@ -91,7 +93,8 @@ def test_pascal_volta_hint_names_an_available_cu126_build(monkeypatch, torch_ver
 def test_newer_gpu_on_cuda12_build_is_sent_back_to_the_locked_build(monkeypatch):
     fake_backend(monkeypatch, "nvidia", (12, 0), CUDA126_ARCHS, cuda_version="12.6", torch_version="2.14.1+cu126")
     message = ga.cuda_device_supported(0)[1]
-    assert "uv sync --inexact --extra models --reinstall-package torch --reinstall-package torchvision" in message
+    # Only a full reinstall restores CUDA 13 files that CUDA 12 wheels overwrote in place.
+    assert "uv sync --reinstall --extra models" in message
     assert "whl/cu126" not in message
 
 

@@ -98,19 +98,22 @@ def _recovery_hint(major: int, minor: int) -> str:
             version = _LAST_CU126_TORCH
         return (
             "CUDA 13 builds of torch dropped GPUs older than compute capability 7.5; the CUDA 12.6 "
-            f"builds of torch {last[0]}.{last[1]} and earlier still support them. From villa/vesuvius, "
-            f"run `uv pip install torch=={version}+cu126 torchvision --index-url "
+            f"builds of torch {last[0]}.{last[1]} and earlier still support them. Their CUDA libraries "
+            "overwrite the locked ones on Linux, so use a separate environment: from villa/vesuvius, "
+            "set UV_PROJECT_ENVIRONMENT=.venv-cu126, run `uv sync --extra models`, then "
+            f"`uv pip install --python .venv-cu126 torch=={version}+cu126 torchvision --index-url "
             "https://download.pytorch.org/whl/cu126 --reinstall-package torch "
             "--reinstall-package torchvision` (already-installed packages such as NumPy are kept), "
-            "then start commands with `uv run --no-sync`: a plain `uv run` re-syncs uv.lock and puts "
+            "and start commands with `uv run --no-sync`: a plain `uv run` re-syncs uv.lock and puts "
             "the CUDA 13 build back."
         )
     cuda_major = (getattr(torch.version, "cuda", None) or "").split(".")[0]
     if capability >= (7, 5) and not integrated and cuda_major.isdigit() and int(cuda_major) < 13:
         return (
-            "This GPU needs a newer CUDA build of torch. From villa/vesuvius, restore the locked "
-            "CUDA 13 build with `uv sync --inexact --extra models --reinstall-package torch "
-            "--reinstall-package torchvision` (--inexact keeps packages from other extras)."
+            "This GPU needs a newer CUDA build of torch. From villa/vesuvius, unset "
+            "UV_PROJECT_ENVIRONMENT to use the locked CUDA 13 build in .venv; if torch was replaced "
+            "inside .venv, rebuild it with `uv sync --reinstall` and your extras, e.g. "
+            "`uv sync --reinstall --extra models`."
         )
     return (
         f"Install a torch build that includes compute capability {major}.{minor} "
