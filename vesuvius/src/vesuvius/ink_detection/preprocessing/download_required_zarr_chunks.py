@@ -1,8 +1,10 @@
 """Copy the source Zarr chunks selected by tifxyz label-patch geometry."""
 
 import argparse
+import hashlib
 import json
 import multiprocessing as mp
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
@@ -39,6 +41,13 @@ DEFAULT_PATCH_FILTER = "supervision"
 DOWNLOAD_PLAN_ATTR = "vesuvius_ink_download_plan"
 DOWNLOAD_PROGRESS_ATTR = "vesuvius_ink_download_progress"
 DOWNLOAD_PLAN_FORMAT = "vesuvius-ink-sparse-download-v1"
+# Append-only sidecar inside the output group: one JSON line per copied chunk with
+# a digest of the decoded source values. Resume re-reads a sample of completed
+# chunks from the source and compares digests, so a source volume that was
+# re-uploaded in place between runs is detected instead of silently mixing two
+# source versions in one sparse copy.
+DOWNLOAD_DIGESTS_FILE = ".vesuvius_ink_download_digests.jsonl"
+DEFAULT_RESUME_VERIFY_CHUNKS = 8
 
 _WORKER_SOURCE = None
 _WORKER_DEST = None
@@ -487,8 +496,17 @@ def _init_chunk_copy_worker(volume_path: str, volume_scale: int, volume_auth_jso
     _WORKER_ARRAY_SHAPE = tuple(int(v) for v in _WORKER_SOURCE.shape)
 
 
-def _copy_one_chunk(chunk_id: tuple[int, int, int]) -> tuple[int, int, int]:
-    if _WORKER_SOURCE is None or _WORKER_DEST is None:
+def _chunk_digest(data: np.ndarray) -> str:
+    """Digest of decoded chunk values; independent of source codec and compression."""
+    array = np.ascontiguousarray(data)
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(f"{array.dtype.str}|{array.shape}|".encode("ascii"))
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _read_source_chunk(chunk_id: tuple[int, int, int]):
+    if _WORKER_SOURCE is None:
         raise RuntimeError("Chunk copy worker is not initialized.")
 
     z_idx, y_idx, x_idx = (int(v) for v in chunk_id)
@@ -508,8 +526,126 @@ def _copy_one_chunk(chunk_id: tuple[int, int, int]) -> tuple[int, int, int]:
         raise ValueError(f"Chunk id is outside source bounds: {chunk_id}")
 
     slices = tuple(slice(start, stop) for start, stop in zip(starts, stops))
-    _WORKER_DEST[slices] = np.asarray(_WORKER_SOURCE[slices])
-    return tuple(int(value) for value in chunk_id)
+    return slices, np.asarray(_WORKER_SOURCE[slices])
+
+
+def _copy_one_chunk(chunk_id: tuple[int, int, int]) -> tuple[tuple[int, int, int], str]:
+    if _WORKER_DEST is None:
+        raise RuntimeError("Chunk copy worker is not initialized.")
+    slices, data = _read_source_chunk(chunk_id)
+    _WORKER_DEST[slices] = data
+    return tuple(int(value) for value in chunk_id), _chunk_digest(data)
+
+
+def _digest_record(scale: int, chunk_id: tuple[int, int, int], digest: str) -> str:
+    return json.dumps(
+        {"scale": int(scale), "chunk_id": [int(v) for v in chunk_id], "digest": digest},
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def _load_chunk_digests(output_path: Path) -> dict[int, dict[tuple[int, int, int], str]]:
+    """Read the digest sidecar; a torn final line from an interrupted run is ignored."""
+    digests: dict[int, dict[tuple[int, int, int], str]] = {}
+    digest_path = output_path / DOWNLOAD_DIGESTS_FILE
+    if not digest_path.is_file():
+        return digests
+    text = digest_path.read_text()
+    lines = text.split("\n")
+    # A run killed mid-write leaves at most one unterminated last line; that line's
+    # chunk was never marked complete in progress, so it is safe to drop.
+    torn_tail = lines.pop() if lines else ""
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            record = json.loads(line)
+            scale = int(record["scale"])
+            chunk_id = tuple(int(v) for v in record["chunk_id"])
+            digest = str(record["digest"])
+            if len(chunk_id) != 3:
+                raise ValueError("chunk_id must have three entries")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(
+                f"Digest sidecar is corrupt at line {line_number} ({exc}); "
+                f"rerun with --overwrite: {digest_path}"
+            ) from exc
+        digests.setdefault(scale, {})[chunk_id] = digest
+    if torn_tail:
+        print(f"[resume] ignoring an incomplete last line in {digest_path}")
+    return digests
+
+
+def _truncate_torn_digest_tail(output_path: Path) -> None:
+    """Drop an unterminated last record so appended records start on their own line."""
+    digest_path = output_path / DOWNLOAD_DIGESTS_FILE
+    if not digest_path.is_file():
+        return
+    data = digest_path.read_bytes()
+    keep = data.rfind(b"\n") + 1
+    if keep < len(data):
+        os.truncate(digest_path, keep)
+
+
+def _verification_sample(
+    chunk_ids: Iterable[tuple[int, int, int]],
+    sample_count: int,
+) -> list[tuple[int, int, int]]:
+    """Deterministic, evenly spread sample; ``sample_count < 0`` selects every chunk."""
+    ordered = sorted(chunk_ids)
+    if sample_count < 0 or sample_count >= len(ordered):
+        return ordered
+    if sample_count == 0:
+        return []
+    positions = np.linspace(0, len(ordered) - 1, num=sample_count)
+    return [ordered[index] for index in sorted({int(round(p)) for p in positions})]
+
+
+def _verify_resumed_chunks_match_source(
+    *,
+    volume_path: str,
+    volume_auth_json: str | None,
+    output_path: Path,
+    completed_chunk_ids_by_scale: dict[int, set[tuple[int, int, int]]],
+    sample_count: int,
+) -> None:
+    if sample_count == 0:
+        return
+    digests = _load_chunk_digests(output_path)
+    for scale in sorted(completed_chunk_ids_by_scale):
+        completed = completed_chunk_ids_by_scale[scale]
+        recorded = digests.get(int(scale), {})
+        with_digest = [chunk_id for chunk_id in completed if chunk_id in recorded]
+        missing = len(completed) - len(with_digest)
+        if missing:
+            print(
+                f"[resume] scale {scale}: {missing} completed chunk(s) have no recorded "
+                "source digest (written by an older version); they cannot be checked "
+                "for source changes"
+            )
+        sample = _verification_sample(with_digest, sample_count)
+        if not sample:
+            continue
+        _init_chunk_copy_worker(
+            volume_path=volume_path,
+            volume_scale=scale,
+            volume_auth_json=volume_auth_json,
+            output_path=str(output_path),
+        )
+        changed = []
+        for chunk_id in sample:
+            _, data = _read_source_chunk(chunk_id)
+            if _chunk_digest(data) != recorded[chunk_id]:
+                changed.append(chunk_id)
+        if changed:
+            raise ValueError(
+                f"Source volume changed since this sparse output was started: "
+                f"{len(changed)} of {len(sample)} checked chunk(s) at scale {scale} now "
+                f"read different values (first: {list(changed[0])}). Resuming would mix "
+                f"two source versions in one copy; rerun with --overwrite: {output_path}"
+            )
+        print(
+            f"[resume] scale {scale}: {len(sample)} of {len(completed)} completed "
+            "chunk(s) re-read from the source and match their recorded digests"
+        )
 
 
 def copy_chunks_to_output(
@@ -523,6 +659,7 @@ def copy_chunks_to_output(
     tqdm_desc: str,
     overwrite: bool,
     recompress: str,
+    resume_verify_chunks: int = DEFAULT_RESUME_VERIFY_CHUNKS,
 ) -> dict[str, dict[int, int]]:
     source_group = open_volume_root(
         volume_path, auth_json_path=volume_auth_json
@@ -540,6 +677,14 @@ def copy_chunks_to_output(
         shutil.rmtree(output_path)
     if output_path.exists():
         completed_chunk_ids_by_scale = _load_resume_progress(output_path, plan)
+        _verify_resumed_chunks_match_source(
+            volume_path=volume_path,
+            volume_auth_json=volume_auth_json,
+            output_path=output_path,
+            completed_chunk_ids_by_scale=completed_chunk_ids_by_scale,
+            sample_count=int(resume_verify_chunks),
+        )
+        _truncate_torn_digest_tail(output_path)
     else:
         output_root = _create_output_arrays(source_group, output_path, recompress)
         output_root.attrs[DOWNLOAD_PLAN_ATTR] = plan
@@ -552,54 +697,65 @@ def copy_chunks_to_output(
 
     copied_counts_by_scale = {}
     existing_counts_by_scale = {}
-    for scale in sorted(chunk_ids_by_scale):
-        requested_chunk_ids = chunk_ids_by_scale[scale]
-        completed_chunk_ids = completed_chunk_ids_by_scale[int(scale)]
-        chunk_ids = _missing_chunk_ids_for_scale(
-            chunk_ids=requested_chunk_ids,
-            completed_chunk_ids=completed_chunk_ids,
-        )
-        copied_counts_by_scale[int(scale)] = 0
-        existing_counts_by_scale[int(scale)] = int(len(requested_chunk_ids) - len(chunk_ids))
-        scale_desc = f"{tqdm_desc} [scale {scale}]"
-        if not chunk_ids:
-            continue
-        if worker_count <= 1:
-            _init_chunk_copy_worker(
-                volume_path=volume_path,
-                volume_scale=scale,
-                volume_auth_json=volume_auth_json,
-                output_path=str(output_path),
-            )
-            copied_count = 0
-            try:
-                for chunk_id in tqdm(chunk_ids, total=len(chunk_ids), desc=scale_desc, unit="chunk"):
-                    completed_chunk_ids.add(_copy_one_chunk(chunk_id))
-                    copied_count += 1
-                    if copied_count % 64 == 0:
-                        _write_progress(output_path, completed_chunk_ids_by_scale)
-            finally:
-                _write_progress(output_path, completed_chunk_ids_by_scale)
-            copied_counts_by_scale[int(scale)] = copied_count
-            continue
+    with open(output_path / DOWNLOAD_DIGESTS_FILE, "a", encoding="utf-8") as digest_file:
 
-        ctx = mp.get_context("spawn")
-        with ctx.Pool(
-            processes=worker_count,
-            initializer=_init_chunk_copy_worker,
-            initargs=(volume_path, scale, volume_auth_json, str(output_path)),
-        ) as pool:
-            iterator = pool.imap_unordered(_copy_one_chunk, chunk_ids, chunksize=8)
-            copied_count = 0
-            try:
-                for copied_chunk_id in tqdm(iterator, total=len(chunk_ids), desc=scale_desc, unit="chunk"):
-                    completed_chunk_ids.add(copied_chunk_id)
-                    copied_count += 1
-                    if copied_count % 64 == 0:
-                        _write_progress(output_path, completed_chunk_ids_by_scale)
-            finally:
-                _write_progress(output_path, completed_chunk_ids_by_scale)
-            copied_counts_by_scale[int(scale)] = copied_count
+        def write_progress() -> None:
+            # Digests must be on disk before progress marks their chunks complete.
+            digest_file.flush()
+            os.fsync(digest_file.fileno())
+            _write_progress(output_path, completed_chunk_ids_by_scale)
+
+        for scale in sorted(chunk_ids_by_scale):
+            requested_chunk_ids = chunk_ids_by_scale[scale]
+            completed_chunk_ids = completed_chunk_ids_by_scale[int(scale)]
+            chunk_ids = _missing_chunk_ids_for_scale(
+                chunk_ids=requested_chunk_ids,
+                completed_chunk_ids=completed_chunk_ids,
+            )
+            copied_counts_by_scale[int(scale)] = 0
+            existing_counts_by_scale[int(scale)] = int(len(requested_chunk_ids) - len(chunk_ids))
+            scale_desc = f"{tqdm_desc} [scale {scale}]"
+            if not chunk_ids:
+                continue
+            if worker_count <= 1:
+                _init_chunk_copy_worker(
+                    volume_path=volume_path,
+                    volume_scale=scale,
+                    volume_auth_json=volume_auth_json,
+                    output_path=str(output_path),
+                )
+                copied_count = 0
+                try:
+                    for chunk_id in tqdm(chunk_ids, total=len(chunk_ids), desc=scale_desc, unit="chunk"):
+                        copied_chunk_id, digest = _copy_one_chunk(chunk_id)
+                        digest_file.write(_digest_record(scale, copied_chunk_id, digest))
+                        completed_chunk_ids.add(copied_chunk_id)
+                        copied_count += 1
+                        if copied_count % 64 == 0:
+                            write_progress()
+                finally:
+                    write_progress()
+                copied_counts_by_scale[int(scale)] = copied_count
+                continue
+
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(
+                processes=worker_count,
+                initializer=_init_chunk_copy_worker,
+                initargs=(volume_path, scale, volume_auth_json, str(output_path)),
+            ) as pool:
+                iterator = pool.imap_unordered(_copy_one_chunk, chunk_ids, chunksize=8)
+                copied_count = 0
+                try:
+                    for copied_chunk_id, digest in tqdm(iterator, total=len(chunk_ids), desc=scale_desc, unit="chunk"):
+                        digest_file.write(_digest_record(scale, copied_chunk_id, digest))
+                        completed_chunk_ids.add(copied_chunk_id)
+                        copied_count += 1
+                        if copied_count % 64 == 0:
+                            write_progress()
+                finally:
+                    write_progress()
+                copied_counts_by_scale[int(scale)] = copied_count
 
     return {
         "copied_counts_by_scale": copied_counts_by_scale,
@@ -1094,6 +1250,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Replace any existing <dataset>/<dataset>.zarr output before downloading.",
     )
     parser.add_argument(
+        "--resume-verify-chunks",
+        type=int,
+        default=DEFAULT_RESUME_VERIFY_CHUNKS,
+        help=(
+            "When resuming an existing output, re-read this many already-copied chunks per "
+            "scale from the source and compare them with the digests recorded when they were "
+            "copied; a mismatch means the source changed in place and the run stops. "
+            "0 disables the check, -1 checks every completed chunk that has a recorded digest. "
+            "Changes in unchecked chunks go undetected."
+        ),
+    )
+    parser.add_argument(
         "--recompress",
         choices=("fast", "balanced"),
         default=DEFAULT_RECOMPRESS_PRESET,
@@ -1178,6 +1346,7 @@ def main(argv: list[str] | None = None) -> int:
             tqdm_desc=f"Downloading {plan.dataset_name}",
             overwrite=bool(args.overwrite),
             recompress=str(args.recompress),
+            resume_verify_chunks=int(args.resume_verify_chunks),
         )
         copied_counts_by_scale = copy_stats["copied_counts_by_scale"]
         existing_counts_by_scale = copy_stats["existing_counts_by_scale"]
