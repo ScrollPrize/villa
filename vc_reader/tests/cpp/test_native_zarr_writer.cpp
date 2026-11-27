@@ -7,6 +7,7 @@
 #include "vc_reader/native/rounding.hpp"
 #include "vc_reader/native/sigv4.hpp"
 #include "vc_reader/native/reader_types.hpp"
+#include "vc_reader/native/zarr/files.hpp"
 
 #include <algorithm>
 #include <barrier>
@@ -588,7 +589,7 @@ static void packbitsFilter(const fs::path& root)
                 writer.writeRegion({0, 0, 0}, {2, 5, 3}, data.data());
                 require(read(writer.reader(), {0, 0, 0}, {2, 5, 3}, 1) == data, "packbits round trip");
                 vcr::zarr::OpenOptions open;
-                auto opened = vcr::zarr::openArray(path, open);
+                auto opened = vcr::zarr::openArray(path.string(), open);
                 require(read(*opened.array, {0, 0, 0}, {2, 5, 3}, 1) == data, "packbits read through a new array");
                 auto like = vcr::zarr::createOptionsLike(writer.meta());
                 require(like.packbits, "createOptionsLike keeps packbits");
@@ -673,10 +674,133 @@ static void joinsLocations()
     require(vcr::zarr::s3Location("https://b.s3.us-west-2.amazonaws.com/k/x") == "s3://b/k/x", "virtual host");
     require(vcr::zarr::s3Location("https://b.s3.amazonaws.com") == "s3://b", "bucket only");
     require(!vcr::zarr::s3Location("https://example.com/k") && !vcr::zarr::s3Location("/a/b"), "not S3");
+    // A backslash in a URL or an S3 key is part of a name: split exactly as before.
+    require(vcr::parentLocation("https://example.test/a\\b/c") == "https://example.test/a\\b" &&
+                vcr::parentLocation("s3://bucket/a\\b") == "s3://bucket" &&
+                !vcr::zarr::levelGroupLocation("s3://b/a/x.zarr\\4"),
+            "a backslash in a URL is data");
+#ifdef _WIN32
+    // A local path in Windows' native spelling splits at its backslashes.
+    require(vcr::parentLocation("C:\\data\\a\\b") == "C:\\data\\a" && vcr::parentLocation("C:\\data\\a\\b\\") == "C:\\data\\a" &&
+                vcr::parentLocation("C:\\data/a\\b") == "C:\\data/a",
+            "parent of a path with backslashes");
+    require(vcr::zarr::levelGroupLocation("C:\\data\\x.zarr\\4") == "C:\\data\\x.zarr" &&
+                !vcr::zarr::levelGroupLocation("C:\\data\\x.zarr\\4a"),
+            "a numbered level of a .zarr, with backslashes");
+#else
+    // A backslash is a file name character here: `x.zarr\4` is one name, not a level of x.zarr.
+    require(vcr::parentLocation("/data/a\\b") == "/data" && !vcr::zarr::levelGroupLocation("/data/x.zarr\\4"),
+            "a backslash in a path is data");
+#endif
     require(vcr::zarr::levelGroupLocation("s3://b/a/x.zarr/4?sig=y") == "s3://b/a/x.zarr?sig=y", "a numbered level of a .zarr");
     require(!vcr::zarr::levelGroupLocation("s3://b/a/x.zarr/4a") && !vcr::zarr::levelGroupLocation("s3://b/a/x.zarr") &&
                 !vcr::zarr::levelGroupLocation("s3://b/a/x/4") && !vcr::zarr::levelGroupLocation("/no/such.dir/0"),
             "not a level: letters, no key, parent not a group");
+}
+
+// The Windows rules, on every platform: the functions take the platform's separators or flag.
+static void windowsLocations()
+{
+    const char* const win = "/\\";
+    const char* const posix = "/";
+    const auto level = [&](const std::string& path, const std::string& parent, const std::string& leaf) {
+        const auto found = vcr::numberedLevel(path, win);
+        return found && found->parent == parent && found->leaf == leaf;
+    };
+    // Backslash, mixed and trailing separators.
+    require(vcr::parentLocation("C:\\data\\a\\b", win) == "C:\\data\\a" && vcr::parentLocation("C:\\data\\a\\b\\", win) == "C:\\data\\a" &&
+                vcr::parentLocation("C:\\data/a\\b", win) == "C:\\data/a" && vcr::parentLocation("C:/data\\a\\\\", win) == "C:/data",
+            "parent of a Windows path");
+    require(vcr::trimSeparators("C:\\a\\/\\", win) == "C:\\a" && vcr::trimSeparators("C:\\a\\", posix) == "C:\\a\\", "trailing separators");
+    require(level("C:\\data\\x.zarr\\4\\", "C:\\data\\x.zarr", "4"), "level 4 of a Windows store");
+    require(!vcr::numberedLevel("C:\\data\\x.zarr\\4a", win) && !vcr::numberedLevel("C:\\data\\x.zarr\\", win), "not digits only");
+    require(!vcr::numberedLevel("C:\\data\\x.zarr\\4", posix), "on POSIX the backslash is part of the name");
+    // URLs, S3 keys and POSIX paths: a backslash is a name character, whatever the platform.
+    require(vcr::locationSeparators("https://h/a\\b", true) == std::string("/") && vcr::locationSeparators("s3://b/a\\4", true) == std::string("/") &&
+                vcr::locationSeparators("/data/a\\b", false) == std::string("/") && vcr::locationSeparators("C:\\a", true) == std::string("/\\"),
+            "separator set");
+    require(vcr::parentLocation("https://example.test/a\\b/c", vcr::locationSeparators("https://example.test/a\\b/c", true)) == "https://example.test/a\\b" &&
+                vcr::parentLocation("s3://bucket/a\\b", vcr::locationSeparators("s3://bucket/a\\b", true)) == "s3://bucket" &&
+                vcr::parentLocation("/data/a\\b", posix) == "/data",
+            "a backslash in a URL, an S3 key or a POSIX path stays in its name");
+    // Drive roots keep their separator.
+    require(vcr::trimSeparators("C:\\", win) == "C:\\" && vcr::trimSeparators("C:/", win) == "C:/" && vcr::trimSeparators("C:\\\\", win) == "C:\\" &&
+                vcr::trimSeparators("C:", win) == "C:" && vcr::parentLocation("C:\\", win) == "C:\\" && vcr::parentLocation("C:", win) == "C:",
+            "a drive root keeps its separator");
+    require(vcr::parentLocation("C:\\a", win) == "C:\\" && vcr::parentLocation("C:/a/", win) == "C:/", "the parent of a drive's child is the drive root");
+    require(level("C:\\5", "C:\\", "5") && level("C:\\volume.zarr\\5", "C:\\volume.zarr", "5") && level("X:/5", "X:/", "5"),
+            "level 5 straight under a drive root");
+    require(vcr::numberedLevel("X:/5", posix)->parent == "X:", "X:/5 has the drive root as its store on Windows only");
+    // Relative paths, drive-relative paths and odd inputs.
+    require(level(".\\volume.zarr\\5", ".\\volume.zarr", "5") && level("volume.zarr\\5", "volume.zarr", "5"), "relative paths");
+    require(vcr::parentLocation("C:x", win) == "C:x" && !vcr::numberedLevel("C:5", win) && vcr::parentLocation("", win).empty() &&
+                vcr::parentLocation("", posix).empty() && vcr::trimSeparators("", win).empty() && vcr::trimSeparators("/", posix) == "/" &&
+                vcr::trimSeparators("\\", win) == "\\" && vcr::parentLocation("/", posix).empty(),
+            "drive-relative and odd inputs");
+    // joinLocation uses the same separators.
+    require(vcr::joinLocation("C:\\a\\", "k", win) == "C:\\a/k" && vcr::joinLocation("C:\\a\\\\", "k", win) == "C:\\a/k" &&
+                vcr::joinLocation("C:\\", "k", win) == "C:\\k" && vcr::joinLocation("C:/", "k", win) == "C:/k" &&
+                vcr::joinLocation("C:\\\\", "k", win) == "C:\\k" && vcr::joinLocation("C:", "k", win) == "C:/k" &&
+                vcr::joinLocation("C:\\a\\", "k", posix) == "C:\\a\\/k",
+            "joining below a Windows path");
+    require(vcr::joinLocation("/data/a//", "/k", posix) == "/data/a/k" && vcr::joinLocation("/", "k", posix) == "/k" &&
+                vcr::joinLocation("https://h/a/?t=1", "k", posix) == "https://h/a/k?t=1" &&
+                vcr::joinLocation("s3://b/a\\", "k", vcr::locationSeparators("s3://b/a\\", true)) == "s3://b/a\\/k",
+            "joining below a path with slashes, a URL or an S3 key is unchanged");
+    // UNC and extended paths are split plainly, which already finds the store; a drive root inside one keeps its separator.
+    require(level("\\\\server\\share\\v.zarr\\5", "\\\\server\\share\\v.zarr", "5") && level("\\\\?\\C:\\v.zarr\\5", "\\\\?\\C:\\v.zarr", "5") &&
+                level("\\\\?\\UNC\\server\\share\\v.zarr\\5", "\\\\?\\UNC\\server\\share\\v.zarr", "5") &&
+                level("\\\\?\\unc\\server\\share\\v.zarr\\5", "\\\\?\\unc\\server\\share\\v.zarr", "5") &&
+                level("\\\\?\\Volume{1}\\v.zarr\\5", "\\\\?\\Volume{1}\\v.zarr", "5") && level("\\\\?\\C:\\5", "\\\\?\\C:\\", "5") &&
+                vcr::trimSeparators("\\\\?\\C:\\", win) == "\\\\?\\C:\\" && vcr::parentLocation("\\\\?\\C:\\a", win) == "\\\\?\\C:\\" &&
+                vcr::trimSeparators("\\\\server\\share\\\\", win) == "\\\\server\\share",
+            "UNC and extended paths split plainly");
+    // A drive spec needs a letter before the colon; a colon inside a name is not a drive.
+    require(level("1:\\5", "1:", "5") && level("a:b\\5", "a:b", "5") && level("C:\\a:b\\5", "C:\\a:b", "5"), "a drive spec needs a letter");
+    // levelGroupLocation and storeMetadata take their separators through detail:: overloads, so every platform tests the Windows rules.
+    const auto group = [&](const std::string& location, bool windows) {
+        return vcr::zarr::detail::levelGroupLocation(location, vcr::locationSeparators(location, windows));
+    };
+    require(group("C:\\data\\x.zarr\\4", true) == "C:\\data\\x.zarr" && group("C:\\data\\x.zarr\\4\\", true) == "C:\\data\\x.zarr" &&
+                group("C:/data/x.zarr\\4", true) == "C:/data/x.zarr" && group("\\\\server\\share\\v.zarr\\5", true) == "\\\\server\\share\\v.zarr" &&
+                !group("C:\\data\\x.zarr\\4", false) && !group("C:\\data\\x.zarr\\4a", true) && !group("C:\\data\\x.zarr", true) &&
+                !group("s3://b/a/x.zarr\\4", true) && !group("/data/x.zarr\\4", false) && group("/data/x.zarr/4", true) == "/data/x.zarr",
+            "levelGroupLocation with a platform");
+    const auto voxelSize = [&](const std::string& store, bool windows) {
+        const vcr::zarr::MetadataReader read = [&](const std::string& node, const std::string& name) -> std::optional<std::string> {
+            if (node == "C:\\data\\x.zarr" && name == "meta.json")
+                return std::string(R"({"voxelsize": 7.91})");
+            return std::nullopt;
+        };
+        return vcr::zarr::detail::storeMetadata(store, read, vcr::locationSeparators(store, windows)).voxelSizeUm;
+    };
+    require(voxelSize("C:\\data\\x.zarr\\3", true) == 7.91 && voxelSize("C:\\data\\x.zarr\\3\\", true) == 7.91 && !voxelSize("C:\\data\\x.zarr\\3", false),
+            "storeMetadata with a platform");
+}
+
+static void writeText(const fs::path& path, const std::string& text)
+{
+    fs::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::binary) << text;
+}
+
+// A level opened by its path as the system spells it: with backslashes on Windows.
+static void opensLevelsByPath(const fs::path& root)
+{
+    const std::string zarray = R"({"shape":[4,4,4],"chunks":[4,4,4],"dtype":"|u1","fill_value":0,"order":"C","filters":null,"dimension_separator":"/","compressor":null,"zarr_format":2})";
+    const auto store = root / "level-paths" / "volume.zarr";
+    writeText(store / ".zgroup", R"({"zarr_format":2})");
+    writeText(store / "3" / ".zarray", zarray);
+    const auto level = (store / "3").string();
+    auto opened = vcr::zarr::openArray(level, {});
+    require(opened.store == store.string() && opened.levelKey == "3", "a numbered path is a level of its store");
+#ifndef _WIN32
+    // A backslash is a file name character here: an array named `a\3` is a root array.
+    const auto odd = (root / "level-paths" / "plain" / "a\\3").string();
+    writeText(fs::path(odd) / ".zarray", zarray);
+    auto root_array = vcr::zarr::openArray(odd, {});
+    require(root_array.store == odd && root_array.levelKey.empty(), "a\\3 is not level 3 of a");
+#endif
 }
 
 static void storedChunks(const fs::path& root)
@@ -771,6 +895,8 @@ int main()
         fs::create_directories(root);
         generalOptions(root);
         joinsLocations();
+        windowsLocations();
+        opensLevelsByPath(root);
         storedChunks(root);
         pyramidReductions(root);
         packbitsFilter(root);

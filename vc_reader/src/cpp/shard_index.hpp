@@ -136,6 +136,8 @@ public:
         if (!file_) throw std::runtime_error("truncated shard payload");
     }
 
+    void close() { file_.close(); }
+
     std::vector<std::uint8_t> index;
     std::uint64_t total = 0;
 

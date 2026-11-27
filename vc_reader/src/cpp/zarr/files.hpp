@@ -8,11 +8,17 @@
 #include <string>
 #include <vector>
 
+#include "vc_reader/zarr_metadata.hpp"
+
 namespace vcr::zarr {
 struct Access;
 }
 
 namespace vcr::zarr::detail {
+// levelGroupLocation and storeMetadata for given separators (see locationSeparators), so every platform can test the Windows rules.
+std::optional<std::string> levelGroupLocation(const std::string& location, const char* separators);
+StoreMetadata storeMetadata(const std::string& input, const MetadataReader& reader, const char* separators);
+
 // Writes beside the destination and publishes only after the complete file closes.
 void atomicWriteFile(const std::filesystem::path& path, const std::function<void(std::ostream&)>& write);
 

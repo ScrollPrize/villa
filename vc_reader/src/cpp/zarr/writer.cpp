@@ -290,6 +290,7 @@ struct Writer::Impl {
         }
         if (!replacement && !existed) return false;
         if (!replacement && !remaining) {
+            previous.close();  // Windows cannot delete a file that is still open
             fs::remove(file);
             return true;
         }
@@ -316,6 +317,7 @@ struct Writer::Impl {
                 putLittle(index.data() + index.size() - 4, crc32c(index.data(), index.size() - 4), 4);
             if (!layout.indexEnd) out.seekp(0);
             out.write(reinterpret_cast<const char*>(index.data()), std::streamsize(index.size()));
+            previous.close();  // Windows cannot replace a file that is still open
         });
         return existed;
     }

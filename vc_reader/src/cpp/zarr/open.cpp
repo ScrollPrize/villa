@@ -4,6 +4,7 @@
 #include "vc_reader/zarr_metadata.hpp"
 #include "vc_reader/array.hpp"
 #include "vc_reader/native/utf8_path.hpp"
+#include "vc_reader/native/reader_types.hpp"
 #include "files.hpp"
 
 #include <algorithm>
@@ -24,9 +25,8 @@ namespace vcr::zarr {
 namespace {
 std::string stripSlashes(std::string s)
 {
-    while (s.size() > 1 && s.back() == '/')
-        s.pop_back();
-    return s;
+    const auto* separators = locationSeparators(s);
+    return trimSeparators(std::move(s), separators);
 }
 
 bool digits(const std::string& s)
@@ -251,14 +251,16 @@ OpenedArray openArray(const std::string& input, const OpenOptions& options, Arra
     std::optional<std::string> group = hints.group, levelKey = hints.levelKey;
     if (group) {
         *group = stripSlashes(*group);
-        if (!levelKey)
-            levelKey = location.substr(group->size() + 1);
+        if (!levelKey) {
+            const bool root = !group->empty() && isSeparator(group->back(), locationSeparators(*group));
+            levelKey = location.substr(group->size() + (root ? 0 : 1));
+        }
     } else if (!levelKey) {
         // An OME-Zarr level is a digits-only path under its group.
-        const auto slash = location.rfind('/');
-        if (slash != std::string::npos && slash > 0 && digits(location.substr(slash + 1))) {
-            group = location.substr(0, slash);
-            levelKey = location.substr(slash + 1);
+        const auto level = numberedLevel(location, locationSeparators(location));
+        if (level && !level->parent.empty()) {
+            group = level->parent;
+            levelKey = level->leaf;
         }
     }
 

@@ -6,6 +6,7 @@
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/native/utf8_path.hpp"
 #include "vc_reader/native/http.hpp"
+#include "files.hpp"
 
 #include <curl/curl.h>
 
@@ -160,21 +161,20 @@ std::optional<std::string> s3Location(const std::string& url)
 
 std::optional<std::string> levelGroupLocation(const std::string& location)
 {
+    return detail::levelGroupLocation(location, locationSeparators(location));
+}
+
+std::optional<std::string> detail::levelGroupLocation(const std::string& location, const char* separators)
+{
     const bool url = location.find("://") != std::string::npos;
-    auto path = location.substr(0, url ? location.find_first_of("?#") : std::string::npos);
-    while (path.size() > 1 && path.back() == '/')
-        path.pop_back();
-    const auto slash = path.rfind('/');
-    if (slash == std::string::npos || slash + 1 == path.size())
+    const auto level = numberedLevel(location.substr(0, url ? location.find_first_of("?#") : std::string::npos), separators);
+    if (!level)
         return std::nullopt;
-    const auto leaf = path.substr(slash + 1);
-    if (!std::all_of(leaf.begin(), leaf.end(), [](unsigned char c) { return std::isdigit(c) != 0; }))
-        return std::nullopt;
-    const auto parentPath = path.substr(0, slash);
+    const auto& parentPath = level->parent;
     const bool group = parentPath.ends_with(".zarr") || (!url && isLocalZarrNode(utf8Path(parentPath)));
     if (!group)
         return std::nullopt;
-    return parentLocation(location);
+    return parentLocation(location, separators);
 }
 
 std::string Access::url(const std::string& location) const
