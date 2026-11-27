@@ -112,6 +112,31 @@ VCR_POINT_HD inline bool point(Lookup& L, const std::int64_t* base, const float*
     return available;
 }
 
+// Whether point(L, base, c, order, ...) reads only voxels inside a volume of `shape`
+// (ZYX), so its value owes nothing to the fill that stands in beyond the edges: the
+// nearest voxel (order 0), or the neighbours on the axes c is off the grid (order 1),
+// with point's tie rule and cells. A voxel inside the volume whose block is not stored
+// counts as inside: the array's fill is its value. Non-finite points are not inside.
+VCR_POINT_HD inline bool pointInside(const std::int64_t* shape, const std::int64_t* base, const float* c, int order)
+{
+    for (int a = 0; a < 3; ++a) {
+        // point's own range test first: beyond it no voxel is read (and the index
+        // conversion below would overflow).
+        if (!(c[a] > float(-1 - base[a]) && c[a] < float(shape[a] - base[a]) + 1.0f))
+            return false;
+        const float low = floorf(c[a]);
+        const float frac = c[a] - low;
+        std::int64_t v = base[a] + std::int64_t(low);
+        if (order == 0)
+            v += nearest_rounds_up(frac);
+        if (v < 0 || v >= shape[a])
+            return false;
+        if (order != 0 && frac != 0 && v + 1 >= shape[a])
+            return false;
+    }
+    return true;
+}
+
 }  // namespace vcr::sampling
 
 #undef VCR_POINT_HD

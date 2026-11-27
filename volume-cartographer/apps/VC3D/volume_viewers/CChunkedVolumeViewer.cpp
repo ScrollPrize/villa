@@ -354,6 +354,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     _view->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     _view->setRenderHint(QPainter::Antialiasing, false);
     _view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
+    // The measurement overlays (histogram, profile, grid, loupe) measure the presented
+    // frame, and only while it shows the live view.
+    _view->setMeasurementFrameSource([this] { return measurementFrame(); });
 
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CChunkedVolumeViewer::onVolumeClicked);
     connect(_view, &CVolumeViewerView::sendZoom, this, &CChunkedVolumeViewer::onZoom);
@@ -1338,8 +1341,19 @@ struct CChunkedVolumeViewer::RenderResult {
     cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
-    // What this frame could not sample from the caches.
+    // Set when the job asked for measurement: nonzero where `values` holds a value
+    // that read only voxels inside the volume at the level and sampling it came from
+    // (vcr::grid::Result::inside, so no fill from beyond the edges), sampled for this
+    // view and geometry. A pixel carried from an earlier frame keeps that frame's
+    // mark when the geometry is the same, and is 0 otherwise or when that frame had
+    // no mask (rendered with the overlays off).
+    cv::Mat_<uint8_t> measureMask;
+    // What this frame could not sample from the caches. Publishing the frame moves
+    // it to the viewer's load queue, so read `complete` for whether it had any.
     vc3d::ViewerLoad load;
+    // Whether every pixel came from its target level with nothing left to read, set
+    // when the frame is rendered: the values (and peaks) are final, not provisional.
+    bool complete = false;
     double renderFrameElapsedMs = 0.0;
     std::chrono::steady_clock::time_point submittedAt;
     std::chrono::steady_clock::time_point workerStartedAt;
@@ -1407,6 +1421,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     cv::Mat_<cv::Vec3b> colorValues;
     cv::Mat_<uint8_t> overlayValues;
     cv::Mat_<uint8_t> overlayCoverage;
+    cv::Mat_<uint8_t> measureMask;  // see RenderResult::measureMask
     std::vector<std::int8_t> missingBase, missingOverlay;
     cv::Mat_<uint8_t> focusBoundsInside;
     if (ctx.renderJob.focusBoundsBase) {
@@ -1552,10 +1567,25 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
             base.offsets = layerOffsets(front, behind, zStep);
             base.composite = (cs.params.volumetric ? std::nullopt : std::optional(cs.params.options));
         }
+        // The measurement overlays count only values the reader took from inside the
+        // volume, judged by the sampler itself at each pixel's level and order (slab
+        // layers included), so padding never counts and in-volume zeros always do.
+        base.reportInside = ctx.renderJob.measure;
         const auto sampled = vc3d::sampleCached(ctx.levels, geometry, base, &result.load);
         missingBase = sampled.level;
         if (!sampled.values.empty())
             vcr::display::toUint8(sampled.values.data(), std::size_t(sampled.width) * sampled.height, values.ptr(), coverage.ptr());
+        if (ctx.renderJob.measure) {
+            measureMask = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
+            if (sampled.inside.size() == measureMask.total())
+                for (int y = 0; y < ctx.fbH; ++y) {
+                    auto* m = measureMask.ptr<uint8_t>(y);
+                    const auto* c = coverage.ptr<uint8_t>(y);
+                    const auto* in = sampled.inside.data() + std::size_t(y) * ctx.fbW;
+                    for (int x = 0; x < ctx.fbW; ++x)
+                        m[x] = c[x] && in[x] ? 1 : 0;
+                }
+        }
     }
     if (overlayActive) {
         overlayValues = cv::Mat_<uint8_t>(ctx.fbH, ctx.fbW, uint8_t(0));
@@ -1616,24 +1646,19 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         auto fillFromPrev = [](cv::Mat_<uint8_t>& dst, cv::Mat_<uint8_t>& cov,
                                const cv::Mat_<uint8_t>& prevDst,
                                const cv::Mat_<uint8_t>& prevCov,
-                               const std::vector<std::int8_t>& missing) {
+                               const std::vector<std::int8_t>& missing,
+                               cv::Mat_<uint8_t>* measure, const cv::Mat_<uint8_t>* prevMeasure) {
             if (dst.empty() || prevDst.empty() ||
-                dst.size() != prevDst.size() || cov.size() != prevCov.size())
+                dst.size() != prevDst.size() || cov.size() != prevCov.size() ||
+                !dst.isContinuous() || !cov.isContinuous() || !prevDst.isContinuous() || !prevCov.isContinuous())
                 return;
-            for (int y = 0; y < dst.rows; ++y) {
-                uint8_t* dstRow = dst.ptr<uint8_t>(y);
-                uint8_t* covRow = cov.ptr<uint8_t>(y);
-                const uint8_t* prevDstRow = prevDst.ptr<uint8_t>(y);
-                const uint8_t* prevCovRow = prevCov.ptr<uint8_t>(y);
-                for (int x = 0; x < dst.cols; ++x) {
-                    const auto q = std::size_t(y) * dst.cols + x;
-                    if (!covRow[x] && prevCovRow[x] && q < missing.size() &&
-                        missing[q] == vcr::grid::Result::kMissing) {
-                        dstRow[x] = prevDstRow[x];
-                        covRow[x] = 1;
-                    }
-                }
-            }
+            const bool measured = measure && measure->size() == dst.size() && measure->isContinuous();
+            const bool prevMeasured = measured && prevMeasure && prevMeasure->size() == dst.size() &&
+                                      prevMeasure->isContinuous();
+            vc3d::hud::carryMissingPixels(dst.total(), dst.ptr<uint8_t>(), cov.ptr<uint8_t>(),
+                                          measured ? measure->ptr<uint8_t>() : nullptr, prevDst.ptr<uint8_t>(),
+                                          prevCov.ptr<uint8_t>(), prevMeasured ? prevMeasure->ptr<uint8_t>() : nullptr,
+                                          missing, vcr::grid::Result::kMissing);
         };
         auto fillFromPrevColor = [](cv::Mat_<cv::Vec3b>& dst, cv::Mat_<uint8_t>& cov,
                                     const cv::Mat_<cv::Vec3b>& prevDst,
@@ -1658,16 +1683,24 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         // compares ==), so exactly one of these applies per frame.
         if (!colorValues.empty() && sameGeometry && !ctx.geometryDirty)
             fillFromPrevColor(colorValues, coverage, prev->colorValues, prev->coverage);
-        else
-            fillFromPrev(values, coverage, prev->values, prev->coverage, missingBase);
+        else {
+            // Pixels carried from a frame of other geometry (an edit) show where the
+            // surface was, not where it is: they stay on screen but are not measured.
+            const bool prevMeasured = sameGeometry && prev->measureMask.size() == measureMask.size();
+            fillFromPrev(values, coverage, prev->values, prev->coverage, missingBase,
+                         measureMask.empty() ? nullptr : &measureMask,
+                         prevMeasured ? &prev->measureMask : nullptr);
+        }
         fillFromPrev(overlayValues, overlayCoverage,
-                     prev->overlayValues, prev->overlayCoverage, missingOverlay);
+                     prev->overlayValues, prev->overlayCoverage, missingOverlay, nullptr, nullptr);
     }
+    result.complete = result.load.empty();
     result.values = values;
     result.coverage = coverage;
     result.colorValues = colorValues;
     result.overlayValues = overlayValues;
     result.overlayCoverage = overlayCoverage;
+    result.measureMask = measureMask;
     if (profilePhases) phaseTimer.restart();
     std::array<uint32_t, 256> lut{};
     vcr::display::windowLevelLut(lut, ctx.windowLow, ctx.windowHigh);
@@ -1761,6 +1794,10 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.overlayComposite = _overlayComposite;
     job.loadedDataEpoch = _loadedDataEpoch;
     job.surfaceGeometryEpoch = _surfaceGeometryEpoch;
+    if (_view) {
+        const auto& hud = _view->hudOptions();
+        job.measure = hud.histogram || hud.lineProfile || hud.loupe;
+    }
     // Focus bounds are in volume base coordinates for every view, including
     // segment QuadSurfaces. Mask the generated coordinates, not UVs;
     // the underlying surface and its cached tiles remain unchanged.
@@ -1830,6 +1867,7 @@ bool CChunkedVolumeViewer::renderJobsEquivalentForDisplay(const PendingRenderJob
     return renderJobsSameGeometry(a, b) &&
            a.loadedDataEpoch == b.loadedDataEpoch &&
            a.geometryDirty == b.geometryDirty &&
+           a.measure == b.measure &&
            boundsEqual(a.focusBoundsBase, b.focusBoundsBase);
 }
 
@@ -1902,6 +1940,119 @@ void CChunkedVolumeViewer::updateDisplayedFramebufferMapping()
         currentHalfH + static_cast<qreal>(screenDelta[1]) * static_cast<qreal>(_scale) -
             renderedHalfH * ratio);
     _view->setDirectFramebufferMapping(ratio, offset);
+}
+
+CVolumeViewerView::FrameResult CChunkedVolumeViewer::measurementFrame() const
+{
+    CVolumeViewerView::FrameResult out;
+    const auto surf = _surfWeak.lock();
+    if (!_volume || !surf) {
+        out.unavailable = tr("no volume shown");
+        return out;
+    }
+    if (!_lastRenderResult || !_displayedRenderJob) {
+        out.unavailable = tr("loading");
+        return out;
+    }
+    const auto& job = *_displayedRenderJob;
+    const auto& result = *_lastRenderResult;
+    // The frame on screen must be the one rendered for the live view: same size, pan,
+    // zoom, normal offset, sampling, window, composite and camera settings and surface
+    // geometry. Otherwise it is a retained frame standing in until the next render
+    // arrives, and pairing its pixels with the live geometry would misplace them.
+    CompositeRenderSettings liveComposite = _compositeSettings;
+    if (_volumetricAzimuthInSurface)
+        liveComposite.params.camAzimuthDeg = 0.0f;
+    const QSize vp = _view->viewport()->size();
+    if (job.fbW != vp.width() || job.fbH != vp.height() || job.surf != surf ||
+        job.levels != _levels || job.surfacePtrX != _surfacePtrX || job.surfacePtrY != _surfacePtrY ||
+        job.scale != _scale || job.zOff != _zOff || job.surfaceGeometryEpoch != _surfaceGeometryEpoch ||
+        job.samplingMethod != _samplingMethod || job.windowLow != _windowLow ||
+        job.windowHigh != _windowHigh || !(job.compositeSettings == liveComposite)) {
+        out.unavailable = tr("updating");
+        return out;
+    }
+    const auto& cs = job.compositeSettings;
+    const bool planeView = job.plane.has_value();
+    const bool baseComposite = planeView ? cs.planeEnabled : cs.enabled;
+    if (!result.colorValues.empty() || (baseComposite && cs.params.volumetric)) {
+        out.unavailable = tr("not measured in volumetric mode");
+        return out;
+    }
+    if (result.values.empty() || result.values.cols != job.fbW || result.values.rows != job.fbH) {
+        out.unavailable = tr("loading");
+        return out;
+    }
+    CVolumeViewerView::MeasurementFrame frame;
+    frame.serial = result.serial;
+    frame.values = result.values;
+    // The mask comes with frames rendered while an overlay that reads samples is on;
+    // turning one on renders the view again. Until then only the grid uses the frame.
+    frame.samples = job.measure && result.measureMask.size() == result.values.size();
+    frame.coverage = frame.samples ? result.measureMask
+                                   : cv::Mat_<std::uint8_t>(result.values.rows, result.values.cols, std::uint8_t(0));
+    frame.windowLow = job.windowLow;
+    frame.windowHigh = job.windowHigh;
+    {
+        // The renderer's own lookup table, so black and white counts match the screen.
+        std::array<uint32_t, 256> lut{};
+        vcr::display::windowLevelLut(lut, job.windowLow, job.windowHigh);
+        for (std::size_t i = 0; i < lut.size(); ++i)
+            frame.displayed[i] = static_cast<std::uint8_t>(lut[i] & 0xFFu);
+    }
+    frame.overlayBlended = !result.overlayValues.empty() && job.overlayOpacity > 0.0f;
+    frame.complete = result.complete;
+    if (baseComposite) {
+        const int front = std::max(0, planeView ? cs.planeLayersFront : cs.layersFront);
+        const int behind = std::max(0, planeView ? cs.planeLayersBehind : cs.layersBehind);
+        frame.composite = tr("%1 of %2 slices")
+                              .arg(QString::fromStdString(compositeMethodName(cs.params)))
+                              .arg(front + behind + 1);
+    }
+    if (job.plane) {
+        // Exactly the map the frame was sampled with, normal offset included.
+        const auto& pl = *job.plane;
+        vc3d::hud::AffineMap map;
+        for (int k = 0; k < 3; ++k) {
+            map.origin[std::size_t(k)] = pl.origin[std::size_t(k)];
+            map.dx[std::size_t(k)] = pl.dx[std::size_t(k)];
+            map.dy[std::size_t(k)] = pl.dy[std::size_t(k)];
+        }
+        frame.planeMap = map;
+    } else {
+        // The vertex grid and raster this frame was sampled with, not the live surface:
+        // frame pixel (x, y) sits at grid column x0 + x * sx + y * kx, row
+        // y0 + x * ky + y * sy, offset zOff along the normal. Holes give NaN.
+        const auto toGrid = [raster = job.raster, window = job.gridWindow](const QPointF& p) {
+            return QPointF(raster.x0 - window.x + p.x() * raster.sx + p.y() * raster.kx,
+                           raster.y0 - window.y + p.x() * raster.ky + p.y() * raster.sy);
+        };
+        const auto at = [grid = job.gridSurface, zOff = job.zOff](const QPointF& g) {
+            const float nan = std::numeric_limits<float>::quiet_NaN();
+            if (!grid) {
+                return cv::Vec3f(nan, nan, nan);
+            }
+            const float xy[2] = {float(g.x()), float(g.y())};
+            float xyz[3] = {nan, nan, nan};
+            float normal[3] = {0.0f, 0.0f, 0.0f};
+            grid->pointsAt(xy, 1, xyz, zOff != 0.0f ? normal : nullptr);
+            if (zOff != 0.0f && !(std::isfinite(normal[0]) && std::isfinite(normal[1]) && std::isfinite(normal[2]))) {
+                return cv::Vec3f(nan, nan, nan);
+            }
+            return cv::Vec3f(xyz[0] + zOff * normal[0], xyz[1] + zOff * normal[1], xyz[2] + zOff * normal[2]);
+        };
+        frame.toVolume = [toGrid, at](const QPointF& p) { return at(toGrid(p)); };
+        frame.joined = [toGrid, at](const QPointF& a, const QPointF& b) {
+            return vc3d::hud::everyCrossedCell(toGrid(a), toGrid(b), [&at](const QPointF& g) {
+                const cv::Vec3f v = at(g);
+                return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+            });
+        };
+    }
+    const double voxel = _volume->voxelSize();
+    frame.voxelSizeUm = voxel > 0.0 && std::isfinite(voxel) ? voxel : 0.0;
+    out.frame = std::move(frame);
+    return out;
 }
 
 void CChunkedVolumeViewer::startRenderJob(PendingRenderJob job)

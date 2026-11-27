@@ -25,6 +25,7 @@
 #include "overlays/VolumeOverlayController.hpp"
 #include "overlays/StoreSurfaceOverlayController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -533,4 +534,122 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
 
     // Echo the resulting full settings (unknown keys are ignored).
     return viewerRenderSettingsJson();
+}
+
+
+QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
+{
+    ViewerManager* mgr = _window ? _window->_viewerManager.get() : nullptr;
+    if (!mgr) {
+        QJsonObject data;
+        data["detail"] = "viewer manager is not available";
+        throw AgentBridgeError{-32010, "Viewer manager unavailable", data};
+    }
+    const QJsonObject p = params.toObject();
+    const bool wantsLine = p.contains("profileLine");
+    const bool clearProfile = p.value("clearProfile").toBool();
+
+    // Resolve the profile's viewer before changing anything, so a bad target leaves
+    // every switch as it was.
+    CVolumeViewerView* view = nullptr;
+    CChunkedVolumeViewer* chunked = nullptr;
+    if (wantsLine || clearProfile) {
+        chunked = dynamic_cast<CChunkedVolumeViewer*>(resolveViewer(p.value("viewer")));
+        if (!chunked || !chunked->graphicsView()) {
+            QJsonObject data;
+            data["detail"] = "the profile line needs a slice viewer";
+            throw AgentBridgeError{-32002, "Viewer not found", data};
+        }
+        view = chunked->graphicsView();
+    }
+
+    // The switches apply to every viewer of every manager, like View > Measurement Overlays.
+    vc3d::hud::Options options = ViewerManager::fleetHudOptions();
+    if (p.contains("histogram")) options.histogram = p.value("histogram").toBool();
+    if (p.contains("lineProfile")) options.lineProfile = p.value("lineProfile").toBool();
+    if (p.contains("grid")) options.grid = p.value("grid").toBool();
+    if (p.contains("loupe")) options.loupe = p.value("loupe").toBool();
+    if (p.contains("gridStep")) options.gridStep = std::max(0.0, p.value("gridStep").toDouble());
+    if (wantsLine) options.lineProfile = true;
+    ViewerManager::setFleetHudOptions(options);
+
+    QJsonObject hud;
+    hud["histogram"] = options.histogram;
+    hud["lineProfile"] = options.lineProfile;
+    hud["grid"] = options.grid;
+    hud["loupe"] = options.loupe;
+    hud["gridStep"] = options.gridStep;
+    QJsonObject out;
+    out["hud"] = hud;
+    if (!view) {
+        return out;
+    }
+
+    // The profile line belongs to one viewer, given in fractions of its viewport: 0 is
+    // the first pixel and 1 the last, so a line can reach every pixel.
+    out["viewer"] = viewerIdFor(chunked);
+    if (clearProfile && !wantsLine) {
+        view->setProfileLine(std::nullopt);
+        return out;
+    }
+    const QJsonObject line = p.value("profileLine").toObject();
+    const double w = view->viewport()->width();
+    const double h = view->viewport()->height();
+    auto at = [&](const char* x, const char* y) {
+        return QPointF(vc3d::hud::fractionToPixel(line.value(x).toDouble(), w),
+                       vc3d::hud::fractionToPixel(line.value(y).toDouble(), h));
+    };
+    view->setProfileLine(QLineF(at("x1", "y1"), at("x2", "y2")));
+    view->viewport()->repaint();
+
+    const CVolumeViewerView::ProfileReadout r = view->profileReadout();
+    QJsonObject profile;
+    profile["available"] = r.available;
+    if (!r.available) {
+        profile["unavailable"] = r.unavailable;
+        out["profile"] = profile;
+        return out;
+    }
+    const int n = static_cast<int>(r.values.size());
+    QJsonArray values;
+    double lo = 255, hi = 0, sum = 0;
+    int finite = 0;
+    for (float v : r.values) {
+        if (std::isnan(v)) {
+            values.append(QJsonValue::Null);
+            continue;
+        }
+        values.append(std::round(v * 10.0) / 10.0);
+        lo = std::min(lo, double(v));
+        hi = std::max(hi, double(v));
+        sum += v;
+        ++finite;
+    }
+    QJsonArray peaks;
+    for (int idx : r.peaks) {
+        peaks.append(n > 1 ? double(idx) / (n - 1) : 0.0);
+    }
+    profile["samples"] = n;
+    profile["missing"] = r.missing;
+    profile["complete"] = r.complete;
+    profile["values"] = values;
+    // One 8-bit sample of a single slice per point, before the display window. Slab
+    // composites (Max, Mean, ...) and the volumetric view are not profiled.
+    profile["valueKind"] = QStringLiteral("sample8");
+    profile["peaks"] = peaks;
+    profile["lengthAlong"] = r.alongSurface ? QStringLiteral("surface") : QStringLiteral("plane");
+    profile["lengthUnit"] = r.physical ? QStringLiteral("um") : QStringLiteral("vx");
+    profile["length"] = r.length ? QJsonValue(*r.length) : QJsonValue(QJsonValue::Null);
+    auto point = [](const std::array<double, 3>& v) {
+        return QJsonArray{v[0], v[1], v[2]};
+    };
+    if (r.start) profile["start"] = point(*r.start);
+    if (r.end) profile["end"] = point(*r.end);
+    if (finite > 0) {
+        profile["min"] = lo;
+        profile["max"] = hi;
+        profile["mean"] = sum / finite;
+    }
+    out["profile"] = profile;
+    return out;
 }

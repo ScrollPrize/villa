@@ -47,6 +47,7 @@ struct Params {
     int levelCount = 0;
     float* values = nullptr;        // pixels, or layers * pixels (layer-major)
     std::int8_t* level = nullptr;   // per pixel
+    std::uint8_t* inside = nullptr; // per pixel, when the request reports it (Result::inside)
     // Bricks of the first level a sample lacked (blocking requests).
     LackingSet lacking{};
 };

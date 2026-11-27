@@ -1,6 +1,9 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
+#include <functional>
+#include <optional>
 
 #include <QGraphicsView>
 #include <QPointF>
@@ -9,6 +12,7 @@
 
 #include <opencv2/core.hpp>
 #include "vc/core/util/PlaneSurface.hpp"
+#include "ViewerHud.hpp"
 
 class CVolumeViewerView : public QGraphicsView
 {
@@ -36,11 +40,87 @@ public:
         update();
     }
 
+    bool physicalUnits() const { return m_physicalUnits; }
+
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
     
     void showCoordinateFrame(bool visible);
     void setCoordinateFrame(PlaneSurface* plane);
+
+    // Measurement overlays drawn from the rendered frame (see ViewerHud.hpp).
+    void setHudOptions(const vc3d::hud::Options& options);
+    const vc3d::hud::Options& hudOptions() const { return _hud; }
+    // Line for the intensity profile, in viewport pixels; nullopt clears it.
+    void setProfileLine(std::optional<QLineF> line);
+    std::optional<QLineF> profileLine() const { return _profileLine; }
+    // Drawing a profile line takes one left drag after it is armed (View > Measurement
+    // Overlays > Draw Profile Line), so the overlay never takes clicks from the tools
+    // and embedded controls that own them. The drag, or Escape, disarms it.
+    void armProfileLine(bool armed);
+    bool profileLineArmed() const { return _profileArmed; }
+
+    // The rendered frame the overlays measure. Only a frame that shows the live view is
+    // measured: one still drawn for an earlier pan, zoom, offset, camera or surface is not.
+    struct MeasurementFrame {
+        std::uint64_t serial = 0;
+        cv::Mat_<std::uint8_t> values;    // base-volume samples, 8-bit, before the display window
+        // Nonzero where the frame measured the volume: the value read only voxels inside
+        // the volume at the level and sampling it came from (never the reader's fill
+        // beyond the edges; in-volume zeros count), and was not carried over from an
+        // earlier surface while chunks load, however many frames carried it.
+        cv::Mat_<std::uint8_t> coverage;
+        double windowLow = 0.0;
+        double windowHigh = 255.0;
+        // The gray the renderer's window gives each value; the histogram counts black
+        // and white from it.
+        vc3d::hud::DisplayMap displayed = vc3d::hud::identityDisplay();
+        bool overlayBlended = false;      // a colored overlay volume is drawn over these samples
+        // Set when each value reduces several slices along the normal (a Max, Mean or
+        // other slab composite), e.g. "max of 9 slices". Such a value has no single
+        // position, so the profile and loupe do not report one.
+        QString composite;
+        // False when the frame lacked chunks when it was rendered: its values (and the
+        // peaks) are provisional until the next frame. A complete frame can still miss
+        // samples outside the volume or across a surface hole.
+        bool complete = true;
+        // False when the frame has positions but no measurement mask yet (it was
+        // rendered before an overlay that reads samples was turned on): only the grid
+        // may use it.
+        bool samples = true;
+        // Frame pixel to volume position (level-0 voxels) from the geometry this frame
+        // was sampled with, including the normal offset (Ctrl+. and Ctrl+,); NaN where
+        // the pixel is off the surface.
+        std::function<cv::Vec3f(const QPointF&)> toVolume;
+        // Set on plane views, where toVolume is affine; the grid needs it.
+        std::optional<vc3d::hud::AffineMap> planeMap;
+        // Set on surface views: whether the surface is unbroken along the straight path
+        // between two frame pixels.
+        std::function<bool(const QPointF&, const QPointF&)> joined;
+        double voxelSizeUm = 0.0;  // > 0 only when the volume states its voxel size
+    };
+    struct FrameResult {
+        std::optional<MeasurementFrame> frame;
+        QString unavailable;  // why there is no frame to measure, shown in place of a readout
+    };
+    void setMeasurementFrameSource(std::function<FrameResult()> source);
+
+    // Numbers behind the line profile, for scripts and tests.
+    struct ProfileReadout {
+        bool available = false;
+        QString unavailable;          // why not, when !available
+        std::vector<float> values;    // 8-bit samples before the window; NaN where not measured
+        int missing = 0;              // samples that are NaN
+        bool complete = true;         // false while some of the frame's chunks are still loading
+        std::vector<int> peaks;
+        std::vector<double> arc;      // length from the start to each sample; NaN once a position is missing
+        std::optional<double> length; // arc.back() when every position is known
+        bool physical = false;        // lengths in µm (true) or level-0 voxels
+        bool alongSurface = false;    // along a curved surface rather than a plane
+        std::optional<std::array<double, 3>> start;
+        std::optional<std::array<double, 3>> end;
+    };
+    ProfileReadout profileReadout() const;
 
     struct ScaleBarLabel {
         double displayLength = 0.0;
@@ -74,6 +154,10 @@ signals:
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     void sendTiltHandleChanged(QPointF tilt);
     void sendTiltHandleReset();
+    // A drag began drawing the profile line, which disarms the other views.
+    void profileLineDrawStarted();
+    // Escape cancelled arming or drawing the profile line, which disarms every view.
+    void profileLineCancelled();
     
 protected:
     bool _regular_pan = false;
@@ -106,6 +190,25 @@ private:
     void drawCoordinateFrame(QPainter* painter) const;
     void drawTiltHandle(QPainter* painter) const;
     void drawScaleBar(QPainter* painter) const;
+    void drawHistogram(QPainter* painter) const;
+    void drawLineProfile(QPainter* painter) const;
+    void drawGrid(QPainter* painter) const;
+    void drawLoupe(QPainter* painter) const;
+    // The live frame; with needSamples, only one whose samples may be measured.
+    FrameResult measurementFrame(bool needSamples = true) const;
+    vc3d::hud::PanelLayout panelLayout() const;
+    QRectF scaleBarRect() const;
+    void cancelProfileGesture();
+    // The profile gesture's own events (its Escape press, repeats and release; an armed
+    // left press and the rest of its drag) go to this view ahead of every event filter
+    // on it or its viewport, such as a workspace tool's, which never sees them.
+    friend class ProfileGestureFilter;
+    bool takeProfileGestureEvent(QObject* watched, QEvent* event);
+    bool profileGestureActive() const
+    {
+        return _profileArmed || _profileDragging || _profileDragCancelled || _profileOwnsEscape;
+    }
+    QObject* _gestureFilter = nullptr;  // on the application while profileGestureActive()
     bool pointInSceneWidget(const QPointF& viewportPos) const;
 
     // µm (or voxels, when !m_physicalUnits) per scene-unit (pixel)
@@ -129,4 +232,18 @@ private:
     
     bool _showFrame = false;
     cv::Vec3f _frame[3];
+
+    vc3d::hud::Options _hud;
+    std::optional<QLineF> _profileLine;
+    bool _profileArmed = false;
+    bool _profileDragging = false;
+    // Escape cancelled a profile drag: the rest of that drag (moves and the release)
+    // stays with the profile instead of reaching the tools.
+    bool _profileDragCancelled = false;
+    // Escape was taken by the profile: its auto-repeats and release are taken too.
+    bool _profileOwnsEscape = false;
+    QPointF _lastCursorVp{-1.0, -1.0};
+    std::function<FrameResult()> _frameSource;
+    mutable std::uint64_t _histogramSerial = 0;
+    mutable vc3d::hud::Histogram _histogram;
 };

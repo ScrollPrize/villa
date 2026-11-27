@@ -350,6 +350,34 @@ surface's store UUID. Methods on segments need an open project and volume (-3200
 - Viewer-manager settings remain meaningful with zero viewers. Per-viewer
   toggles are broadcast to every live base viewer and their persisted defaults
   are updated where applicable.
+- `viewer.set_hud` switches the measurement overlays for every viewer of every
+  viewer manager (main and Spiral), exactly like View > Measurement Overlays, whose
+  items follow it. The profile target is resolved in the main viewer manager and
+  checked first: a bad `viewer` with `profileLine` or `clearProfile` returns -32002
+  and changes nothing. A `profileLine` is given in fractions of the target viewer's
+  viewport, 0 the first pixel and 1 the last (`x * (width - 1)`), and turns profile
+  mode on. Measurements read only the presented frame, and only while it shows the
+  live view; otherwise `profile.available` is false and `profile.unavailable` says
+  why (for example "updating" right after a pan, a normal-offset, window or
+  composite change, "loading", "no volume shown", volumetric mode, or a slab
+  composite such as "max of 9 slices", whose values have no single position).
+  `values` are the base volume's 8-bit samples of one slice before the display
+  window (`valueKind: "sample8"`), null where the frame did not measure the volume:
+  loading gaps, surface holes, pixels carried over from an earlier surface while an
+  edit loads (through every later frame that carries them), and samples that read
+  any voxel beyond the volume's edges at the pyramid level and sampling (nearest or
+  linear) they came from, where the reader returns its fill value. In-volume zeros
+  are values. `missing` counts the nulls. `complete` is false when the frame that
+  supplied the values still lacked chunks: its values and peaks are provisional and
+  a later call returns the final ones. A complete frame can still have `missing`
+  samples outside the volume or across a surface hole. Positions come from the geometry the frame was
+  sampled with. `length` is measured along those positions (`lengthAlong`:
+  "plane", or "surface" on a flattened segment, where it follows the surface
+  rather than the screen), in µm only when the volume states its voxel size and in
+  level-0 voxels otherwise (`lengthUnit`), and null once part of the line has no
+  position (it leaves the surface or crosses a hole). `start` and `end` are the
+  volume positions of the line's ends, normal offset included, left out when an
+  end has none. The grid draws only on plane views.
 - Overlay updates are atomic. A clear request removes the overlay; explicit
   volumes must resolve in the open package. Intersection sets always include
   the segmentation surface and are not applied to the segmentation viewer
@@ -643,6 +671,7 @@ is the sole bridge method without an MCP tool.
 | `vc3d_select_volume` | `volume.select` |
 | `vc3d_set_auto_fill_mode` | `points.set_auto_fill_mode` |
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
+| `vc3d_set_hud` | `viewer.set_hud` | Turn the slice viewers' measurement overlays (histogram, line profile, coordinate grid, loupe) on or off; with a profile line, returns the sample values, peaks and length along it. |
 | `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines viewers draw; stored surfaces (UUIDs) are drawn on every plane viewer. |
 | `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, window, intensity-as-alpha, resolution cap, composite); any subset. |
 | `vc3d_set_point_collection_color` | `points.set_collection_color` |

@@ -34,6 +34,13 @@ class _Window(TypedDict):
     high: float
 
 
+class _ProfileLine(TypedDict):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
 class _OverlayComposite(TypedDict, total=False):
     enabled: bool
     method: Literal["max", "mean", "min"]
@@ -289,6 +296,69 @@ async def vc3d_set_render_settings(
                 "segmentationCursorMirroring": segmentation_cursor_mirroring,
                 "zScrollSensitivity": z_scroll_sensitivity,
                 "composite": composite,
+            }
+        ),
+    )
+
+
+@mcp.tool()
+async def vc3d_set_hud(
+    viewer: Optional[str] = None,
+    histogram: Optional[bool] = None,
+    line_profile: Optional[bool] = None,
+    grid: Optional[bool] = None,
+    loupe: Optional[bool] = None,
+    grid_step: Optional[float] = None,
+    profile_line: Optional[_ProfileLine] = None,
+    clear_profile: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Turn the slice viewers' measurement overlays on or off, and measure
+    samples along a line. Same as View > Measurement Overlays, for every
+    viewer; every argument is optional and omitted ones are left unchanged.
+    A bad `viewer` with profile_line or clear_profile changes nothing.
+
+    histogram: histogram of the visible base-volume samples (8-bit, before
+    the display window), with the 1st/99th percentiles and the share the
+    window shows as black or white.
+    line_profile: profile overlay (View > Measurement Overlays > Draw Profile
+    Line arms one left drag to draw the line).
+    grid: labeled lines at round volume coordinates on plane views;
+    grid_step sets their spacing in voxels (0 picks one from the zoom).
+    loupe: magnifier that follows the mouse.
+    profile_line: {"x1", "y1", "x2", "y2"} in fractions of `viewer`'s
+    viewport, 0 the first pixel and 1 the last; draws the line, turns the
+    profile on and returns the profile.
+    clear_profile: remove `viewer`'s line.
+
+    Returns {"hud": {...current switches}} and, with profile_line,
+    "viewer" and "profile": {"available", and when false "unavailable" (why:
+    "updating", "loading", "no volume shown", volumetric mode, or a slab
+    composite such as "max of 9 slices", which has no single position per
+    value); otherwise "samples", "values" (8-bit samples of one slice before
+    the window per pixel of length, null where the frame did not measure the
+    volume: loading gaps, surface holes, samples reading beyond the volume's
+    edges at their level and sampling), "missing" (count of nulls),
+    "complete" (false while the frame that supplied the values still lacked
+    chunks: values and peaks are provisional; a complete frame can still have
+    missing samples),
+    "valueKind" ("sample8"), "peaks" (fractions along the line where a
+    bright crossing peaks; intensity peaks, not a count of sheets), "length"
+    (along "lengthAlong": "plane" or "surface"; null when part of the line
+    has no position), "lengthUnit" ("um" only when the volume states its
+    voxel size, else "vx"), "start"/"end" (volume positions, left out when
+    an end has none), "min", "max", "mean"}."""
+    return await _call(
+        "viewer.set_hud",
+        _strip_none(
+            {
+                "viewer": viewer,
+                "histogram": histogram,
+                "lineProfile": line_profile,
+                "grid": grid,
+                "loupe": loupe,
+                "gridStep": grid_step,
+                "profileLine": profile_line,
+                "clearProfile": clear_profile,
             }
         ),
     )
