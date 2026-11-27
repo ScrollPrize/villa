@@ -510,8 +510,21 @@ def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path
     with ObjectStore.create(str(tmp_path / 'roundtrip.vcobj'), author='test') as other:
         result = other.ingest_geometry_source('fiber', collection)
         assert not result['problems'] and result['ingested'] == 2 and result['edges_imported'] == 1
-    # No filename-based endpoint repair, even when both files are available.
+    # A version-4 branch saved with only its branch_file resolves through the peer file's UUID,
+    # as published fiber annotations need.
     del first['branches'][0]['target_uuid']
+    root.write_text(json.dumps(first))
+    with ObjectStore.create(str(tmp_path / 'by-file.vcobj'), author='test') as other:
+        result = other.ingest_geometry_source('fiber', root)
+        assert not result['problems'] and result['ingested'] == 2 and result['edges_imported'] == 1
+    # Not in a collection, where it could resolve to a loose file of that name.
+    (tmp_path / 'peer.json').write_text(json.dumps({k: v for k, v in second.items() if k != 'uuid'}))
+    collection.write_text(json.dumps(dict(type='vc3d_fiber_collection', version=1, point_collections=[first, second])))
+    with ObjectStore.create(str(tmp_path / 'by-file-collection.vcobj'), author='test') as other:
+        assert other.ingest_geometry_source('fiber', collection)['problems']
+        assert other.object_count('fiber') == 0
+    # A branch that names neither a target UUID nor a file is still refused.
+    del first['branches'][0]['branch_file']
     root.write_text(json.dumps(first))
     with ObjectStore.create(str(tmp_path / 'invalid.vcobj'), author='test') as other:
         assert other.ingest_geometry_source('fiber', root)['problems']
@@ -522,7 +535,9 @@ def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path
         assert other.object_count('fiber') == 0
 
 
-def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path):
+# VC3D's version 4 files from before the store are written like version 3 ones.
+@pytest.mark.parametrize('version', [3, 4])
+def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path, version):
     import json
     import uuid
     ids = [str(uuid.uuid4()) for _ in range(3)]
@@ -536,7 +551,7 @@ def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path):
 
     def write(directory, noise):
         directory.mkdir()
-        documents = [dict(type='vc3d_fiber', version=3, uuid=uid, filename=name, sequence=i,
+        documents = [dict(type='vc3d_fiber', version=version, uuid=uid, filename=name, sequence=i,
                           control_points=[{'position': [i, 0, 0]}, {'position': [i, 1, 0]}],
                           line_points=[[i, 0, 0], [i, 1, 0]], branches=[])
                      for i, (uid, name) in enumerate(zip(ids, files))]
@@ -557,6 +572,7 @@ def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path):
         assert {edge['a'], edge['b']} == set(ids[:2]) and edge['approval_state'] == 'approved'
         for uid in ids:
             assert store.object(uid)['meta']['coordinates'] == dict(volume_uuid='20260411134726', scale_factor=1)
+        assert ('vc_open_data_coordinate_space' in store.object(ids[0])['meta']['source']) == (version == 4)
     # Reciprocal declarations that genuinely disagree still roll back the batch.
     write(tmp_path / 'conflict', 1e-3)
     with ObjectStore.create(str(tmp_path / 'conflict.vcobj'), author='test') as store:
