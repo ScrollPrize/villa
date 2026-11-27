@@ -55,9 +55,9 @@ def test_too_few_layers_is_undecided():
     assert end_texture(_Source(_stack(True, c=20))) is None
 
 
-def _env(monkeypatch, value):
+def _env(monkeypatch, value, **extra):
     for k, v in {"MODEL": "m", "START_LAYER": "2", "END_LAYER": "64", "STEP": "inference",
-                 "SURFACE_VOLUME_ZARR": "/tmp/sv.zarr", "IMAGE_ROLE": "gpu"}.items():
+                 "SURFACE_VOLUME_ZARR": "/tmp/sv.zarr", "IMAGE_ROLE": "gpu", **extra}.items():
         monkeypatch.setenv(k, v)
     if value is None:
         monkeypatch.delenv("FORCE_REVERSE", raising=False)
@@ -73,3 +73,9 @@ def test_force_reverse_env_values(monkeypatch):
     assert (lambda i: (i.force_reverse, i.auto_reverse))(_env(monkeypatch, "true")) == (True, False)
     assert (lambda i: (i.force_reverse, i.auto_reverse))(_env(monkeypatch, "AUTO")) == (False, True)
     assert (lambda i: (i.force_reverse, i.auto_reverse))(_env(monkeypatch, "false")) == (False, False)
+
+
+def test_auto_rejected_for_partitioned_s3(monkeypatch):
+    with pytest.raises(ValueError, match="FORCE_REVERSE=auto"):
+        _env(monkeypatch, "auto", NUM_PARTS="2", SURFACE_VOLUME_ZARR="s3://b/sv.zarr")
+    assert _env(monkeypatch, "auto", NUM_PARTS="2").auto_reverse

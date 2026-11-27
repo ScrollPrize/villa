@@ -56,6 +56,7 @@ COPY model_resnet3d.py /app
 COPY model_resnet3d_3d_decoder.py /app
 COPY k8s.py /app
 COPY runtime_contracts.py /app
+COPY orientation.py /app
 COPY models/ /app/models/
 
 ENV PYTHONUNBUFFERED=1

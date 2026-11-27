@@ -169,6 +169,12 @@ def parse_env() -> Inputs:
             # Inference step requires surface_volume_zarr
             if not surface_volume_zarr:
                 raise ValueError("STEP=inference requires SURFACE_VOLUME_ZARR (run STEP=prepare first)")
+            # Every partition would sample, and so download, most of the stack.
+            if auto_reverse and num_parts > 1 and surface_volume_zarr.startswith("s3://"):
+                raise ValueError(
+                    "FORCE_REVERSE=auto is not supported with NUM_PARTS > 1 on an S3 zarr; "
+                    "set FORCE_REVERSE to true or false"
+                )
         elif step == "aggregate-profiling" and not profiling_raw_root:
             raise ValueError("STEP=aggregate-profiling requires PROFILING_RAW_ROOT")
         # reduce step doesn't require these
