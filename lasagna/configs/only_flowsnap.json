@@ -1,5 +1,6 @@
 {
 	"args": {
+		"model-init": "model",
 		"tifxyz-flow-gate-channels": true
 	},
 	"base": {
