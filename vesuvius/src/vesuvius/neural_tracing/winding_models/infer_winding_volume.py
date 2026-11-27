@@ -230,6 +230,18 @@ def _supplied_options(options):
     })
 
 
+def _default_device(gpus_given, prob_volume):
+    """cuda when available (or when --gpus asks for it), else an Apple GPU,
+    else cpu. --prob-volume needs float64 on the device, so it skips mps."""
+    import torch
+
+    if gpus_given or torch.cuda.is_available():
+        return "cuda"
+    if not prob_volume and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -438,10 +450,11 @@ def parse_args():
     parser.add_argument("--gpus", default=None,
                         help="comma-separated GPU indices (default: all visible)")
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"),
-                        default="cuda",
-                        help="device the workers run the model on (default "
-                             "cuda, one worker per --gpus entry); mps (Apple "
-                             "GPU) and cpu run one worker")
+                        default=None,
+                        help="device the workers run the model on (default: "
+                             "cuda when available or with --gpus, one worker "
+                             "per --gpus entry; else mps, else cpu); mps "
+                             "(Apple GPU) and cpu run one worker")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile the model in each worker (adds "
@@ -492,6 +505,8 @@ def parse_args():
              "above 1 reduces cache reads but requires --max-level to cover "
              "the wider retained-anchor gap")
     args = parser.parse_args()
+    if args.device is None:
+        args.device = _default_device(args.gpus is not None, args.prob_volume)
     if args.device != "cuda" and args.gpus is not None:
         parser.error("--gpus selects CUDA devices; drop it with --device "
                      f"{args.device}")

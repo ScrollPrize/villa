@@ -1419,7 +1419,8 @@ def parse_args(argv=None):
     parser.add_argument("--no-patches", action="store_true")
     parser.add_argument("--scratch-dir", default=None)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default=None,
+                        help="torch device (default: cuda, else mps, else cpu)")
     parser.add_argument("--margin", type=int, default=140)
     parser.add_argument("--z-crop", type=int, nargs=2, default=None)
     parser.add_argument("--limit-blocks", type=int, default=None)
@@ -1454,7 +1455,13 @@ def parse_args(argv=None):
     parser.add_argument("--checkpoint-minutes", type=float, default=30.0)
     parser.add_argument("--zstd-level", type=int, default=5)
     parser.add_argument("--agreement-samples", type=int, default=0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.device is None:
+        import torch
+
+        args.device = ("cuda" if torch.cuda.is_available()
+                       else "mps" if torch.backends.mps.is_available() else "cpu")
+    return args
 
 
 def main(argv=None):

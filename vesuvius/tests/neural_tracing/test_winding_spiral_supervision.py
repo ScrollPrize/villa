@@ -355,3 +355,36 @@ def test_device_option_rejects_cuda_only_settings(extra):
             "volume.zarr", "--model-ckpt", "model.pth", *extra]
     with mock.patch.object(sys, "argv", argv), pytest.raises(SystemExit):
         iwv.parse_args()
+
+
+@pytest.mark.parametrize("cuda, mps, gpus, prob, expected", [
+    (True, True, False, False, "cuda"),
+    (False, True, False, False, "mps"),
+    (False, False, False, False, "cpu"),
+    (False, True, False, True, "cpu"),   # --prob-volume needs float64 on the device
+    (False, True, True, False, "cuda"),  # --gpus asks for CUDA workers
+])
+def test_infer_default_device(monkeypatch, cuda, mps, gpus, prob, expected):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
+    assert iwv._default_device(gpus, prob) == expected
+
+
+def test_infer_parse_args_fills_default_device(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    argv = ["infer_winding_volume.py", "fit.ckpt", "out", "--reference-zarr",
+            "volume.zarr", "--model-ckpt", "model.pth"]
+    with mock.patch.object(sys, "argv", argv):
+        assert iwv.parse_args().device == "mps"
+    with mock.patch.object(sys, "argv", argv + ["--device", "cpu"]):
+        assert iwv.parse_args().device == "cpu"
+
+
+@pytest.mark.parametrize("cuda, mps, expected", [(True, True, "cuda"), (False, True, "mps"), (False, False, "cpu")])
+def test_merge_default_device(monkeypatch, cuda, mps, expected):
+    from vesuvius.neural_tracing.winding_models import merge_winding_field as mwf
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: mps)
+    assert mwf.parse_args(["archive", "out"]).device == expected
