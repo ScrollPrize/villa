@@ -265,10 +265,14 @@ def lasagna_flatten(concat_path, flat_path, lasagna_dir, lasagna_config, lasagna
     # matters for the large full-scroll flatten on a memory-contended GPU.
     env = os.environ.copy()
     env.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+    # --snapshot-interval 0: the scratch dir, and every model snapshot in it, is deleted below,
+    # and each snapshot runs a full CPU UV inversion and writes a checkpoint the size of the mesh.
+    # The final model and the flattened tifxyz are saved regardless of the interval.
     subprocess.run(
         [sys.executable, lasagna_fit_script,
          os.path.abspath(lasagna_config), overlay_path,
-         '--out-dir', scratch, '--device', device],
+         '--out-dir', scratch, '--device', device,
+         '--snapshot-interval', '0'],
         check=True, cwd=lasagna_dir, env=env,
     )
     produced = os.path.join(scratch, 'tifxyz', 'flatten.tifxyz')
