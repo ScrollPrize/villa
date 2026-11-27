@@ -52,8 +52,9 @@ def resolve_trace_seed(item, ct, spec):
         fiber, t, reverse, cfg = pending
         frame = frame_from_heading(heading)
         reframe_item(item, frame)
-        item.update(continuation_targets(fiber, t, reverse, item['pos'], frame, cfg))
-        supervise(item)
+        if '_frame_label_context' in item:  # labels only; inference items built without labels have none
+            item.update(continuation_targets(fiber, t, reverse, item['pos'], frame, cfg))
+            supervise(item)
     return item
 
 

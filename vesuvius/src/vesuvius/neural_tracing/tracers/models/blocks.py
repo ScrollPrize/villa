@@ -11,6 +11,7 @@ import torch.nn.functional as F
 LOGIT_SCALE_LR_SCALE = 10.  # LR multiple of the attention logit scales' optimizer group (no weight decay)
 
 from vesuvius.models.build.resblocks import BasicBlockD, StackedResidualBlocks
+from vesuvius.neural_tracing.tracers.models.mps_attention import fused_attention_suits, masked_attention
 
 
 def _group_norm(channels: int, **kwargs) -> nn.GroupNorm:
@@ -107,6 +108,14 @@ class MLP(nn.Sequential):
             nn.init.zeros_(self[-1].bias)
 
 
+def attention(q, k, v, mask=None):
+    """``F.scaled_dot_product_attention(q, k, v, attn_mask=mask)``; on Apple GPUs a fused Metal kernel takes the
+    bool-masked inference calls (models/mps_attention.py ``masked_attention``)."""
+    if fused_attention_suits(q, k, v, mask):
+        return masked_attention(q, k, v, mask)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+
+
 class TransformerLayer(nn.Module):
     """One pre-norm transformer layer's weights (attention and FFN branches) and its head split/merge. ``qk_norm``:
     queries and keys are RMS-normalized per head (learned gain) before attention, which bounds the attention logits.
@@ -147,5 +156,5 @@ class SelfAttentionLayer(TransformerLayer):
     def forward(self, x, padding=None):
         q, k, v = self.split(self.norm1(x))
         mask = None if padding is None else ~padding[:, None, None, :]
-        x = x+self.merge(F.scaled_dot_product_attention(q, k, v, attn_mask=mask))
+        x = x+self.merge(attention(q, k, v, mask))
         return x+self.ffn(self.norm2(x))

@@ -2,14 +2,16 @@
 
 A crop (``CropSpec``, frame columns ``u, v, f``) is laid out ``(D, H, W)`` = forward (f), v, u; sample ``(i, j, k)``
 lies at CT-array xyz ``pos*scale + (frame*scale) @ (lateral[k], vertical[j], forward[i])``. ``crop_grids`` turns that
-into the origin and axes of ``ZarrReader.read_affine_many`` (CPU) and ``CudaReader.read_affine_batch`` (CUDA): the
-same trilinear values, CT/255, with the array's fill value outside it.
+into the origin and axes of ``ZarrReader.read_affine_many`` (CPU), ``CudaReader.read_affine_batch`` (CUDA) and
+``MetalReader.read_affine_batch`` (Apple GPU): the same trilinear values, CT/255, with the array's fill value outside
+it.
 """
 import numpy as np
 import torch
 
 from vesuvius.neural_tracing.tracers.shared.geometry import CropSpec
-from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import normalize_ct, zscore_crops
+from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import (
+    normalize_ct, zscore_crops_float64, zscore_crops_torch)
 
 
 def empty_image_batch(shape):
@@ -82,10 +84,27 @@ def scalar_crops(items, ct, spec, crop, *, out=None, normalize=True):
 
 def cuda_scalar_crops(items, cuda, spec, crop) -> torch.Tensor:
     """``scalar_crops`` on the GPU from a vc_reader ``CudaReader`` (``ZarrReader.cuda()``): (B, 1, D, H, W) float32
-    crops on its device, z-scored per crop (``zscore_crops``)."""
+    crops on its device, scaled and z-scored with the CPU's arithmetic (``zscore_crops_float64``)."""
     out = torch.empty((len(items), crop.depth, crop.height or crop.width, crop.width), dtype=torch.float32,
                       device=torch.device('cuda', cuda.device))
     if items:
         size, origins, axes = crop_grids(items, crop, spec.input_scale)
         cuda.read_affine_batch(size, origins, axes, order=1, out=out)
-    return zscore_crops(out[:, None]/255.)
+    # the CPU sampler's float32 scale and float64 z-score, so model inputs track the CPU crops to the sample
+    return zscore_crops_float64(out[:, None].mul_(float(np.float32(1/255))))
+
+
+def metal_scalar_crops(items, metal, spec, crop) -> torch.Tensor:
+    """``scalar_crops`` on an Apple GPU from a vc_reader ``MetalReader`` (``ZarrReader.metal()``): (B, 1, D, H, W)
+    float32 MPS crops, z-scored per crop (``mps_zscore.zscore_crops_metal``, the Metal form of
+    ``zscore_crops_torch``)."""
+    out = torch.empty((len(items), crop.depth, crop.height or crop.width, crop.width), dtype=torch.float32,
+                      device=metal.device)
+    if items:
+        size, origins, axes = crop_grids(items, crop, spec.input_scale)
+        metal.read_affine_batch(size, origins, axes, order=1, out=out)
+    out.mul_(np.float32(1/255))  # scalar_crops' scaling, so the values round as the CPU's do
+    from vesuvius.neural_tracing.tracers.shared.crop_sampling import mps_zscore
+    if mps_zscore.suits(out):
+        return mps_zscore.zscore_crops_metal(out)[:, None]
+    return zscore_crops_torch(out[:, None])

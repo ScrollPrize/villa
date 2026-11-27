@@ -191,6 +191,7 @@ vesuvius = [
     "tifxyz_label_transfer/*.cpp",
     "neural_tracing/fiber_trace_3d/fiber_lemon.cpp",
     "neural_tracing/fiber_trace_3d/fiber_pns.cpp",
+    "neural_tracing/tracers/models/*.metal",
     "wgraph_profiles/*.json",
     "tifxyz_label_transfer/*.md",
     "tifxyz_label_transfer/docs/*.md",

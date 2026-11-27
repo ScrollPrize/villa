@@ -38,6 +38,8 @@ and omits unavailable error statistics; empty patch sheets are not written.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 from pathlib import Path
@@ -51,14 +53,15 @@ from vc_reader.reader import open_zarr
 from vesuvius.neural_tracing.tracers.fibers.data.observations import IdentityObservationBuilder, IdentitySampling
 from vesuvius.neural_tracing.tracers.fibers.data.samples import STARTUP_CATEGORIES, SampleConfig, decision_on_path
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import oriented_seed_heading
-from vesuvius.neural_tracing.tracers.fibers.frames.learned import prediction_window
+from vesuvius.neural_tracing.tracers.fibers.frames.learned import frame_predictor, prediction_window
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.data import (
     RunFibers, StripBuilder, StripIndex, crop_orientation, load_umbilicus, polyline_points)
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.model import strip_grid
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.targets import strip_targets
 from vesuvius.neural_tracing.tracers.fibers.sheet_strip.train import load_strip_model, with_tube
+from vesuvius.neural_tracing.tracers.models.mps import optimize_for_mps, start_queued_work
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
-    add_volume_arguments, configure_volume, resolve_checkpoint)
+    add_volume_arguments, configure_volume, gpu_crop_backend, gpu_frame_predictor, resolve_checkpoint)
 from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.normalization import prepare_normalization
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import CTVolumeSpec
@@ -85,6 +88,12 @@ def add_checkpoint_arguments(ap):
     ap.add_argument('--umbilicus', help="umbilicus.json for models reading the crop orientation (default: the "
                                         f"checkpoint run's, else {UMBILICUS_NAME} next to the checkpoint)")
     ap.add_argument('--device', default='cuda')
+    ap.add_argument('--crops', choices=('cpu', 'gpu'), default='cpu',
+                    help="cpu (default): crops from the CPU sampler and the frame model on the CPU; gpu: crops sampled "
+                         "by vc_reader's CUDA or Metal reader and the frame model on the --device GPU (same crops to 1e-4, "
+                         "strips within the batch-size tolerance below)")
+    ap.add_argument('--gpu-chunks', type=int, default=1024,
+                    help="with --crops gpu: CT chunks in the GPU reader's device cache (2 MiB each for 128^3 uint8)")
 
 
 def recorded_file(path):
@@ -116,13 +125,14 @@ def trim_ends(keep, first_arc, row_step, length, margin):
     return keep & ((arc >= margin) & (arc <= length-margin))[:, None]
 
 
-def decision_item(fiber, t, sample_cfg, n_history, window):
-    """The decision at arclength ``t`` of a fiber traced exactly up to its head, its crop axis from the fiber ahead."""
+def decision_item(fiber, t, sample_cfg, n_history, window, labels=True):
+    """The decision at arclength ``t`` of a fiber traced exactly up to its head, its crop axis from the fiber ahead
+    (``labels=False``: without the training labels, which no model input reads)."""
     p, s = fiber.points, fiber.s
     count = int(min(t//sample_cfg.history_step, n_history))
     arcs = t-np.arange(count, -1, -1)*sample_cfg.history_step
     item = decision_on_path(fiber, t, False, sample_cfg, interp_at(p, s, arcs), arcs,
-                            STARTUP_CATEGORIES.index('established'), 0., {})
+                            STARTUP_CATEGORIES.index('established'), 0., {}, labels=labels)
     if window:
         item['prev_prediction'] = interp_at(p, s, np.minimum(t+np.arange(1., window+1e-9), s[-1]))
     item['fiber_ref'] = (0, float(t), False)
@@ -177,13 +187,29 @@ class StripPredictor:
     """A sheet-strip checkpoint and what its decisions need (frame model and crop builder, CT volume, umbilicus),
     loaded once; ``predict`` runs one fiber's decisions."""
 
-    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, volume=None):
+    def __init__(self, checkpoint=DEFAULT_CHECKPOINT, device='cuda', umbilicus=None, batch=16, volume=None,
+                 crops='cpu', gpu_chunks=1024, memory_cache=3 << 30):
         """``checkpoint``: a file or a Hugging Face repo (module notes); ``volume``: parsed CT and frame-model options
-        (runtime.add_volume_arguments; None: the checkpoint's). ``source`` is what outputs record as the checkpoint."""
+        (runtime.add_volume_arguments; None: the checkpoint's). ``source`` is what outputs record as the checkpoint.
+        ``crops='gpu'``: crops and the frame model on the CUDA or Apple ``device`` (a device cache of ``gpu_chunks`` CT
+        chunks); the default builds them on the CPU. ``memory_cache``: bytes of CT chunks the CPU reader keeps."""
         path = resolve_checkpoint(checkpoint)
         self.source = checkpoint_source(checkpoint, path)
+        # the current CUDA device is per thread: predict_many's prepare thread binds the one this predictor was
+        # made under, so a bare 'cuda' names the same GPU there as here
+        self.cuda_index = None
+        if torch.device(device).type == 'cuda':
+            self.cuda_index = torch.device(device).index
+            if self.cuda_index is None:
+                self.cuda_index = torch.cuda.current_device()
         self.model, self.cfg, self.ck = load_strip_model(path, device)
+        if torch.device(device).type == 'mps':
+            optimize_for_mps(self.model)  # same weights and outputs (models/mps.py)
         self.device, self.batch = device, batch
+        self.pipeline = True  # build the next batch while the device runs this one (predict)
+        # MPS: run a short last batch padded to the batch size (repeats of its last decision), so every launch has
+        # one shape and the allocator and graph caches do not grow with each fibre's remainder
+        self.pad_batches = torch.device(device).type == 'mps'
         self.data = self.ck['run_config']['data']
         self.spec = CTVolumeSpec.from_dict(self.ck['vol_spec'])
         configure_volume(volume or argparse.Namespace(), self.spec, self.cfg, path)
@@ -197,7 +223,19 @@ class StripPredictor:
         if self.cfg.strip_orientation:
             self.umbilicus = load_umbilicus(umbilicus or find_umbilicus(checkpoint, path, self.data.get('umbilicus')))
         self.ct = open_zarr(self.spec.ct_zarr, level=self.spec.ct_level, cache_dir=self.spec.cache_dir,
-                            memory_cache=3 << 30)
+                            memory_cache=memory_cache)
+        # with --crops gpu: vc_reader's CUDA or Metal reader and the crop backend sampling from it
+        self.gpu_reader = self.gpu_crops = None
+        if crops == 'gpu':
+            # The CPU work per decision is mostly crop building (the frame model's crops and forward, the strip
+            # crop and its normalization); on the GPU the CPU keeps only the decisions' geometry
+            if torch.device(device).type not in ('cuda', 'mps'):
+                raise ValueError('--crops gpu needs a CUDA or MPS --device')
+            self.gpu_reader, self.gpu_crops = gpu_crop_backend(self.ct, device, gpu_chunks)
+            self.builder.crop_images = self.gpu_crops
+            self.builder.frame_model = gpu_frame_predictor(frame_predictor(self.cfg), device, self.gpu_crops)
+        elif crops != 'cpu':
+            raise ValueError(f'Unknown crop backend {crops!r}')
         self.rng = np.random.default_rng(0)
         c = self.cfg.fine  # the crop's farthest point from its head, plus a sample
         self.crop_reach = math.sqrt((max(c.behind, c.depth-c.behind)*c.spacing)**2+2*((c.width-1)/2*c.spacing)**2)+c.spacing
@@ -205,45 +243,148 @@ class StripPredictor:
     def predict(self, fiber, arcs, on_items=None, log=None):
         """Strip heights (K, Nf, Nv), log error scales (K, Nf, Nv; None without ``strip_uncertainty``), frames (K, 3, 3)
         and positions (K, 3) of the decisions at fiber arclengths ``arcs`` (trace voxels). ``on_items`` sees each
-        batch's decision items."""
+        batch's decision items, ``log`` the number of decisions done after each batch."""
+        ((_, result),) = self.predict_many([(None, fiber, arcs)], on_items, log)
+        return result
+
+    def predict_many(self, jobs, on_items=None, log=None, across_fibers=False):
+        """For each ``job = (key, fiber, arcs)`` of the iterable ``jobs``, in order, yield ``(job, result)`` with the
+        result of :meth:`predict` for that fiber and those arclengths; ``key`` is the caller's.
+
+        Jobs are read lazily. With ``pipeline`` (the default), a worker thread builds the next batch's decisions,
+        frames and crops while the device runs the current one, also across jobs, so the device does not wait for the
+        host between fibers. Each job's decisions run in batches of their own, as :meth:`predict` runs them; with
+        ``across_fibers``, batches take the next decisions across job ends, so they stay full (per-decision results
+        then move by the batch's rounding). Decisions do not depend on earlier outputs and are built in job and
+        arclength order, so the results are those of one fiber at a time. ``on_items`` and ``log`` are as for
+        :meth:`predict`, with ``log`` counting decisions over all jobs."""
+        started = deque()  # jobs in order; the front is yielded once all its decisions are collected
+        parts = _decision_batches(jobs, self.batch, started, across_fibers)
+        done = 0
+        with ThreadPoolExecutor(1, thread_name_prefix='strip-prepare', initializer=self._bind_device) as pool:
+            prepare = lambda part: pool.submit(self._prepare, part)
+            part = next(parts, None)
+            pending = None if part is None else prepare(part)
+            while part is not None:
+                items, inputs = pending.result()
+                if on_items is not None:
+                    on_items(items)
+                upcoming = next(parts, None)
+                if upcoming is not None and self.pipeline:
+                    pending = prepare(upcoming)
+                outputs = self._launch(inputs)
+                self._collect(part, items, outputs)
+                done += len(part)
+                if log is not None:
+                    log(done)
+                if upcoming is not None and not self.pipeline:
+                    pending = prepare(upcoming)
+                part = upcoming
+                while started and started[0].complete():
+                    yield started.popleft().result()
+        while started:  # jobs without decisions after the last batch
+            yield started.popleft().result()
+
+    def _bind_device(self):
+        if self.cuda_index is not None:
+            torch.cuda.set_device(self.cuda_index)
+
+    def _prepare(self, part):
+        """One batch's decision items and model inputs (frames oriented, crops built, still on the host or the GPU
+        crop backend's device), for ``part``: (job, arclength) pairs from :func:`_decision_batches`."""
         cfg, crop = self.cfg, self.cfg.fine
-        heights, scales, frames, positions = [], [], [], []
-        seed_headings = {}
-        for start in range(0, len(arcs), self.batch):
-            items = [self.builder.prepare(decision_item(fiber, float(t), self.sample_cfg, cfg.n_history,
-                                                        self.sample_cfg.prediction_window), fiber, self.rng)
-                     for t in arcs[start:start+self.batch]]
-            for item in items:
-                skip_remote_seed_heading(item, self.crop_reach)
-                reuse_seed_heading(item, self.ct, self.spec, seed_headings)
-            batch = self.builder(items, self.ct, self.spec)  # orients each crop with the frame model, then crops the CT
-            tube = np.zeros((len(items), 2048, 3), np.float32)
-            valid = np.zeros((len(items), 2048), bool)
-            for row, item in enumerate(items):
-                curve = polyline_points(fiber.points, np.asarray(item['pos']), np.asarray(item['frame']), crop,
-                                        crop.spacing/2, 3*cfg.tube_sigma*crop.spacing, len(tube[row]))
-                tube[row, :len(curve)], valid[row, :len(curve)] = curve, True
-            if on_items is not None:
-                on_items(items)
-            inputs = dict(x=batch['x'], hist=batch['hist'], hmask=batch['hmask'], tube_points=torch.from_numpy(tube),
-                          tube_valid=torch.from_numpy(valid))
-            if self.umbilicus is not None:
-                inputs['crop_orientation'] = torch.from_numpy(crop_orientation(
-                    np.stack([i['pos'] for i in items]), np.stack([i['frame'] for i in items]), self.umbilicus,
-                    self.trace_per_patch))
-            device_batch = move_batch(inputs, self.device)
-            with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
-                ctx = self.model.context(with_tube(self.model, device_batch), device_batch['hist'], device_batch['hmask'])
-                out, scale = self.model.strip_outputs(ctx)
-            heights.append(out[:, -1].float().cpu().numpy())
-            if scale is not None:
-                scales.append(scale.float().cpu().numpy())
-            frames.extend(np.asarray(item['frame'], np.float64) for item in items)
-            positions.extend(np.asarray(item['pos'], np.float64) for item in items)
-            if log is not None:
-                log(min(start+self.batch, len(arcs)))
-        return (np.concatenate(heights).astype(np.float64), np.concatenate(scales) if scales else None,
-                np.stack(frames), np.stack(positions))
+        items = [self.builder.prepare(decision_item(job.fiber, float(t), self.sample_cfg, cfg.n_history,
+                                                    self.sample_cfg.prediction_window), job.fiber, self.rng)
+                 for job, t in part]
+        for (job, _), item in zip(part, items):
+            skip_remote_seed_heading(item, self.crop_reach)
+            reuse_seed_heading(item, self.ct, self.spec, job.seed_headings)
+        batch = self.builder(items, self.ct, self.spec)  # orients each crop with the frame model, then crops the CT
+        tube = np.zeros((len(items), 2048, 3), np.float32)
+        valid = np.zeros((len(items), 2048), bool)
+        for row, ((job, _), item) in enumerate(zip(part, items)):
+            curve = polyline_points(job.fiber.points, np.asarray(item['pos']), np.asarray(item['frame']), crop,
+                                    crop.spacing/2, 3*cfg.tube_sigma*crop.spacing, len(tube[row]))
+            tube[row, :len(curve)], valid[row, :len(curve)] = curve, True
+        inputs = dict(x=batch['x'], hist=batch['hist'], hmask=batch['hmask'], tube_points=torch.from_numpy(tube),
+                      tube_valid=torch.from_numpy(valid))
+        if self.umbilicus is not None:
+            inputs['crop_orientation'] = torch.from_numpy(crop_orientation(
+                np.stack([i['pos'] for i in items]), np.stack([i['frame'] for i in items]), self.umbilicus,
+                self.trace_per_patch))
+        return items, inputs
+
+    def _launch(self, inputs):
+        """Queue the strip model on one batch's inputs; returns its device outputs (strip heights, error scales)."""
+        count = len(inputs['tube_points'])
+        if self.pad_batches and count < self.batch:
+            inputs = {k: _pad_rows(v, self.batch) for k, v in inputs.items()}
+        device_batch = move_batch(inputs, self.device)
+        with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.startswith('cuda')):
+            ctx = self.model.context(with_tube(self.model, device_batch), device_batch['hist'], device_batch['hmask'])
+            outputs = self.model.strip_outputs(ctx)
+        if torch.device(self.device).type == 'mps':
+            start_queued_work()  # MPS would otherwise hold the batch until its outputs are read
+        return tuple(None if o is None else o[:count] for o in outputs)
+
+    def _collect(self, part, items, outputs):
+        """Read one launched batch's outputs back (waiting for the device) into its jobs."""
+        out, scale = outputs
+        heights = out[:, -1].float().cpu().numpy()
+        scales = None if scale is None else scale.float().cpu().numpy()
+        for row, ((job, _), item) in enumerate(zip(part, items)):
+            job.heights.append(heights[row])
+            if scales is not None:
+                job.scales.append(scales[row])
+            job.frames.append(np.asarray(item['frame'], np.float64))
+            job.positions.append(np.asarray(item['pos'], np.float64))
+
+
+class _Job:
+    """One ``(key, fiber, arcs)`` of :meth:`StripPredictor.predict_many`: its per-fiber seed headings and the
+    outputs collected so far, one entry per decision"""
+
+    def __init__(self, key, fiber, arcs):
+        self.key, self.fiber, self.arcs = key, fiber, arcs
+        self.seed_headings = {}
+        self.heights, self.scales, self.frames, self.positions = [], [], [], []
+
+    def complete(self):
+        return len(self.frames) == len(self.arcs)
+
+    def result(self):
+        if not self.frames:
+            raise ValueError(f'No decisions for fiber job {self.key!r}')
+        return (self.key, self.fiber, self.arcs), (np.stack(self.heights).astype(np.float64), np.stack(self.scales) if self.scales else None,
+                          np.stack(self.frames), np.stack(self.positions))
+
+
+def _decision_batches(jobs, size, started, across_fibers):
+    """Batches of up to ``size`` (job, arclength) pairs over ``jobs`` in order, each job appended to ``started`` (a
+    deque) as it is first read; a batch ends with its job unless ``across_fibers``"""
+    part = []
+    for key, fiber, arcs in jobs:
+        job = _Job(key, fiber, arcs)
+        started.append(job)
+        for t in arcs:
+            part.append((job, t))
+            if len(part) == size:
+                yield part
+                part = []
+        if part and not across_fibers:
+            yield part
+            part = []
+    if part:
+        yield part
+
+def _pad_rows(value, rows):
+    """``value`` (a tensor, or a dict of them) with its first dimension padded to ``rows`` by repeating its last row;
+    anything else as is"""
+    if isinstance(value, dict):
+        return {k: _pad_rows(v, rows) for k, v in value.items()}
+    if not isinstance(value, torch.Tensor):
+        return value
+    return torch.cat((value, value[-1:].expand(rows-len(value), *value.shape[1:])))
 
 
 def orient_decisions(heights, frames):
@@ -434,7 +575,8 @@ def main(argv=None):
         render_saved(args.out, open_zarr(spec.ct_zarr, level=spec.ct_level, cache_dir=spec.cache_dir), spec)
         return
     try:
-        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, volume=args)
+        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, volume=args,
+                                   crops=args.crops, gpu_chunks=args.gpu_chunks)
     except ValueError as error:
         raise SystemExit(str(error))
     cfg, ck, data, spec = predictor.cfg, predictor.ck, predictor.data, predictor.spec

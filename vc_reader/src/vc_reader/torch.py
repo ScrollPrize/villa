@@ -350,18 +350,39 @@ def sample_array(values, points, *, order=1, boundary="zeros", fill=0):
     Native CPU/CUDA forward and first-order gradients for values and coordinates.
     CUDA value gradients use atomic addition, like torch grid_sample. Coordinate
     gradients and forward values have no competing floating-point writes.
-    MPS, or CUDA when built without the native CUDA backend, stages through CPU and retains autograd. Double backward is unsupported.
+    MPS runs order-1, zeros-boundary, zero-fill sampling that needs no
+    gradient through torch grid_sample (the same taps, within float32 rounding
+    of the coordinate normalization). PyTorch has no MPS grid_sample backward,
+    so calls that need gradients, other MPS cases, and CUDA when built without
+    the native CUDA backend, stage through CPU, which keeps autograd. Double
+    backward is unsupported.
     """
     if values.ndim not in (4, 5) or points.ndim < 3 or points.shape[0] != values.shape[0] or points.shape[-1] != values.ndim-2:
         raise ValueError('expected B,C,[Z,]Y,X values and B,...,D points')
     if values.device != points.device:
         raise ValueError('values and points must be on the same device')
     device = values.device
+    if device.type == 'mps' and order == 1 and boundary == "zeros" and fill == 0 and min(values.shape[2:]) > 1:
+        needs_grad = torch.is_grad_enabled() and (values.requires_grad or points.requires_grad)
+        if not needs_grad:
+            return _grid_sample_linear(values, points)
     if _uses_cpu_staging(device):
         return sample_array(values.cpu(), points.cpu(), order=order, boundary=boundary, fill=fill).to(device)
     shape = points.shape[1:-1]
     result = _SampleArray.apply(values.float().contiguous(), points.float().reshape(values.shape[0], -1, points.shape[-1]).contiguous(), int(order), boundary, float(fill))
     return result.reshape(values.shape[:2] + shape)
+
+
+def _grid_sample_linear(values, points):
+    """sample_array(order=1, boundary="zeros", fill=0) by grid_sample: array index p of an axis of size n is the
+    align_corners grid coordinate 2p/(n-1)-1, and taps outside the array read zero, as in the native sampler."""
+    import torch.nn.functional as F
+    b, dims = values.shape[0], points.shape[-1]
+    scale = torch.tensor([2/(n-1) for n in values.shape[2:]], dtype=torch.float32, device=values.device)
+    grid = (points.float().reshape(b, -1, dims)*scale-1).flip(-1)  # grid_sample takes x, y[, z]
+    grid = grid.reshape(b, -1, *([1]*(dims-1)), dims)
+    out = F.grid_sample(values.float(), grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return out.reshape(values.shape[:2]+points.shape[1:-1])
 
 
 def _surface_derivatives_impl(xyz, valid):

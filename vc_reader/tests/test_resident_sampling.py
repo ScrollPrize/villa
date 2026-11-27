@@ -30,6 +30,30 @@ def test_dense_values_and_first_gradients(device, shape, boundary):
         torch.testing.assert_close(a, b, atol=2e-5, rtol=3e-5)
 
 
+
+@pytest.mark.parametrize('shape', [(7, 9), (5, 7, 9)])
+def test_mps_gradients_match_cpu(shape):
+    # PyTorch has no MPS grid_sample backward, so MPS sampling that needs gradients stages through the CPU sampler,
+    # and only gradient-free calls take the grid_sample path
+    if not torch.backends.mps.is_available():
+        pytest.skip('MPS required')
+    rng = np.random.default_rng(12)
+    values = torch.tensor(rng.normal(size=(2, 3, *shape)), dtype=torch.float32)
+    points = torch.tensor(rng.uniform(-1.5, np.array(shape)+.5, (2, 43, len(shape))), dtype=torch.float32)
+    cot = torch.tensor(rng.normal(size=(2, 3, 43)), dtype=torch.float32)
+    cpu = [t.clone().requires_grad_() for t in (values, points)]
+    expected = torch_sample(*cpu)
+    references = torch.autograd.grad(expected, cpu, cot)
+    mps = [t.to('mps').requires_grad_() for t in (values, points)]
+    actual = torch_sample(*mps)
+    grads = torch.autograd.grad(actual, mps, cot.to('mps'))
+    with torch.no_grad():
+        sampled = torch_sample(*(t.to('mps') for t in (values, points)))
+    torch.testing.assert_close(actual.detach().cpu(), expected.detach())
+    torch.testing.assert_close(sampled.cpu(), expected.detach(), atol=4e-6, rtol=2e-5)
+    for a, b in zip(grads, references):
+        torch.testing.assert_close(a.cpu(), b)
+
 def test_constant_nearest_nan_and_empty_queries():
     values = np.arange(12, dtype=np.float32).reshape(3, 4)
     points = np.array([[1, 1.5], [-.1, 1], [np.nan, 0], [1e30, 0]], np.float32)

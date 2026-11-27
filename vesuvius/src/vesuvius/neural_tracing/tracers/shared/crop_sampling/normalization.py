@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import numpy as np
+import torch
 from vc_reader import cuda as vc_cuda, transforms as A
 from vc_reader.reader import open_zarr
 
@@ -86,3 +87,30 @@ def zscore_crops(crops):
     if flat.device.type == 'mps' or (flat.device.type == 'cuda' and not vc_cuda.is_available()):
         return _ZSCORE.batch(flat.cpu()).to(crops.device).view_as(crops)
     return _ZSCORE.batch(flat).view_as(crops)
+
+
+def zscore_crops_float64(crops):
+    """``normalize_ct`` of torch float32 crops (..., D, H, W) on any device: the CPU z-score's float64 arithmetic
+    (mean, population standard deviation of at least ``ZSCORE_EPSILON``, reciprocal multiply) cast back to float32,
+    so equal crops normalize to the CPU's values. Only the summation order differs, which can move a value by one
+    float32 step when it changes the float64 mean's last bit."""
+    x = crops.reshape(-1, crops.shape[-3:].numel()).double()
+    deviation = x-x.sum(1, keepdim=True)/x.shape[1]
+    divisor = torch.sqrt((deviation*deviation).sum(1, keepdim=True)/x.shape[1]).clamp_min(ZSCORE_EPSILON)
+    return (deviation*(1/divisor)).float().view_as(crops)
+
+
+def zscore_crops_torch(crops):
+    """``zscore_crops`` in PyTorch on any device, for GPUs vc_reader's transforms do not run on (Apple MPS).
+
+    The native z-score's rules: population standard deviation about the mean, divisor ``max(std, epsilon)``, and a
+    constant crop becomes all zeros. Statistics accumulate in float32 where the native code uses float64 (MPS has no
+    float64), which moves outputs by about 1e-6; constant crops are found exactly, by their extrema, so float32
+    rounding of the mean cannot turn one into noise divided by epsilon."""
+    flat = crops.reshape(-1, crops.shape[-3:].numel())
+    mean = flat.mean(1, keepdim=True)
+    centred = flat-mean
+    std = centred.square().mean(1, keepdim=True).sqrt()
+    out = centred*std.clamp_min(ZSCORE_EPSILON).reciprocal()
+    constant = flat.amin(1, keepdim=True) == flat.amax(1, keepdim=True)
+    return out.masked_fill_(constant, 0.).view_as(crops)

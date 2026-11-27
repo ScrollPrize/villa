@@ -286,12 +286,55 @@ run's. Its strips are reproduced exactly with `--batch 4 --threads 1`, as above;
 (the defaults: 32 and 2) changes nodes by about 0.015 voxels on average and up to about 0.3 (GPU batch numerics and
 the CPU frame model).
 
-Throughput is CPU-bound: building each decision's crops (frame model, CT sampling and normalization) dominates. Each
-process needs about 1.3–1.5 GB of GPU memory, so 18 shards fill a 32 GB card. On the 24-core machine that gives about
+Fiber by fiber, throughput is CPU-bound: building each decision's crops (frame model, CT sampling and normalization)
+dominates. Each process needs about 1.3–1.5 GB of GPU memory, so 18 shards fill a 32 GB card. On the 24-core machine that gives about
 318 decisions/s, about 15 h for Paris4's 238k fibers over 2.5 mm (17M decisions). The sampler forms its frame products
 per crop axis rather than per point, and `normalize_ct` makes fewer passes (both bitwise unchanged): 220 -> 310
 decisions/s. Running the shards as clients of an NVIDIA MPS daemon (`nvidia-cuda-mps-control -d`, with the shards'
 `CUDA_MPS_PIPE_DIRECTORY` set to its pipe directory) lowers GPU use from 92% to 76% at the same rate.
+
+`--workers N` switches a shard to batched mode (`sheet_strip/batched.py`; CUDA or the CPU). N CPU worker processes
+build each decision's geometry, then stitch and write the strips. The shard's own process samples the crops (on the GPU with
+`--crops gpu`) and runs the frame and strip models over the decisions of many fibers at once, the strip model on the
+device and the frame model where the per-fiber loop runs it (the GPU with `--crops gpu`, else the CPU). Outputs are the same
+files and index records as fiber by fiber. Records are appended in the order fibers finish, and a record's `seconds`
+is the time since the shard's previous record, because fibers overlap. Without `--across-fibers` both models run each
+fiber's decisions in batches of `--batch`, as the per-fiber loop does, and on the CPU the strips are identical to the
+per-fiber loop's. `--across-fibers` fills each batch of both models with `--batch` decisions from any fibers, and
+`--compile MODE` compiles the strip model with `torch.compile` (CUDA only; it needs `--across-fibers`, so every batch
+has one shape). Compiling turns on inductor's `emulate_precision_casts`.
+
+```bash
+python -m vesuvius.neural_tracing.tracers.fibers.sheet_strip.infer_all --fibers FIBERS.vcobj --out OUT \
+  --batch 64 --across-fibers --crops gpu --workers 10 --compile max-autotune-no-cudagraphs
+```
+
+On an RTX 5090, with 1,152 PHerc0211 fibers (the letter-box set) whose CT was already in the disk cache:
+
+| Run | Decisions/s |
+| --- | --- |
+| 12 per-fiber shards, `--batch 4 --threads 1` | about 230-270 |
+| batched, `--batch 64 --across-fibers --crops gpu --workers 10` | 360-365 |
+| the same with `--compile max-autotune-no-cudagraphs` | 465-480 (x1.37 over eager in a paired A/B) |
+| batched, `--batch 64 --across-fibers --workers 10` with CPU crops | 43 |
+
+With CPU crops the shard's one process samples every crop and runs the frame model on the CPU, so batched mode needs
+`--crops gpu` to be fast. Batched mode peaks at about 12.5-16 GiB of GPU memory. Each worker holds its own CT reader with a 256 MiB memory cache
+(it reads the CT only around each fiber's seed). Like any change of batch size, `--across-fibers` at batch 64 moves
+nodes by up to about 0.35 voxels under bf16; the per-fiber runner at `--batch 32` moves them by 0.34 against its own
+`--batch 4`, and the mean distance stays under 0.01 voxels for both. On 200 PHerc0211 fibers scored against per-fiber `--batch 4`,
+the paired difference in strip error was within noise (confidence intervals straddle zero) for both eager batch 64 and
+compiled batch 64. Compiling without emulated casts was measurably worse (strip_mean +1.8e-4).
+
+On Apple GPUs, `--device mps --crops gpu --batch 16 --across-fibers` samples the crops with vc_reader's Metal reader
+and runs the frame model and the strip model on the GPU, with the CropCNN, the cell-token gather, the crop z-score and
+the masked attention as Metal kernels (`models/mps*.py`, same weights). Without `--workers`, `--across-fibers` fills
+the batches across fiber ends inside the shard's process (`StripPredictor.predict_many`); batched mode
+(`--workers`) does not run on MPS. On an M4 Pro Mac
+mini one such process wrote strips at 58.8 decisions/s over 21,153 PHerc0211 decisions, in a 6.8 GiB peak, against
+15.5 decisions/s for `--device mps --batch 4` and 8.0 for the CPU path (`--batch 4`, 12 threads); its nodes match the
+`--batch 4 --threads 1` strips to 2.2e-6 voxels on average and 0.001 at most. That run is GPU-bound, so run the shards
+one after another.
 
 A decision every 8 trace voxels (`--step 8`) gave the same stitched strips as every 4 on held-out fibers (median node
 distance to the patch sheet within 0.012 voxels); every 16 was 0.01–0.03 worse. Decisions whose seed lies outside the

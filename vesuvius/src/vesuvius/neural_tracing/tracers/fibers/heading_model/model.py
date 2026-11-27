@@ -196,7 +196,7 @@ class HeadingPredictor:
 
     @staticmethod
     def _world_normals(frames, out, priors):
-        heads, normals = (out[k].double().cpu().numpy() for k in ('heading', 'normal'))
+        heads, normals = (out[k].cpu().double().numpy() for k in ('heading', 'normal'))  # MPS has no float64
         heads = [f @ h for f, h in zip(frames, heads)]
         return ([h if h @ np.asarray(p) >= 0 else -h for h, p in zip(heads, priors)],
                 [f @ n for f, n in zip(frames, normals)])

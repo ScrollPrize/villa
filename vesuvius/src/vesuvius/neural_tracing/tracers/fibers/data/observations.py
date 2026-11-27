@@ -32,11 +32,18 @@ class ObservationBuilder:
         self.cfg = cfg
         # Crop backend: CPU crops (image_crop) unless a tracer installs another one with the same values.
         self.crop_images = image_crop
+        # Frame model: the configuration's shared CPU predictor (frame_predictor) unless a runner installs a copy on
+        # another device (tracing/runtime.gpu_frame_predictor)
+        self.frame_model = None
+
+    def frames(self):
+        """The frame model that orients this builder's crops, or None without one."""
+        return self.frame_model if self.frame_model is not None else frame_predictor(self.cfg)
 
     def finalize_frames(self,items,ct,spec):
         for item in items:
             resolve_trace_seed(item,ct,spec)
-        orient_items(items,ct,spec,frame_predictor(self.cfg),window=prediction_window(self.cfg))
+        orient_items(items,ct,spec,self.frames(),window=prediction_window(self.cfg))
 
     def images(self,items,ct,spec):
         self.finalize_frames(items,ct,spec)
@@ -279,7 +286,7 @@ class IdentityObservationBuilder(ObservationBuilder):
         super().finalize_frames(items,ct,spec)
         for item in items:
             if self.augment:
-                self.apply_roll(item, any_heading_planned=frame_predictor(self.cfg) is not None)
+                self.apply_roll(item, any_heading_planned=self.frames() is not None)
             else:
                 item.pop('roll_augmentation', None)
                 item.pop('tilt_augmentation', None)

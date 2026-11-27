@@ -34,7 +34,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from vesuvius.neural_tracing.tracers.models.blocks import CNN_ACTIVATIONS, MLP, CropCNN, TransformerLayer
+from vesuvius.neural_tracing.tracers.models.blocks import CNN_ACTIVATIONS, MLP, CropCNN, TransformerLayer, attention
 from vesuvius.neural_tracing.tracers.models.flow import FlowMatching, FlowOptions, time_embedding
 from vesuvius.neural_tracing.tracers.models.follower import (
     REFERENCE_METADATA, FollowerConfig, crop_support, path_readout, plane_coordinates, proposal_output, read_path,
@@ -197,7 +197,7 @@ class CropTransformerLayer(TransformerLayer):
         q, k, v = self.split(self.norm1(x))
         if last:
             return None, (k, v)
-        x = x+self.merge(F.scaled_dot_product_attention(q, k, v, attn_mask=~padding[:, None, None, :]))
+        x = x+self.merge(attention(q, k, v, ~padding[:, None, None, :]))
         return x+self.ffn(self.norm2(x)), (k, v)
 
     def queries(self, x, context, mask, modulation=None):
@@ -214,7 +214,7 @@ class CropTransformerLayer(TransformerLayer):
             residual = lambda value, branch, i: value+gate[..., i, :]*branch
         q, k, v = self.split(branch_input(x, self.norm1, 0))
         k, v = torch.cat((context[0], k), 2), torch.cat((context[1], v), 2)
-        x = residual(x, self.merge(F.scaled_dot_product_attention(q, k, v, attn_mask=mask[:, None])), 0)
+        x = residual(x, self.merge(attention(q, k, v, mask[:, None])), 0)
         return residual(x, self.ffn(branch_input(x, self.norm2, 1)), 1)
 
 
