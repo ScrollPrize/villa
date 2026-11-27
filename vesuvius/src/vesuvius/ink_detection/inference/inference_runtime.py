@@ -14,7 +14,7 @@ from torch._inductor.exc import TritonMissing
 
 from vesuvius.ink_detection.models.input_padding import center_pad_input_depth
 from vesuvius.models.utilities.compilation import has_triton
-from vesuvius.models.utilities.get_accelerator import get_accelerator
+from vesuvius.models.utilities.get_accelerator import cuda_device_supported, get_accelerator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -253,6 +253,10 @@ def prepare_model_for_inference(
                 f"Requested CUDA device ids {invalid!r} are unavailable; "
                 f"visible device count is {visible}"
             )
+        for device_id in requested:
+            supported, message = cuda_device_supported(device_id)
+            if not supported:
+                raise ValueError(message)
         device = torch.device(f"cuda:{requested[0]}")
     elif device_type == "auto":
         # get_accelerator() tries cuda first, so CUDA hosts resolve exactly as before;
@@ -261,6 +265,9 @@ def prepare_model_for_inference(
     elif device_type == "cuda":
         if not torch.cuda.is_available():
             raise ValueError("--device cuda was requested, but CUDA is unavailable")
+        supported, message = cuda_device_supported(torch.cuda.current_device())
+        if not supported:
+            raise ValueError(message)
         device = torch.device("cuda")
     elif device_type == "mps":
         if not torch.backends.mps.is_available():
