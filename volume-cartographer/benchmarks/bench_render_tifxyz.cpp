@@ -8,6 +8,12 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#ifdef VC_BENCH_VC_READER
+#include "vc/core/types/Volume.hpp"
+
+#include <vc_reader/zarr.hpp>
+#endif
+
 #include <spawn.h>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -152,6 +158,20 @@ int main(int argc, char** argv)
         }
         const auto& volumeArg = source.location;
         fixture.rejectUnused();
+#ifdef VC_BENCH_VC_READER
+        if (prefetch && source.remote) {
+            // The tool caches the metadata of the levels it renders from only, and a
+            // cached run opens the volume offline, which reads every level's.
+            // The volume is opened as the tool opens it, so the URL, credentials and cache match.
+            ::setenv("VC3D_CONFIG_DIR", vc3dConfig.c_str(), 1);
+            const auto volume = Volume::NewFromUrl(source.location);
+            auto options = volume->sourceOpenOptions();
+            options.cacheWrites = true;
+            const auto location = volume->sourceLocation();
+            for (const auto& level : vcr::zarr::pyramidLevels(location, options))
+                (void)vcr::zarr::openPyramidLevel(location, level.level, options);
+        }
+#endif
 
         auto config = fixture.config();
         config["tool"] = tool;
