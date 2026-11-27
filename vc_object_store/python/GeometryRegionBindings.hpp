@@ -74,10 +74,10 @@ inline nb::dict geometryRegionFromPy(PyObjectStore& self, const vo::RegionSlice&
     const auto view = slice;
     const auto request = options;
     vo::RegionResult result;
-    { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-      result = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-          return db.geometryRegion(txn, view, request, [cancel](const auto&) { return cancel && cancel->cancelled.load(); });
-      }); }
+    // withRead<true> checks the store, holds it and releases the GIL once; the read touches no Python object (the cancel flag is an atomic).
+    result = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+        return db.geometryRegion(txn, view, request, [cancel](const auto&) { return cancel && cancel->cancelled.load(); });
+    });
     return regionResultToPy(result);
 }
 }

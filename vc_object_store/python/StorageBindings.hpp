@@ -373,7 +373,13 @@ struct PyObjectStore {
     auto withRead(Fn&& fn)
     {
         return withStore<ReleaseGil>([&](auto& store) {
-            auto txn = store.read();
+            // No caller reaches withRead<false> with the GIL released any more (geometry_region uses withRead<true>). The check is a second line
+            // only, for callers not written yet: it answers 1 always once a sub-interpreter exists, so it is not a guarantee. Nothing here touches Python.
+            auto txn = [&] {
+                if constexpr (ReleaseGil) { return store.read(); }
+                else if (PyGILState_Check()) { nb::gil_scoped_release release; return store.read(); }
+                else { return store.read(); }
+            }();
             return fn(store, txn);
         });
     }

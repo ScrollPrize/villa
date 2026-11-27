@@ -803,6 +803,59 @@ def resolve_selection(store, request):
                            None if shell is None else shell['object'])
 
 
+# Tracks are read this many at a time and cut down as they arrive. Read
+# whole, a million tracks held every stored record (about 7 KB each, of which
+# the fit uses a fifth) at once and the load needed over 36 GB.
+TRACK_READ_BATCH = 20000
+# What later code reads of a track: its identity (object_reference reads
+# uuid, version, version_generation and version_store), adapter_metadata,
+# object_frame (meta.coordinates) and the dataset and key order.
+_TRACK_RECORD_KEYS = ('uuid', 'kind', 'name', 'version', 'version_generation', 'version_store',
+                      'retired', 'tags')
+_TRACK_FIELDS = ('dataset_ref', 'external_key', 'family')
+_TRACK_SHARED_KEYS = ('kind', 'version_generation', 'version_store', 'tags')
+
+
+def _cut_track_revision(revision, shared):
+    """``revision`` with its record cut to what the fit reads of a track.
+    What most tracks have alike (their dataset, frame, family) is held once,
+    in ``shared``; nothing reads these values but to compare them."""
+    def once(value):
+        return shared.setdefault(json.dumps(value, sort_keys=True), value)
+
+    record = revision['record']
+    cut = {key: record[key] for key in _TRACK_RECORD_KEYS if key in record}
+    for key in _TRACK_SHARED_KEYS:
+        if key in cut:
+            cut[key] = once(cut[key])
+    meta = record['meta']
+    cut['meta'] = {'coordinates': once(meta['coordinates'])} if 'coordinates' in meta else {}
+    track = record.get('track') or {}
+    cut['track'] = {key: once(track[key]) if key != 'external_key' else track[key]
+                    for key in _TRACK_FIELDS if key in track}
+    return {'object_uuid': revision['object_uuid'],
+            'geometry_revision': revision['geometry_revision'], 'record': cut}
+
+
+def _read_selected_inputs(store, refs, tracks, position):
+    """``store.selected_inputs`` of ``refs`` at ``position``: one native read,
+    which validates every object against the one position. Its objects come
+    to ``cut`` TRACK_READ_BATCH at a time, inside the read, and each track is
+    cut (_cut_track_revision) as its slice arrives, so the whole records of
+    all tracks never exist in Python together. The relationships of every
+    object but a track are enumerated; the tracks enumerate none."""
+    if not tracks:
+        return store.selected_inputs(refs, position.provenance())
+    shared = {}
+
+    def cut(part):
+        return [_cut_track_revision(revision, shared) if revision['object_uuid'] in tracks else revision
+                for revision in part]
+    return store.selected_inputs(
+        refs, position.provenance(), slice_size=TRACK_READ_BATCH, on_slice=cut,
+        relationship_refs=[ref for ref in refs if ref['object'] not in tracks])
+
+
 def read_snapshot(store, request, selected=None):
     """Resolve, validate and freeze one selection of the store.
 
@@ -813,10 +866,11 @@ def read_snapshot(store, request, selected=None):
     object is read at the version the selection resolved it at
     (objects_at_versions), and the relationships between those versions
     (relationships_at_versions) are guarded against moving overlay membership.
-    One native read (selected_inputs) validates and returns every object; of
-    the tracks it enumerates no relationship (``relationship_refs``), since
-    the fit computes their crossings itself, and it reports each track's
-    dataset as the store resolves it.
+    One native read (selected_inputs) validates and returns every object, the
+    tracks cut down as they arrive (_read_selected_inputs). Of the tracks it
+    enumerates no relationship (``relationship_refs``), since the fit
+    computes their crossings itself, and it reports each track's dataset as
+    the store resolves it.
     Every selected object must declare a frame in the fit volume; all frame
     problems are reported together. The selected outer shell is
     read alongside, in the same volume, but is not among ``objects``.
@@ -829,14 +883,7 @@ def read_snapshot(store, request, selected=None):
             f'the fit needs the outer shell, and no surface is tagged {OUTER_SHELL_TAG}'])
     position = selected.position
     pins = selected.pins()
-    tracks = frozenset(selected['track'])
-    refs = pins.refs()
-    if tracks:
-        captured = store.selected_inputs(
-            refs, position.provenance(),
-            relationship_refs=[ref for ref in refs if ref['object'] not in tracks])
-    else:
-        captured = store.selected_inputs(refs, position.provenance())
+    captured = _read_selected_inputs(store, pins.refs(), frozenset(selected['track']), position)
     revisions = {revision['object_uuid']: revision for revision in captured['objects']}
     relationships_read = captured['relationships']
     track_datasets = captured.get('track_datasets') or {}
