@@ -1,4 +1,6 @@
 #include <nlohmann/json.hpp>
+#include "vc_objrefine_offset_report.hpp"
+#include "vc_objrefine_report_publish.hpp"
 
 
 #include <vc_reader/grid.hpp>
@@ -16,6 +18,7 @@
 #include "vc/core/util/StoreToolOptions.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/Surface.hpp"
+#include <vc_reader/image_write.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -27,6 +30,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 enum class SurfaceInputType {
     Obj,
@@ -47,6 +51,11 @@ struct RefinementConfig {
     float reader_scale = 0.5f;
     std::string dataset_group = "1";
     std::size_t cache_bytes = static_cast<std::size_t>(10e9);
+    // tifxyz only: also save each vertex's offset and opacity as a report
+    // (see docs/objrefine.md). It never changes the surface written.
+    bool  offset_report = false;
+    float offset_threshold = 5.0f;
+    float offset_min_opacity = 0.5f;
 };
 
 static RefinementConfig parse_config(const nlohmann::json& params)
@@ -61,6 +70,9 @@ static RefinementConfig parse_config(const nlohmann::json& params)
     if (params.contains("gen_vertexcolor")) cfg.gen_vertexcolor = params.at("gen_vertexcolor").get<bool>();
     if (params.contains("overwrite")) cfg.overwrite = params.at("overwrite").get<bool>();
     if (params.contains("reader_scale")) cfg.reader_scale = params.at("reader_scale").get<float>();
+    if (params.contains("offset_report")) cfg.offset_report = params.at("offset_report").get<bool>();
+    if (params.contains("offset_threshold")) cfg.offset_threshold = params.at("offset_threshold").get<float>();
+    if (params.contains("offset_min_opacity")) cfg.offset_min_opacity = params.at("offset_min_opacity").get<float>();
     if (params.contains("cache_bytes")) {
         const auto bytes = params.at("cache_bytes").get<uint64_t>();
         cfg.cache_bytes = static_cast<std::size_t>(bytes);
@@ -137,6 +149,7 @@ struct DSReader {
     vcr::zarr::OpenedArray& level;
     vcr::zarr::LevelPlacement base;
     float scale;
+    std::filesystem::path path;  // the volume, for the offset report
 };
 
 // Trilinear samples at volume XYZ points (mapped through the levels' placements),
@@ -162,8 +175,11 @@ static cv::Mat_<uint8_t> sample(DSReader& reader, const cv::Mat_<cv::Vec3f>& xyz
 // The opacity-weighted offset along `normal` of the volume around `point`: the layers
 // of a d x d plane patch (pixel (0, 0) at the point, steps of the plane's basis / scale)
 // sampled linearly at start, start + step, ... stop, kept in float, blurred and
-// composited front to back at the patch's centre pixel.
-float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, float start, float stop, float step, float low, float high, int r)
+// composited front to back at the patch's centre pixel. `opacity`, when given,
+// receives the accumulated opacity in [0, 1]; near 0 means no papyrus was found
+// between start and stop.
+float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, float start, float stop, float step, float low, float high, int r,
+                       float* opacity = nullptr)
 {
     int d = 2*r+1;
     cv::Size size = {d,d};
@@ -207,6 +223,9 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
     }
 
     integ_z /= (1-transparent+1e-5);
+    if (opacity) {
+        *opacity = 1 - transparent;
+    }
 
     return integ_z;
 }
@@ -280,6 +299,10 @@ int process_obj(const std::string& src,
     if (vs.size() != vns.size())
         throw std::runtime_error("sorry our taste in obj is quite peculiar ...");
 
+    if (cfg.offset_report) {
+        std::cerr << "warning: offset_report needs tifxyz input (it writes maps on the segment grid); ignoring\n";
+    }
+
     refine_vertices(vs, vns, cfg, reader);
 
     cv::Mat_<uint8_t> slice;
@@ -311,9 +334,77 @@ int process_obj(const std::string& src,
     return EXIT_SUCCESS;
 }
 
+namespace {
+
+namespace fs = std::filesystem;
+
+fs::path normalizedPath(const fs::path& p)
+{
+    std::error_code ec;
+    fs::path c = fs::weakly_canonical(p, ec);
+    if (ec || c.empty()) {
+        c = fs::absolute(p).lexically_normal();
+    }
+    if (!c.has_filename() && c.has_parent_path() && c != c.root_path()) {
+        c = c.parent_path();
+    }
+    return c;
+}
+
+// A report-only run writes a plain folder with the three report files and no
+// surface. Refuse any output that is, is inside, or holds a segment, so the
+// run can never rewrite or delete a segment's files. Empty when allowed.
+// publishReport checks the folder again when the report is written.
+std::string reportOnlyRefusal(const fs::path& src, const fs::path& dst, bool overwrite)
+{
+    const fs::path s = normalizedPath(src);
+    const fs::path d = normalizedPath(dst);
+    const fs::path rel = d.lexically_relative(s);
+    if (!rel.empty() && *rel.begin() != "..") {
+        return "the output must not be the source segment or a folder inside it";
+    }
+    return vc_objrefine::reportFolderRefusal(d, overwrite, d);
+}
+
+// Write the maps and report.json into a fresh staging folder beside `dir`,
+// then swap it in (vc_objrefine::publishReport), so `dir` ends up with the
+// whole new report or keeps what it had.
+void writeOffsetReport(const fs::path& dir,
+                       bool overwrite,
+                       const cv::Mat_<float>& offsetMap,
+                       const cv::Mat_<float>& opacityMap,
+                       const nlohmann::json& report,
+                       float dpi)
+{
+    const std::string warning = vc_objrefine::publishReport(dir, overwrite, [&](const fs::path& tmp) {
+        vcr::sources::TiffOptions tiff;
+        if (dpi > 0) tiff.pixelUm = 25400.0 / dpi;
+        const cv::Mat_<float> offsets = offsetMap.isContinuous() ? offsetMap : offsetMap.clone();
+        const cv::Mat_<float> opacities = opacityMap.isContinuous() ? opacityMap : opacityMap.clone();
+        vcr::sources::writeTiff(tmp / "offset.tif", offsets.ptr(), "<f4", offsets.rows, offsets.cols, 1, tiff);
+        vcr::sources::writeTiff(tmp / "opacity.tif", opacities.ptr(), "<f4", opacities.rows, opacities.cols, 1, tiff);
+        std::ofstream out(tmp / "report.json");
+        out << report.dump(4) << std::endl;
+        if (!out) {
+            throw std::runtime_error("cannot write " + (tmp / "report.json").string());
+        }
+    });
+    if (!warning.empty()) {
+        std::cerr << "warning: " << warning << std::endl;
+    }
+}
+
+}  // namespace
+
 // The surface with every valid vertex moved along its normal by the
 // alpha-composited offset (unchanged without cfg.refine); null if it has no points.
-std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader, const RefinementConfig& cfg)
+// With offsetMap and opacityMap (the offset report), each vertex's offset and
+// accumulated opacity also land there, on the surface grid; NaN marks vertices
+// where no ray was cast: the same ones refine leaves in place (loc_valid fails,
+// which includes the last row and column, or the surface has no valid normal there).
+std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader, const RefinementConfig& cfg,
+                                            cv::Mat_<float>* offsetMap = nullptr,
+                                            cv::Mat_<float>* opacityMap = nullptr)
 {
     cv::Mat_<cv::Vec3f> original = surf.rawPoints().clone();
     if (original.empty()) {
@@ -323,7 +414,13 @@ std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader,
 
     cv::Mat_<cv::Vec3f> refined = original.clone();
 
-    if (cfg.refine) {
+    const bool report = offsetMap && opacityMap;
+    if (report) {
+        *offsetMap = cv::Mat_<float>(original.size(), std::numeric_limits<float>::quiet_NaN());
+        *opacityMap = cv::Mat_<float>(original.size(), std::numeric_limits<float>::quiet_NaN());
+    }
+
+    if (cfg.refine || report) {
         const int rows = original.rows;
         const int cols = original.cols;
 
@@ -340,6 +437,7 @@ std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader,
                     continue;
                 }
                 const cv::Vec3f& point = original(y, x);
+                float opacity = 0.0f;
                 const float off = alphacomp_offset(reader,
                                                    point,
                                                    normal,
@@ -348,8 +446,15 @@ std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader,
                                                    cfg.step,
                                                    cfg.low,
                                                    cfg.high,
-                                                   cfg.r);
-                refined(y, x) = point + normal * (off + cfg.border_off);
+                                                   cfg.r,
+                                                   &opacity);
+                if (cfg.refine) {
+                    refined(y, x) = point + normal * (off + cfg.border_off);
+                }
+                if (report) {
+                    (*offsetMap)(y, x) = off;
+                    (*opacityMap)(y, x) = opacity;
+                }
             }
         }
     }
@@ -369,6 +474,18 @@ int process_tifxyz(const std::filesystem::path& src,
                    DSReader& reader,
                    const RefinementConfig& cfg)
 {
+    // Report-only: measure the source and write only the report, no surface.
+    const bool reportOnly = cfg.offset_report && !cfg.refine;
+    const std::filesystem::path reportDir =
+        reportOnly ? normalizedPath(dst) : dst / "alphacomp_offset";
+    if (reportOnly) {
+        const std::string why = reportOnlyRefusal(src, dst, cfg.overwrite);
+        if (!why.empty()) {
+            std::cerr << "offset report: " << why << std::endl;
+            return EXIT_FAILURE;
+        }
+    }
+
     std::unique_ptr<QuadSurface> surf;
     try {
         surf = load_quad_from_tifxyz(src.string());
@@ -376,16 +493,105 @@ int process_tifxyz(const std::filesystem::path& src,
         std::cerr << "failed to load tifxyz: " << e.what() << std::endl;
         return EXIT_FAILURE;
     }
-    auto outSurf = refine_surface(*surf, reader, cfg);
-    if (!outSurf) return EXIT_FAILURE;
-    outSurf->id = dst.filename().string();
 
-    try {
-        outSurf->saveEdited(src, dst, cfg.overwrite);
-    } catch (const std::exception& e) {
-        std::cerr << "failed to save tifxyz: " << e.what() << std::endl;
-        return EXIT_FAILURE;
+    cv::Mat_<float> offsetMap;
+    cv::Mat_<float> opacityMap;
+    auto outSurf = refine_surface(*surf, reader, cfg,
+                                  cfg.offset_report ? &offsetMap : nullptr,
+                                  cfg.offset_report ? &opacityMap : nullptr);
+    if (!outSurf) return EXIT_FAILURE;
+
+    if (!reportOnly) {
+        outSurf->id = dst.filename().string();
+
+        // An earlier report describes the geometry about to be replaced, and
+        // saving over a segment keeps its subfolders. Move it aside first, so
+        // it goes with the old surface: deleted once the new surface is
+        // saved, put back if the save fails. If it cannot be moved, nothing
+        // is saved.
+        fs::path staleReport;
+        if (vc_objrefine::pathExists(reportDir)) {
+            try {
+                staleReport = vc_objrefine::freeSibling(reportDir, "stale");
+                fs::rename(reportDir, staleReport);
+            } catch (const std::exception& e) {
+                std::cerr << "cannot move the earlier offset report " << reportDir
+                          << " aside, so the surface was not saved: " << e.what() << std::endl;
+                return EXIT_FAILURE;
+            }
+        }
+
+        try {
+            outSurf->saveEdited(src, dst, cfg.overwrite);
+        } catch (const std::exception& e) {
+            std::cerr << "failed to save tifxyz: " << e.what() << std::endl;
+            if (!staleReport.empty()) {
+                std::error_code ec;
+                fs::rename(staleReport, reportDir, ec);
+                if (ec) {
+                    std::cerr << "the earlier offset report could not be put back and is in "
+                              << staleReport << ": " << ec.message() << std::endl;
+                }
+            }
+            return EXIT_FAILURE;
+        }
+
+        if (!staleReport.empty()) {
+            std::error_code ec;
+            fs::remove_all(staleReport, ec);
+            if (ec) {
+                std::cerr << "warning: the earlier offset report no longer matches the surface; it was moved"
+                          << " out of the way to " << staleReport << " but could not be deleted: "
+                          << ec.message() << std::endl;
+            }
+        }
     }
+
+    if (cfg.offset_report) {
+        nlohmann::json report = nlohmann::json::object();
+        report["tool"] = "vc_objrefine";
+        report["schema_version"] = 1;
+        report["offset_map"] = "offset.tif";
+        report["opacity_map"] = "opacity.tif";
+        report["units"] = "source surface coordinates (full-resolution voxels) along the grid normal; positive is the normal direction";
+        nlohmann::json inputs = nlohmann::json::object();
+        inputs["volume"] = normalizedPath(reader.path).string();
+        inputs["source_surface"] = normalizedPath(src).string();
+        if (surf->meta.is_object() && surf->meta.contains("uuid") &&
+            surf->meta["uuid"].is_string()) {
+            inputs["source_uuid"] = surf->meta["uuid"].get<std::string>();
+        } else {
+            inputs["source_uuid"] = nullptr;
+        }
+        report["inputs"] = std::move(inputs);
+        nlohmann::json params = nlohmann::json::object();
+        params["refine"] = cfg.refine;
+        params["start"] = static_cast<double>(cfg.start);
+        params["stop"] = static_cast<double>(cfg.stop);
+        params["step"] = static_cast<double>(cfg.step);
+        params["low"] = static_cast<double>(cfg.low);
+        params["high"] = static_cast<double>(cfg.high);
+        params["r"] = cfg.r;
+        params["border_off"] = static_cast<double>(cfg.border_off);
+        params["reader_scale"] = static_cast<double>(cfg.reader_scale);
+        params["scale_group"] = cfg.dataset_group;
+        report["parameters"] = std::move(params);
+        report["summary"] = vc_objrefine::summarizeOffsets(
+            offsetMap, opacityMap, surf->validMask(),
+            cfg.offset_threshold, cfg.offset_min_opacity);
+
+        try {
+            writeOffsetReport(reportDir, cfg.overwrite, offsetMap, opacityMap, report, surf->dpi());
+        } catch (const std::exception& e) {
+            if (!reportOnly) {
+                std::cerr << "the surface was saved to " << dst << ", but ";
+            }
+            std::cerr << "failed to write the offset report: " << e.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+        std::cout << "offset report: " << reportDir << std::endl;
+    }
+
     return EXIT_SUCCESS;
 }
 
@@ -395,6 +601,17 @@ int process_tifxyz(const std::filesystem::path& src,
 int process_stored(StoreSurfaces& store, const StoreToolOptions& options, const nlohmann::json& parameters,
                    DSReader& reader, const RefinementConfig& cfg)
 {
+    // The offset report writes files beside a tifxyz folder; a stored surface
+    // has none, so it needs a tifxyz path. Report-only would store an
+    // unchanged revision, so refuse it; with refine, refine and skip the report.
+    if (cfg.offset_report && !cfg.refine) {
+        std::cerr << "offset report: needs a tifxyz folder, not a stored surface; nothing was changed" << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (cfg.offset_report) {
+        std::cerr << "warning: offset_report needs a tifxyz folder, not a stored surface; ignoring\n";
+    }
+
     const auto& uuid = options.surfaces.front();
     try {
         auto surf = store.load(uuid, true, options.volume);
@@ -469,6 +686,13 @@ int main(int argc, char *argv[])
 
     const nlohmann::json params = nlohmann::json::parse(std::ifstream(params_path));
     const RefinementConfig cfg = parse_config(params);
+    if (cfg.offset_report &&
+        !(std::isfinite(cfg.offset_threshold) && cfg.offset_threshold >= 0.0f &&
+          std::isfinite(cfg.offset_min_opacity) && cfg.offset_min_opacity >= 0.0f &&
+          cfg.offset_min_opacity <= 1.0f)) {
+        std::cerr << "offset_threshold must be >= 0 and offset_min_opacity in [0, 1]" << std::endl;
+        return EXIT_FAILURE;
+    }
 
     const int level = std::stoi(cfg.dataset_group);
     vcr::zarr::OpenOptions options;
@@ -491,7 +715,7 @@ int main(int argc, char *argv[])
               << "[" << chunk_shape[0] << ", " << chunk_shape[1] << ", " << chunk_shape[2] << "]" << std::endl;
     std::cout << "memory cache size (bytes) " << cfg.cache_bytes << std::endl;
 
-    DSReader reader{*opened, base, cfg.reader_scale};
+    DSReader reader{*opened, base, cfg.reader_scale, vol_path};
 
     MeasureLife timer("processing surface ...\n");
 

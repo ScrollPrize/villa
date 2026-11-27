@@ -7,6 +7,7 @@
 
 #include <vector>
 
+class QAction;
 class QDockWidget;
 class QFrame;
 class QHBoxLayout;
@@ -26,6 +27,10 @@ public:
 
     QWidget* takeBarWidget();
     void addDock(QDockWidget* dock);
+    // Action that opens dock's panel as a click on its status bar button
+    // does, putting a closed button back in the bar first. Null when dock is
+    // not in the host.
+    QAction* openAction(QDockWidget* dock) const;
     // Expands the dock's panel (or raises it when detached), restoring its bar
     // button first if the user closed it.
     void showDock(QDockWidget* dock);
@@ -40,6 +45,7 @@ private:
         QPointer<QWidget> page;
         QPointer<QPushButton> button;
         QPointer<QToolButton> pinButton;
+        QPointer<QAction> openAction;
         QSize panelSize;
         bool visibleInBar = true;
         bool pinned = false;
@@ -50,6 +56,7 @@ private:
     Item* itemForDock(QDockWidget* dock);
     int itemIndex(const Item& item) const;
     void toggleItem(Item& item);
+    void openItem(Item& item);
     void expandItem(Item& item);
     void collapseCurrent();
     void detachItem(Item& item);

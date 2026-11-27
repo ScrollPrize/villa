@@ -1,5 +1,6 @@
 #include "SettingsDialog.hpp"
 
+#include "SettingsFilter.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -95,6 +96,14 @@ SettingsDialog::SettingsDialog(QWidget *parent)
     });
 
     connect(btnHelpRamCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpRamCacheSize->toolTip()); });
+
+    // Type to show only the matching settings.
+    auto* noMatch = new QLabel(tr("No settings match the filter."), this);
+    noMatch->setAlignment(Qt::AlignCenter);
+    auto* filter = vc3d::settings_filter::createFilterField(this, noMatch);
+    mainVBox->insertWidget(0, filter);
+    mainVBox->insertWidget(1, noMatch);
+    filter->setFocus();
 }
 
 void SettingsDialog::setupCacheActionControls()
