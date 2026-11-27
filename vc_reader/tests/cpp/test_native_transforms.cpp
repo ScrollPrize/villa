@@ -1,5 +1,6 @@
 #include <vc_reader/transforms.hpp>
 #include <iostream>
+#include <numeric>
 
 int main()
 {
@@ -38,6 +39,39 @@ int main()
             require(threw, std::string("rejected: ") + what);
         };
         Normalize percentiles; percentiles.lower = 90; percentiles.upper = 10; rejected(percentiles, "percentile order");
+        {
+            // The padding of a float32 image is refilled after a transform from a one byte mask.
+            Target padded; padded.fill = 7; Target valid; valid.role = Role::Valid;
+            Sample s; s["image"] = {Array({2, 1, 2, 3}, 'f', 4), padded, "image"};
+            auto* v = static_cast<float*>(s.at("image").array.data()); std::iota(v, v + 12, 1.f);
+            Array mask({1, 1, 2, 3}, 'u', 1); const std::uint8_t m[6]{1, 0, 1, 1, 0, 1}; std::memcpy(mask.data(), m, 6); s["padding_mask"] = {std::move(mask), valid, "padding_mask"};
+            BrightnessMultiply twice; twice.factor = 2.;
+            const auto out = Pipeline({twice}, {{"image", padded}, {"padding_mask", valid}}).run(s, 0, false).sample.at("image").array;
+            for (std::size_t c = 0; c < 2; ++c) for (std::size_t i = 0; i < 6; ++i)
+                require(out.get(c * 6 + i) == (m[i] ? 2.f * float(c * 6 + i + 1) : 7.f), "padding refilled per channel, valid voxels transformed");
+        }
+        {
+            // The same refill from a float32 mask, as the training datasets build it.
+            Target padded; padded.fill = 7; Target valid; valid.role = Role::Valid;
+            Sample s; s["image"] = {Array({2, 1, 2, 3}, 'f', 4), padded, "image"};
+            auto* v = static_cast<float*>(s.at("image").array.data()); std::iota(v, v + 12, 1.f);
+            Array mask({1, 1, 2, 3}, 'f', 4); const float m[6]{1.f, 0.f, 1.f, 1.f, 0.f, 1.f}; std::memcpy(mask.data(), m, 24); s["padding_mask"] = {std::move(mask), valid, "padding_mask"};
+            BrightnessMultiply twice; twice.factor = 2.;
+            const auto out = Pipeline({twice}, {{"image", padded}, {"padding_mask", valid}}).run(s, 0, false).sample.at("image").array;
+            for (std::size_t c = 0; c < 2; ++c) for (std::size_t i = 0; i < 6; ++i)
+                require(out.get(c * 6 + i) == (m[i] != 0.f ? 2.f * float(c * 6 + i + 1) : 7.f), "padding refilled from a float32 mask");
+        }
+        {
+            // A mask without a zero leaves a borrowed image borrowed: nothing to refill, nothing to copy.
+            Target padded; padded.fill = 7; Target valid; valid.role = Role::Valid;
+            for (const char kind : {'u', 'f'}) {
+                const float image[6]{1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+                Sample s; s["image"] = {Array({1, 1, 2, 3}, 'f', 4, image), padded, "image"};
+                Array mask({1, 1, 2, 3}, kind, kind == 'f' ? 4 : 1); if (kind == 'f') { const float m[6]{1.f, 1.f, 1.f, 1.f, 1.f, 1.f}; std::memcpy(mask.data(), m, 24); } else { const std::uint8_t m[6]{1, 1, 1, 1, 1, 1}; std::memcpy(mask.data(), m, 6); } s["padding_mask"] = {std::move(mask), valid, "padding_mask"};
+                restore_valid(s);
+                require(s.at("image").array.borrowed == image, "all valid mask keeps the image borrowed");
+            }
+        }
         Normalize fixed; fixed.scale = 0; rejected(fixed, "fixed scale");
         BrightnessMultiply chance; chance.options.p_channel = 2; rejected(chance, "channel probability");
         Gamma gamma; gamma.p_invert = -1; rejected(gamma, "gamma inversion probability");
