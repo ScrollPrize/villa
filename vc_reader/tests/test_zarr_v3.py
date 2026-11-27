@@ -1890,10 +1890,23 @@ class V3RemoteTests(RemoteFixtureCase):
 
             # 416 fallback commit-once: member 0 succeeds on v1, shard mutates before member 1 -> raises 412,
             # zero v2 suffix GETs, member 0 cleanly cached.
+            #
+            # The two fallback members are read concurrently, so the order in which their HTTP
+            # responses arrive is arbitrary. Member 0 is therefore always answered from the v1
+            # bytes, whatever the file holds, so it is always delivered and committed on v1. The
+            # reader decides whether a 412 may refresh the shard only after every fallback member
+            # has settled, so that commit precedes the decision in either interleaving and the
+            # read must fail without fetching the v2 index. Member 1 swaps the shard only after
+            # member 0 has been answered and then receives a genuine If-Match 412.
             name2 = 'fallback-416-commit-once'
             write_custom_shard_array(self.root / name2, v1_data, (1, 1, 4), (20, 1, 4))
             write_custom_shard_array(self.root / (name2 + '-v2'), v2_data, (1, 1, 4), (20, 1, 4))
+            v1_bytes2 = (self.root / name2 / 'c/0/0/0').read_bytes()
+            v1_tag2 = '"' + hashlib.sha256(v1_bytes2).hexdigest() + '"'
             v2_bytes2 = (self.root / (name2 + '-v2') / 'c/0/0/0').read_bytes()
+            member0_served = threading.Event()
+            hook_lock2 = threading.Lock()
+            seen2 = []
             swapped2 = False
             v2_suffix_gets = 0
 
@@ -1902,10 +1915,23 @@ class V3RemoteTests(RemoteFixtureCase):
                 if handler.path != f'/{name2}/c/0/0/0':
                     return False
                 rng = handler.headers.get('Range') or ''
+                with hook_lock2:
+                    seen2.append((rng, handler.headers.get('If-Match')))
                 if rng == 'bytes=4-11':
                     handler.send_error(416)
                     return True
+                if rng == 'bytes=4-7':
+                    handler.send_response(206)
+                    handler.send_header('Content-Range', f'bytes 4-7/{len(v1_bytes2)}')
+                    handler.send_header('Content-Length', '4')
+                    handler.send_header('ETag', v1_tag2)
+                    handler.end_headers()
+                    handler.wfile.write(v1_bytes2[4:8])
+                    handler.wfile.flush()
+                    member0_served.set()
+                    return True
                 if rng == 'bytes=8-11' and not swapped2:
+                    self.assertTrue(member0_served.wait(5))
                     swapped2 = True
                     (self.root / name2 / 'c/0/0/0').write_bytes(v2_bytes2)
                     return False
@@ -1920,11 +1946,59 @@ class V3RemoteTests(RemoteFixtureCase):
                 self.server.request_hook = hook_416
                 with self.assertRaisesRegex(RuntimeError, '412|changed'):
                     reader.read_many([np.s_[1:2, 0:1, 0:4], np.s_[2:3, 0:1, 0:4]])
+                self.server.request_hook = None
+                self.assertTrue(member0_served.is_set())
                 self.assertTrue(swapped2)
                 self.assertEqual(v2_suffix_gets, 0)
+                self.assertCountEqual(seen2, [
+                    ('bytes=4-11', v1_tag2), ('bytes=4-7', v1_tag2), ('bytes=8-11', v1_tag2),
+                ])
                 fetches_before = reader.stats()['remote_fetches']
                 self.assertEqual(int(reader[1, 0, 0]), 55)
                 self.assertEqual(reader.stats()['remote_fetches'], fetches_before)
+
+            # 416 fallback before any commit: both members observe the replacement, so the
+            # shard has delivered nothing on v1 and its single pre-commit refresh returns v2
+            # for both chunks. Member 1 waits for the replacement, so both members fail with
+            # If-Match 412 whatever order they reach the server in.
+            name3 = 'fallback-416-pre-commit-refresh'
+            write_custom_shard_array(self.root / name3, v1_data, (1, 1, 4), (20, 1, 4))
+            write_custom_shard_array(self.root / (name3 + '-v2'), v2_data, (1, 1, 4), (20, 1, 4))
+            v1_tag3 = '"' + hashlib.sha256((self.root / name3 / 'c/0/0/0').read_bytes()).hexdigest() + '"'
+            v2_bytes3 = (self.root / (name3 + '-v2') / 'c/0/0/0').read_bytes()
+            v2_tag3 = '"' + hashlib.sha256(v2_bytes3).hexdigest() + '"'
+            swapped3 = threading.Event()
+            hook_lock3 = threading.Lock()
+            seen3 = []
+
+            def hook_416_pre(handler):
+                if handler.path != f'/{name3}/c/0/0/0':
+                    return False
+                rng = handler.headers.get('Range') or ''
+                with hook_lock3:
+                    seen3.append((rng, handler.headers.get('If-Match')))
+                    if rng == 'bytes=4-7' and not swapped3.is_set():
+                        (self.root / name3 / 'c/0/0/0').write_bytes(v2_bytes3)
+                        swapped3.set()
+                if rng == 'bytes=4-11':
+                    handler.send_error(416)
+                    return True
+                if rng == 'bytes=8-11':
+                    self.assertTrue(swapped3.wait(5))
+                return False
+
+            with ZarrReader.open(self.url + '/' + name3, threads=1, memory_cache=MemoryCache(1 << 20)) as reader:
+                self.assertEqual(int(reader[0, 0, 0]), 55)
+                self.assertEqual(int(reader[0, 1, 0]), 55)
+                self.server.request_hook = hook_416_pre
+                out = reader.read_many([np.s_[1:2, 0:1, 0:4], np.s_[2:3, 0:1, 0:4]])
+                self.server.request_hook = None
+                self.assertEqual([int(x[0, 0, 0]) for x in out], [66, 66])
+                self.assertCountEqual(seen3, [
+                    ('bytes=4-11', v1_tag3), ('bytes=4-7', v1_tag3), ('bytes=8-11', v1_tag3),
+                    ('bytes=-324', None),
+                    ('bytes=4-11', v2_tag3), ('bytes=4-7', v2_tag3), ('bytes=8-11', v2_tag3),
+                ])
 
         self.server.request_hook = None
 
