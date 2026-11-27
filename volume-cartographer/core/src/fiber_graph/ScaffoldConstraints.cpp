@@ -716,6 +716,10 @@ geometry::WindingConstraintOptions sharedConstraintOptions(const ScaffoldMeasure
     shared.parallelWeight = options.parallelWeight;
     shared.signWeight = options.signWeight;
     shared.crossingFilter = options.crossingFilter;
+    shared.stepCosts = options.stepCosts;
+    shared.fartherApartFactor = options.separations == ScaffoldSeparationMode::Split ? options.fartherApartFactor : 1.0;
+    shared.calibrationVOutside = options.calibrationVOutside;
+    shared.calibrationHOutside = options.calibrationHOutside;
     shared.enclosures = options.enclosures && options.enclosureWeight > 0;
     // The crossing's evidence, exactly as the sign stage weights it.
     shared.dotWeightPower = options.crossingConfidence ? options.confidence.dotWeightPower : 0.;
@@ -783,10 +787,21 @@ void appendEventConstraints(std::vector<ScaffoldConstraint>& constraints, const 
             built.sign.side > 0 ? ScaffoldConstraintKind::SignAtLeast : ScaffoldConstraintKind::SignAtMost));
         if (report) ++report->signConstraints;
     }
+    for (const auto& bound : built.bounds) {
+        const geometry::winding_graph_detail::Arc arc{bound.a, bound.b, bound.target, bound.weight};
+        constraints.push_back(constraintOfArc(
+            arc, event, index, relation.transport,
+            bound.side > 0 ? ScaffoldConstraintKind::SignAtLeast : ScaffoldConstraintKind::SignAtMost));
+    }
     if (!relation.usable) return;
     const auto kind = event.parallel ? ScaffoldConstraintKind::Parallel : ScaffoldConstraintKind::Perpendicular;
     if (report && relation.hasUpper) ++report->fractional;
-    if (options.separations == ScaffoldSeparationMode::Rounded) {
+    if (relation.costTable) {
+        constraints.push_back(constraintOfArc(relation.lower, event, index, relation.transport, kind));
+        if (relation.hasUpper) constraints.push_back(constraintOfArc(relation.upper, event, index, relation.transport, kind));
+        for (const auto& arc : relation.extra) constraints.push_back(constraintOfArc(arc, event, index, relation.transport, kind));
+        if (report) report->expanded += 1 + std::int64_t(relation.hasUpper) + std::int64_t(relation.extra.size());
+    } else if (options.separations == ScaffoldSeparationMode::Rounded) {
         // The nearer integer with the event's whole weight.
         auto nearer = relation.hasUpper && relation.upper.weight > relation.lower.weight ? relation.upper
                                                                                         : relation.lower;
@@ -855,6 +870,11 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
     std::vector<Bound> bounds;
 
     const auto shared = sharedConstraintOptions(options);
+    // What a reviewer stated is not read through the learned step costs.
+    auto stated_ = shared;
+    stated_.stepCosts.reset();
+    stated_.fartherApartFactor = 1.0;
+    stated_.calibrationVOutside = stated_.calibrationHOutside = {};
     const auto normalsApproved = [&](std::int64_t fiber, double arc) {
         const auto line = geometry.lineIndexAt(std::size_t(fiber), arc);
         return line >= 0 &&
@@ -870,7 +890,8 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
         if (review == ScaffoldNeighbour::Direct && options.windingScale > 0)
             event.distance = options.perpendicularOffset / options.windingScale;
         auto built = eventConstraints(graph, geometry, event, normalSign[std::size_t(event.a)],
-                                      normalSign[std::size_t(event.b)], fallingSign, shared);
+                                      normalSign[std::size_t(event.b)], fallingSign,
+                                      review != ScaffoldNeighbour::Undecided ? stated_ : shared);
         if (built.filtered) { ++report.crossingFiltered; continue; }
         if (review == ScaffoldNeighbour::Distant) {
             // Farther than a direct neighbour: the bound moves one winding
@@ -940,6 +961,38 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
     report.enclosureNonunique += std::int64_t(counts.nonunique);
     report.enclosureArcs += std::int64_t(counts.accepted);
     return constraints;
+}
+
+std::vector<ScaffoldEventReadout> scaffoldEventReadouts(const ScaffoldGraph& graph, const ScaffoldGeometry& geometry,
+                                                        std::span<const ScaffoldEvent> events,
+                                                        std::span<const std::int64_t> normalSign,
+                                                        const ScaffoldMeasuredOptions& options)
+{
+    if (normalSign.size() != graph.fibers.size())
+        throw std::invalid_argument("scaffold constraints: the normal signs cover a different fiber set");
+    const auto fallingSign = std::int64_t(scaffoldFallingWindingSign(graph));
+    // Every class states its relation here, so the transport is always there.
+    auto shared = sharedConstraintOptions(options);
+    shared.enclosures = true;
+    if (shared.perpendicularWeight <= 0) shared.perpendicularWeight = 1;
+    if (shared.parallelWeight <= 0) shared.parallelWeight = 1;
+    std::vector<ScaffoldEventReadout> readouts(events.size());
+    for (std::size_t index = 0; index < events.size(); ++index) {
+        const auto& event = events[index];
+        auto& readout = readouts[index];
+        if (!eventStatesRelation(graph, event, nullptr)) continue;
+        readout.states = true;
+        readout.familyDelta = familyIndex(graph.fibers[std::size_t(event.b)].family) -
+                              familyIndex(graph.fibers[std::size_t(event.a)].family);
+        const auto built = eventConstraints(graph, geometry, event, normalSign[std::size_t(event.a)],
+                                            normalSign[std::size_t(event.b)], fallingSign, shared);
+        readout.filtered = built.filtered;
+        readout.sign = built.relation.sign;
+        readout.hasTransport = built.relation.hasTransport;
+        readout.transport = built.relation.transport;
+        readout.evidence = built.evidence;
+    }
+    return readouts;
 }
 
 objects::FiberConstraintKind scaffoldConstraintStoreKind(ScaffoldConstraintKind kind)

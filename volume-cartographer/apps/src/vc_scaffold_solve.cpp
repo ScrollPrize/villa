@@ -182,6 +182,30 @@ ScaffoldMeasuredOptions measuredOptionsFrom(const Json& cfg)
     options.perpendicularOffset = section.value("perpendicular_offset", options.perpendicularOffset);
     options.windingScale = section.value("winding_scale", options.windingScale);
     options.enclosures = section.value("enclosures", options.enclosures);
+    // calibration: {"v_outside": {"scale": s, "offset": o}, "h_outside": {...}}.
+    const auto calibration = section.value("calibration", Json::object());
+    const auto calibrationOf = [&](const char* name, vc::geometry::WindingDistanceCalibration& into) {
+        const auto entry = calibration.value(name, Json::object());
+        into.scale = entry.value("scale", into.scale);
+        into.offset = entry.value("offset", into.offset);
+    };
+    calibrationOf("v_outside", options.calibrationVOutside);
+    calibrationOf("h_outside", options.calibrationHOutside);
+    options.fartherApartFactor = section.value("farther_apart_factor", options.fartherApartFactor);
+    // step_cost_table: a JSON file {bin_width, bins, step_min, steps, weights} (WindingStepCostTable).
+    if (section.contains("step_cost_table")) {
+        const auto file = Json::parse(std::ifstream(section.at("step_cost_table").get<std::string>()));
+        auto table = std::make_shared<vc::geometry::WindingStepCostTable>();
+        table->binWidth = file.at("bin_width").get<double>();
+        table->bins = file.at("bins").get<std::int64_t>();
+        table->stepMin = file.at("step_min").get<std::int64_t>();
+        table->steps = file.at("steps").get<std::int64_t>();
+        table->weights = file.at("weights").get<std::vector<double>>();
+        if (!(table->binWidth > 0) || table->bins <= 0 || table->steps <= 0 ||
+            table->weights.size() != std::size_t(2 * table->bins * table->steps))
+            throw std::invalid_argument("step_cost_table: inconsistent table");
+        options.stepCosts = std::move(table);
+    }
     options.crossingFilter = section.value("crossing_filter", options.crossingFilter);
     // "split" (two weighted integers around a fractional separation) or
     // "rounded" (one constraint at the nearer integer).
@@ -974,6 +998,34 @@ int run(const std::string& configPath)
     }
     const double reportSeconds = seconds(reportStarted) - persistSeconds;
     const auto filesStarted = Clock::now();
+    // crossings_output: every measured crossing as measured (no calibration) with its signed order and
+    // transport, and every constraint of the solve - what a calibration of the separations is fitted on.
+    if (cfg.contains("crossings_output") && measure) {
+        const auto readouts = scaffoldEventReadouts(graph, geometry, events, signs.sign, *measuredOptions);
+        Json rows = Json::array();
+        for (std::size_t i = 0; i < events.size(); ++i) {
+            const auto& event = events[i];
+            const auto& readout = readouts[i];
+            if (!readout.states) continue;
+            rows.push_back({{"event", i}, {"a", graph.fibers[std::size_t(event.a)].uuid},
+                            {"b", graph.fibers[std::size_t(event.b)].uuid}, {"arc_a", event.arcA}, {"arc_b", event.arcB},
+                            {"point_a", event.pointA}, {"point_b", event.pointB},
+                            {"distance", std::isfinite(event.distance) ? Json(event.distance) : Json()},
+                            {"closest_distance", event.closestDistance}, {"parallel", event.parallel},
+                            {"sign", readout.sign}, {"family_delta", readout.familyDelta},
+                            {"transport", readout.hasTransport ? Json(readout.transport) : Json()},
+                            {"evidence", readout.evidence}, {"filtered", readout.filtered}});
+        }
+        Json constraints = Json::array();
+        for (const auto& constraint : result.constraints)
+            constraints.push_back({{"kind", scaffoldConstraintKindName(constraint.kind)},
+                                   {"a", graph.fibers[std::size_t(constraint.a)].uuid},
+                                   {"b", graph.fibers[std::size_t(constraint.b)].uuid}, {"target", constraint.target},
+                                   {"step", constraint.step}, {"weight", constraint.weight}, {"event", constraint.event},
+                                   {"link", constraint.link}});
+        writeJson(cfg.at("crossings_output").get<std::string>(),
+                  Json{{"crossings", std::move(rows)}, {"constraints", std::move(constraints)}});
+    }
     if (cfg.contains("windings_output")) {
         Json windings{{"ids", Json::array()}, {"family", Json::array()}, {"selected_winding", Json::array()},
                       {"component", Json::array()}};

@@ -409,6 +409,15 @@ def aggregate_arcs(a,b,target,weight,side):
                 weight=np.add.reduceat(np.asarray(weight,dtype=np.float64)[order],starts))
 
 
+def _step_cost_table(config):
+    """The learned step costs of perpendicular crossings (`step_cost_table`: a JSON file), as native arguments."""
+    if not config.get('step_cost_table'):return {}
+    import json
+    with open(config['step_cost_table']) as f:t=json.load(f)
+    return dict(step_cost_weights=np.ascontiguousarray(t['weights'],dtype=np.float64),step_cost_bin_width=float(t['bin_width']),
+                step_cost_bins=int(t['bins']),step_cost_min=int(t['step_min']),step_cost_steps=int(t['steps']))
+
+
 def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
     """Automatic, enclosure, sign and manual constraints with their type weights, aggregated.
 
@@ -441,6 +450,9 @@ def _assemble_arcs(config,settings,graph,paths,ids,family,normal_sign):
             dot_weight_power=settings['dot_weight_power'],
             damp_by_winding_distance=settings['winding_distance_weight']=='inverse_square',
             sign_weight=weights['sign'],enclosures=weights['enclosure']>0,
+            calibration=[float(config.get('distance_calibration',{}).get(c,{}).get(k,d)) for c in ('v_outside','h_outside') for k,d in (('scale',1.),('offset',0.))],
+            farther_apart_factor=float(config.get('farther_apart_factor',1.)),
+            **_step_cost_table(config),
             constraint_batch=int(config.get('constraint_batch',500000)),
             read_batch=int(config.get('read_batch',32768)),
             workers=int(config.get('workers',32)))

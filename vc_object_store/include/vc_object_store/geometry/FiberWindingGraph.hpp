@@ -2,6 +2,7 @@
 #include "vc_object_store/geometry/FiberCrossingFilter.hpp"
 #include "vc_object_store/geometry/FiberCrossingWeight.hpp"
 #include "vc_object_store/geometry/FiberWinding.hpp"
+#include <memory>
 #include <queue>
 #include <tuple>
 
@@ -44,7 +45,34 @@ struct FiberWindingGraphInput {
 // What a measured crossing is turned into, the same for every consumer: the
 // traced volume's winding stage and a manual scaffold's solve build their
 // constraints from these options through windingEventConstraints below.
+// Experiment: what a perpendicular crossing of a known signed order states,
+// learned from crossings whose true step is known. Per crossing class (0: the
+// V fiber outside the H fiber, 1: the H fiber outside the V fiber) and bin of
+// the measured separation, the weights of the terms |n - (stepMin + k)| on
+// the anchor-level outward step n: together a convex cost of every whole
+// step, in place of the two integers around the measurement. The separation's
+// own distance damping is not applied on top: the table states it.
+struct WindingStepCostTable {
+    double binWidth=0;
+    int64_t bins=0,stepMin=0,steps=0;
+    std::vector<double> weights; // [class][bin][step]
+};
+// Experiment: a measured separation d of one perpendicular crossing class is
+// read as scale * d + offset turns (never below 0) before it is turned into a
+// winding step. The evidence damping keeps the separation as measured.
+struct WindingDistanceCalibration {double scale=1,offset=0;};
 struct WindingConstraintOptions {
+    std::shared_ptr<const WindingStepCostTable> stepCosts;
+    // Per class under the given normal signs: the V fiber outside the H fiber,
+    // and the H fiber outside the V fiber. A crossing whose normals state no
+    // order has no class and keeps its measurement.
+    WindingDistanceCalibration calibrationVOutside,calibrationHOutside;
+    // Experiment: a measured separation as mostly a lower bound. Placing the
+    // two fibers of a signed perpendicular crossing farther apart than
+    // measured costs this share of the crossing's weight, placing them closer
+    // the whole weight: the equation keeps the share and a one-sided
+    // constraint (WindingEventConstraints::bounds) carries the rest. 1: off.
+    double fartherApartFactor=1;
     double windingScale=1,perpendicularOffset=.5,perpendicularWeight=1,parallelWeight=1;
     // How much each crossing counts as evidence, on top of its type weight
     // (FiberCrossingWeight.hpp, the rule the sign solve uses): |dot|^power,
@@ -165,6 +193,10 @@ struct WindingEventRelation {
     bool withoutDistance=false,usable=false,hasEnclosure=false,hasUpper=false,hasTransport=false;
     winding_graph_detail::EnclosureBound enclosure{};
     winding_graph_detail::Arc lower{},upper{};
+    // Under a step cost table: the crossing's further terms, and the flag
+    // that lower, upper and these are all stated as they are.
+    std::vector<winding_graph_detail::Arc> extra;
+    bool costTable=false;
     // The whole-fiber transport of the a->b step (connector crossings minus
     // b's turns plus a's), present whenever the event yielded an arc or an
     // enclosure bound: target = anchor step + transport.
@@ -253,6 +285,8 @@ struct WindingEventConstraints {
     double weight=0;
     bool hasSign=false;
     WindingSignConstraint sign{};
+    // The one-sided parts of the separation (WindingConstraintOptions::fartherApartFactor).
+    std::vector<WindingSignConstraint> bounds;
     // The crossing filter took the crossing out (WindingConstraintOptions::crossingFilter).
     bool filtered=false;
 };
@@ -272,9 +306,48 @@ inline WindingEventConstraints windingEventConstraints(const PackedFiberGeometry
                 *(options.dampByWindingDistance?fiberCrossingDistanceFactor(event.distance):1.);
     out.weight=(event.parallel?options.parallelWeight:options.perpendicularWeight)*out.evidence;
     event.weight=out.weight;
+    if(!event.parallel&&std::isfinite(event.distance)){
+        const int order=int(fiberSignedOrder(event.connector,
+            Point{event.normalA[0]*double(event.signA),event.normalA[1]*double(event.signA),event.normalA[2]*double(event.signA)},
+            Point{event.normalB[0]*double(event.signB),event.normalB[1]*double(event.signB),event.normalB[2]*double(event.signB)}));
+        if(order&&!options.stepCosts){
+            const auto& calibration=order*int(event.familyB-event.familyA)>0?options.calibrationVOutside:options.calibrationHOutside;
+            event.distance=std::max(0.,calibration.scale*event.distance+calibration.offset);
+        }
+    }
     event.enclosure=options.enclosures||options.signWeight>0;
     event.perpendicularOffset=options.perpendicularOffset;
     out.relation=windingEventRelation(geometry,event);
+    if(options.stepCosts&&!event.parallel&&out.relation.usable&&out.relation.sign!=0){
+        const auto& table=*options.stepCosts;auto& r=out.relation;
+        const size_t kind=r.sign*int(event.familyB-event.familyA)>0?0:1;
+        const auto bin=size_t(std::clamp<int64_t>(int64_t(event.distance/table.binWidth),0,table.bins-1));
+        out.evidence=fiberCrossingDotWeight(dot,options.dotWeightPower);
+        out.weight=options.perpendicularWeight*out.evidence;
+        const double* weights=&table.weights[(kind*size_t(table.bins)+bin)*size_t(table.steps)];
+        std::vector<winding_graph_detail::Arc> arcs;
+        for(int64_t k=0;k<table.steps;++k){
+            if(!(weights[k]>0))continue;
+            const int64_t target=r.sign*(table.stepMin+k)+r.transport;
+            const double weight=out.weight*weights[k];
+            arcs.push_back(event.a>event.b?winding_graph_detail::Arc{event.b,event.a,-target,weight}
+                                          :winding_graph_detail::Arc{event.a,event.b,target,weight});
+        }
+        r.costTable=true;r.hasUpper=arcs.size()>1;r.usable=!arcs.empty();
+        if(!arcs.empty())r.lower=arcs[0];
+        if(arcs.size()>1)r.upper=arcs[1];
+        if(arcs.size()>2)r.extra.assign(arcs.begin()+2,arcs.end());
+    }
+    if(options.fartherApartFactor<1&&!event.parallel&&out.relation.usable&&out.relation.sign!=0&&!out.relation.costTable){
+        auto& r=out.relation;
+        const int side=r.sign*(event.a>event.b?-1:1);
+        const auto split=[&](winding_graph_detail::Arc& arc){
+            out.bounds.push_back({arc.a,arc.b,arc.target,(1-options.fartherApartFactor)*arc.weight,side});
+            arc.weight*=options.fartherApartFactor;
+        };
+        split(r.lower);
+        if(r.hasUpper)split(r.upper);
+    }
     if(out.relation.hasEnclosure&&options.signWeight>0){
         // The H -> V step is at least its bound (the V fiber outside) or at
         // most it; stated in node order.
@@ -386,9 +459,11 @@ inline FiberWindingL1Columns prepareFiberWindingGraph(const PackedFiberGeometry&
                 part.withoutDistance+=relation.withoutDistance;
                 if(relation.hasEnclosure&&options.enclosures)part.enclosures.push_back(relation.enclosure);
                 if(constraints.hasSign)part.signs.push_back(constraints.sign);
+                part.signs.insert(part.signs.end(),constraints.bounds.begin(),constraints.bounds.end());
                 if(!relation.usable)continue;
                 batch.push_back(relation.lower);
                 if(relation.hasUpper)upper.push_back(relation.upper);
+                upper.insert(upper.end(),relation.extra.begin(),relation.extra.end());
                 if(options.eventTargets){
                     part.eventA.push_back(relation.lower.a);part.eventB.push_back(relation.lower.b);
                     part.eventTarget.push_back(relation.fractionalTarget);

@@ -4,6 +4,8 @@
 #include "vc_object_store/geometry/FiberCrossingFilter.hpp"
 #include "vc_object_store/geometry/FiberWindingFlow.hpp"
 #include "FiberUvEventBindings.hpp"
+#include <nanobind/stl/array.h>
+#include <array>
 #include <nanobind/ndarray.h>
 #include <memory>
 #include <optional>
@@ -131,6 +133,7 @@ void bindFiberWinding(nb::module_& module){
             std::optional<WindingF64> crossingAlternative,
             double scale,double offset,double parallelWeight,double perpendicularWeight,
             double dotWeightPower,bool dampByWindingDistance,double signWeight,bool enclosures,bool eventTargets,
+            std::array<double,4> calibration,double fartherApartFactor,std::optional<WindingF64> stepCostWeights,double stepCostBinWidth,int64_t stepCostBins,int64_t stepCostMin,int64_t stepCostSteps,
             size_t constraintBatch,size_t readBatch,size_t workers){
             if(normalA.shape(1)!=3||normalB.shape(1)!=3||connector.shape(1)!=3)
                 throw std::invalid_argument("winding graph normals require XYZ triples");
@@ -155,6 +158,18 @@ void bindFiberWinding(nb::module_& module){
             options.signWeight=signWeight;options.enclosures=enclosures;
             options.constraintBatch=constraintBatch;options.readBatch=readBatch;options.workers=workers;
             options.eventTargets=eventTargets;
+            options.calibrationVOutside={calibration[0],calibration[1]};options.calibrationHOutside={calibration[2],calibration[3]};
+            if(!(fartherApartFactor>0)||fartherApartFactor>1)throw std::invalid_argument("farther_apart_factor must be in (0, 1]");
+            if(fartherApartFactor<1&&!(signWeight>0))throw std::invalid_argument("farther_apart_factor needs a sign weight");
+            options.fartherApartFactor=fartherApartFactor;
+            if(stepCostWeights){
+                auto table=std::make_shared<vc::geometry::WindingStepCostTable>();
+                table->binWidth=stepCostBinWidth;table->bins=stepCostBins;table->stepMin=stepCostMin;table->steps=stepCostSteps;
+                table->weights.assign(stepCostWeights->data(),stepCostWeights->data()+stepCostWeights->shape(0));
+                if(!(table->binWidth>0)||table->bins<=0||table->steps<=0||table->weights.size()!=size_t(2*table->bins*table->steps))
+                    throw std::invalid_argument("inconsistent step cost table");
+                options.stepCosts=std::move(table);
+            }
             vc::geometry::FiberWindingL1Columns output;
             {nb::gil_scoped_release release;output=vc::geometry::prepareFiberWindingGraph(self.geometry,input,options);}
             nb::dict result;
@@ -197,7 +212,7 @@ void bindFiberWinding(nb::module_& module){
           "crossing_findings"_a=nb::none(),"crossing_alternative"_a=nb::none(),
           "lasagna_winding_scale"_a=1.,"perpendicular_offset"_a=.5,"parallel_weight"_a=1.,"perpendicular_weight"_a=1.,
           "dot_weight_power"_a=0.,"damp_by_winding_distance"_a=false,"sign_weight"_a=0.,
-          "enclosures"_a=false,"event_targets"_a=false,"constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
+          "enclosures"_a=false,"event_targets"_a=false,"calibration"_a=std::array<double,4>{1,0,1,0},"farther_apart_factor"_a=1.,"step_cost_weights"_a=nb::none(),"step_cost_bin_width"_a=0.,"step_cost_bins"_a=0,"step_cost_min"_a=0,"step_cost_steps"_a=0,"constraint_batch"_a=500000,"read_batch"_a=32768,"workers"_a=32);
     module.def("fiber_crossing_use",[](nb::ndarray<const uint8_t,nb::ndim<1>,nb::c_contig,nb::device::cpu> findings,
                                        WindingF64 alternative,WindingF64 dot,WindingI64 signProduct,int unsignedDrop){
         const size_t n=findings.shape(0);

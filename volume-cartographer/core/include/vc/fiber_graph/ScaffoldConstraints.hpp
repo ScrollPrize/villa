@@ -24,6 +24,7 @@
 #include "vc/fiber_tracer/FiberNormalSign.hpp"
 #include "vc/fiber_tracer/FiberRibbonCrossings.hpp"
 #include "vc/fiber_tracer/FiberTraceConstraints.hpp"
+#include "vc_object_store/geometry/FiberWindingGraph.hpp"
 #include "vc_object_store/objects/FiberConstraintApprovalExtension.hpp"
 
 #include <cstdint>
@@ -237,6 +238,14 @@ enum class ScaffoldSeparationMode {
 };
 
 struct ScaffoldMeasuredOptions {
+    // Experiment: the learned cost of a perpendicular crossing's steps
+    // (vc_object_store geometry/FiberWindingGraph.hpp), stated with all its
+    // terms under either separation mode. A reviewed crossing does not use it.
+    std::shared_ptr<const geometry::WindingStepCostTable> stepCosts;
+    // Experiment: scale and offset of the measured separation per class.
+    geometry::WindingDistanceCalibration calibrationVOutside, calibrationHOutside;
+    // Experiment: WindingConstraintOptions::fartherApartFactor; under Split only.
+    double fartherApartFactor = 1.0;
     ScaffoldSeparationMode separations = ScaffoldSeparationMode::Split;
     // Per-type weights, the names the automatic winding stage uses. A zero
     // weight omits that type's arcs; enclosures are derived from the signed
@@ -344,6 +353,22 @@ std::vector<ScaffoldConstraint> scaffoldMeasuredConstraints(const ScaffoldGraph&
                                                            const ScaffoldMeasuredOptions&, ScaffoldMeasuredReport&,
                                                            std::span<const ScaffoldNeighbour> stated = {},
                                                            std::vector<ScaffoldCrossing>* crossings = nullptr);
+
+// What one crossing states before any calibration, for a readout that fits
+// one: whether it states a relation at all, whether the crossing rule took it
+// out, the signed order of its two fibers (a -> b, 0 when the normals state
+// none), familyB - familyA, the whole-fiber transport of the a -> b step
+// (target = anchor step + transport) and the evidence its weights carry.
+struct ScaffoldEventReadout {
+    bool states = false, filtered = false, hasTransport = false;
+    int sign = 0, familyDelta = 0;
+    std::int64_t transport = 0;
+    double evidence = 0;
+};
+std::vector<ScaffoldEventReadout> scaffoldEventReadouts(const ScaffoldGraph&, const ScaffoldGeometry&,
+                                                        std::span<const ScaffoldEvent>,
+                                                        std::span<const std::int64_t> normalSign,
+                                                        const ScaffoldMeasuredOptions&);
 
 // A measured constraint's identity in the store, and the spans an approval of
 // it is fingerprinted over. A manual link is not one of these: its approval is
