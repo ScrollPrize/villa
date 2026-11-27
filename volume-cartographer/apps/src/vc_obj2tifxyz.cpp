@@ -200,18 +200,20 @@ int main(int argc, char *argv[])
     // to the input sampling density. Absent -> legacy metric sizing.
     nlohmann::json sourceMeta = nlohmann::json::object();
     std::unique_ptr<StoreSurfaces> store;
+    cv::Mat_<cv::Vec3f> sourcePoints;
     if (!tifxyz_source.empty() || !source_surface.empty()) {
         try {
             if (!source_surface.empty())
                 store = std::make_unique<StoreSurfaces>(store_output.store, "vc_obj2tifxyz");
-            std::unique_ptr<QuadSurface> src(source_surface.empty()
+            std::unique_ptr<QuadSurface> source(source_surface.empty()
                 ? load_quad_from_tifxyz(tifxyz_source)
                 : store->load(source_surface));
-            if (src->meta.is_object())
-                sourceMeta = src->meta;
-            const cv::Vec2f s = src->scale();
+            if (source->meta.is_object())
+                sourceMeta = source->meta;
+            const cv::Vec2f s = source->scale();
             if (s[0] > 0.f && s[1] > 0.f) {
                 converter.setSrcScale(s);
+                sourcePoints = source->rawPoints();
                 std::cout << "Source tifxyz scale: " << s[0] << ", " << s[1]
                           << " (sizing output grid to input density)\n";
             } else {
@@ -230,7 +232,7 @@ int main(int argc, char *argv[])
     converter.determineGridDimensions(stretch_factor);
     
     // Create quad surface
-    QuadSurface* surf = converter.createQuadSurface(mesh_units);
+    QuadSurface* surf = converter.createQuadSurface(mesh_units, sourcePoints);
     if (!surf) {
         std::cerr << "Failed to create quad surface" << std::endl;
         return EXIT_FAILURE;

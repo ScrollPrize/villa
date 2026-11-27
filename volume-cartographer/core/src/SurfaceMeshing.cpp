@@ -251,7 +251,9 @@ void UvGridRasterizer::determineGridDimensions(float stretch_factor) {
     // input's resolution/scale instead of metric mode's 1 cell / UV unit
     // (which inflated the grid by ~1/src_scale per axis). Decimation/caps
     // still apply on top, never finer than source.
-    if (src_scale[0] > 0.f && src_scale[1] > 0.f) {
+    const bool has_source_scale = src_scale[0] > 0.f && src_scale[1] > 0.f;
+    at_source_density = has_source_scale && decim == 1.0;
+    if (has_source_scale) {
         int gw_src = std::max(2, static_cast<int>(std::lround(uv_range[0] * src_scale[0])) + 1);
         int gh_src = std::max(2, static_cast<int>(std::lround(uv_range[1] * src_scale[1])) + 1);
         // Honor any further user decimation / pixel cap on top of source density.
@@ -318,15 +320,81 @@ void UvGridRasterizer::determineGridDimensions(float stretch_factor) {
 }
 
 
-QuadSurface* UvGridRasterizer::createQuadSurface(float mesh_units) {
-    // Use one bit per cell to let the top-left owner replace an edge sample.
-    std::vector<bool> boundarySamples(static_cast<std::size_t>(grid_size[0]) * grid_size[1]);
+void UvGridRasterizer::restoreSourceGridSamples(
+    cv::Mat_<cv::Vec3f>& points, const cv::Mat_<cv::Vec3f>& sourcePoints) const
+{
+    const auto source = meshGrid(sourcePoints);
+    if (source.cells.empty() || source.cells.size() != vertices.size()
+        || source.cells.size() != uvs.size() || source.faces.size() != faces.size()) {
+        return;
+    }
+
+    for (std::size_t i = 0; i < faces.size(); ++i) {
+        for (int k = 0; k < 3; ++k) {
+            if (faces[i].v[k] != source.faces[i][k] || faces[i].vt[k] != source.faces[i][k]) {
+                return;
+            }
+        }
+    }
+
+    int firstRow = sourcePoints.rows;
+    int firstCol = sourcePoints.cols;
+    for (const auto& cell : source.cells) {
+        firstRow = std::min(firstRow, cell[0]);
+        firstCol = std::min(firstCol, cell[1]);
+    }
+
+    // The exporter writes fixed six-decimal XYZ and UV coordinates. Check both
+    // the export and where the rasterizer snapped each UV on the output grid.
+    constexpr float objTolerance = 1e-6f;
+    const cv::Vec2f uvStep(1.f / src_scale[0], 1.f / src_scale[1]);
+    const double rx = std::max<double>(uv_max[0] - uv_min[0], 1e-12);
+    const double ry = std::max<double>(uv_max[1] - uv_min[1], 1e-12);
+    for (std::size_t i = 0; i < source.cells.size(); ++i) {
+        const auto& cell = source.cells[i];
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!(std::abs(vertices[i][axis] - source.positions[i][axis]) <= objTolerance)) {
+                return;
+            }
+        }
+        const auto& uv = uvs[i];
+        if (!(std::abs(uv[0] - cell[1] * uvStep[0]) <= objTolerance)
+            || !(std::abs(uv[1] - cell[0] * uvStep[1]) <= objTolerance)) {
+            return;
+        }
+        const double x = (double(uv[0]) - uv_min[0]) / rx * (points.cols - 1);
+        const double y = (double(uv[1]) - uv_min[1]) / ry * (points.rows - 1);
+        const int col = cell[1] - firstCol;
+        const int row = cell[0] - firstRow;
+        if (col >= points.cols || row >= points.rows
+            || std::llround(x * SUBPIXEL) != col * SUBPIXEL
+            || std::llround(y * SUBPIXEL) != row * SUBPIXEL) {
+            return;
+        }
+    }
+
+    // Each restored point belongs to a quad present in the source export.
+    for (std::size_t i = 0; i < source.cells.size(); ++i) {
+        const auto& cell = source.cells[i];
+        auto& point = points(cell[0] - firstRow, cell[1] - firstCol);
+        if (!vc::geometry::validSurfacePoint(point)) {
+            point = vertices[i];
+        }
+    }
+}
+
+QuadSurface* UvGridRasterizer::createQuadSurface(float mesh_units,
+                                                const cv::Mat_<cv::Vec3f>& sourcePoints) {
     // Create points matrix initialized with invalid values
     cv::Mat_<cv::Vec3f>* points = new cv::Mat_<cv::Vec3f>(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
 
     // Rasterize triangles onto the grid
     for (const auto& face : faces) {
-        rasterizeTriangle(*points, face, &boundarySamples);
+        rasterizeTriangle(*points, face);
+    }
+
+    if (at_source_density && !sourcePoints.empty()) {
+        restoreSourceGridSamples(*points, sourcePoints);
     }
 
     // Count valid points
@@ -421,8 +489,7 @@ void UvGridRasterizer::calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points,
     std::cout << "Calculated scale factors from grid: " << scale[0] << ", " << scale[1] << " micrometers" << std::endl;
 }
 
-void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face,
-                                         std::vector<bool>* boundarySamples) {
+void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face) {
     // Validate indices
     for (int k = 0; k < 3; ++k) {
         if (face.v[k] < 0 || face.v[k] >= (int)vertices.size()) {
@@ -489,23 +556,16 @@ void UvGridRasterizer::rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFa
             const long long w0 = edgeFn(X[1], Y[1], X[2], Y[2], Px, Py); // weight of vertex 0
             const long long w1 = edgeFn(X[2], Y[2], X[0], Y[0], Px, Py); // weight of vertex 1
             const long long w2 = edgeFn(X[0], Y[0], X[1], Y[1], Px, Py); // weight of vertex 2
-            const bool excluded = (w0 + bias0) < 0 || (w1 + bias1) < 0 || (w2 + bias2) < 0;
-            if (excluded && (!boundarySamples || w0 < 0 || w1 < 0 || w2 < 0)) {
+            if ((w0 + bias0) < 0 || (w1 + bias1) < 0 || (w2 + bias2) < 0) {
                 continue;
             }
-            auto& point = points(y, x);
-            const auto index = static_cast<std::size_t>(y) * points.cols + x;
-            if (vc::geometry::validSurfacePoint(point)
-                && (!boundarySamples || excluded || !(*boundarySamples)[index])) {
-                continue;
+            if (vc::geometry::validSurfacePoint(points(y, x))) {
+                continue; // first triangle wins
             }
             const float b0 = static_cast<float>(w0 * inv_area);
             const float b1 = static_cast<float>(w1 * inv_area);
             const float b2 = static_cast<float>(w2 * inv_area);
-            point = b0 * pos[0] + b1 * pos[1] + b2 * pos[2];
-            if (boundarySamples) {
-                (*boundarySamples)[index] = excluded;
-            }
+            points(y, x) = b0 * pos[0] + b1 * pos[1] + b2 * pos[2];
         }
     }
 }

@@ -191,7 +191,72 @@ TEST_CASE("vc_tifxyz2obj --keep writes the decimated grid")
           "v 116.000000 128.000000 80.800003\nvt 8.000000 4.000000\nvn 0.099504 0.000000 0.995037");
 }
 
-TEST_CASE("vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize an OBJ")
+TEST_CASE("vc_obj2tifxyz restores an unchanged source export without bridging resampled gaps")
+{
+    Dir dir;
+    const auto source = dir.path / "source";
+    const auto obj = dir.path / "source.obj";
+    cv::Mat_<cv::Vec3f> points(7, 11);
+    for (int r = 0; r < points.rows; ++r)
+        for (int c = 0; c < points.cols; ++c)
+            points(r, c) = c == 5 ? cv::Vec3f(-1, -1, -1)
+                                 : cv::Vec3f(10.f + c, 20.f + r, 30.f);
+    QuadSurface(points, {1.f, 1.f}).save(source, true);
+    run(tool("VC_TIFXYZ2OBJ_BIN") + " " + quoted(source) + " " + quoted(obj),
+        dir.path / "obj.log");
+
+    const auto import = [&](const fs::path& input, const std::string& options) {
+        const auto output = dir.path / "roundtrip";
+        run(tool("VC_OBJ2TIFXYZ_BIN") + " " + quoted(input) + " " + quoted(output)
+                + " --tifxyz-source=" + quoted(source) + options,
+            dir.path / "import.log");
+        const auto surface = load_quad_from_tifxyz(output);
+        const auto result = surface->rawPoints();
+        fs::remove_all(output);
+        return result;
+    };
+
+    const auto restored = import(obj, "");
+    REQUIRE(restored.size() == points.size());
+    CHECK(cv::norm(restored, points, cv::NORM_INF) == 0);
+
+    const auto checkOpenGap = [](const cv::Mat_<cv::Vec3f>& grid, int col) {
+        REQUIRE(grid.cols > col + 1);
+        for (int r = 0; r < grid.rows; ++r) {
+            CHECK_FALSE(validPoint(grid(r, col)));
+        }
+        CHECK(validPoint(grid(1, col - 1)));
+        CHECK(validPoint(grid(1, col + 1)));
+    };
+    const auto decimated = import(obj, " --uv-downsample=2");
+    REQUIRE(decimated.cols == 6);
+    checkOpenGap(decimated, 2);
+    const auto capped = import(obj, " --grid-cap=35");
+    REQUIRE(capped.size() == decimated.size());
+    CHECK(cv::norm(capped, decimated, cv::NORM_INF) == 0);
+
+    // Move the right strip's left edge one UV cell toward the gap. UVs are
+    // still grid-aligned with the same bounds, and XYZ and faces are unchanged.
+    const auto shifted = dir.path / "shifted.obj";
+    {
+        std::ifstream input(obj);
+        std::ofstream output(shifted);
+        for (std::string line; std::getline(input, line);) {
+            if (line.starts_with("vt ")) {
+                float u, v;
+                std::istringstream(line.substr(3)) >> u >> v;
+                output << "vt " << (u == 6.f ? u - 1.f : u) << " " << v << '\n';
+            } else {
+                output << line << '\n';
+            }
+        }
+    }
+    const auto flattened = import(shifted, "");
+    REQUIRE(flattened.size() == points.size());
+    checkOpenGap(flattened, 4);
+}
+
+TEST_CASE("vc_obj2tifxyz rasterizes a metric OBJ")
 {
     Dir dir;
     writeJitteredObj(dir.path / "sheet.obj");
@@ -199,7 +264,12 @@ TEST_CASE("vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize an OBJ")
         dir.path / "modern.log");
     const auto modern = load_quad_from_tifxyz(dir.path / "modern");
     checkStats(stats(*modern->rawPointsPtr(), validPoint), GridStats{99, 126, 11136, {727999.00440979004, 805493.74280548096, 455152.21654510498}, {1124922.4311063644, 1261103.0851978033, 700345.92459452897}}, 3);
+}
 
+TEST_CASE("vc_obj2tifxyz_legacy rasterizes a jittered OBJ")
+{
+    Dir dir;
+    writeJitteredObj(dir.path / "sheet.obj");
     run(tool("VC_OBJ2TIFXYZ_LEGACY_BIN") + " " + quoted(dir.path / "sheet.obj") + " " + quoted(dir.path / "legacy") + " 1.5",
         dir.path / "legacy.log");
     const auto legacy = load_quad_from_tifxyz(dir.path / "legacy");

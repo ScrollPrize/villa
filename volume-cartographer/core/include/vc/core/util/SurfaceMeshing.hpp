@@ -68,8 +68,7 @@ bool readUvObj(const std::string& path, UvMesh& mesh);
 
 // Rasterizes a UV-mapped triangle mesh onto a regular grid spanning its UV
 // bounds; each grid point takes the barycentric mix of its triangle's 3D
-// corners. The fixed-point top-left rule resolves shared samples; otherwise
-// empty samples on mesh edges are also kept.
+// corners (exact fixed-point coverage, top-left fill rule, first triangle wins).
 class UvGridRasterizer {
 public:
     void setUVMetric(bool v) { uv_is_metric = v; }
@@ -83,12 +82,16 @@ public:
     void setMesh(std::vector<cv::Vec3f> vertices, std::vector<cv::Vec2f> uvs, std::vector<UvFace> faces);
 
     void determineGridDimensions(float stretch_factor = 1.0f);
-    QuadSurface* createQuadSurface(float mesh_units = 1.0f);
+    // A matching tifxyz export at source density can recover samples excluded
+    // by the rasterizer's fill rule.
+    QuadSurface* createQuadSurface(float mesh_units = 1.0f,
+                                   const cv::Mat_<cv::Vec3f>& sourcePoints = {});
 
 private:
+    void restoreSourceGridSamples(cv::Mat_<cv::Vec3f>& points,
+                                  const cv::Mat_<cv::Vec3f>& sourcePoints) const;
     void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f);
-    void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face,
-                           std::vector<bool>* boundarySamples = nullptr);
+    void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face);
 
     std::vector<cv::Vec3f> vertices;
     std::vector<cv::Vec2f> uvs;
@@ -103,6 +106,7 @@ private:
     // UV decimation / capping
     float uv_downsample = 1.0f;            // user-specified uniform decimation
     uint64_t grid_cap_pixels = 0;          // cap total pixel count (0=off)
+    bool at_source_density = false;
     cv::Vec2f src_scale = cv::Vec2f(0.f, 0.f);  // <=0 = unset
 };
 
