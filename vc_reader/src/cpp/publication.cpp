@@ -1,5 +1,6 @@
 #include "vc_reader/publication.hpp"
 #include <algorithm>
+#include <cerrno>
 #include <exception>
 #include <fstream>
 #include <set>
@@ -8,6 +9,7 @@
 #include <string>
 #include <system_error>
 #include "platform_io.hpp"
+#include "publication_files.hpp"
 #if defined(__linux__)
 #include <sys/syscall.h>
 #include <linux/fs.h>
@@ -57,6 +59,71 @@ void publishPath(const std::filesystem::path& source,const std::filesystem::path
     else {fs::create_hard_link(source,destination);fs::remove(source);}
 #endif
 }
+
+namespace {
+namespace fs = std::filesystem;
+
+bool inside(const fs::path& outer, const fs::path& inner)
+{
+    const auto a = fs::absolute(outer).lexically_normal(), b = fs::absolute(inner).lexically_normal();
+    auto i = a.begin(), j = b.begin();
+    for (; i != a.end() && j != b.end() && *i == *j; ++i, ++j) {}
+    return i == a.end() || (i->empty() && std::next(i) == a.end());
+}
+
+fs::filesystem_error destinationExists(const fs::path& source, const fs::path& destination)
+{
+    return fs::filesystem_error("publication destination already exists", source, destination,
+                                std::make_error_code(std::errc::file_exists));
+}
+}  // namespace
+
+namespace detail {
+bool renameFlagRefused(const std::error_code& error)
+{
+    if (error.category() != std::generic_category()) return false;
+    const int value = error.value();
+    return value == EINVAL || value == ENOTSUP || value == EOPNOTSUPP || value == ENOSYS;
+}
+
+void renameNewDirectory(const fs::path& source, const fs::path& destination, const Rename& rename)
+{
+    if (!fs::is_directory(fs::symlink_status(source)) || inside(source, destination))
+        throw std::invalid_argument("publication needs a staged directory outside the destination");
+    if (fs::exists(fs::symlink_status(destination))) throw destinationExists(source, destination);
+    try {
+        if (rename) rename(source, destination);
+        else fs::rename(source, destination);
+    } catch (const fs::filesystem_error& error) {
+        // NFS can report a rename that took effect as failed. The staging directory is
+        // gone only if it was renamed, so that counts as published. A failed lookup does not.
+        std::error_code ignored;
+        if (fs::symlink_status(source, ignored).type() == fs::file_type::not_found &&
+            fs::is_directory(fs::symlink_status(destination, ignored)))
+            return;
+        if (error.code() == std::errc::directory_not_empty || error.code() == std::errc::file_exists)
+            throw destinationExists(source, destination);
+        throw;
+    }
+}
+
+void publishNewDirectory(const fs::path& source, const fs::path& destination)
+{
+    std::lock_guard<std::recursive_mutex> lock(directoryMutex(destination));
+    try {
+        publishPath(source, destination, false);
+    } catch (const fs::filesystem_error& error) {
+        if (!renameFlagRefused(error.code())) throw;
+        renameNewDirectory(source, destination);
+    }
+}
+
+void publishStaged(const fs::path& source, const fs::path& destination, bool overwrite, bool existed)
+{
+    if (overwrite && !existed) publishNewDirectory(source, destination);
+    else publishDirectory(source, destination, overwrite);
+}
+}  // namespace detail
 
 constexpr auto kSaveRollbackDir = ".vc-save-rollback";
 constexpr auto kSaveRollbackReady = ".ready";
