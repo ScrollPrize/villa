@@ -939,7 +939,13 @@ def run_block_inference(
     tta_batch_size: int | None,
     roi_bounds: tuple[int, int, int, int] | None = None,
 ) -> None:
-    """Forward nonempty flat patches and feed their weighted probabilities."""
+    """Forward nonempty flat patches and feed their weighted probabilities.
+
+    On CUDA, batch k's probabilities are copied to the host asynchronously and
+    accumulated while the GPU runs batch k+1, so the GPU and the CPU work at the
+    same time. The accumulator still gets the same calls in the same order (skips
+    of batch k, adds of batch k, skips of batch k+1, ...), so the sums are the same.
+    """
 
     mask_f32 = None if mask is None else mask.astype(np.float32, copy=False)
     autocast = (
@@ -947,72 +953,151 @@ def run_block_inference(
         if device.type == "cuda"
         else nullcontext()
     )
+
+    def skip_blocks(skipped_metadata: torch.Tensor) -> None:
+        for values in skipped_metadata.numpy():
+            y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
+            if roi_bounds is not None:
+                clipped = clip_block_to_roi(
+                    Block(y0, x0, valid_h, valid_w), roi_bounds
+                )
+                if clipped is None:
+                    continue
+                y0, x0 = clipped.y0, clipped.x0
+                valid_h, valid_w = clipped.valid_h, clipped.valid_w
+            accumulator.skip_tile(
+                y0=y0, x0=x0, valid_h=valid_h, valid_w=valid_w
+            )
+
+    def add_blocks(probabilities_np: np.ndarray, kept_metadata: torch.Tensor) -> None:
+        for probability, values in zip(probabilities_np, kept_metadata.numpy()):
+            y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
+            tile = probability[:valid_h, :valid_w]
+            weights = weight_map[:valid_h, :valid_w]
+            if mask_f32 is not None:
+                weights = weights * mask_f32[
+                    y0 : y0 + valid_h, x0 : x0 + valid_w
+                ]
+            if roi_bounds is not None:
+                clipped = clip_block_to_roi(Block(y0, x0, valid_h, valid_w), roi_bounds)
+                if clipped is None:
+                    continue
+                source_y0 = clipped.y0 + roi_bounds[0] - y0
+                source_x0 = clipped.x0 + roi_bounds[2] - x0
+                source = (
+                    slice(source_y0, source_y0 + clipped.valid_h),
+                    slice(source_x0, source_x0 + clipped.valid_w),
+                )
+                tile, weights = tile[source], weights[source]
+                y0, x0 = clipped.y0, clipped.x0
+            accumulator.add_tile(
+                y0=y0,
+                x0=x0,
+                tile=tile,
+                tile_weights=weights,
+            )
+
+    # Two host buffers, used in turn: batch k is copied into one while batch k-1 is
+    # read from the other (add_tile adds what it reads into its own arrays and keeps
+    # no reference). Pinned, so the copy is asynchronous; WSL caps pinned host
+    # memory, so fall back to pageable buffers, whose copy blocks, instead of failing.
+    host_buffers: list[torch.Tensor | None] = [None, None]
+    pinned = device.type == "cuda"
+    batch_index = 0
+
+    def start_host_copy(
+        probabilities: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.cuda.Event | None]:
+        nonlocal pinned, batch_index
+        if device.type != "cuda":
+            return probabilities.cpu(), None
+        slot = batch_index % 2
+        batch_index += 1
+        buffer = host_buffers[slot]
+        if (
+            buffer is None
+            or buffer.numel() < probabilities.numel()
+            or buffer.dtype != probabilities.dtype
+        ):
+            buffer = None
+            if pinned:
+                try:
+                    buffer = torch.empty(
+                        probabilities.numel(),
+                        dtype=probabilities.dtype,
+                        pin_memory=True,
+                    )
+                except RuntimeError as exc:
+                    pinned = False
+                    LOGGER.warning(
+                        "Pinned host memory unavailable (%s); device-to-host copies "
+                        "will block",
+                        exc,
+                    )
+            if buffer is None:
+                buffer = torch.empty(probabilities.numel(), dtype=probabilities.dtype)
+            host_buffers[slot] = buffer
+        host = buffer[: probabilities.numel()].view(probabilities.shape)
+        host.copy_(probabilities, non_blocking=host.is_pinned())
+        # The copy runs on the current stream of the probabilities' device, which is
+        # not the current device with --gpus 1: record the event on that stream.
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(probabilities.device))
+        return host, ready
+
+    def finish(
+        batch: tuple[torch.Tensor, torch.cuda.Event | None, torch.Tensor],
+    ) -> None:
+        host, ready, kept_metadata = batch
+        if ready is not None:
+            ready.synchronize()
+        add_blocks(host.numpy()[:, 0], kept_metadata)
+
+    pending = None
     with torch.inference_mode(), autocast:
         for images_BCZYX, metadata in loader:
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
-            for values in metadata[~keep].numpy():
-                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
-                if roi_bounds is not None:
-                    clipped = clip_block_to_roi(
-                        Block(y0, x0, valid_h, valid_w), roi_bounds
+            skipped_metadata = metadata[~keep]
+            launched = None
+            if bool(keep.any()):
+                if not bool(keep.all()):
+                    # Boolean indexing copies the batch into new pageable memory:
+                    # the loader's pinned buffer is lost, so the copy below blocks,
+                    # and the index runs as a parallel CPU op whose threads then spin
+                    # between batches. Block selection already drops empty patches,
+                    # so a whole batch is the usual case and goes to the device as
+                    # it is.
+                    images_BCZYX = images_BCZYX[keep]
+                    metadata = metadata[keep]
+                # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
+                # read its host source after it is freed (pytorch/pytorch#189690).
+                images_BCZYX = images_BCZYX.to(
+                    device, non_blocking=device.type == "cuda"
+                )
+                if tta_axes:
+                    probabilities = predict_with_mirror_tta(
+                        model,
+                        images_BCZYX,
+                        tta_axes=tta_axes,
+                        tta_batch_size=tta_batch_size,
                     )
-                    if clipped is None:
-                        continue
-                    y0, x0 = clipped.y0, clipped.x0
-                    valid_h, valid_w = clipped.valid_h, clipped.valid_w
-                accumulator.skip_tile(
-                    y0=y0, x0=x0, valid_h=valid_h, valid_w=valid_w
-                )
-            if not bool(keep.any()):
-                continue
-            # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
-            # read this boolean-index temporary after it is freed
-            # (pytorch/pytorch#189690).
-            images_BCZYX = images_BCZYX[keep].to(
-                device, non_blocking=device.type == "cuda"
-            )
-            metadata = metadata[keep]
-            if tta_axes:
-                probabilities = predict_with_mirror_tta(
-                    model,
-                    images_BCZYX,
-                    tta_axes=tta_axes,
-                    tta_batch_size=tta_batch_size,
-                )
-            else:
-                probabilities = logits_to_probabilities(
-                    model(images_BCZYX),
-                    image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
-                )
-            probabilities_np = probabilities.cpu().numpy()[:, 0]
-            for probability, values in zip(probabilities_np, metadata.numpy()):
-                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
-                tile = probability[:valid_h, :valid_w]
-                weights = weight_map[:valid_h, :valid_w]
-                if mask_f32 is not None:
-                    weights = weights * mask_f32[
-                        y0 : y0 + valid_h, x0 : x0 + valid_w
-                    ]
-                if roi_bounds is not None:
-                    clipped = clip_block_to_roi(Block(y0, x0, valid_h, valid_w), roi_bounds)
-                    if clipped is None:
-                        continue
-                    source_y0 = clipped.y0 + roi_bounds[0] - y0
-                    source_x0 = clipped.x0 + roi_bounds[2] - x0
-                    source = (
-                        slice(source_y0, source_y0 + clipped.valid_h),
-                        slice(source_x0, source_x0 + clipped.valid_w),
+                else:
+                    probabilities = logits_to_probabilities(
+                        model(images_BCZYX),
+                        image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
                     )
-                    tile, weights = tile[source], weights[source]
-                    y0, x0 = clipped.y0, clipped.x0
-                accumulator.add_tile(
-                    y0=y0,
-                    x0=x0,
-                    tile=tile,
-                    tile_weights=weights,
-                )
+                launched = (*start_host_copy(probabilities), metadata)
+                del images_BCZYX, probabilities
+            # Batch k-1's tiles go in once batch k is queued on the device and
+            # before batch k's skips: the original call order.
+            if pending is not None:
+                finish(pending)
+            skip_blocks(skipped_metadata)
+            pending = launched
+        if pending is not None:
+            finish(pending)
 
 
 def iter_probability_tiles(
