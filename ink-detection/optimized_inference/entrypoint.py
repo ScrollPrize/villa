@@ -57,6 +57,7 @@ class Inputs:
     start_layer: int
     end_layer: int
     force_reverse: bool = False
+    auto_reverse: bool = False  # FORCE_REVERSE=auto: choose the order with orientation.air_end
     wk_inference: bool = False
     wk_dataset_id: str = ""
     step: str = "inference"  # "prepare", "inference", "reduce", or "aggregate-profiling"
@@ -90,7 +91,9 @@ def parse_env() -> Inputs:
         s3_path = os.getenv("S3_PATH", "").strip()
         start_layer = int(os.environ["START_LAYER"].strip())
         end_layer = int(os.environ["END_LAYER"].strip())
-        force_reverse = os.getenv("FORCE_REVERSE", "false").lower() == "true"
+        force_reverse_env = os.getenv("FORCE_REVERSE", "false").strip().lower()
+        force_reverse = force_reverse_env == "true"
+        auto_reverse = force_reverse_env == "auto"
         wk_dataset_id = os.getenv("WK_DATASET_ID", "").strip()
 
         # Map/reduce parameters
@@ -181,6 +184,7 @@ def parse_env() -> Inputs:
             start_layer=start_layer,
             end_layer=end_layer,
             force_reverse=force_reverse,
+            auto_reverse=auto_reverse,
             wk_inference=wk_inference,
             wk_dataset_id=wk_dataset_id,
             step=step,
@@ -795,18 +799,24 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
             except Exception as e:
                 logger.warning(f"Warmup after compile failed (continuing un-warmed): {e}")
 
-    # Determine reverse option similar to local test
-    if inputs.force_reverse:
-        is_reverse_segment = True
-        logger.info("Force reverse enabled via env")
-    else:
-        is_reverse_segment = False
-
     # Run inference from zarr. A zarr written by the prepare step holds only the requested
     # layers and records that window in its attrs, so the window is rebased onto its channels;
     # a predefined full-depth zarr (no attrs) is cropped with the absolute layer indices.
     from processing import resolve_zarr_layer_window
     start_z, end_z = resolve_zarr_layer_window(inputs.surface_volume_zarr, inputs.start_layer, inputs.end_layer)
+
+    # Determine reverse option similar to local test
+    if inputs.force_reverse:
+        is_reverse_segment = True
+        logger.info("Force reverse enabled via env")
+    elif inputs.auto_reverse:
+        from inference import LayersSource
+        from orientation import air_end
+        end = air_end(LayersSource(inputs.surface_volume_zarr, start_z=start_z, end_z=end_z))
+        is_reverse_segment = end == "low"
+        logger.info(f"FORCE_REVERSE=auto: air end {end or 'unclear'}, reverse={is_reverse_segment}")
+    else:
+        is_reverse_segment = False
     logger.info(
         f"Running inference from surface volume zarr with layer range [{inputs.start_layer}, {inputs.end_layer})"
         f" -> zarr channels [{start_z}, {end_z})..."
