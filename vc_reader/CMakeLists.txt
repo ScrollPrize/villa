@@ -84,6 +84,8 @@ if(VC_READER_BUILD_NATIVE_TESTS)
         set_tests_properties(test_native_thinning_cuda PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     add_executable(test_sheet_normal_prepared tests/cpp/test_sheet_normal_prepared.cpp)
+    set_source_files_properties(tests/cpp/test_sheet_normal_prepared.cpp PROPERTIES
+        COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")
     target_compile_features(test_sheet_normal_prepared PRIVATE cxx_std_20)
     add_test(NAME test_sheet_normal_prepared COMMAND test_sheet_normal_prepared)
     add_executable(test_native_catalog tests/cpp/test_native_catalog.cpp)
@@ -334,6 +336,9 @@ target_link_libraries(_transforms PRIVATE vc_reader::transforms)
 install(TARGETS _transforms LIBRARY DESTINATION vc_reader)
 if(VC_READER_BUILD_READER)
     nanobind_add_module(_reader NB_STATIC NOMINSIZE src/cpp/bindings.cpp)
+    # Holds the CPU sheet normals too: unfused, as in cmake/NativeReader.cmake.
+    set_source_files_properties(src/cpp/bindings.cpp PROPERTIES
+        COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-ffp-contract=off>")
     target_link_libraries(_reader PRIVATE vc_reader::reader)
     if(APPLE)
         set_target_properties(_reader PROPERTIES INSTALL_RPATH "@loader_path/../lib")
