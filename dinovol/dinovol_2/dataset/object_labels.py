@@ -10,6 +10,7 @@ merged into one. Pairs of objects are marked as different only when that is prov
 from __future__ import annotations
 
 from dataclasses import dataclass
+import gzip
 import json
 import math
 from pathlib import Path
@@ -623,7 +624,12 @@ def _load_metadata_json(metadata_path: str | Path) -> dict[str, Any]:
             if text is None:
                 raise FileNotFoundError(key)
         else:
-            text = Path(key).read_text(encoding="utf-8")
+            data = Path(key).read_bytes()
+            # The bucket serves metadata.json with Content-Encoding: gzip, so a
+            # plain download (urlretrieve, curl without --compressed) is gzip.
+            if data[:2] == b"\x1f\x8b":
+                data = gzip.decompress(data)
+            text = data.decode("utf-8")
         _METADATA_CACHE[key] = json.loads(text)
     return _METADATA_CACHE[key]
 
