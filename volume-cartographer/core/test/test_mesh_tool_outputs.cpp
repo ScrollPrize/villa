@@ -237,6 +237,8 @@ TEST_CASE("vc_tifxyz2obj writes a multi-megabyte OBJ as a stream formats it")
     std::istringstream lines(obj);
     int normals = 0, badNormals = 0;
     for (std::string line; std::getline(lines, line);) {
+        // A text-mode stream writes CRLF on Windows; the reference uses LF.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.rfind("vn ", 0) == 0) {
             cv::Vec3f n;
             std::istringstream(line.substr(3)) >> n[0] >> n[1] >> n[2];
