@@ -382,6 +382,9 @@ static int run_main(int argc, char *argv[])
     std::string name_prefix = "auto_grown_";
     int tgt_overlap_count = params.value("tgt_overlap_count", 20);
     float min_area_cm = params.value("min_area_cm", 0.3);
+    // A trace stopped by time_limit_s keeps its partial surface under the default
+    // cutoff; only a min_area_cm the params file sets can reject it.
+    const bool min_area_explicit = params.contains("min_area_cm");
     int search_effort = params.value("search_effort", 10);
     int thread_limit = params.value("thread_limit", 0);
 
@@ -1511,9 +1514,35 @@ static int run_main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
+    // Never lose a surface this run did not make. When the output directory already
+    // exists (--segment-name names an existing surface), snapshots go to a staging
+    // directory beside it, and a result the area cutoff rejects leaves it untouched.
+    const bool target_preexisting = !store && !seg_dir.empty() && std::filesystem::exists(seg_dir);
+    std::filesystem::path staging_dir;
+    if (target_preexisting && params.value("snapshot-interval", 0) > 0) {
+        std::filesystem::path base = seg_dir.lexically_normal();
+        if (base.filename().empty()) {
+            base = base.parent_path();
+        }
+        // Claim a new directory so siblings and other runs' snapshots are never overwritten or removed.
+        std::random_device rd;
+        do {
+            staging_dir = base;
+            staging_dir += ".tracing-" + std::to_string(rd());
+        } while (!std::filesystem::create_directory(staging_dir));
+        std::cout << "snapshots go to " << staging_dir << " until the trace is accepted" << std::endl;
+    }
+    auto remove_staging = [&] {
+        if (!staging_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(staging_dir, ec);
+        }
+    };
+
     QuadSurface *surf = nullptr;
     try {
-        surf = tracer(tracing_volume, 1.0, origin, params, voxelsize, resume_surf.get(), seg_dir, meta_params, corrections, nullptr);
+        surf = tracer(tracing_volume, 1.0, origin, params, voxelsize, resume_surf.get(),
+                      staging_dir.empty() ? seg_dir : staging_dir, meta_params, corrections, nullptr);
     } catch (const std::exception& e) {
         // A growth failure (e.g. a remote normal-grid store whose metadata
         // could not be fetched) must exit as a normal tool failure, not crash
@@ -1521,17 +1550,28 @@ static int run_main(int argc, char *argv[])
         // GUI runner report a non-zero exit + this stderr line cleanly.
         std::cerr << "ERROR: vc_grow_seg_from_seed: segment growth failed: "
                   << e.what() << std::endl;
+        if (!staging_dir.empty()) {
+            std::cerr << "snapshots of the failed trace are in " << staging_dir.string() << std::endl;
+        }
         return EXIT_FAILURE;
     }
 
+    const bool timed_stop = surf->meta.value("stop_reason", std::string()) == "time_limit";
     if (min_area_cm > 0.0f) {
         // area_cm2 is guaranteed present here: the startup check rejects an
         // unusable voxel size, and storeAreaMeta() omits the key only then.
         const double area_cm2 = surf->meta["area_cm2"].get<double>();
-        if (area_cm2 < min_area_cm) {
+        if (area_cm2 < min_area_cm && timed_stop && !min_area_explicit) {
+            std::cout << "keeping the surface stopped by time_limit_s although area_cm2 " << area_cm2
+                      << " is below the default min_area_cm " << min_area_cm
+                      << " (set min_area_cm to apply a cutoff to timed stops)" << std::endl;
+        } else if (area_cm2 < min_area_cm) {
             std::cout << "discarding generated surface because area_cm2 " << area_cm2
                       << " is below min_area_cm " << min_area_cm << std::endl;
-            if (!store && std::filesystem::exists(seg_dir)) {
+            remove_staging();
+            if (target_preexisting) {
+                std::cout << "kept the existing surface in " << seg_dir.string() << std::endl;
+            } else if (!store && !seg_dir.empty() && std::filesystem::exists(seg_dir)) {
                 std::filesystem::remove_all(seg_dir);
             }
 #if defined(_WIN32)
@@ -1558,6 +1598,7 @@ static int run_main(int argc, char *argv[])
     std::cout << "saving " << seg_dir.string() << std::endl;
     surf->saveAsNew(seg_dir, true);
     surf->path = seg_dir;
+    remove_staging();
 
     delete surf;
     for (auto sm : surfs_v) {
