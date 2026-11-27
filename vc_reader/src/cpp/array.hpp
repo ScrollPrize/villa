@@ -1606,6 +1606,7 @@ private:
             result.shard_exists = rev->exists;
             result.shard_path = rev->path;
             result.shard_etag = rev->etag;
+            result.shard_modified = rev->modified;
             result.shard_total = rev->total;
             result.shard_index_hash = rev->index_hash;
         }
@@ -1616,7 +1617,8 @@ private:
         if (session && loaded.from_remote_shard)
             session->verify_or_bind_committed(
                 loaded.shard_path, loaded.shard_exists,
-                loaded.shard_etag, loaded.shard_total, loaded.shard_index_hash);
+                loaded.shard_etag, loaded.shard_modified,
+                loaded.shard_total, loaded.shard_index_hash);
     }
 
     std::shared_ptr<const ChunkLoad> chunk_result(bool available, ChunkPtr whole = nullptr,
@@ -2205,7 +2207,7 @@ private:
             std::string key;
             std::optional<Claim> claim;
         };
-        std::vector<Slot> slots(work.size());
+        std::vector<Slot> batch_slots(work.size());
         std::mutex error_mutex;
         std::size_t first_error_slot = work.size();
         std::exception_ptr first_error;
@@ -2219,7 +2221,7 @@ private:
 
         try {
             pool_->parallel_for(work.size(), [&](std::size_t i) {
-                auto& slot = slots[i];
+                auto& slot = batch_slots[i];
                 const auto& item = work[i];
                 try {
                     slot.key = key(item.idx);
@@ -2256,16 +2258,16 @@ private:
 
             std::vector<std::string> keys;
             std::vector<std::size_t> owners;
-            for (std::size_t i = 0; i < slots.size(); ++i) {
-                if (slots[i].claim && slots[i].claim->owner()) {
-                    keys.push_back(slots[i].key);
+            for (std::size_t i = 0; i < batch_slots.size(); ++i) {
+                if (batch_slots[i].claim && batch_slots[i].claim->owner()) {
+                    keys.push_back(batch_slots[i].key);
                     owners.push_back(i);
                 }
             }
             if (!keys.empty()) {
                 source_->read_batch(keys, *pool_, [&](std::size_t owner_idx, ZarrStorage::BatchChunkResult result) {
                     const auto i = owners[owner_idx];
-                    auto& slot = slots[i];
+                    auto& slot = batch_slots[i];
                     if (result.error) {
                         try {
                             slot.claim->resolve([&]() -> std::shared_ptr<const ChunkLoad> {
@@ -2300,7 +2302,7 @@ private:
             }
         } catch (...) {
             auto error = std::current_exception();
-            for (auto& slot : slots) {
+            for (auto& slot : batch_slots) {
                 if (slot.claim && slot.claim->owner()) {
                     try {
                         slot.claim->resolve([&]() -> std::shared_ptr<const ChunkLoad> { std::rethrow_exception(error); });
@@ -2312,11 +2314,11 @@ private:
         }
         if (first_error)
             std::rethrow_exception(first_error);
-        if (std::none_of(slots.begin(), slots.end(), [](const Slot& slot) { return slot.claim.has_value(); }))
+        if (std::none_of(batch_slots.begin(), batch_slots.end(), [](const Slot& slot) { return slot.claim.has_value(); }))
             return;
         pool_->parallel_for(work.size(), [&](std::size_t i) {
-            if (!slots[i].claim) return;
-            const auto loaded = slots[i].claim->resolve([]() -> std::shared_ptr<const ChunkLoad> {
+            if (!batch_slots[i].claim) return;
+            const auto loaded = batch_slots[i].claim->resolve([]() -> std::shared_ptr<const ChunkLoad> {
                 throw std::logic_error("shard batch producer did not complete");
             });
             apply(full_span(work[i].idx, false, loaded, session).second, work[i], out_strides, op, output);

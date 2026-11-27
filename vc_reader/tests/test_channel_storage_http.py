@@ -1,7 +1,9 @@
 """Selective channel transport uses the existing range/ETag fixtures."""
+import hashlib
 import numpy as np
 import pickle
 import multiprocessing
+import threading
 import unittest
 
 from test_source_storage import RemoteFixtureCase
@@ -110,3 +112,63 @@ class ChannelStorageHttpTests(RemoteFixtureCase):
                         process.terminate()
                         process.join()
                 self.assertEqual(process.exitcode, 0)
+
+    def test_sharded_concurrent_channel_refresh_on_pre_read_replacement(self):
+        # Sharded 4D Blosc array with 2 shards along axis 1 (each shard holds 3 chunks along axis 3).
+        # Prime shard 0 (v1), visit shard 1 so shard 0 is retained, replace shard 0 v1 -> v2,
+        # then read channel 4 from two chunks of shard 0 concurrently (threads=2) -> must share
+        # the single pre-commit refresh and both return v2 without spurious HTTP 412.
+        shape = (7, 16, 16, 48)
+        chunks = (7, 8, 16, 16)
+        shards = (7, 8, 16, 48)
+        v1 = np.full(shape, 17, dtype=np.uint8)
+        v2 = np.full(shape, 73, dtype=np.uint8)
+        for name, arr in (('chan-shared-refresh', v1), ('chan-shared-refresh-v2', v2)):
+            w = ZarrWriter.create(
+                self.root / name, shape=shape, chunks=chunks, dtype='u1',
+                compressor='blosc', cname='zstd', level=1, version=3, separator='/', shards=shards,
+            )
+            w[:] = arr
+        shard0 = self.root / 'chan-shared-refresh' / 'c/0/0/0/0'
+        v1_etag = '"' + hashlib.sha256(shard0.read_bytes()).hexdigest() + '"'
+        v2_bytes = (self.root / 'chan-shared-refresh-v2' / 'c/0/0/0/0').read_bytes()
+
+        barrier = threading.Barrier(2, timeout=5)
+        v1_hits = 0
+        v2_suffix_gets = 0
+        lock = threading.Lock()
+
+        def hook(handler):
+            nonlocal v1_hits, v2_suffix_gets
+            if handler.path == '/chan-shared-refresh/c/0/0/0/0':
+                rng = handler.headers.get('Range') or ''
+                if rng.startswith('bytes=-'):
+                    with lock:
+                        v2_suffix_gets += 1
+                elif handler.headers.get('If-Match') == v1_etag:
+                    with lock:
+                        v1_hits += 1
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        pass
+            return False
+
+        with ZarrReader.open(self.url + '/chan-shared-refresh', memory_cache=None, threads=2) as reader:
+            reader.request_channel_cache([4])
+            # Prime shard 0 (chunk 0) then visit shard 1 so shard 0 is retained in indexes_.
+            self.assertEqual(int(reader[4, 0, 0, 0]), 17)
+            self.assertEqual(int(reader[4, 8, 0, 0]), 17)
+            # Replace shard 0 v1 -> v2 before concurrent read_many on chunks 1 & 2 of shard 0.
+            shard0.write_bytes(v2_bytes)
+            self.server.request_hook = hook
+            try:
+                out = reader.read_many([
+                    (4, slice(0, 1), slice(0, 1), slice(16, 17)),
+                    (4, slice(0, 1), slice(0, 1), slice(32, 33)),
+                ])
+            finally:
+                self.server.request_hook = None
+            self.assertEqual(v1_hits, 2)
+            self.assertEqual(v2_suffix_gets, 1)
+            self.assertEqual([int(x[0, 0, 0]) for x in out], [73, 73])

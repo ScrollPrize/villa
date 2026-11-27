@@ -54,10 +54,19 @@ plan admits at most 16 chunks at a time and a merged request never exceeds
 per-read session pins each touched remote shard's revision across all ranges,
 16-chunk windows, and joined in-flight claims: a stale retained index may
 refresh at most once before any chunk or missing marker of that shard is
-committed, and any incompatible shard replacement after commitment raises
-rather than returning mixed-revision chunks or persisting contradictory offline
-cache entries. (Pre-existing entries already present in memory or disk caches
-from earlier reads remain trusted without remote revalidation.) An HTTP 416 on
+committed (sibling workers observing `HTTP 412` on that same superseded index
+share the completed refresh), and any incompatible shard replacement after
+commitment raises rather than returning mixed-revision chunks or persisting
+contradictory offline cache entries. Full byte-level revision consistency across
+ranges and windows requires strong ETags (enforced via `If-Match`); when a
+server provides only a weak ETag or omits `ETag`, the reader disables range
+merging and cross-visit index retention, revalidates the shard index across
+windows, and checks `ETag`, `Last-Modified`, object length, and shard index
+bytes, but weaker validators, lengths, and index hashes cannot conclusively
+prove byte identity against same-size in-place payload overwrites whose
+validator and index remain unchanged. (Pre-existing entries already present in
+memory or disk caches from earlier reads remain trusted without remote
+revalidation.) An HTTP 416 on
 a merged range falls back to individual ranges for the same shard version.
 Cancelable, cache-only, streaming and selective-channel reads keep their
 regular chunk path. A reused index from another shard visit requires a strong

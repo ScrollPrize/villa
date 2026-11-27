@@ -24,6 +24,7 @@ struct ChunkLoad {
     bool shard_exists=true;
     std::string shard_path;
     std::string shard_etag;
+    std::string shard_modified;
     std::uint64_t shard_total=0;
     std::uint64_t shard_index_hash=0;
 };
