@@ -107,16 +107,11 @@ public:
     {
         if (position >= indexBytes / 16 || index.size() != indexBytes)
             throw std::out_of_range("shard index position outside grid");
-        const auto offset = little_uint(index.data() + 16 * position, 8);
-        const auto length = little_uint(index.data() + 16 * position + 8, 8);
-        constexpr auto missing = std::numeric_limits<std::uint64_t>::max();
-        if (offset == missing && length == missing) return std::nullopt;
+        const auto probed = probe_entry(index, position, total);
+        if (probed.state == EntryState::Present) return probed.entry;
+        if (probed.state == EntryState::Missing) return std::nullopt;
         if (total < indexBytes) throw std::runtime_error("truncated shard index");
-        const auto end = indexEnd ? total - indexBytes : total;
-        if (offset > end || length > end - offset || (!indexEnd && offset < indexBytes) ||
-            !length || length > maxPayload)
-            throw std::runtime_error("invalid or oversized shard chunk offset/length");
-        return Entry{offset, length};
+        throw std::runtime_error("invalid or oversized shard chunk offset/length");
     }
 };
 

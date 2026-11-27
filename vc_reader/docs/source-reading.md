@@ -50,15 +50,20 @@ batching remote misses. The reader checks the response range, keeps per-chunk
 decoding and disk cache entries, and isolates per-chunk failures so healthy
 chunks remain available to concurrent callers and subsequent cached reads. A
 plan admits at most 16 chunks at a time and a merged request never exceeds
-512 KiB or crosses an unrequested gap. An HTTP 416 on a merged range falls
-back to individual ranges for the same shard version. Cancelable, cache-only,
-streaming and selective-channel reads keep their regular chunk path. A reused
-index from another shard visit requires a strong ETag and valid present entries
-for the requested chunks, revokes trust in any previously active shard
-immediately, and never trusts missing entries without a fresh index fetch. If
-the server reports that a shard changed, the reader evicts that shard's stale
-index and refreshes each affected shard at most once while preserving
-unaffected shards.
+512 KiB or crosses an unrequested gap. Within one read or `read_many` call, a
+per-read session pins each touched remote shard's revision across all ranges,
+16-chunk windows, and joined in-flight claims: a stale retained index may
+refresh at most once before any chunk or missing marker of that shard is
+committed, and any incompatible shard replacement after commitment raises
+rather than returning mixed-revision chunks or persisting contradictory offline
+cache entries. (Pre-existing entries already present in memory or disk caches
+from earlier reads remain trusted without remote revalidation.) An HTTP 416 on
+a merged range falls back to individual ranges for the same shard version.
+Cancelable, cache-only, streaming and selective-channel reads keep their
+regular chunk path. A reused index from another shard visit requires a strong
+ETag and valid present entries for the requested chunks, revokes trust in any
+previously active shard immediately, and never trusts missing entries without a
+fresh index fetch.
 
 ## Plain image files
 

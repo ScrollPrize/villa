@@ -19,6 +19,13 @@ struct ChunkLoad {
     ChunkPtr whole;
     std::vector<DecodedChannel> channels;
     std::shared_ptr<MemoryCache> cache;
+    // Remote sharded revision provenance for full-read consistency across SingleFlight joins.
+    bool from_remote_shard=false;
+    bool shard_exists=true;
+    std::string shard_path;
+    std::string shard_etag;
+    std::uint64_t shard_total=0;
+    std::uint64_t shard_index_hash=0;
 };
 struct ChannelPolicy {
     std::atomic<bool> enabled{false};

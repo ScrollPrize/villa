@@ -892,18 +892,32 @@ private:
                 if (!cancelled())
                     hint(work[i]);
             });
+        std::optional<ZarrStorage::ReadSession> session_storage;
+        ZarrStorage::ReadSession* session = nullptr;
+        if (work.size() > 1 && source_ && source_->is_remote_sharded()) {
+            session_storage.emplace();
+            session = &*session_storage;
+        }
         if (!cancel && !stream && (!op || !op->miss) && work.size() > 1 &&
             source_ && source_->can_batch() && chunk_bytes_ <= ZarrStorage::max_merged_bytes &&
             !spec_.caller_thread_only && !channel_policy_->enabled.load(std::memory_order_acquire)) {
+            if (session && work.size() > ZarrStorage::max_batch_chunks) {
+                for (const auto& item : work) {
+                    auto [path, inner] = source_->locate_chunk(item.idx);
+                    session->plan_position(std::move(path), inner);
+                }
+            }
             for (std::span<const Work> todo(work); !todo.empty();) {
                 const auto n = std::min(todo.size(), ZarrStorage::max_batch_chunks);
-                run_sharded(todo.first(n), out_strides, op, output);
+                run_sharded(todo.first(n), out_strides, op, output, session);
                 todo = todo.subspan(n);
             }
             return;
         }
         if (!cancel) {
-            pool_->parallel_for(work.size(), [&](std::size_t i) { resolve(work[i], out_strides, op, output, stream); });
+            pool_->parallel_for(work.size(), [&](std::size_t i) {
+                resolve(work[i], out_strides, op, output, stream, session);
+            });
             return;
         }
         std::vector<std::uint8_t> local;
@@ -912,7 +926,7 @@ private:
         pool_->parallel_for(work.size(), [&](std::size_t i) {
             if (cancelled())
                 return;
-            resolve(work[i], out_strides, op, output, stream);
+            resolve(work[i], out_strides, op, output, stream, session);
             done[i] = 1;
         });
         if (std::find(done.begin(), done.end(), 0) != done.end())
@@ -1585,14 +1599,38 @@ private:
         return out;
     }
 
-    std::shared_ptr<const ChunkLoad> chunk_result(bool available,ChunkPtr whole=nullptr) {
+    static void stamp_revision(ChunkLoad& result, const ZarrStorage::ShardRevision* rev)
+    {
+        if (rev && rev->valid) {
+            result.from_remote_shard = true;
+            result.shard_exists = rev->exists;
+            result.shard_path = rev->path;
+            result.shard_etag = rev->etag;
+            result.shard_total = rev->total;
+            result.shard_index_hash = rev->index_hash;
+        }
+    }
+
+    static void verify_session_load(const ChunkLoad& loaded, ZarrStorage::ReadSession* session)
+    {
+        if (session && loaded.from_remote_shard)
+            session->verify_or_bind_committed(
+                loaded.shard_path, loaded.shard_exists,
+                loaded.shard_etag, loaded.shard_total, loaded.shard_index_hash);
+    }
+
+    std::shared_ptr<const ChunkLoad> chunk_result(bool available, ChunkPtr whole = nullptr,
+                                                  const ZarrStorage::ShardRevision* rev = nullptr) {
         auto result=std::make_shared<ChunkLoad>();result->available=available;
-        result->complete=true;result->whole=std::move(whole);result->cache=cache_;return result;
+        result->complete=true;result->whole=std::move(whole);result->cache=cache_;
+        stamp_revision(*result, rev);
+        return result;
     }
 
     // Called only by the producer for this exact physical/cache-quality key.
     std::shared_ptr<const ChunkLoad> selected_now(const Index& idx,const std::string& k,
-        const std::string& ck,std::size_t plane,const std::vector<std::size_t>& missing,bool cached_only)
+        const std::string& ck,std::size_t plane,const std::vector<std::size_t>& missing,bool cached_only,
+        ZarrStorage::ReadSession* session = nullptr)
     {
         std::vector<std::size_t> relevant;
         {
@@ -1660,6 +1698,7 @@ private:
             offline_miss(idx);
             decoded = split(nullptr);
         }
+        ZarrStorage::ShardRevision rev;
         if (!decoded) {
             if (spec_.compute) decoded = split(compute_now(idx,k));
             else if (source_ || http_) {
@@ -1668,13 +1707,13 @@ private:
                 // compressed chunk under a full-chunk disk-cache key.
                 const bool random_access = remote_codec_ == Codec::Raw || remote_codec_ == Codec::Blosc;
                 if (!random_access || missing.size() == std::size_t(spec_.chunks[0]))
-                    decoded = split(fetch_now(k));
+                    decoded = split(fetch_now(k, &rev, session));
                 else try {
-                    if (source_) decoded = source_->read_channels(k,remote_codec_,chunk_bytes_,plane,missing,relevant);
+                    if (source_) decoded = source_->read_channels(k,remote_codec_,chunk_bytes_,plane,missing,relevant,session,&rev);
                     else {
                         ZarrStorage remote(spec_.remote_url,"",spec_.separator,{},true,false,chunk_bytes_,
                                            http_.get(),stats_.remote_fetches,stats_.remote_bytes);
-                        decoded = remote.read_channels(k,remote_codec_,chunk_bytes_,plane,missing,relevant);
+                        decoded = remote.read_channels(k,remote_codec_,chunk_bytes_,plane,missing,relevant,session,&rev);
                     }
                     if (!decoded) {
                         ++stats_.remote_missing;
@@ -1695,14 +1734,17 @@ private:
         stats_.channel_decoded_bytes += decoded->bytesDecoded;
 
         auto result=std::make_shared<ChunkLoad>();result->cache=cache_;
-        result->channels=std::move(decoded->channels);return result;
+        result->channels=std::move(decoded->channels);
+        stamp_revision(*result, &rev);
+        return result;
     }
     // The result spans first..last requested channel. Gaps are not read/decoded
     // and are never addressed by the work that requested this span. A single
     // channel returns its cache buffer directly, with no assembly/copy.
     std::pair<bool, ChunkPtr> selected_span(const Index& idx,
         const std::vector<std::size_t>& requested, bool cached_only,
-        std::vector<ChunkPtr>* planes = nullptr,const std::shared_ptr<const ChunkLoad>& seed = {})
+        std::vector<ChunkPtr>* planes = nullptr,const std::shared_ptr<const ChunkLoad>& seed = {},
+        ZarrStorage::ReadSession* session = nullptr)
     {
         const auto plane=std::size_t(chunk_strides_[0]);
         const auto k=key(idx),ck=spec_.identity+"|"+k;
@@ -1733,7 +1775,7 @@ private:
                     for(auto c:requested)result->channels.push_back({c,channels[c]});
                     return result;
                 }
-                return selected_now(idx,k,ck,plane,missing,cached_only);
+                return selected_now(idx,k,ck,plane,missing,cached_only,session);
             };
             std::shared_ptr<const ChunkLoad> loaded;
             if(spec_.caller_thread_only)loaded=produce();
@@ -1746,6 +1788,7 @@ private:
                 if(cached_only)return {false,nullptr};
                 continue; // A cache-only producer could not consult the source.
             }
+            verify_session_load(*loaded, session);
             if(loaded->complete) {
                 for(auto c:missing) {
                     channels[c]=loaded->whole?std::make_shared<const Chunk>(
@@ -1988,7 +2031,7 @@ private:
     }
 
     void resolve(const Work& w, const std::vector<Index>& out_strides, const PointOp* op, const BoxOutput* output,
-                 bool stream = false)
+                 bool stream = false, ZarrStorage::ReadSession* session = nullptr)
     {
         if (channel_policy_->enabled.load(std::memory_order_acquire)) {
             std::set<std::size_t> needed;
@@ -2007,14 +2050,14 @@ private:
             }
             if (needed.empty()) {
                 // A null-output region is an explicit full-chunk prefill.
-                selected_span(w.idx,all_channels(),false);
+                selected_span(w.idx,all_channels(),false,nullptr,{},session);
                 return;
             }
             const std::vector<std::size_t> channels(needed.begin(), needed.end());
             const bool sparse=op && op->read_channels && w.pieces.empty();
             const bool direct = sparse || !w.has_points() || (op && op->reach == std::int64_t(spec_.itemsize) && w.runs.empty());
             std::vector<ChunkPtr> planes;
-            auto [found, data] = selected_span(w.idx, channels, op && bool(op->miss), direct ? &planes : nullptr);
+            auto [found, data] = selected_span(w.idx, channels, op && bool(op->miss), direct ? &planes : nullptr, {}, session);
             if (!found) { op->miss(w); return; }
             if (!data) { fill_pieces(w, out_strides, op, output); return; }
             if(sparse){op->read_channels(planes,w);return;}
@@ -2073,7 +2116,7 @@ private:
         // decoder or whole chunk to coalesce, and no full allocation is needed.
         if ((!cache_ || stream) && try_raw_disk(k, w, out_strides, op, output, cached_only))
             return;
-        const auto [found,chunk]=full_span(w.idx,cached_only);
+        const auto [found,chunk]=full_span(w.idx,cached_only,{},session);
         if(!found){op->miss(w);return;}
         apply(chunk,w,out_strides,op,output);
     }
@@ -2154,7 +2197,8 @@ private:
     // independently as its chunk settles, and wait on foreign claims only after
     // our own producers complete.
     void run_sharded(std::span<const Work> work, const std::vector<Index>& out_strides,
-                     const PointOp* op, const BoxOutput* output)
+                     const PointOp* op, const BoxOutput* output,
+                     ZarrStorage::ReadSession* session = nullptr)
     {
         using Claim = SingleFlight<std::shared_ptr<const ChunkLoad>>::Claim;
         struct Slot {
@@ -2236,7 +2280,7 @@ private:
                         const auto loaded = slot.claim->resolve([&] {
                             auto value = finish_fetch(slot.key, std::move(result.body), result.found);
                             if (cache_) cache_->put(spec_.identity + "|" + slot.key, value);
-                            return chunk_result(true, std::move(value));
+                            return chunk_result(true, std::move(value), &result.revision);
                         });
                         slot.claim.reset();
                         apply(loaded->whole, work[i], out_strides, op, output);
@@ -2252,7 +2296,7 @@ private:
                         slot.claim.reset();
                         record_error(i, std::move(err));
                     }
-                });
+                }, session);
             }
         } catch (...) {
             auto error = std::current_exception();
@@ -2275,14 +2319,15 @@ private:
             const auto loaded = slots[i].claim->resolve([]() -> std::shared_ptr<const ChunkLoad> {
                 throw std::logic_error("shard batch producer did not complete");
             });
-            apply(full_span(work[i].idx, false, loaded).second, work[i], out_strides, op, output);
+            apply(full_span(work[i].idx, false, loaded, session).second, work[i], out_strides, op, output);
         });
     }
 
     // All whole-chunk loads, including local decoded layers, share the same
     // per-key producer as selected-plane loads. Hot hits bypass coordination.
     std::pair<bool,ChunkPtr> full_span(const Index& idx, bool cached_only,
-                                      std::shared_ptr<const ChunkLoad> loaded = {})
+                                      std::shared_ptr<const ChunkLoad> loaded = {},
+                                      ZarrStorage::ReadSession* session = nullptr)
     {
         const auto k=key(idx),ck=spec_.identity+"|"+k;
         if (!loaded)
@@ -2301,9 +2346,10 @@ private:
                         throw CacheMiss("chunk "+k+" of "+spec_.identity+" is not in the disk cache (offline)");
                     }
                     if(!http_&&!source_&&!spec_.compute)return chunk_result(true);
-                    auto value=spec_.compute?compute_now(idx,k):fetch_now(k);
+                    ZarrStorage::ShardRevision rev;
+                    auto value=spec_.compute?compute_now(idx,k):fetch_now(k, &rev, session);
                     if(cache_)cache_->put(ck,value);
-                    return chunk_result(true,std::move(value));
+                    return chunk_result(true,std::move(value),&rev);
                 };
                 if(spec_.caller_thread_only)loaded=produce();
                 else {
@@ -2317,24 +2363,27 @@ private:
                 loaded.reset();
                 continue;
             }
+            verify_session_load(*loaded, session);
             if(!loaded->complete) {
                 // Channel selection was enabled during an earlier whole read.
                 // Reuse the selected result and request only the missing planes.
                 if(cache_&&cache_.get()!=loaded->cache.get())
                     for(const auto& c:loaded->channels)if(c.bytes||!spec_.offline)cache_->put(ck+"|channel="+std::to_string(c.index),c.bytes);
-                return selected_span(idx,all_channels(),cached_only,nullptr,loaded);
+                return selected_span(idx,all_channels(),cached_only,nullptr,loaded,session);
             }
             if(cache_&&cache_.get()!=loaded->cache.get()&&(loaded->whole||!spec_.offline))cache_->put(ck,loaded->whole);
             return {true,loaded->whole};
         }
     }
 
-    ChunkPtr fetch_now(const std::string& k)
+    ChunkPtr fetch_now(const std::string& k,
+                       ZarrStorage::ShardRevision* out_revision = nullptr,
+                       ZarrStorage::ReadSession* session = nullptr)
     {
         std::vector<std::uint8_t> body;
         bool found;
         if (source_) {
-            found = source_->read(k, body);
+            found = source_->read(k, body, out_revision, session);
             if (!http_ && found) ++stats_.disk_hits;
         } else {
             ++stats_.remote_fetches;

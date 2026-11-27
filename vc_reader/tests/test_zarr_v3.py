@@ -984,6 +984,452 @@ class V3RemoteTests(RemoteFixtureCase):
         self.assertEqual(len(ranges), 2)
         self.assertIn('bytes=262144-786431', ranges)
 
+    def test_full_read_revision_consistency_across_windows_and_ranges(self):
+        def write_custom_shard_array(path, data, chunk_shape, shard_shape, missing_chunks=()):
+            path.mkdir(parents=True, exist_ok=True)
+            missing_set = set(missing_chunks)
+            dtype = np.dtype(data.dtype)
+            endian = 'big' if dtype.byteorder == '>' else 'little'
+            if dtype.itemsize == 1:
+                inner_codecs = [dict(name='bytes')]
+            else:
+                inner_codecs = [dict(name='bytes', configuration=dict(endian=endian))]
+            codecs = [dict(name='sharding_indexed', configuration=dict(
+                chunk_shape=list(chunk_shape),
+                codecs=inner_codecs,
+                index_codecs=[dict(name='bytes', configuration=dict(endian='little')), dict(name='crc32c')],
+                index_location='end',
+            ))]
+            dtype_name = {
+                np.dtype('u1'): 'uint8',
+                np.dtype('<u8'): 'uint64',
+            }[dtype]
+            metadata = dict(
+                zarr_format=3,
+                node_type='array',
+                shape=list(data.shape),
+                data_type=dtype_name,
+                chunk_grid=dict(name='regular', configuration=dict(chunk_shape=list(shard_shape))),
+                chunk_key_encoding=dict(name='default', configuration=dict(separator='/')),
+                fill_value=7,
+                codecs=codecs,
+                attributes={},
+                dimension_names=[f'd{i}' for i in range(data.ndim)],
+            )
+            (path / 'zarr.json').write_text(json.dumps(metadata))
+            shard_grid = tuple(s // sh for s, sh in zip(data.shape, shard_shape))
+            inner_grid = tuple(sh // ch for sh, ch in zip(shard_shape, chunk_shape))
+            expected = data.copy()
+            for s_idx in np.ndindex(shard_grid):
+                body = bytearray()
+                index = []
+                for i_idx in np.ndindex(inner_grid):
+                    c_idx = tuple(si * ig + ii for si, ig, ii in zip(s_idx, inner_grid, i_idx))
+                    slices = tuple(slice(ci * ch, (ci + 1) * ch) for ci, ch in zip(c_idx, chunk_shape))
+                    if c_idx in missing_set:
+                        index.extend([2**64 - 1, 2**64 - 1])
+                        expected[slices] = 7
+                        continue
+                    payload = data[slices].tobytes()
+                    index.extend([len(body), len(payload)])
+                    body.extend(payload)
+                encoded = np.array(index, dtype='<u8').tobytes()
+                encoded += crc32c(encoded).to_bytes(4, 'little')
+                body.extend(encoded)
+                target = path / 'c' / '/'.join(str(x) for x in s_idx)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(bytes(body))
+            return expected
+
+        # 1. Cross-plan (2 windows) two-shard interleaved replacement fails fast instead of mixing revisions.
+        with self.subTest(case='cross_plan_two_shard_interleaved'):
+            name = 'rev-cross-plan-interleaved'
+            v1_data = np.arange(20 * 2 * 4, dtype=np.uint8).reshape(20, 2, 4)
+            v2_data = (v1_data.astype(np.uint16) + 100).astype(np.uint8)
+            write_custom_shard_array(self.root / name, v1_data, (1, 1, 4), (20, 1, 4))
+            write_custom_shard_array(self.root / (name + '-v2'), v2_data, (1, 1, 4), (20, 1, 4))
+            v1_s0 = (self.root / name / 'c/0/0/0').read_bytes()
+            v1_s0_etag = '"' + hashlib.sha256(v1_s0).hexdigest() + '"'
+            replaced = False
+            c0_done = threading.Event()
+
+            def hook(handler):
+                nonlocal replaced
+                if handler.path == f'/{name}/c/0/0/0' and handler.headers.get('Range') == 'bytes=0-3':
+                    handler.send_response(206)
+                    handler.send_header('Content-Range', f'bytes 0-3/{len(v1_s0)}')
+                    handler.send_header('Content-Length', '4')
+                    handler.send_header('ETag', v1_s0_etag)
+                    handler.end_headers()
+                    handler.wfile.write(v1_s0[:4])
+                    c0_done.set()
+                    return True
+                if not replaced and handler.path == f'/{name}/c/0/1/0' and handler.headers.get('Range') == 'bytes=0-59':
+                    c0_done.wait(5)
+                    replaced = True
+                    (self.root / name / 'c/0/0/0').write_bytes((self.root / (name + '-v2') / 'c/0/0/0').read_bytes())
+                return False
+
+            self.server.request_hook = hook
+            sels = [np.s_[0:1, 0:1, 0:4]] + [np.s_[y:y + 1, 1:2, 0:4] for y in range(15)] + [np.s_[16:17, 0:1, 0:4]]
+            with ZarrReader.open(self.url + '/' + name, threads=1, memory_cache=None) as reader:
+                with self.assertRaisesRegex(RuntimeError, '412|changed'):
+                    reader.read_many(sels)
+            self.assertTrue(replaced)
+
+        # 2. Cross-plan single-shard retained replacement must fail Window 2 after Window 1 commits.
+        with self.subTest(case='cross_plan_single_shard_retained'):
+            name = 'rev-cross-plan-retained'
+            v1_data = np.arange(20 * 4, dtype=np.uint8).reshape(20, 4)
+            v2_data = (v1_data.astype(np.uint16) + 77).astype(np.uint8)
+            write_custom_shard_array(self.root / name, v1_data, (1, 4), (20, 4))
+            write_custom_shard_array(self.root / (name + '-v2'), v2_data, (1, 4), (20, 4))
+            replaced = False
+            suffix_gets = 0
+
+            def hook(handler):
+                nonlocal replaced, suffix_gets
+                if handler.path == f'/{name}/c/0/0':
+                    rng = handler.headers.get('Range')
+                    if rng == 'bytes=-324':
+                        suffix_gets += 1
+                    elif not replaced and rng == 'bytes=4-67':
+                        replaced = True
+                        # Replace on disk right after Window 1's merged range starts; serve v1 for Window 1.
+                        v1_bytes = (self.root / name / 'c/0/0').read_bytes()
+                        (self.root / name / 'c/0/0').write_bytes((self.root / (name + '-v2') / 'c/0/0').read_bytes())
+                        etag = '"' + hashlib.sha256(v1_bytes).hexdigest() + '"'
+                        handler.send_response(206)
+                        handler.send_header('Content-Range', f'bytes 4-67/{len(v1_bytes)}')
+                        handler.send_header('Content-Length', '64')
+                        handler.send_header('ETag', etag)
+                        handler.end_headers()
+                        handler.wfile.write(v1_bytes[4:68])
+                        return True
+                return False
+
+            self.server.request_hook = hook
+            with ZarrReader.open(self.url + '/' + name, threads=1, memory_cache=None) as reader:
+                np.testing.assert_array_equal(reader[0:1, 0:4], v1_data[0:1, 0:4])
+                sels = [np.s_[y:y + 1, 0:4] for y in range(1, 18)]
+                with self.assertRaisesRegex(RuntimeError, '412|changed'):
+                    reader.read_many(sels)
+            self.assertTrue(replaced)
+            self.assertEqual(suffix_gets, 1)
+
+        # 3. Intra-plan commit-once two-range split prevents mixed (v1, v2) and contradictory offline .missing.
+        with self.subTest(case='intra_plan_commit_once_two_ranges'):
+            # Build 3-chunk shard (chunk 2 primes retained index, chunks 0 & 1 are uncached and >512 KiB combined).
+            name = 'rev-intra-plan-3chunk'
+            v1_data = np.full((64, 64, 240), 11, dtype=np.uint8)
+            v2_data = np.full((64, 64, 240), 22, dtype=np.uint8)
+            write_custom_shard_array(self.root / name, v1_data, (64, 64, 80), (64, 64, 240))
+            write_custom_shard_array(self.root / (name + '-v2'), v2_data, (64, 64, 80), (64, 64, 240),
+                                     missing_chunks=[(0, 0, 1)])
+            v1_bytes = (self.root / name / 'c/0/0/0').read_bytes()
+            v1_etag = '"' + hashlib.sha256(v1_bytes).hexdigest() + '"'
+            v2_bytes = (self.root / (name + '-v2') / 'c/0/0/0').read_bytes()
+            cache_dir = self.cache / 'rev-intra-plan-3chunk-cache'
+            suffix_gets = 0
+            replaced = False
+            r0_swapped = threading.Event()
+
+            def hook3(handler):
+                nonlocal suffix_gets, replaced
+                if handler.path == f'/{name}/c/0/0/0':
+                    rng = handler.headers.get('Range')
+                    if rng == 'bytes=-52':
+                        suffix_gets += 1
+                    elif rng == 'bytes=0-327679' and not replaced:
+                        replaced = True
+                        (self.root / name / 'c/0/0/0').write_bytes(v2_bytes)
+                        r0_swapped.set()
+                        handler.send_response(206)
+                        handler.send_header('Content-Range', f'bytes 0-327679/{len(v1_bytes)}')
+                        handler.send_header('Content-Length', '327680')
+                        handler.send_header('ETag', v1_etag)
+                        handler.end_headers()
+                        handler.wfile.write(v1_bytes[:327680])
+                        return True
+                    elif rng == 'bytes=327680-655359':
+                        r0_swapped.wait(5)
+                return False
+
+            self.server.request_hook = hook3
+            uri = self.url + '/' + name
+            with ZarrReader.open(uri, cache_dir=cache_dir, threads=1, memory_cache=None) as reader:
+                self.assertEqual(reader[0, 0, 160], 11)
+                with self.assertRaisesRegex(RuntimeError, '412|changed'):
+                    reader.read_many([np.s_[0:1, 0:1, 0:1], np.s_[0:1, 0:1, 80:81]])
+            self.assertTrue(replaced)
+            self.assertEqual(suffix_gets, 1)
+            # Offline reopen: chunk 0 is v1, chunk 1 has NO contradictory .missing marker!
+            self.server.request_hook = None
+            with ZarrReader.open(uri, cache_dir=cache_dir, threads=1, memory_cache=None,
+                                 offline=True) as offline_reader:
+                self.assertEqual(offline_reader[0, 0, 0], 11)
+                with self.assertRaises(CacheMissError):
+                    _ = offline_reader[0, 0, 80]
+
+        # 3b. HTTP 416 fallback: once member 0 commits on v1, member 1 receiving 412 MUST fail fast (no mixed v1/v2).
+        with self.subTest(case='http_416_fallback_commit_once_no_mixed_revisions'):
+            name = 'rev-416-commit-once'
+            v1_data = np.full((64, 64, 128), 41, dtype=np.uint8)
+            v2_data = np.full((64, 64, 128), 82, dtype=np.uint8)
+            write_custom_shard_array(self.root / name, v1_data, (64, 64, 64), (64, 64, 128))
+            write_custom_shard_array(self.root / (name + '-v2'), v2_data, (64, 64, 64), (64, 64, 128))
+            v1_bytes = (self.root / name / 'c/0/0/0').read_bytes()
+            v1_etag = '"' + hashlib.sha256(v1_bytes).hexdigest() + '"'
+            v2_bytes = (self.root / (name + '-v2') / 'c/0/0/0').read_bytes()
+            replaced = False
+            m0_swapped = threading.Event()
+
+            def hook416(handler):
+                nonlocal replaced
+                if handler.path != f'/{name}/c/0/0/0':
+                    return False
+                rng = handler.headers.get('Range')
+                if rng == 'bytes=0-524287':
+                    handler.send_error(416)
+                    return True
+                if rng == 'bytes=0-262143' and not replaced:
+                    replaced = True
+                    (self.root / name / 'c/0/0/0').write_bytes(v2_bytes)
+                    m0_swapped.set()
+                    handler.send_response(206)
+                    handler.send_header('Content-Range', f'bytes 0-262143/{len(v1_bytes)}')
+                    handler.send_header('Content-Length', '262144')
+                    handler.send_header('ETag', v1_etag)
+                    handler.end_headers()
+                    handler.wfile.write(v1_bytes[:262144])
+                    return True
+                if rng == 'bytes=262144-524287':
+                    m0_swapped.wait(5)
+                return False
+
+            self.server.request_hook = hook416
+            storage = MemoryCache(1 << 20)
+            with ZarrReader.open(self.url + '/' + name, threads=1, memory_cache=storage) as reader:
+                with self.assertRaisesRegex(RuntimeError, '412|changed'):
+                    reader.read_many([np.s_[0:1, 0:1, 0:1], np.s_[0:1, 0:1, 64:65]])
+                # Member 0 (v1) is already cached cleanly without double-delivery or abandoned claim.
+                fetches_before = reader.stats()['remote_fetches']
+                self.assertEqual(reader[0, 0, 0], 41)
+                self.assertEqual(reader.stats()['remote_fetches'], fetches_before)
+            self.assertTrue(replaced)
+
+        # 4. Cross-plan offline missing-to-present contradiction prevented.
+        with self.subTest(case='cross_plan_offline_missing_contradiction'):
+            name = 'rev-cross-plan-missing'
+            v1_data = np.full((20, 2, 4), 33, dtype=np.uint8)
+            v2_data = np.full((20, 2, 4), 44, dtype=np.uint8)
+            write_custom_shard_array(self.root / name, v1_data, (1, 1, 4), (20, 1, 4),
+                                     missing_chunks=[(16, 0, 0)])
+            write_custom_shard_array(self.root / (name + '-v2'), v2_data, (1, 1, 4), (20, 1, 4))
+            v1_s0 = (self.root / name / 'c/0/0/0').read_bytes()
+            v1_s0_etag = '"' + hashlib.sha256(v1_s0).hexdigest() + '"'
+            cache_dir = self.cache / 'rev-cross-plan-missing-cache'
+            replaced = False
+            c0_done = threading.Event()
+
+            def hook(handler):
+                nonlocal replaced
+                if handler.path == f'/{name}/c/0/0/0' and handler.headers.get('Range') == 'bytes=0-3':
+                    handler.send_response(206)
+                    handler.send_header('Content-Range', f'bytes 0-3/{len(v1_s0)}')
+                    handler.send_header('Content-Length', '4')
+                    handler.send_header('ETag', v1_s0_etag)
+                    handler.end_headers()
+                    handler.wfile.write(v1_s0[:4])
+                    c0_done.set()
+                    return True
+                if not replaced and handler.path == f'/{name}/c/0/1/0' and handler.headers.get('Range') == 'bytes=0-59':
+                    c0_done.wait(5)
+                    replaced = True
+                    (self.root / name / 'c/0/0/0').write_bytes((self.root / (name + '-v2') / 'c/0/0/0').read_bytes())
+                return False
+
+            self.server.request_hook = hook
+            uri = self.url + '/' + name
+            sels = [np.s_[0:1, 0:1, 0:4]] + [np.s_[y:y + 1, 1:2, 0:4] for y in range(15)] + [np.s_[16:17, 0:1, 0:4]]
+            with ZarrReader.open(uri, cache_dir=cache_dir, threads=1, memory_cache=None) as reader:
+                with self.assertRaisesRegex(RuntimeError, '412|changed'):
+                    reader.read_many(sels)
+            self.assertTrue(replaced)
+            self.server.request_hook = None
+            with ZarrReader.open(uri, cache_dir=cache_dir, threads=1, memory_cache=None,
+                                 offline=True) as offline_reader:
+                np.testing.assert_array_equal(offline_reader[0:1, 0:1, 0:4], np.full((1, 1, 4), 33, dtype=np.uint8))
+                with self.assertRaises(CacheMissError):
+                    _ = offline_reader[16:17, 0:1, 0:4]
+
+        # 5. Foreign SingleFlight claim with different shard revision fails Reader A without blocking Reader B.
+        with self.subTest(case='foreign_singleflight_revision_conflict'):
+            name = 'rev-foreign-sf'
+            v1_data = np.full((2, 4), 51, dtype=np.uint8)
+            v2_data = np.full((2, 4), 62, dtype=np.uint8)
+            write_custom_shard_array(self.root / name, v1_data, (1, 4), (2, 4))
+            write_custom_shard_array(self.root / (name + '-v2'), v2_data, (1, 4), (2, 4))
+            v1_bytes = (self.root / name / 'c/0/0').read_bytes()
+            v1_etag = '"' + hashlib.sha256(v1_bytes).hexdigest() + '"'
+            v2_bytes = (self.root / (name + '-v2') / 'c/0/0').read_bytes()
+            b_holding = threading.Event()
+            release_b = threading.Event()
+
+            def hook(handler):
+                if handler.path == f'/{name}/c/0/0':
+                    rng = handler.headers.get('Range')
+                    if rng == 'bytes=0-3':
+                        # Reader B fetched v1 index and is now reading chunk 0; swap disk to v2 before waking Reader A.
+                        (self.root / name / 'c/0/0').write_bytes(v2_bytes)
+                        b_holding.set()
+                        release_b.wait(5)
+                        handler.send_response(206)
+                        handler.send_header('Content-Range', f'bytes 0-3/{len(v1_bytes)}')
+                        handler.send_header('Content-Length', '4')
+                        handler.send_header('ETag', v1_etag)
+                        handler.end_headers()
+                        handler.wfile.write(v1_bytes[0:4])
+                        return True
+                    if rng == 'bytes=4-7':
+                        # Reader A is fetching chunk 1 from v2; let Reader B finish chunk 0 on v1.
+                        release_b.set()
+                return False
+
+            self.server.request_hook = hook
+            uri = self.url + '/' + name
+            with ZarrReader.open(uri, threads=2, memory_cache=None) as rb, \
+                    ZarrReader.open(uri, threads=2, memory_cache=None) as ra, \
+                    ThreadPoolExecutor(2) as pool:
+                fb = pool.submit(lambda: rb[0:1, 0:4])
+                self.assertTrue(b_holding.wait(5))
+                try:
+                    fa = pool.submit(lambda: ra.read_many([np.s_[0:1, 0:4], np.s_[1:2, 0:4]]))
+                    with self.assertRaisesRegex(RuntimeError, 'changed|412'):
+                        fa.result(timeout=10)
+                    np.testing.assert_array_equal(fb.result(timeout=5), v1_data[0:1, 0:4])
+                finally:
+                    release_b.set()
+
+        # 6. Weak and absent ETags succeed across multiple windows when unchanged, and fail when mutated.
+        for tag_mode in ('weak', 'absent'):
+            with self.subTest(case=f'etag_{tag_mode}_multi_window'):
+                name = f'rev-etag-{tag_mode}'
+                v1_data = np.arange(20 * 2 * 4, dtype=np.uint8).reshape(20, 2, 4)
+                v2_data = (v1_data.astype(np.uint16) + 90).astype(np.uint8)
+                write_custom_shard_array(self.root / name, v1_data, (1, 1, 4), (20, 1, 4))
+                # Make v2 have a missing entry in unused chunk (19, 0, 0) so index bytes mutate even if total size differs or matches.
+                write_custom_shard_array(self.root / (name + '-v2'), v2_data, (1, 1, 4), (20, 1, 4),
+                                         missing_chunks=[(19, 0, 0)])
+                mutate = False
+                mutated = False
+                c0_served_in_mutate = threading.Event()
+
+                def serve_etag(handler):
+                    nonlocal mutated
+                    if not handler.path.startswith(f'/{name}/c/'):
+                        return False
+                    rel = handler.path[len(f'/{name}/'):]
+                    fpath = self.root / name / rel
+                    rng = handler.headers.get('Range')
+                    if mutate and rel == 'c/0/1/0' and rng == 'bytes=56-59' and not mutated:
+                        c0_served_in_mutate.wait(5)
+                        mutated = True
+                        (self.root / name / 'c/0/0/0').write_bytes((self.root / (name + '-v2') / 'c/0/0/0').read_bytes())
+                    raw = fpath.read_bytes()
+                    if rng and rng.startswith('bytes='):
+                        spec = rng[6:]
+                        if spec.startswith('-'):
+                            n = int(spec[1:])
+                            start, end = len(raw) - n, len(raw) - 1
+                        else:
+                            a, b = spec.split('-')
+                            start, end = int(a), int(b)
+                        chunk = raw[start:end + 1]
+                        handler.send_response(206)
+                        handler.send_header('Content-Range', f'bytes {start}-{end}/{len(raw)}')
+                        handler.send_header('Content-Length', str(len(chunk)))
+                        if tag_mode == 'weak':
+                            handler.send_header('ETag', 'W/"' + hashlib.sha256(raw).hexdigest()[:16] + '"')
+                        handler.end_headers()
+                        handler.wfile.write(chunk)
+                        if mutate and rel == 'c/0/0/0' and rng == 'bytes=0-3':
+                            c0_served_in_mutate.set()
+                        return True
+                    return False
+
+                self.server.request_hook = serve_etag
+                sels = [np.s_[0:1, 0:1, 0:4]] + [np.s_[y:y + 1, 1:2, 0:4] for y in range(15)] + [np.s_[16:17, 0:1, 0:4]]
+                with ZarrReader.open(self.url + '/' + name, threads=1, memory_cache=None) as reader:
+                    out = reader.read_many(sels)
+                    np.testing.assert_array_equal(out[0], v1_data[0:1, 0:1, 0:4])
+                    np.testing.assert_array_equal(out[-1], v1_data[16:17, 0:1, 0:4])
+                    mutate = True
+                    with self.assertRaisesRegex(RuntimeError, 'changed|412'):
+                        reader.read_many(sels)
+
+        # 7. Non-batched sharded path (chunk_bytes > 512 KiB) enforces full-read revision pinning.
+        with self.subTest(case='non_batched_large_chunk_sharded_consistency'):
+            name = 'rev-non-batched-large'
+            v1_data = np.full((64, 64, 260), 17, dtype=np.uint8)
+            v2_data = np.full((64, 64, 260), 29, dtype=np.uint8)
+            write_custom_shard_array(self.root / name, v1_data, (64, 64, 130), (64, 64, 260))
+            write_custom_shard_array(self.root / (name + '-v2'), v2_data, (64, 64, 130), (64, 64, 260))
+            v1_bytes = (self.root / name / 'c/0/0/0').read_bytes()
+            v1_etag = '"' + hashlib.sha256(v1_bytes).hexdigest() + '"'
+            v2_bytes = (self.root / (name + '-v2') / 'c/0/0/0').read_bytes()
+            replaced = False
+            c0_swapped = threading.Event()
+
+            def hook(handler):
+                nonlocal replaced
+                if handler.path == f'/{name}/c/0/0/0':
+                    rng = handler.headers.get('Range')
+                    if rng == 'bytes=0-532479' and not replaced:
+                        replaced = True
+                        (self.root / name / 'c/0/0/0').write_bytes(v2_bytes)
+                        c0_swapped.set()
+                        handler.send_response(206)
+                        handler.send_header('Content-Range', f'bytes 0-532479/{len(v1_bytes)}')
+                        handler.send_header('Content-Length', '532480')
+                        handler.send_header('ETag', v1_etag)
+                        handler.end_headers()
+                        handler.wfile.write(v1_bytes[:532480])
+                        return True
+                    if rng == 'bytes=532480-1064959':
+                        c0_swapped.wait(5)
+                return False
+
+            self.server.request_hook = hook
+            with ZarrReader.open(self.url + '/' + name, threads=1, memory_cache=None) as reader:
+                with self.assertRaisesRegex(RuntimeError, '412|changed'):
+                    reader.read_many([np.s_[0:1, 0:1, 0:1], np.s_[0:1, 0:1, 130:131]])
+            self.assertTrue(replaced)
+
+        # 8. Multi-shard pre-commit recovery across windows succeeds when all shards changed before read_many.
+        with self.subTest(case='multi_shard_pre_commit_recovery_across_windows'):
+            name = 'rev-multi-shard-precommit'
+            v1_data = np.arange(10 * 3 * 4, dtype=np.uint8).reshape(10, 3, 4)
+            v2_data = (v1_data.astype(np.uint16) + 123).astype(np.uint8)
+            write_custom_shard_array(self.root / name, v1_data, (1, 1, 4), (10, 1, 4))
+            write_custom_shard_array(self.root / (name + '-v2'), v2_data, (1, 1, 4), (10, 1, 4))
+            self.server.request_hook = None
+            with ZarrReader.open(self.url + '/' + name, threads=1, memory_cache=None) as reader:
+                # Prime all 3 shards into retained LRU.
+                for sx in range(3):
+                    np.testing.assert_array_equal(reader[0:1, sx:sx + 1, 0:4], v1_data[0:1, sx:sx + 1, 0:4])
+                # Replace all 3 shards BEFORE read_many begins.
+                for sx in range(3):
+                    (self.root / name / f'c/0/{sx}/0').write_bytes(
+                        (self.root / (name + '-v2') / f'c/0/{sx}/0').read_bytes())
+                # Request 21 chunks across all 3 shards (2 batching windows).
+                sels = [np.s_[y:y + 1, sx:sx + 1, 0:4] for y in range(1, 8) for sx in range(3)]
+                out = reader.read_many(sels)
+                for idx_s, sel in enumerate(sels):
+                    np.testing.assert_array_equal(out[idx_s], v2_data[sel])
+
+        self.server.request_hook = None
+
     def test_remote_group_companions_offline(self):
         attrs = dict(multiscales=[dict(axes=['y', 'x'], datasets=[dict(path='0')])])
         for name in ('labels', 'mask'):

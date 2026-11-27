@@ -31,6 +31,7 @@ class ZarrStorage {
         std::vector<std::uint8_t> bytes;
         std::uint64_t total = 0, start = 0;
         std::uint64_t epoch = 0;
+        std::uint64_t hash = 0;
         std::string etag;
     };
     struct IndexLookup {
@@ -53,14 +54,88 @@ class ZarrStorage {
     };
     struct Position { std::size_t inner, slot; };
     struct ContentRange { std::uint64_t first, last, total; };
-    struct RetryShardRange : std::runtime_error { using std::runtime_error::runtime_error; };
+    struct RetryShardRange : HttpRangeChanged { using HttpRangeChanged::HttpRangeChanged; };
 
     static constexpr int max_shard_refreshes = 1;
 public:
+    struct ShardRevision {
+        bool valid = false;
+        bool exists = true;
+        std::string path;
+        std::string etag;
+        std::uint64_t total = 0;
+        std::uint64_t index_hash = 0;
+    };
+
+    struct ShardPin {
+        bool initialized = false;
+        bool exists = true;
+        std::shared_ptr<const IndexData> index;  // nullptr for 404 or foreign-provenance-only pin
+        std::string etag;
+        std::uint64_t total = 0;
+        std::uint64_t index_hash = 0;
+        bool retained = false;    // true iff `index` came from retained LRU without fresh suffix GET
+        bool committed = false;   // true once ANY chunk or missing entry of this shard is delivered/consumed
+        int refreshes = 0;        // bounded per-shard across the entire ReadSession (<= 1, only while !committed)
+    };
+
+    // Per-Array::run revision-consistency scope spanning all batch windows,
+    // intra-plan ranges, foreign SingleFlight joins, and non-batched sharded reads.
+    struct ReadSession {
+        std::mutex mutex;
+        std::unordered_map<std::string, std::vector<std::size_t>> planned_positions;
+        std::unordered_map<std::string, ShardPin> shards;
+
+        void plan_position(std::string path, std::size_t inner)
+        {
+            std::lock_guard lock(mutex);
+            planned_positions[std::move(path)].push_back(inner);
+        }
+
+        // Atomically bind or verify a committed revision from a foreign SingleFlight claim
+        // (or non-batched remote read). Throws HttpRangeChanged on incompatible revision.
+        void verify_or_bind_committed(const std::string& path, bool exists,
+                                      const std::string& etag, std::uint64_t total,
+                                      std::uint64_t index_hash = 0)
+        {
+            std::lock_guard lock(mutex);
+            auto& pin = shards[path];
+            if (!pin.initialized) {
+                pin.initialized = true;
+                pin.exists = exists;
+                pin.index = nullptr;
+                pin.etag = etag;
+                pin.total = total;
+                pin.index_hash = index_hash;
+                pin.retained = false;
+                pin.committed = true;
+                return;
+            }
+            if (!foreign_revisions_compatible(pin.exists, pin.etag, pin.total, pin.index_hash,
+                                              exists, etag, total, index_hash)) {
+                if (pin.committed)
+                    throw HttpRangeChanged("shard changed during read: " + path);
+                // Pre-commit foreign claim supersedes an uncommitted pin.
+                pin.exists = exists;
+                pin.index = nullptr;
+                pin.etag = etag;
+                pin.total = total;
+                pin.index_hash = index_hash;
+                pin.retained = false;
+                pin.committed = true;
+                return;
+            }
+            if (pin.index_hash == 0 && index_hash != 0)
+                pin.index_hash = index_hash;
+            pin.committed = true;
+        }
+    };
+
     struct BatchChunkResult {
         bool found = false;
         std::vector<std::uint8_t> body;
         std::exception_ptr error;
+        ShardRevision revision;
     };
     using ChunkCallback = std::function<void(std::size_t, BatchChunkResult)>;
 
@@ -72,7 +147,24 @@ public:
           requests_(requests), bytes_(bytes)
     {}
 
-    bool read(const std::string& key, std::vector<std::uint8_t>& body)
+    bool is_remote_sharded() const
+    {
+        return http_ && !layout_.ratios.empty();
+    }
+
+    std::pair<std::string, std::size_t> locate_chunk(const Index& coordinates) const
+    {
+        const auto [shard, position] = layout_.locate(coordinates);
+        std::string shard_key;
+        for (auto coordinate : shard) {
+            if (!shard_key.empty()) shard_key += separator_;
+            shard_key += std::to_string(coordinate);
+        }
+        return {joinLocation(root_, prefix_ + shard_key), position};
+    }
+
+    bool read(const std::string& key, std::vector<std::uint8_t>& body,
+              ShardRevision* out_revision = nullptr, ReadSession* session = nullptr)
     {
         const auto [path, position] = location(key);
         if (layout_.ratios.empty()) {
@@ -91,16 +183,32 @@ public:
         const Position requested{*position, 0};
         bool force_refresh = false;
         for (int attempt = 0; attempt <= max_shard_refreshes; ++attempt) {
-            const auto lookup = shard_index(path, {&requested, 1}, force_refresh);
-            if (!lookup.index) return false;
+            const auto lookup = acquire_session_index(path, {&requested, 1}, force_refresh, session);
+            const auto rev = make_revision(path, lookup.index);
+            if (!lookup.index) {
+                commit_or_verify_session(path, lookup.index, session);
+                if (out_revision) *out_revision = rev;
+                return false;
+            }
             const auto entry = layout_.entry(lookup.index->bytes, *position, lookup.index->total);
-            if (!entry) return false;
+            if (!entry) {
+                if (lookup.retained)
+                    throw std::logic_error("unexpected missing entry in retained shard index");
+                commit_or_verify_session(path, lookup.index, session);
+                if (out_revision) *out_revision = rev;
+                return false;
+            }
             const auto [offset, length] = *entry;
-            const bool can_retry = lookup.retained && attempt < max_shard_refreshes;
+            const bool can_retry = lookup.retained && attempt < max_shard_refreshes &&
+                                   can_retry_session(path, session);
             try {
                 read_shard_range(path, lookup, offset, length, body, can_retry);
+                commit_or_verify_session(path, lookup.index, session);
+                if (out_revision) *out_revision = rev;
                 return true;
             } catch (const RetryShardRange&) {
+                if (!consume_session_refresh(path, session))
+                    throw;
                 force_refresh = true;
             }
         }
@@ -118,8 +226,10 @@ public:
     // The caller owns these remote misses. Plan and read each shard independently
     // on the existing pool, delivering every slot exactly once as soon as its
     // chunk settles so healthy chunks are neither blocked nor poisoned by sibling
-    // errors. Stale retained indexes refresh per shard with a bounded retry limit.
-    void read_batch(const std::vector<std::string>& keys, ThreadPool& pool, const ChunkCallback& deliver)
+    // errors. When a ReadSession is supplied, shard revision pinning and
+    // commit-once conflict reporting span all ranges and batch windows.
+    void read_batch(const std::vector<std::string>& keys, ThreadPool& pool,
+                    const ChunkCallback& deliver, ReadSession* session = nullptr)
     {
         if (keys.size() > max_batch_chunks)
             throw std::invalid_argument("shard batch exceeds chunk limit");
@@ -133,7 +243,7 @@ public:
                 auto [path, position] = location(keys[slot]);
                 by_shard[std::move(path)].emplace_back(*position, slot);
             } catch (...) {
-                deliver(slot, BatchChunkResult{false, {}, std::current_exception()});
+                deliver(slot, BatchChunkResult{false, {}, std::current_exception(), {}});
             }
         }
         std::vector<ShardGroup> groups;
@@ -141,32 +251,313 @@ public:
         for (auto& [path, positions] : by_shard)
             groups.push_back({std::move(path), std::move(positions)});
 
+        std::optional<ReadSession> local_session;
+        ReadSession* active_session = session;
+        if (!active_session) {
+            local_session.emplace();
+            active_session = &*local_session;
+        }
         pool.parallel_for(groups.size(), [&](std::size_t s) {
-            process_shard(groups[s].path, groups[s].positions, pool, deliver);
+            process_shard(groups[s].path, groups[s].positions, pool, deliver, active_session);
         });
     }
 
 private:
+    static std::uint64_t hash_index_bytes(const std::vector<std::uint8_t>& bytes)
+    {
+        std::uint64_t h = 14695981039346656037ULL;
+        for (std::uint8_t b : bytes) {
+            h ^= static_cast<std::uint64_t>(b);
+            h *= 1099511628211ULL;
+        }
+        return h ? h : 1ULL;
+    }
+
+    static bool foreign_revisions_compatible(bool a_exists, const std::string& a_etag, std::uint64_t a_total,
+                                             std::uint64_t a_hash,
+                                             bool b_exists, const std::string& b_etag, std::uint64_t b_total,
+                                             std::uint64_t b_hash)
+    {
+        if (a_exists != b_exists) return false;
+        if (!a_exists) return true;
+        if (a_total != b_total || a_etag != b_etag) return false;
+        if (!is_strong_etag(a_etag) && a_hash != 0 && b_hash != 0 && a_hash != b_hash)
+            return false;
+        return true;
+    }
+
+    static bool revisions_compatible(const ShardPin& pin, const std::shared_ptr<const IndexData>& candidate)
+    {
+        const bool cand_exists = static_cast<bool>(candidate);
+        if (pin.exists != cand_exists) return false;
+        if (!pin.exists) return true;
+        if (candidate->total != pin.total || candidate->etag != pin.etag) return false;
+        if (is_strong_etag(pin.etag)) return true;
+        // Weak or absent ETag: also check index table bytes / hash when available.
+        if (pin.index && candidate->bytes != pin.index->bytes) return false;
+        if (pin.index_hash != 0 && candidate->hash != 0 && pin.index_hash != candidate->hash) return false;
+        return true;
+    }
+
+    static ShardRevision make_revision(const std::string& path, const std::shared_ptr<const IndexData>& index)
+    {
+        ShardRevision rev;
+        rev.valid = true;
+        rev.exists = static_cast<bool>(index);
+        rev.path = path;
+        if (index) {
+            rev.etag = index->etag;
+            rev.total = index->total;
+            rev.index_hash = index->hash;
+        }
+        return rev;
+    }
+
+    bool is_active_fresh_locked(const std::string& path, const std::shared_ptr<const IndexData>& index)
+    {
+        if (!index || active_fresh_.epoch == 0 || active_fresh_.path != path)
+            return false;
+        const auto current = active_fresh_.index.lock();
+        if (!current || current.get() != index.get())
+            return false;
+        const auto* cached = indexes_.peek(path);
+        return cached && cached->get() == index.get();
+    }
+
+    bool is_active_fresh(const std::string& path, const std::shared_ptr<const IndexData>& index)
+    {
+        std::lock_guard lock(index_mutex_);
+        return is_active_fresh_locked(path, index);
+    }
+
+    bool is_session_committed(const std::string& path, ReadSession* session) const
+    {
+        if (!session) return false;
+        std::lock_guard lock(session->mutex);
+        const auto it = session->shards.find(path);
+        return it != session->shards.end() && it->second.committed;
+    }
+
+    bool can_retry_session(const std::string& path, ReadSession* session) const
+    {
+        if (!session) return true;
+        std::lock_guard lock(session->mutex);
+        const auto it = session->shards.find(path);
+        if (it == session->shards.end()) return true;
+        const auto& pin = it->second;
+        return !pin.committed && pin.retained && pin.refreshes < max_shard_refreshes;
+    }
+
+    bool consume_session_refresh(const std::string& path, ReadSession* session) const
+    {
+        if (!session) return true;
+        std::lock_guard lock(session->mutex);
+        auto& pin = session->shards[path];
+        if (pin.committed || !pin.retained || pin.refreshes >= max_shard_refreshes)
+            return false;
+        ++pin.refreshes;
+        pin.initialized = false;
+        pin.index.reset();
+        pin.retained = false;
+        return true;
+    }
+
+    // Atomically linearizes the first committed revision of `path` inside `session`,
+    // and rejects any conflicting revision before data or missing markers can be delivered.
+    void commit_or_verify_session(const std::string& path, const std::shared_ptr<const IndexData>& index,
+                                  ReadSession* session) const
+    {
+        if (!session) return;
+        std::lock_guard lock(session->mutex);
+        auto& pin = session->shards[path];
+        if (!pin.initialized) {
+            pin.initialized = true;
+            pin.exists = static_cast<bool>(index);
+            pin.index = index;
+            pin.etag = index ? index->etag : std::string{};
+            pin.total = index ? index->total : 0;
+            pin.index_hash = index ? index->hash : 0;
+            pin.committed = true;
+            return;
+        }
+        if (!revisions_compatible(pin, index)) {
+            if (pin.committed)
+                throw HttpRangeChanged("shard changed during read: " + path);
+            pin.exists = static_cast<bool>(index);
+            pin.index = index;
+            pin.etag = index ? index->etag : std::string{};
+            pin.total = index ? index->total : 0;
+            pin.index_hash = index ? index->hash : 0;
+            pin.retained = false;
+            pin.committed = true;
+            return;
+        }
+        if (!pin.index && index)
+            pin.index = index;
+        if (pin.index_hash == 0 && index)
+            pin.index_hash = index->hash;
+        pin.committed = true;
+    }
+
+    IndexLookup acquire_session_index(const std::string& path, std::span<const Position> positions,
+                                      bool force_refresh, ReadSession* session)
+    {
+        if (!session)
+            return shard_index(path, positions, force_refresh);
+
+        ShardPin pin_copy;
+        std::vector<std::size_t> extra_positions;
+        {
+            std::lock_guard lock(session->mutex);
+            if (const auto it = session->shards.find(path); it != session->shards.end())
+                pin_copy = it->second;
+            if (!pin_copy.initialized) {
+                if (const auto pit = session->planned_positions.find(path); pit != session->planned_positions.end())
+                    extra_positions = pit->second;
+            }
+        }
+
+        if (!force_refresh && pin_copy.initialized) {
+            // Case 1: Pinned to a confirmed 404 shard.
+            if (!pin_copy.exists) {
+                const auto reval = shard_index(path, positions, /*force_refresh=*/true);
+                if (reval.index)
+                    throw HttpRangeChanged("shard changed during read: " + path);
+                return IndexLookup{nullptr, false};
+            }
+            // Case 2: Pinned to a known IndexData from an earlier window/thread in this ReadSession.
+            if (pin_copy.index) {
+                bool has_missing = false;
+                bool has_invalid = false;
+                for (const auto& p : positions) {
+                    const auto state = layout_.probe_entry(pin_copy.index->bytes, p.inner, pin_copy.index->total).state;
+                    if (state == ShardLayout::EntryState::Missing) has_missing = true;
+                    else if (state == ShardLayout::EntryState::Invalid) has_invalid = true;
+                }
+                if (has_invalid && !pin_copy.committed && pin_copy.retained &&
+                    pin_copy.refreshes < max_shard_refreshes) {
+                    {
+                        std::lock_guard lock(index_mutex_);
+                        if (const auto* cached = indexes_.peek(path); cached && cached->get() == pin_copy.index.get())
+                            indexes_.erase(path);
+                    }
+                    if (consume_session_refresh(path, session))
+                        return acquire_session_index(path, positions, /*force_refresh=*/true, session);
+                }
+                if (!has_missing && is_strong_etag(pin_copy.etag)) {
+                    // Strong ETag + present (or committed invalid) entries: reuse pinned index directly;
+                    // server enforces exact revision via If-Match.
+                    const bool retained = !pin_copy.committed && pin_copy.retained;
+                    return IndexLookup{pin_copy.index, retained};
+                }
+                if (is_strong_etag(pin_copy.etag) && is_active_fresh(path, pin_copy.index)) {
+                    return IndexLookup{pin_copy.index, false};
+                }
+                // Either missing entry needs confirmation or weak/absent ETag lost active_fresh_:
+                // revalidate via fresh suffix GET and enforce exact revision identity against pin!
+                const auto reval = shard_index(path, positions, /*force_refresh=*/true);
+                if (!revisions_compatible(pin_copy, reval.index)) {
+                    {
+                        std::lock_guard lock(session->mutex);
+                        auto& pin = session->shards[path];
+                        if (!pin.committed && pin.retained && pin.refreshes < max_shard_refreshes) {
+                            ++pin.refreshes;
+                            pin.initialized = true;
+                            pin.exists = static_cast<bool>(reval.index);
+                            pin.index = reval.index;
+                            pin.etag = reval.index ? reval.index->etag : std::string{};
+                            pin.total = reval.index ? reval.index->total : 0;
+                            pin.index_hash = reval.index ? reval.index->hash : 0;
+                            pin.retained = false;
+                            return IndexLookup{reval.index, false};
+                        }
+                    }
+                    throw HttpRangeChanged("shard changed during read: " + path);
+                }
+                return IndexLookup{reval.index, false};
+            }
+            // Case 3: Pinned from a foreign SingleFlight claim (revision provenance only, index == nullptr).
+            auto lookup = shard_index(path, positions, /*force_refresh=*/false);
+            if (!revisions_compatible(pin_copy, lookup.index)) {
+                // Local retained/active cache may simply predate the foreign claim's revision:
+                // check live server once with force_refresh before declaring a conflict.
+                lookup = shard_index(path, positions, /*force_refresh=*/true);
+                if (!revisions_compatible(pin_copy, lookup.index))
+                    throw HttpRangeChanged("shard changed during read: " + path);
+            }
+            {
+                std::lock_guard lock(session->mutex);
+                auto& pin = session->shards[path];
+                if (!pin.index && lookup.index && revisions_compatible(pin, lookup.index)) {
+                    pin.index = lookup.index;
+                    if (pin.index_hash == 0)
+                        pin.index_hash = lookup.index->hash;
+                }
+            }
+            return IndexLookup{lookup.index, false};
+        }
+
+        // First lookup for `path` in this ReadSession (or explicit pre-commit refresh).
+        auto lookup = shard_index(path, positions, force_refresh, extra_positions);
+        {
+            std::lock_guard lock(session->mutex);
+            auto& pin = session->shards[path];
+            if (!pin.initialized) {
+                pin.initialized = true;
+                pin.exists = static_cast<bool>(lookup.index);
+                pin.index = lookup.index;
+                pin.etag = lookup.index ? lookup.index->etag : std::string{};
+                pin.total = lookup.index ? lookup.index->total : 0;
+                pin.index_hash = lookup.index ? lookup.index->hash : 0;
+                pin.retained = lookup.retained;
+            } else if (!revisions_compatible(pin, lookup.index)) {
+                if (pin.committed)
+                    throw HttpRangeChanged("shard changed during read: " + path);
+                pin.exists = static_cast<bool>(lookup.index);
+                pin.index = lookup.index;
+                pin.etag = lookup.index ? lookup.index->etag : std::string{};
+                pin.total = lookup.index ? lookup.index->total : 0;
+                pin.index_hash = lookup.index ? lookup.index->hash : 0;
+                pin.retained = lookup.retained;
+            } else {
+                if (!pin.index && lookup.index)
+                    pin.index = lookup.index;
+                if (pin.index_hash == 0 && lookup.index)
+                    pin.index_hash = lookup.index->hash;
+            }
+        }
+        return lookup;
+    }
+
     void process_shard(const std::string& path, const std::vector<Position>& all_positions,
-                       ThreadPool& pool, const ChunkCallback& deliver)
+                       ThreadPool& pool, const ChunkCallback& deliver, ReadSession* session)
     {
         std::vector<Position> pending = all_positions;
         bool force_refresh = false;
-        int refreshes = 0;
+        int local_refreshes = 0;
 
         while (!pending.empty()) {
             IndexLookup lookup;
             try {
-                lookup = shard_index(path, pending, force_refresh);
+                lookup = acquire_session_index(path, pending, force_refresh, session);
             } catch (...) {
                 auto err = std::current_exception();
                 for (const auto& p : pending)
-                    deliver(p.slot, BatchChunkResult{false, {}, err});
+                    deliver(p.slot, BatchChunkResult{false, {}, err, {}});
                 return;
             }
+            const auto rev = make_revision(path, lookup.index);
             if (!lookup.index) {
+                try {
+                    commit_or_verify_session(path, nullptr, session);
+                } catch (...) {
+                    auto err = std::current_exception();
+                    for (const auto& p : pending)
+                        deliver(p.slot, BatchChunkResult{false, {}, err, {}});
+                    return;
+                }
                 for (const auto& p : pending)
-                    deliver(p.slot, BatchChunkResult{false, {}, nullptr});
+                    deliver(p.slot, BatchChunkResult{false, {}, nullptr, rev});
                 return;
             }
 
@@ -178,6 +569,10 @@ private:
                 std::uint64_t start, stop;
                 std::vector<Member> members;
             };
+            struct RetryItem {
+                std::size_t inner, slot;
+                std::exception_ptr error;
+            };
 
             std::vector<Member> members;
             members.reserve(pending.size());
@@ -188,10 +583,11 @@ private:
                     } else {
                         if (lookup.retained)
                             throw std::logic_error("unexpected missing entry in retained shard index");
-                        deliver(p.slot, BatchChunkResult{false, {}, nullptr});
+                        commit_or_verify_session(path, lookup.index, session);
+                        deliver(p.slot, BatchChunkResult{false, {}, nullptr, rev});
                     }
                 } catch (...) {
-                    deliver(p.slot, BatchChunkResult{false, {}, std::current_exception()});
+                    deliver(p.slot, BatchChunkResult{false, {}, std::current_exception(), {}});
                 }
             }
             if (members.empty()) return;
@@ -216,19 +612,40 @@ private:
             }
 
             std::mutex retry_mutex;
-            std::vector<Position> retry_positions;
-            const bool can_retry = lookup.retained && refreshes < max_shard_refreshes;
+            std::vector<RetryItem> retry_items;
+            const bool can_retry = lookup.retained && local_refreshes < max_shard_refreshes &&
+                                   can_retry_session(path, session);
+
+            auto deliver_committed = [&](std::size_t slot, std::vector<std::uint8_t> chunk_body) {
+                try {
+                    commit_or_verify_session(path, lookup.index, session);
+                } catch (...) {
+                    deliver(slot, BatchChunkResult{false, {}, std::current_exception(), {}});
+                    return;
+                }
+                deliver(slot, BatchChunkResult{true, std::move(chunk_body), nullptr, rev});
+            };
+
+            auto handle_retry_error = [&](std::size_t inner, std::size_t slot, std::exception_ptr err) {
+                // If this shard already committed a revision in this ReadSession, fail fast
+                // immediately without waiting on sibling ranges or attempting Pass 2.
+                if (is_session_committed(path, session)) {
+                    deliver(slot, BatchChunkResult{false, {}, std::move(err), {}});
+                    return;
+                }
+                std::lock_guard lock(retry_mutex);
+                retry_items.push_back({inner, slot, std::move(err)});
+            };
 
             auto read_member = [&](const Member& member) {
                 std::vector<std::uint8_t> body;
                 try {
                     read_shard_range(path, lookup, member.start, member.stop - member.start, body, can_retry);
-                    deliver(member.slot, BatchChunkResult{true, std::move(body), nullptr});
+                    deliver_committed(member.slot, std::move(body));
                 } catch (const RetryShardRange&) {
-                    std::lock_guard lock(retry_mutex);
-                    retry_positions.push_back({member.inner, member.slot});
+                    handle_retry_error(member.inner, member.slot, std::current_exception());
                 } catch (...) {
-                    deliver(member.slot, BatchChunkResult{false, {}, std::current_exception()});
+                    deliver(member.slot, BatchChunkResult{false, {}, std::current_exception(), {}});
                 }
             };
 
@@ -248,36 +665,48 @@ private:
                     });
                     return;
                 } catch (const RetryShardRange&) {
-                    std::lock_guard lock(retry_mutex);
+                    auto err = std::current_exception();
                     for (const auto& member : range.members)
-                        retry_positions.push_back({member.inner, member.slot});
+                        handle_retry_error(member.inner, member.slot, err);
                     return;
                 } catch (...) {
                     auto err = std::current_exception();
                     for (const auto& member : range.members)
-                        deliver(member.slot, BatchChunkResult{false, {}, err});
+                        deliver(member.slot, BatchChunkResult{false, {}, err, {}});
                     return;
                 }
                 for (const auto& member : range.members) {
                     std::vector<std::uint8_t> slice(
                         body.data() + (member.start - range.start),
                         body.data() + (member.stop - range.start));
-                    deliver(member.slot, BatchChunkResult{true, std::move(slice), nullptr});
+                    deliver_committed(member.slot, std::move(slice));
                 }
             });
 
-            if (retry_positions.empty())
+            if (retry_items.empty())
                 return;
-            pending = std::move(retry_positions);
+            // Re-check commitment AFTER all sibling ranges in Pass 1 have joined:
+            // if ANY sibling range committed a chunk on the old revision, Pass 2 is
+            // strictly forbidden — fail all retry_items with their captured 412 error.
+            if (!consume_session_refresh(path, session) || local_refreshes >= max_shard_refreshes) {
+                for (auto& item : retry_items)
+                    deliver(item.slot, BatchChunkResult{false, {}, std::move(item.error), {}});
+                return;
+            }
+            pending.clear();
+            pending.reserve(retry_items.size());
+            for (const auto& item : retry_items)
+                pending.push_back({item.inner, item.slot});
             force_refresh = true;
-            ++refreshes;
+            ++local_refreshes;
         }
     }
 
 public:
     std::optional<ChannelDecodeResult> read_channels(const std::string& key, const ChunkCodec& codec,
         std::size_t decodedBytes, std::size_t channelBytes, std::span<const std::size_t> requested,
-        std::span<const std::size_t> relevant)
+        std::span<const std::size_t> relevant, ReadSession* session = nullptr,
+        ShardRevision* out_revision = nullptr)
     {
         const auto [path, position] = location(key);
         if (!http_) {
@@ -299,16 +728,51 @@ public:
             return decode_channels(codec, decodedBytes, channelBytes, requested, relevant, std::size_t(stat.size),
                 [&](auto offset, auto length, auto dst) { pread_exact(file.fd(), dst, length, offset, path); });
         }
+        if (position) {
+            const Position requested_pos{*position, 0};
+            bool force_refresh = false;
+            for (int attempt = 0; attempt <= max_shard_refreshes; ++attempt) {
+                auto lookup = acquire_session_index(path, {&requested_pos, 1}, force_refresh, session);
+                if (!lookup.index) {
+                    commit_or_verify_session(path, nullptr, session);
+                    if (out_revision) *out_revision = make_revision(path, nullptr);
+                    return std::nullopt;
+                }
+                const auto entry = layout_.entry(lookup.index->bytes, *position, lookup.index->total);
+                if (!entry) {
+                    if (lookup.retained)
+                        throw std::logic_error("unexpected missing entry in retained shard index");
+                    commit_or_verify_session(path, lookup.index, session);
+                    if (out_revision) *out_revision = make_revision(path, lookup.index);
+                    return std::nullopt;
+                }
+                const auto base = entry->first;
+                const auto length = entry->second;
+                const bool can_retry = lookup.retained && attempt < max_shard_refreshes &&
+                                       can_retry_session(path, session);
+                try {
+                    auto decoded = decode_channels(codec, decodedBytes, channelBytes, requested, relevant, length,
+                        [&](std::size_t offset, std::size_t size, std::uint8_t* dst) {
+                            if (!size) return;
+                            std::vector<std::uint8_t> body;
+                            read_shard_range(path, lookup, base + offset, size, body, can_retry);
+                            std::memcpy(dst, body.data(), size);
+                        });
+                    commit_or_verify_session(path, lookup.index, session);
+                    if (out_revision) *out_revision = make_revision(path, lookup.index);
+                    return decoded;
+                } catch (const RetryShardRange&) {
+                    if (!consume_session_refresh(path, session))
+                        throw;
+                    force_refresh = true;
+                }
+            }
+            throw std::logic_error("shard refresh attempts exhausted");
+        }
         std::uint64_t base = 0, length = 0, total = 0;
         std::string etag;
         std::vector<std::uint8_t> prefix;
-        if (position) {
-            auto index = shard_index(path).index;
-            if (!index) return std::nullopt;
-            const auto entry = layout_.entry(index->bytes, *position, index->total);
-            if (!entry) return std::nullopt;
-            base = entry->first; length = entry->second; total = index->total; etag = index->etag;
-        } else {
+        {
             // Discover size and revision without a HEAD request. For Blosc this
             // is also the complete codec header, reused by the range planner.
             const std::size_t probe = codec == Codec::Blosc ? BLOSC_MIN_HEADER_LENGTH : 1;
@@ -484,7 +948,8 @@ private:
     }
 
     IndexLookup shard_index(const std::string& path, std::span<const Position> positions = {},
-                            bool force_refresh = false)
+                            bool force_refresh = false,
+                            std::span<const std::size_t> extra_positions = {})
     {
         std::shared_ptr<InFlightIndex> my_flight;
         std::shared_ptr<InFlightIndex> join_flight;
@@ -500,7 +965,8 @@ private:
                 if (const auto* cached = indexes_.peek(path)) {
                     const auto& index = **cached;
                     // Reusing a retained index across shard visits requires a strong
-                    // ETag and valid, present entries for every requested position.
+                    // ETag and valid, present entries for every requested position
+                    // (including planned positions in later windows of the same read).
                     // Never trust a missing entry from a retained index, never promote
                     // a retained index into active_fresh_, and erase/refresh on any
                     // invalid retained entry. Immediately revoke any previous
@@ -508,15 +974,22 @@ private:
                     // leaves a prior shard trusted.
                     bool has_invalid = false;
                     bool all_present = can_batch() && !positions.empty() && is_strong_etag(index.etag);
-                    for (const auto& p : positions) {
-                        const auto state = layout_.probe_entry(index.bytes, p.inner, index.total).state;
+                    const auto check_inner = [&](std::size_t inner) {
+                        const auto state = layout_.probe_entry(index.bytes, inner, index.total).state;
                         if (state == ShardLayout::EntryState::Invalid) {
                             has_invalid = true;
                             all_present = false;
-                            break;
+                            return false;
                         }
                         if (state != ShardLayout::EntryState::Present)
                             all_present = false;
+                        return true;
+                    };
+                    for (const auto& p : positions)
+                        if (!check_inner(p.inner)) break;
+                    if (!has_invalid) {
+                        for (const auto inner : extra_positions)
+                            if (!check_inner(inner)) break;
                     }
                     if (has_invalid) {
                         indexes_.erase(path);
@@ -576,6 +1049,7 @@ private:
                 index->etag = response.etag;
                 validate_range(range, index->start, layout_.indexBytes, range.total);
                 layout_.validate(index->bytes, index->total);
+                index->hash = hash_index_bytes(index->bytes);
                 fetched = std::move(index);
             }
         } catch (...) {
