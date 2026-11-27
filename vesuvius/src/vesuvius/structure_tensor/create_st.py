@@ -367,6 +367,7 @@ class ChunkDataset(Dataset):
 
 
 _EIGH_BATCH_SIZE = 65536
+_EIGH_GPU_BATCH_SIZE = 1_048_576
 
 
 def _is_gpu_solver_error(err: BaseException) -> bool:
@@ -407,6 +408,162 @@ def _eigh_and_sanitize(M: torch.Tensor):
     return w, v
 
 
+def _analytical_eigh_3x3_6ch(x_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Closed-form float64 eigensolver for a batch of symmetric 3x3 matrices.
+
+    Computes ascending eigenvalues via Cardano's trigonometric formula and
+    eigenvectors via largest-norm row cross products with Gram-Schmidt
+    orthogonalization, handling single-pair axisymmetric cases (``l1 ≈ l2`` or
+    ``l2 ≈ l3``) with a least-aligned basis-axis seed. Falls back to
+    ``_eigh_and_sanitize`` only when truly near-isotropic (both ``l1 ≈ l2`` and
+    ``l2 ≈ l3``), when orthogonalized norm ``< 1e-3``, or on non-finite outputs.
+
+    Args:
+        x_batch: ``(6, K)`` tensor with channels ``[a00, a01, a02, a11, a12, a22]``
+            (any floating dtype; computed internally in float64).
+
+    Returns:
+        Tuple ``(w, v)`` with ``w`` of shape ``(K, 3)`` float32 ascending
+        eigenvalues and ``v`` of shape ``(K, 3, 3)`` float32 eigenvectors as
+        columns (same layout as ``_eigh_and_sanitize``).
+    """
+    device = x_batch.device
+    x = x_batch.to(torch.float64)
+
+    # Scale each matrix by its max |entry| so the tolerances below are relative.
+    s = x.abs().amax(dim=0).clamp(min=torch.finfo(torch.float64).tiny)
+    inv_s = 1.0 / s
+    a00 = x[0] * inv_s
+    a01 = x[1] * inv_s
+    a02 = x[2] * inv_s
+    a11 = x[3] * inv_s
+    a12 = x[4] * inv_s
+    a22 = x[5] * inv_s
+    del x  # the raw float64 copy is only needed again for the rare fallback
+
+    # --- Cardano (trigonometric) eigenvalues of the scaled matrix: l1 <= l2 <= l3 ---
+    p1 = a01 * a01 + a02 * a02 + a12 * a12
+    q = (a00 + a11 + a22) / 3.0
+    d00 = a00 - q
+    d11 = a11 - q
+    d22 = a22 - q
+    p2 = d00 * d00 + d11 * d11 + d22 * d22 + 2.0 * p1
+    p = torch.sqrt((p2 / 6.0).clamp(min=1e-30))
+    inv_p = 1.0 / p
+    b00 = d00 * inv_p
+    b11 = d11 * inv_p
+    b22 = d22 * inv_p
+    b01 = a01 * inv_p
+    b02 = a02 * inv_p
+    b12 = a12 * inv_p
+    det_b = (
+        b00 * (b11 * b22 - b12 * b12)
+        - b01 * (b01 * b22 - b12 * b02)
+        + b02 * (b01 * b12 - b11 * b02)
+    )
+    phi = torch.acos(torch.clamp(det_b * 0.5, -1.0, 1.0)) / 3.0
+    two_p = 2.0 * p
+    l3 = q + two_p * torch.cos(phi)
+    l1 = q + two_p * torch.cos(phi + (2.0 * np.pi / 3.0))
+    l2 = 3.0 * q - l1 - l3
+    del b00, b11, b22, b01, b02, b12, det_b, phi, two_p, d00, d11, d22, p1, p2, inv_p
+
+    def _best_cross(lam: torch.Tensor):
+        # Largest-norm cross product of the row pairs of (A - lam*I), computed
+        # component-wise from (K,) temporaries (cheaper than stacking rows):
+        # for a simple eigenvalue this is the null vector of the rank-2
+        # matrix, i.e. the eigenvector.
+        m00 = a00 - lam
+        m11 = a11 - lam
+        m22 = a22 - lam
+        # rows r0 = (m00, a01, a02), r1 = (a01, m11, a12), r2 = (a02, a12, m22)
+        c01 = torch.stack(
+            [a01 * a12 - a02 * m11, a02 * a01 - m00 * a12, m00 * m11 - a01 * a01], dim=0
+        )
+        c02 = torch.stack(
+            [a01 * m22 - a02 * a12, a02 * a02 - m00 * m22, m00 * a12 - a01 * a02], dim=0
+        )
+        c12 = torch.stack(
+            [m11 * m22 - a12 * a12, a12 * a02 - a01 * m22, a01 * a12 - m11 * a02], dim=0
+        )
+        n01 = (c01 * c01).sum(dim=0)
+        n02 = (c02 * c02).sum(dim=0)
+        n12 = (c12 * c12).sum(dim=0)
+        use_02 = n02 > n01
+        best_c = torch.where(use_02.unsqueeze(0), c02, c01)
+        best_n = torch.where(use_02, n02, n01)
+        use_12 = n12 > best_n
+        best_c = torch.where(use_12.unsqueeze(0), c12, best_c)
+        best_n = torch.where(use_12, n12, best_n)
+        norm = torch.sqrt(best_n.clamp(min=1e-30))
+        return best_c / norm.unsqueeze(0), norm
+
+    def _ortho_basis_seed(u: torch.Tensor) -> torch.Tensor:
+        # Cross unit vector u with the basis axis least aligned with it.
+        min_axis = torch.argmin(u.abs(), dim=0)
+        basis = torch.zeros_like(u)
+        basis.scatter_(0, min_axis.unsqueeze(0), 1.0)
+        seed = torch.cross(u, basis, dim=0)
+        return seed / torch.sqrt((seed * seed).sum(dim=0).clamp(min=1e-30)).unsqueeze(0)
+
+    # Candidate eigenvectors v3 from (A - l3*I) and v1 from (A - l1*I).
+    v3_raw, n3 = _best_cross(l3)
+    v1_raw, n1 = _best_cross(l1)
+
+    # Detect axisymmetric pairs (l1 ~ l2 or l2 ~ l3) or degenerate cross norms.
+    use_v1_fb = ((l2 - l1) < 1e-8) | (n1 < 1e-14)
+    use_v3_fb = ((l3 - l2) < 1e-8) | (n3 < 1e-14)
+    only_l2_l3 = ~use_v1_fb & use_v3_fb
+
+    # Pick the primary eigenvector (v1 when l2 ~ l3 with simple l1, else v3)
+    # and seed the secondary eigenvector (basis-axis fallback if axisymmetric).
+    primary = torch.where(only_l2_l3.unsqueeze(0), v1_raw, v3_raw)
+    ortho_fb = _ortho_basis_seed(primary)
+    secondary_seed = torch.where((only_l2_l3 | use_v1_fb).unsqueeze(0), ortho_fb, v1_raw)
+    del v1_raw, v3_raw, ortho_fb
+
+    # Gram-Schmidt orthogonalize secondary against primary (in place).
+    secondary_seed -= (secondary_seed * primary).sum(dim=0, keepdim=True) * primary
+    ortho_norm = torch.sqrt((secondary_seed * secondary_seed).sum(dim=0).clamp(min=1e-30))
+    secondary = secondary_seed / ortho_norm.unsqueeze(0)
+    del secondary_seed
+
+    v1 = torch.where(only_l2_l3.unsqueeze(0), primary, secondary)
+    v3 = torch.where(only_l2_l3.unsqueeze(0), secondary, primary)
+    del primary, secondary
+    # Right-handed frame: det([v1, v2, v3]) = +1.
+    v2 = torch.cross(v3, v1, dim=0)
+
+    # Unscale eigenvalues and assemble outputs in the _eigh_and_sanitize layout.
+    w = torch.stack([l1 * s, l2 * s, l3 * s], dim=1)        # (K, 3) ascending
+    del l1, l2, l3, s, p, q
+    v = torch.stack([v1, v2, v3], dim=2).permute(1, 0, 2)     # (K, 3, 3), columns = eigenvectors
+    del v1, v2, v3
+
+    # Rare near-isotropic or ill-conditioned subset goes through the robust LAPACK path.
+    bad = (
+        (use_v1_fb & use_v3_fb)
+        | (ortho_norm < 1e-3)
+        | ~torch.isfinite(w).all(dim=1)
+        | ~torch.isfinite(v).all(dim=(1, 2))
+    )
+    bad_idx = torch.nonzero(bad, as_tuple=False).squeeze(1)
+    if bad_idx.numel() > 0:
+        kb = bad_idx.numel()
+        M = torch.empty((kb, 3, 3), dtype=torch.float64, device=device)
+        M[:, 0, 0] = x_batch[0, bad_idx]; M[:, 0, 1] = x_batch[1, bad_idx]; M[:, 0, 2] = x_batch[2, bad_idx]
+        M[:, 1, 0] = x_batch[1, bad_idx]; M[:, 1, 1] = x_batch[3, bad_idx]; M[:, 1, 2] = x_batch[4, bad_idx]
+        M[:, 2, 0] = x_batch[2, bad_idx]; M[:, 2, 1] = x_batch[4, bad_idx]; M[:, 2, 2] = x_batch[5, bad_idx]
+        wb, vb = _eigh_and_sanitize(M)
+        w[bad_idx] = wb.to(torch.float64)
+        v[bad_idx] = vb.to(torch.float64)
+
+    # Same output sanitize invariants as _eigh_and_sanitize.
+    w = torch.nan_to_num(w.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    v = torch.nan_to_num(v.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    return w, v
+
+
 def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     _, dz, dy, dx = block.shape
     N = dz * dy * dx
@@ -421,13 +578,12 @@ def _compute_eigenvectors_impl(block: torch.Tensor) -> tuple[torch.Tensor, torch
     if K == 0:
         return eigvals_flat.view(3, dz, dy, dx), eigvecs_flat.view(9, dz, dy, dx)
 
-    for start in range(0, K, _EIGH_BATCH_SIZE):
-        bi = nz_idx[start : start + _EIGH_BATCH_SIZE]
-        M = torch.empty((bi.numel(), 3, 3), dtype=torch.float64, device=block.device)
-        M[:, 0, 0] = x[0, bi]; M[:, 0, 1] = x[1, bi]; M[:, 0, 2] = x[2, bi]
-        M[:, 1, 0] = x[1, bi]; M[:, 1, 1] = x[3, bi]; M[:, 1, 2] = x[4, bi]
-        M[:, 2, 0] = x[2, bi]; M[:, 2, 1] = x[4, bi]; M[:, 2, 2] = x[5, bi]
-        wi, vi = _eigh_and_sanitize(M)
+    batch_size = _EIGH_GPU_BATCH_SIZE if block.device.type != "cpu" else _EIGH_BATCH_SIZE
+    for start in range(0, K, batch_size):
+        bi = nz_idx[start : start + batch_size]
+        # Closed-form float64 solver on the (6, K) channel layout: avoids batched
+        # LAPACK/cuSOLVER calls and their workspace/fallback overhead.
+        wi, vi = _analytical_eigh_3x3_6ch(x[:, bi])
         eigvals_flat[:, bi] = wi.transpose(0, 1)
         eigvecs_flat[:, bi] = vi.permute(0, 2, 1).reshape(-1, 9).transpose(0, 1)
 
