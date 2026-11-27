@@ -5,19 +5,25 @@
     <record>/final-review.json    the blind rounds and the decision
     <record>/patch-reviews.json   verdicts and notes on fit patches (the first reviews had them)
     <record>/fit/transform.json   the final transform, in the atlas's format
-    <record>/fit/fit.json         how it was fitted, the points it rests on, its scores
+    <record>/fit/fit.json         how it was fitted, the points it rests on, its scores, and
+                                  (`stored`) the fit, variant and transform digest it was
+                                  stored with: what binds it to the transform beside it
     <record>/events.jsonl         every answer and job, append-only
 
 Files other than `events.jsonl` are replaced whole, in one step, so a reader never sees half
 a file. Coordinates are ZYX level-0 voxels of their own volume, as in the cores.
 """
 
-import fcntl
 import json
 import os
+import secrets
+import stat
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from . import filelock
 
 SCHEMA = "volreg-record/1"
 
@@ -37,6 +43,16 @@ LINES_UP = "lines-up"
 BLIND_ANSWERS = ("unsure", "none")
 # What a decision can publish.
 PUBLISH = ("bend", "affine", "nothing")
+
+
+# The record locks this thread holds, and how deep: a lock taken again by its holder (a
+# decision checked and written under one hold) is not waited for.
+_held = threading.local()
+
+
+def dumps(data):
+    """A record file's bytes, as `Record.write` writes them."""
+    return (json.dumps(data, indent=1) + "\n").encode()
 
 
 def now():
@@ -68,40 +84,68 @@ class Record:
         return self.path(name).exists()
 
     def read(self, name):
-        with open(self.path(name)) as handle:
-            return json.load(handle)
+        """A record file, as JSON. Windows refuses to open a file while another process holds
+        it to replace or delete it; the read is asked again for as long as a replace waits for
+        a reader (`filelock.retry`), so a read that lands during a write goes through, and a
+        refusal that lasts surfaces."""
+        return json.loads(self.read_bytes(name))
+
+    def read_bytes(self, name):
+        return filelock.retry(self.path(name).read_bytes)
 
     def write(self, name, data):
         """Replace a file in one step, with the schema stamped in."""
-        target = self.path(name)
-        target.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(data, dict) and name.endswith(".json") and name != TRANSFORM:
             data = {"schema": SCHEMA} | data
-        scratch = target.with_name(target.name + ".tmp")
-        with open(scratch, "w") as handle:
-            json.dump(data, handle, indent=1)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(scratch, target)
+        self.write_bytes(name, dumps(data))
+
+    def write_bytes(self, name, content):
+        """Replace a file in one step with `content`, exactly."""
+        target = self.path(name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, scratch = _scratch(target)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            filelock.replace(scratch, target)
+        except BaseException:
+            filelock.unlink(scratch, missing_ok=True)
+            raise
 
     @contextmanager
-    def lock(self):
+    def lock(self, name=".lock"):
         """Held while a view (`holdout.json`, `final-review.json`) is rewritten from the
-        log, so a page and a job doing it at once cannot lose each other's answers."""
-        self.directory.mkdir(parents=True, exist_ok=True)
-        with open(self.directory / ".lock", "w") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+        log, so a page and a job doing it at once cannot lose each other's answers. Another
+        `name` is another lock, for what is read, changed and written back (the settings).
+        Taken again by the thread that holds it, it is already held: a check and the writes
+        it allows are made under one hold. Other threads and processes wait."""
+        key = (os.path.normcase(os.path.realpath(self.directory)), name)    # one file, one key, however it is spelled
+        held = _held.__dict__.setdefault("depth", {})
+        if held.get(key):
+            held[key] += 1
             try:
                 yield
             finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                held[key] -= 1
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        with open(self.directory / name, "w") as handle:
+            filelock.lock_exclusive(handle)
+            held[key] = 1
+            try:
+                yield
+            finally:
+                held.pop(key, None)
+                filelock.unlock(handle)
 
     def log(self, kind, **fields):
-        """Append one event; `at` defaults to now. Never rewrites what is there."""
-        self.directory.mkdir(parents=True, exist_ok=True)
+        """Append one event; `at` defaults to now. Never rewrites what is there. Under the
+        record lock: a Windows append seeks to the end and then writes, so two writers at
+        once could pick the same spot and one event would overwrite the other."""
         event = {"at": fields.pop("at", None) or now(), "kind": kind} | fields
-        with open(self.path(EVENTS), "a") as handle:
+        with self.lock(), open(self.path(EVENTS), "a") as handle:
             handle.write(json.dumps(event, sort_keys=False) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -109,8 +153,8 @@ class Record:
     def events(self):
         if not self.exists(EVENTS):
             return []
-        with open(self.path(EVENTS)) as handle:
-            return [json.loads(line) for line in handle if line.strip()]
+        content = filelock.retry(self.path(EVENTS).read_bytes).decode()
+        return [json.loads(line) for line in content.splitlines() if line.strip()]
 
     # ------------------------------------------------------------------ the answers
 
@@ -128,13 +172,16 @@ class Record:
 
     def answers(self):
         """The latest answer per hold-out unit, from the event log."""
-        latest = {}
-        for event in self.events():
-            if event["kind"] == "holdout-answer":
-                latest[event["unit"]] = (None if event["answer"] is None else
-                                         {"answer": event["answer"], "at": event["at"],
-                                          "by": event.get("by")})
-        return latest
+        return latest_answers(self.events())
+
+    def logged_holdout(self):
+        """`holdout.json` with the answers the event log holds (`with_logged_answers`): what
+        the stages that rest on the answers read, so an answer logged whose rewrite of
+        `holdout.json` failed is in it, and the scores made of the file before are stale.
+        Writes nothing and takes no lock: status and the review page read it. The file is
+        read before the log, so an answer logged in between is in what is returned."""
+        held = self.read(HOLDOUT)
+        return with_logged_answers(held, self.events())
 
     def refresh_holdout(self, patches=None, **fields):
         """Rewrite `holdout.json` with `patches` (or the ones it holds), `fields`, and the
@@ -142,7 +189,29 @@ class Record:
         with self.lock():
             return self._refresh_holdout(patches, fields)
 
+    def current_holdout(self):
+        """`holdout.json` with the latest answers and notes from the log, read under the
+        record lock: an answer logged and not yet written into `holdout.json` is in it, so
+        what is checked against the answers is checked against the newest ones. If
+        `holdout.json` is behind the log -- its rewrite after an answer failed (refused past
+        the wait on Windows, or the process stopped) -- it is rewritten here, so the stages
+        that rest on it see the answer and run again, instead of waiting on a rewrite that
+        never comes."""
+        with self.lock():
+            held = self._merged_holdout(None, {})
+            on_file = self.read(HOLDOUT) if self.exists(HOLDOUT) else None
+            if on_file is not None:
+                on_file.pop("schema", None)
+                if on_file != held:
+                    self.write(HOLDOUT, held)
+            return held
+
     def _refresh_holdout(self, patches, fields):
+        held = self._merged_holdout(patches, fields)
+        self.write(HOLDOUT, held)
+        return held
+
+    def _merged_holdout(self, patches, fields):
         held = self.read(HOLDOUT) if self.exists(HOLDOUT) else {"patches": []}
         held |= fields
         if patches is not None:
@@ -156,7 +225,6 @@ class Record:
             for octant in patch.get("octants") or []:
                 octant["answer"] = latest.get(f"{patch['id']}.{octant['index']}")
         held.pop("schema", None)
-        self.write(HOLDOUT, held)
         return held
 
 
@@ -191,13 +259,27 @@ class Record:
         self.refresh_final()
 
 
-    def decide(self, decision, reviewer):
-        """The final decision: `{"fit", "publish", "reason", "override"}`; logged, then shown."""
+    def decide(self, decision, reviewer, check=None):
+        """The final decision: `{"fit", "publish", "reason", "override"}` and, from the review
+        page, the `round` it was made on and the `basis` of the scores it was made on (see
+        `scoring.basis`); logged, then shown. `check(final)`, given
+        `final-review.json` as it stands, raises if the decision does not apply to it; it is
+        called under the record lock the decision is then written under, so no round can be
+        added or answered between the check and the write."""
         if decision["publish"] not in PUBLISH:
             raise ValueError(f"publish one of {', '.join(PUBLISH)}")
-        self.log("decision", **decision, by=reviewer)
-        self.refresh_final()
+        with self.lock():
+            if check is not None:
+                check(self.read(FINAL_REVIEW) if self.exists(FINAL_REVIEW) else {})
+            self.log("decision", **decision, by=reviewer)
+            self.refresh_final()
 
+
+    def logged_final(self):
+        """`final-review.json` with the picks and decision the event log holds
+        (`with_logged_final`), as `logged_holdout` is for the answers. Writes nothing and
+        takes no lock."""
+        return with_logged_final(self.read(FINAL_REVIEW), self.events())
 
     def refresh_final(self, rounds=None):
         """Rewrite `final-review.json` with the latest picks and decision from the log. Rounds
@@ -207,22 +289,108 @@ class Record:
             final.pop("schema", None)
             if rounds is not None:
                 final["rounds"] = rounds
-            picks, decision = {}, None
-            for event in self.events():
-                if event["kind"] == "blind-pick" and not event.get("migrated"):
-                    picks[(event["round"], event["item"])] = event["choice"]
-                elif event["kind"] == "decision":
-                    decision = {key: event[key] for key in ("fit", "publish", "reason", "override")
-                                } | {"by": event.get("by"), "at": event["at"]}
-            for round_ in final["rounds"]:
-                for index, item in enumerate(round_["items"]):
-                    if (round_["id"], index) in picks:
-                        item["choice"] = picks[(round_["id"], index)]
-            if decision:
-                final["decision"] = decision
-                final["status"] = "decided"
+            final = with_logged_final(final, self.events())
             self.write(FINAL_REVIEW, final)
             return final
+
+
+def with_logged_final(final, events):
+    """`final` (a `final-review.json`) with the latest picks and decision in `events`, as
+    `refresh_final` writes it; everything else as it is."""
+    final = json.loads(json.dumps(final))
+    picks, decision = {}, None
+    for event in events:
+        if event["kind"] == "blind-pick" and not event.get("migrated"):
+            picks[(event["round"], event["item"])] = event["choice"]
+        elif event["kind"] == "decision":
+            decision = {key: event[key] for key in ("fit", "publish", "reason", "override")
+                        } | {"by": event.get("by"), "at": event["at"]} | {
+                            key: event[key] for key in ("round", "basis") if event.get(key)}
+    for round_ in final.get("rounds") or []:
+        for index, item in enumerate(round_["items"]):
+            if (round_["id"], index) in picks:
+                item["choice"] = picks[(round_["id"], index)]
+    if decision:
+        final["decision"] = decision
+        final["status"] = "decided"
+    return final
+
+
+def _scratch(target):
+    """A new scratch file beside `target`, of its own so two writers never share one, open
+    for writing and already with the mode the record will have: the file's own mode on a
+    rewrite (set before anything is written, so a private record is never readable by
+    others, even half written), or for a new file the usual mode under the umask, as `open`
+    would give it."""
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        mode = None
+    while True:
+        scratch = target.with_name(f"{target.name}.{secrets.token_hex(6)}.tmp")
+        try:
+            # A rewrite starts private and then takes the file's mode; a new file gets 0o666
+            # less the umask from the system.
+            descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                                 0o600 if mode is not None else 0o666)
+            break
+        except FileExistsError:
+            continue
+    try:
+        if mode is not None and hasattr(os, "fchmod") and os.name != "nt":
+            os.fchmod(descriptor, mode)
+    except BaseException:
+        os.close(descriptor)
+        filelock.unlink(scratch, missing_ok=True)
+        raise
+    return descriptor, scratch
+
+
+def latest_answers(events):
+    """The latest answer per hold-out unit in `events` (a record's event log, in order):
+    `{"answer", "at", "by"}`, or None where it was taken back."""
+    latest = {}
+    for event in events:
+        if event["kind"] == "holdout-answer":
+            latest[event["unit"]] = (None if event["answer"] is None else
+                                     {"answer": event["answer"], "at": event["at"],
+                                      "by": event.get("by")})
+    return latest
+
+
+def _answered_units(held):
+    """Each unit of a hold-out set with where its answer is kept: `(id, patch or octant)`."""
+    for patch in held.get("patches") or []:
+        yield patch["id"], patch
+        for octant in patch.get("octants") or []:
+            yield f"{patch['id']}.{octant['index']}", octant
+
+
+def answers_behind(held, events):
+    """The units whose answer in `held` (a `holdout.json`) is not the latest one the event
+    log holds for them, sorted: an answer logged whose rewrite of `holdout.json` failed. A
+    unit the log never answered is not behind: its answer in the file is the only one there
+    is (a record written before answers were logged, or by hand in a test)."""
+    latest = latest_answers(events)
+    return sorted(unit_id for unit_id, unit in _answered_units(held)
+                  if unit_id in latest and (unit.get("answer") or {}).get("answer")
+                  != (latest[unit_id] or {}).get("answer"))
+
+
+def with_logged_answers(held, events):
+    """`held` (a `holdout.json`) with the latest logged answer of every unit whose answer
+    there is not it (`answers_behind`); everything else as it is, so a file in step with its
+    log comes back unchanged, to the byte. The event log is the answers' only source:
+    `holdout.json` is rewritten from it, and a rewrite that failed leaves the file behind."""
+    behind = set(answers_behind(held, events))
+    if not behind:
+        return held
+    latest = latest_answers(events)
+    held = json.loads(json.dumps(held))
+    for unit_id, unit in _answered_units(held):
+        if unit_id in behind:
+            unit["answer"] = latest[unit_id]
+    return held
 
 
 def holdout_units(held):

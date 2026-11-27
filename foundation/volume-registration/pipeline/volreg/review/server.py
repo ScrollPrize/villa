@@ -28,7 +28,9 @@ migrated records, say, which have no pipeline to drive.
     POST /api/pairs/<pair>/answer             {"unit": ..., "answer": ... or null}
     POST /api/pairs/<pair>/note               {"patch": ..., "text": ...}
     POST /api/pairs/<pair>/pick               {"round": ..., "index": i, "choice": i or "unsure"/"none"}
-    POST /api/pairs/<pair>/decide             {"publish": bend|affine|nothing, "reason": ...}
+    POST /api/pairs/<pair>/decide             {"publish": bend|affine|nothing, "reason": ...,
+                                               "round": ..., "fit": ..., "basis": ...}   (the round,
+                                               fit and scores shown; 409 if any is no longer current)
 """
 
 import argparse
@@ -40,8 +42,10 @@ from urllib.parse import parse_qs, urlparse
 
 from .. import cli
 from .. import engine
+from .. import filelock
 from .. import record as rec
 from .. import stages as pipeline_stages
+from ..scoring import answers_digest
 from . import viewer
 
 HERE = Path(__file__).resolve().parent
@@ -54,9 +58,15 @@ TEST_STRETCHES = 5
 EDITABLE = {"holdout": {"patches": "hold-out patches"},
             "fit": {"patches": "fit patches", "passes": "passes"},
             "blind": {"count": "patches in a round"}}
+# The lock a read-change-write of `params.json` is done under.
+SETTINGS_LOCK = pipeline_stages.SETTINGS_LOCK
 # Settings that only extend what is there: a hold-out set, fit patches or a blind round
 # already drawn stays, so a smaller number would change nothing.
 GROW_ONLY = {("holdout", "patches"), ("fit", "patches"), ("blind", "count")}
+
+
+class Conflict(ValueError):
+    """What a page asks rests on what it showed, and that is no longer current (HTTP 409)."""
 
 
 class Reviews:
@@ -94,7 +104,7 @@ class Reviews:
                      "stages": [self.stage_entry(pipeline, name, states[name])
                                 for name in pipeline.order]}
             if pipeline.record.exists(rec.HOLDOUT):
-                entry["holdout"] = self.progress(pipeline.record.read(rec.HOLDOUT), False)
+                entry["holdout"] = self.progress(pipeline.record.logged_holdout(), False)
                 entry["target"] = pipeline.stage_params("judge-holdout")["min_lines_up"]
             if pipeline.record.exists(rec.FINAL_REVIEW):
                 final = pipeline.record.read(rec.FINAL_REVIEW)
@@ -120,21 +130,23 @@ class Reviews:
         allowed = EDITABLE.get(stage, {})
         if not values or set(values) - set(allowed):
             raise ValueError(f"{stage} has no setting {sorted(set(values) - set(allowed))}")
-        current = self.pipeline(name).stage_params(stage)
-        clean = {}
-        for key, value in values.items():
-            value = int(value)
-            if value < 1:
-                raise ValueError(f"{allowed[key]} must be at least 1")
-            if (stage, key) in GROW_ONLY and value < current[key]:
-                raise ValueError(f"{allowed[key]} can only grow: there are {current[key]} already")
-            clean[key] = value
         record = self.record(name)
-        params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
-        params.pop("schema", None)
-        params.setdefault(stage, {}).update(clean)
-        record.write(pipeline_stages.PARAMS, params)
-        record.log("params", stage=stage, values=clean, by=self.reviewer)
+        # Read, check and write on the same current state: another save waits its turn.
+        with record.lock(SETTINGS_LOCK):
+            current = self.pipeline(name).stage_params(stage)
+            clean = {}
+            for key, value in values.items():
+                value = int(value)
+                if value < 1:
+                    raise ValueError(f"{allowed[key]} must be at least 1")
+                if (stage, key) in GROW_ONLY and value < current[key]:
+                    raise ValueError(f"{allowed[key]} can only grow: there are {current[key]} already")
+                clean[key] = value
+            params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
+            params.pop("schema", None)
+            params.setdefault(stage, {}).update(clean)
+            record.write(pipeline_stages.PARAMS, params)
+            record.log("params", stage=stage, values=clean, by=self.reviewer)
         self.advance(name)
         return params
 
@@ -152,17 +164,7 @@ class Reviews:
         return {"affected": affected}
 
     def more(self, name, holdout, fit):
-        record = self.record(name)
-        params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
-        params.pop("schema", None)
-        defaults = {stage.name: stage.params for stage in pipeline_stages.stages()}
-        for stage, extra in (("holdout", holdout), ("fit", fit)):
-            if extra:
-                current = params.get(stage, {}).get("patches", defaults[stage]["patches"])
-                params.setdefault(stage, {})["patches"] = current + int(extra)
-        record.write(pipeline_stages.PARAMS, params)
-        record.log("more", holdout=holdout, fit=fit, by=self.reviewer)
-        return params
+        return pipeline_stages.more(self.record(name), int(holdout or 0), int(fit or 0), self.reviewer)
 
     # ------------------------------------------------------------------ the hold-out set
 
@@ -202,7 +204,7 @@ class Reviews:
 
     def holdout(self, name, octants=False, reveal=False):
         pipeline = self.pipeline(name)
-        held = pipeline.record.read(rec.HOLDOUT)
+        held = pipeline.record.logged_holdout()
         units = self.units(held, octants)
         progress = self.progress(held, octants)
         target = pipeline.stage_params("judge-holdout")["min_lines_up"]
@@ -215,8 +217,7 @@ class Reviews:
         return {"pair": pipeline.record.read(rec.PAIR)["pair"], "octants": octants,
                 "answers": list(rec.ANSWERS), "units": units, "progress": progress,
                 "target": target, "next": following, "done": done,
-                "scores": json.loads(scores.read_text()) if scores.exists() and (done or reveal)
-                else None,
+                "scores": read_json(scores) if done or reveal else None,
                 "score_stale": pipeline.states()["score"] != engine.DONE}
 
     def viewer(self, name, unit):
@@ -245,16 +246,27 @@ class Reviews:
             return {"round": None, "decision": final.get("decision")}
         round_ = rounds[-1]
         done, tally = tally_of(round_)
-        scores = pipeline.work("scores.json")
+        # The scores shown are those of the current fit, read whole with the answers they
+        # were made of; `basis` names them, and the page sends it with its decision. None
+        # while they are being made again: no decision can be made on them then.
+        unit = None
+        if done:
+            try:
+                unit = pipeline_stages.reviewed_unit(pipeline)
+            except pipeline_stages.Incoherent:
+                unit = None
         return {
             "pair": pipeline.record.read(rec.PAIR)["pair"], "done": done,
+            # The fit the round is about, once it is answered: what a decision on it is for.
+            "fit": round_["candidates"][0] if done else None,
             "round": {"id": round_["id"], "candidates": round_["candidates"] if done else None,
                       "items": [{"patch": item["patch"], "options": len(item["options"]),
                                  "choice": item["choice"]}
                                 | ({"revealed": item["options"]} if done else {})
                                 for item in round_["items"]]},
             "tally": tally if done else None,
-            "scores": json.loads(scores.read_text()) if done and scores.exists() else None,
+            "scores": unit.scores if unit else None,
+            "basis": unit.basis if unit else None,
             "decision": final.get("decision"),
             "revisit": [item for item in final.get("revisit") or [] if not item.get("done")],
         }
@@ -277,24 +289,65 @@ class Reviews:
     def pick(self, name, round_id, index, choice):
         self.record(name).blind_pick(round_id, int(index), choice, self.reviewer)
 
-    def decide(self, name, publish, reason):
-        """The decision, checked against the bar: publishing a variant that misses it is an
-        override, which needs a reason and names what it missed."""
+    def decide(self, name, publish, reason, round_id=None, fit_id=None, basis=None):
+        """The decision on the round, fit and scores the page showed (`round_id`, `fit_id`,
+        and `basis`, which names the scores with the bar's verdict on them and the hold-out
+        answers they were made of), checked against the bar: publishing a variant that misses
+        it is an override, which needs a reason and names what it missed -- in the scores the
+        page showed, the only ones a decision can be made on. The decision keeps the basis.
+
+        Conflict unless the round is the newest one, every item of it is answered, and it is
+        about the current fit, whose blind round is done (nothing it rests on is being made
+        again), with scores of that fit, made of the answers there are, and they are the
+        scores the page showed. All of it is checked while no job can stamp a result or a redo
+        begin (`Pipeline.steady`), and the round and the answers under the record lock the
+        decision is written under, which an answer is logged under too: a page left open
+        across a redo or a rescoring, an old round's id, or an answer changed while the
+        decision is made, is refused, never applied to the scores there are now."""
         pipeline = self.pipeline(name)
-        final = pipeline.record.read(rec.FINAL_REVIEW)
-        rounds = final.get("rounds") or []
-        if not rounds or any(item["choice"] is None for item in rounds[-1]["items"]):
-            raise ValueError("finish the blind round first")
-        fit = json.loads(pipeline.work("fit", "fit.json").read_text())["fit"]
-        scores = json.loads(pipeline.work("scores.json").read_text())["scores"]
-        override = None
-        if publish in ("bend", "affine") and not scores[publish]["bar"]["passes"]:
-            if not (reason or "").strip():
-                raise ValueError(f"the {publish} misses the bar: give a reason to publish it anyway")
-            missed = [part for part, ok in scores[publish]["bar"]["checks"].items() if not ok]
-            override = {"by": self.reviewer, "reason": reason, "bar_missed": missed}
-        pipeline.record.decide({"fit": fit, "publish": publish, "reason": reason or "",
-                                "override": override}, self.reviewer)
+        if not round_id or not fit_id or not basis:
+            raise Conflict("the page did not say which round, fit and scores it shows: reload it and decide again")
+        with pipeline.steady():
+            state = pipeline.states()["blind"]
+            if state != engine.DONE:
+                raise Conflict(f"the blind round is not ready (it is {state}): reload the page "
+                               f"once it is, and decide on what it shows then")
+            try:
+                unit = pipeline_stages.reviewed_unit(pipeline)
+            except pipeline_stages.Incoherent as error:
+                raise Conflict(f"{error}: reload the page once it is done") from error
+
+            def check(final):
+                rounds = final.get("rounds") or []
+                if not rounds or rounds[-1]["id"] != round_id:
+                    raise Conflict(f"the page shows round {round_id}, but the current round is "
+                                   f"{rounds[-1]['id'] if rounds else 'none'}: reload the page")
+                if any(item["choice"] is None for item in rounds[-1]["items"]):
+                    raise Conflict(f"round {round_id} has unanswered items: finish the blind round "
+                                   f"first (reload the page if you did)")
+                if fit_id != rounds[-1]["candidates"][0] or fit_id != unit.fit_id:
+                    raise Conflict(f"the page shows {fit_id}, but the current fit is {unit.fit_id}: "
+                                   f"reload the page")
+                if answers_digest(pipeline.record.current_holdout()) != unit.answers_sha256:
+                    raise Conflict("a hold-out answer changed since these scores were made: reload the "
+                                   "page once they are made again, and decide on what it shows then")
+                if basis != unit.basis:
+                    raise Conflict("the page shows other scores than the current ones (an answer changed, "
+                                   "and they were made again): reload the page, and decide on what it "
+                                   "shows then")
+
+            scores = unit.scores["scores"]
+            override = None
+            if publish in ("bend", "affine") and not scores[publish]["bar"]["passes"]:
+                if not (reason or "").strip():
+                    with pipeline.record.lock():
+                        check(pipeline.record.read(rec.FINAL_REVIEW))   # a stale page hears that first
+                    raise ValueError(f"the {publish} misses the bar: give a reason to publish it anyway")
+                missed = pipeline_stages.bar_failures(scores[publish])
+                override = {"by": self.reviewer, "reason": reason, "bar_missed": missed}
+            pipeline.record.decide({"fit": fit_id, "publish": publish, "reason": reason or "",
+                                    "override": override, "round": round_id, "basis": unit.basis},
+                                   self.reviewer, check=check)
         self.advance(name)
 
     # ---------------------------------------------------------------------- pictures
@@ -322,7 +375,11 @@ def tally_of(round_):
 
 
 def read_json(path):
-    return json.loads(path.read_text()) if path.exists() else None
+    """A JSON file, or None; a read refused while Windows replaces the file is asked again."""
+    try:
+        return json.loads(filelock.retry(path.read_bytes))
+    except FileNotFoundError:
+        return None
 
 
 def fit_row(path, driven, folder):
@@ -460,12 +517,15 @@ def handler_for(reviews):
                     reviews.pick(name, body["round"], body["index"], body["choice"])
                     self.send_json({"ok": True})
                 elif action == "decide":
-                    reviews.decide(name, body["publish"], body.get("reason"))
+                    reviews.decide(name, body["publish"], body.get("reason"), body.get("round"),
+                                   body.get("fit"), body.get("basis"))
                     self.send_json({"ok": True})
                 else:
                     raise KeyError(action)
             except KeyError as error:
                 self.send_json({"error": f"not found: {error}"}, 404)
+            except Conflict as error:
+                self.send_json({"error": str(error)}, 409)
             except (IndexError, ValueError, StopIteration) as error:
                 self.send_json({"error": str(error)}, 400)
             except Exception as error:  # noqa: BLE001 - report it to the page

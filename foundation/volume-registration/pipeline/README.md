@@ -57,11 +57,44 @@ Two things behave differently from the first runs:
 | `recheck` | auto | measures the hold-out set again under the fit (needs both), and flags drift |
 | `score` | auto | the bend and the affine against your answers, and the bar |
 | `blind` | auto | draws and renders a blind round of bend against affine on the patches lining up or partly |
-| `final-review` | you | the blind picks, then the decision; publishing what misses the bar needs a reason, and is stored as an override |
-| `store` | auto | writes the decided transform and its scores into the record |
+| `final-review` | you | the blind picks, then the decision; publishing what misses the bar needs a reason, and is stored as an override naming what it misses |
+| `store` | auto | writes the decided transform and its scores into the record; after a new fit, or new scores (an answer changed), it fails until they are decided |
+
+Store takes the fit, its transform and its scores as one finished fit: the fit's files must
+be the ones its job stamped, and the scores must name that fit (or, written before they
+did, rest on it through their stamps). If a new fit or new scores are written while Store
+reads them, it fails instead of mixing two fits. It writes `fit/fit.json` first, naming the
+fit, the variant and the digest of the transform it then writes beside it; a release and
+`check` take a record only when all three are its decision's, so a store that stopped
+between its writes, or has not run since the decision changed, is not released.
+
+The decision is made on the round, fit and scores the blind page shows: the page sends all
+three (the scores as their `basis`, a digest of the scores of both variants with the bar's
+verdict on each, and the hold-out answers they were made of), and the server refuses it (409,
+saying to reload) unless the round is the newest, every item is answered, it is about the
+current fit, the blind stage is done, the scores are that fit's, they were made of the answers
+there are now, and they are the ones the page showed. So an answer changed while a decision
+is made, or a page left open while the pair is scored again, cannot approve scores nobody
+saw, and a reason typed on it cannot become an override for a failure it never showed. The
+decision keeps the basis. Store stores only the scores it names (and, for a decision from
+before decisions named one, only the scores the event log shows it was made on: it must be
+the last decision logged, after the blind round it names (one that names none, after rounds
+of its fit alone), and no hold-out job or answer that
+changes whether a unit lines up may come after the score that round was drawn from; the
+log's order tells apart what the clock's whole seconds cannot), and only with an override that
+names exactly the parts of the bar they miss; it binds the answers and the basis into
+`fit.json` too. Store rests on the scores as well as the decision, so new scores run it
+again, and it fails until the decision is made on them. (A pair stored before this shows
+Store as stale; `volreg run` stores it again, or `volreg adopt PAIR store "store rests on the
+scores too"` keeps what it stored.) This is checked while no job can stamp a result or a redo begin, and under the lock
+the decision is written under, so a page left open across a redo cannot decide for the fit
+made since.
 
 A job that finishes starts whatever its result made ready, and so does an answer or a
-decision on the review page. So a pair moves on by itself until you are next.
+decision on the review page. So a pair moves on by itself until you are next. Jobs started
+from a `uv run --with-requirements` go back through the same uv (`UV`, which uv sets, or
+`uv` on PATH), since uv deletes that environment when the command ends; with no uv to be
+found nothing is started, and the command says so.
 
 ## Review UI
 
@@ -129,7 +162,23 @@ wins over a migrated one of the same pair. Each pair keeps `pair.json`, `holdout
 stay behind. `index.json` lists each pair's source, decision, score, answer counts and file
 hashes, and what its record does not hold (a migrated record has no code commit or decision
 time, for example); nothing is filled in. Undecided and superseded records are listed as
-left out. `check` runs on a release as on any records folder:
+left out. A pipeline record redone after its decision was stored is left out until its
+store has run again under the decision it now holds; while it is its pair's newest
+decision, the pair's older records are held back too. Every pipeline record must also hold
+the result its decision names (the fit, the variant, the transform its `fit.json` was stored
+with), redone or not; a record stored by an older version is checked on the fit it names
+and whether its transform has a bend. Every released record must also hold the answers its
+scores used: the units its `holdout.json` answers "lines up" must be the ones its published
+score is on (and, for a record whose store bound them, its answers and basis must be the
+ones bound, and its decision's), and a score below the bar needs an override naming what it
+misses. A record whose answers changed after it was stored is left out (and holds its pair's
+older records back) until it is decided and stored again. So is a pipeline record whose event
+log holds an answer its `holdout.json` does not (the rewrite after it failed: the log is the
+answers' source, and Score reads them from it), and one whose decision names no scores and
+whose log does not show the scores it was made on. The event log is read for this, not
+released, so a release is checked on its shipped files alone. The release is written beside `OUT`
+and moved there whole, so a failed release leaves nothing. `check` runs on a release as on any records folder, and checks that binding and those answers before it
+recomputes the score; a record where no unit lines up is checked like any other:
 
     uv run --python 3.12 --with-requirements requirements.txt python -m volreg.cli release OUT RECORDS [RECORDS ...]
 

@@ -19,6 +19,8 @@ The reviewer is taken from --handle and --email, or VOLREG_HANDLE and VOLREG_EMA
 import argparse
 import json
 import os
+import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -28,7 +30,7 @@ from . import record as rec
 from . import release as releasing
 from . import stages as pipeline_stages
 from .cores.transform_io import read_transform_json
-from .scoring import bar_check, score
+from .scoring import bar_check, bar_failures, score
 
 
 def records(paths):
@@ -82,14 +84,44 @@ def show(pipeline):
         print(line)
 
 
+def in_uv_build_env(executable):
+    """Whether an interpreter lives in an environment `uv run --with-requirements` deletes
+    on exit: under uv's cache, in `builds-v<N>`, whichever separator the path uses."""
+    return re.search(r"[\\/]builds-v\d*[\\/]", str(executable)) is not None
+
+
+class CannotLaunch(RuntimeError):
+    """A background job could not be started with what it needs."""
+
+
+def uv_executable():
+    """The uv to start a job through, by absolute path: the one running this process (`uv
+    run` names itself in `UV`), else the one on PATH; None if there is neither."""
+    named = os.environ.get("UV")
+    if named and Path(named).is_file():
+        return str(Path(named).absolute())
+    return shutil.which("uv")
+
+
 def python():
     """How a background job starts Python. `uv run --with-requirements` runs in an
     environment it deletes when it exits, so a job started from a `volreg run` that has
-    since finished would find no interpreter; such a job goes through `uv run` again."""
-    if "/uv/builds-v" not in sys.executable:
+    since finished would find no interpreter; such a job goes through `uv run` again, by the
+    uv that ran this (which need not be on PATH), with the requirements the README's command
+    gives. With no uv to be found, CannotLaunch says what to do: the base interpreter the
+    environment was made from has none of the requirements."""
+    if not in_uv_build_env(sys.executable):
         return [sys.executable]
+    uv = uv_executable()
+    if uv is None:
+        raise CannotLaunch(
+            "volreg runs in a temporary uv environment, which uv deletes when this command "
+            "exits, and no uv was found to start background jobs through (UV is not set and "
+            "uv is not on PATH). Put uv on PATH, or set UV to the uv executable, or run volreg "
+            "from an environment that lasts (python -m venv, then pip install -r "
+            "requirements.txt); nothing was started.")
     requirements = Path(__file__).resolve().parent.parent / "requirements.txt"
-    return ["uv", "run", "-q", "--python", f"{sys.version_info.major}.{sys.version_info.minor}",
+    return [uv, "run", "-q", "--python", f"{sys.version_info.major}.{sys.version_info.minor}",
             "--with-requirements", str(requirements), "python"]
 
 
@@ -115,15 +147,25 @@ def new_pair(directory, start, volumes, name, by):
 
 
 def advance(pair):
-    """Start every stage of a pair that can run, each as a background `volreg job`."""
+    """Start every stage of a pair that can run, each as a background `volreg job`. How a
+    job starts Python is settled before the first one starts: if it cannot be, CannotLaunch
+    is raised and nothing has started."""
     pipeline = pipeline_stages.pipeline(pair)
-    command = python() + ["-m", "volreg.cli", "job", str(pair)]
-    _states, started = pipeline.advance(lambda name: pipeline.start(name, command + [name]))
+    command = []
+
+    def launch(name):
+        if not command:
+            command.extend(python() + ["-m", "volreg.cli", "job", str(pair)])
+        pipeline.start(name, command + [name])
+    _states, started = pipeline.advance(launch)
     return pipeline, started
 
 
 def run(args):
-    pipeline, started = advance(args.pair)
+    try:
+        pipeline, started = advance(args.pair)
+    except CannotLaunch as error:
+        sys.exit(f"{args.pair}: {error}")
     print(f"{args.pair}: started {', '.join(started) if started else 'nothing'}")
     show(pipeline)
 
@@ -157,30 +199,57 @@ def status(args):
         print(line)
 
 
+def same_score(result, stored):
+    """Whether a recomputed score is the stored one: the same units, and (when any line up)
+    the same distances. A score with no unit lining up has no distances to compare."""
+    if result.get("lines_up", 0) != stored.get("lines_up", 0):
+        return False
+    if "per_unit" in stored and set(stored["per_unit"]) != set(result.get("per_unit") or {}):
+        return False
+    if not result.get("lines_up"):
+        return True
+    keys = ("median_fine_voxels", "p90_fine_voxels", "worst_fine_voxels")
+    return all(isinstance(stored.get(key), (int, float)) and abs(result[key] - stored[key]) < 1e-9
+               for key in keys)
+
+
 def check(args):
-    """Recompute the published transform's score from the record alone, and compare it with
-    the stored one; check the decision against the bar. Exit 1 on any mismatch."""
+    """Check that the stored transform, its metadata and its scores are the one result the
+    decision names (the fit, the variant, the transform's digest: see `release.stored_mismatch`),
+    that those scores are of the hold-out answers the record holds and are what its decision
+    and any override were made on (`release.scores_problem`), then recompute the published
+    transform's score from the record alone and compare it with the stored one, and check the
+    decision against the bar. Exit 1 on any mismatch; a record with no unit lining up is
+    checked as any other, never raising."""
     failed = 0
     for record in records(args.records):
-        final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
-        decision = final.get("decision")
-        if not decision or not record.exists(rec.FIT):
+        decision = releasing.decision_of(record)
+        if not decision or not (record.exists(rec.FIT)
+                                or decision["publish"] != "nothing" and is_pipeline(record)):
+            continue
+        mismatch = releasing.decision_behind(record, decision) or releasing.stored_mismatch(
+            record, decision, legacy_too=is_pipeline(record)) or (
+            decision["publish"] != "nothing" and releasing.scores_problem(record, decision))
+        if mismatch or decision["publish"] == "nothing":
+            failed += bool(mismatch)
+            print(f"{record.directory.name:18s} {decision['publish']:6s} of {decision['fit']}  "
+                  + (f"NOT WHAT IS STORED: {mismatch}" if mismatch else "nothing published"))
             continue
         pair, fit = record.read(rec.PAIR), record.read(rec.FIT)
         result = score(record.read(rec.TRANSFORM), record.read(rec.HOLDOUT),
                        pair["coarse_side"] == "fixed", fit["fine_um"])
         stored = fit["scores"][decision["publish"]]
-        same = all(abs(result[key] - stored[key]) < 1e-9 for key in
-                   ("median_fine_voxels", "p90_fine_voxels", "worst_fine_voxels")) \
-            and result["lines_up"] == stored["lines_up"]
-        passes = bar_check(result)["passes"]
-        consistent = passes or bool(decision.get("override"))
+        same = same_score(result, stored)
+        missed = bar_failures(result | {"bar": bar_check(result)})
+        covered = set((decision.get("override") or {}).get("bar_missed") or [])
+        consistent = set(missed) <= covered
         failed += not (same and consistent)
-        print(f"{record.directory.name:18s} {decision['publish']:6s} "
-              f"{result['median_fine_voxels']:.2f}/{result['p90_fine_voxels']:.2f} on {result['lines_up']}"
+        measured = (f"{result['median_fine_voxels']:.2f}/{result['p90_fine_voxels']:.2f} on {result['lines_up']}"
+                    if result.get("lines_up") else "no unit lines up")
+        print(f"{record.directory.name:18s} {decision['publish']:6s} {measured}"
               f"  {'same as stored' if same else 'DIFFERS FROM STORED'}"
-              f"  bar {'passes' if passes else 'missed'}"
-              f"{'' if passes else (' (override)' if decision.get('override') else ' NO OVERRIDE')}")
+              f"  bar {'passes' if not missed else 'missed: ' + ', '.join(missed)}"
+              f"{'' if not missed else (' (override)' if consistent else ' NOT COVERED BY AN OVERRIDE')}")
     return 1 if failed else 0
 
 
@@ -249,15 +318,35 @@ def main(argv=None):
         # A job that finished starts what its result made ready, so a pair moves on by
         # itself until a person is next. Two jobs finishing at once may both try to start
         # the same stage; its lock lets only one run.
-        code = engine.main_job(pipeline_stages.pipeline(args.pair), args.stage)
+        try:
+            pipeline = pipeline_stages.pipeline(args.pair)
+        except Exception as error:   # noqa: BLE001 - recorded as the stage's failure
+            # The pair's settings cannot be read (held past the wait for a replace, say): the
+            # stage fails as a job does, under its lock, instead of being left ready with no
+            # job on it. They are read once more where no redo can come between; read, the
+            # job goes on, and a failure is recorded where a redo after it clears it.
+            loaded = []
+            stamp = engine.Pipeline(args.pair, pipeline_stages.stages()).fail_unstarted(
+                args.stage, error, again=lambda: loaded.append(pipeline_stages.pipeline(args.pair)))
+            if stamp is not None:
+                print(f"{args.stage}: failed before it began: {stamp['error']}", file=sys.stderr)
+                return 1
+            pipeline = loaded[0]
+        code = engine.main_job(pipeline, args.stage)
         if code == 0:
-            advance(args.pair)
+            try:
+                advance(args.pair)
+            except CannotLaunch as error:
+                print(f"{args.pair}: {error}", file=sys.stderr)
         return code
     elif args.command == "import":
         pipeline = pipeline_stages.pipeline(args.pair)
         with pipeline_stages.session_lock(pipeline):
             print(migration.import_session(args.session, args.record, args.pair))
-        advance(args.pair)
+        try:
+            advance(args.pair)
+        except CannotLaunch as error:
+            sys.exit(f"{args.pair}: imported, but {error}")
     elif args.command == "release":
         index = releasing.release(args.out, args.records)
         for pair in index["pairs"]:
@@ -272,29 +361,29 @@ def main(argv=None):
         affected = pipeline_stages.pipeline(args.pair).redo(args.stage)
         print(f"will run again: {', '.join(affected)}")
     elif args.command == "more":
-        record = rec.Record(args.pair)
-        params = record.read(pipeline_stages.PARAMS) if record.exists(pipeline_stages.PARAMS) else {}
-        params.pop("schema", None)
-        defaults = {stage.name: stage.params for stage in pipeline_stages.stages()}
-        for stage, extra in (("holdout", args.holdout), ("fit", args.fit)):
-            if extra:
-                current = params.get(stage, {}).get("patches", defaults[stage]["patches"])
-                params.setdefault(stage, {})["patches"] = current + extra
-        record.write(pipeline_stages.PARAMS, params)
-        record.log("more", holdout=args.holdout, fit=args.fit, by=reviewer(args))
+        try:
+            params = pipeline_stages.more(rec.Record(args.pair), args.holdout, args.fit, reviewer(args))
+        except ValueError as error:
+            parser.error(str(error))
         print(params)
     elif args.command == "revisit":
         record = rec.Record(args.pair)
-        final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
-        final.pop("schema", None)
-        items = final.setdefault("revisit", [])
+        by = reviewer(args)
+        # Under the lock the views are rewritten under, so a blind round or a decision
+        # written meanwhile is not lost.
+        with record.lock():
+            final = record.read(rec.FINAL_REVIEW) if record.exists(rec.FINAL_REVIEW) else {}
+            final.pop("schema", None)
+            items = final.setdefault("revisit", [])
+            if args.done is not None:
+                items[args.done - 1]["done"] = {"at": rec.now(), "by": by}
+            else:
+                items.append({"text": args.text, "at": rec.now(), "by": by, "done": None})
+            record.write(rec.FINAL_REVIEW, final)
         if args.done is not None:
-            items[args.done - 1]["done"] = {"at": rec.now(), "by": reviewer(args)}
-            record.log("revisit-done", item=args.done, by=reviewer(args))
+            record.log("revisit-done", item=args.done, by=by)
         else:
-            items.append({"text": args.text, "at": rec.now(), "by": reviewer(args), "done": None})
-            record.log("revisit", text=args.text, by=reviewer(args))
-        record.write(rec.FINAL_REVIEW, final)
+            record.log("revisit", text=args.text, by=by)
         for index, item in enumerate(items, 1):
             print(f"{index}. {'done' if item['done'] else 'open'}: {item['text']}")
     elif args.command == "answer":

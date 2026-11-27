@@ -3,7 +3,17 @@
 Needs nothing but the record: each hold-out patch answered "lines up" carries its coarse
 centre and the fine point its own measurement put it at, and a transform maps one to the
 other. How far it lands from that point, in fine level-0 voxels, is the patch's score.
+
+A score is only as good as the answers it was made of, and a decision only covers the scores
+it was made on. `answers_digest` names the answers a score used (the units answered "lines
+up", where they sit), and `basis` names what a reviewer decides on: the scores of a fit, with
+the bar's verdict on each variant, and those answers. The review page, the decision, Store
+and Release all carry the basis, so none of them can pair an approval with other scores, or
+scores with other answers.
 """
+
+import hashlib
+import json
 
 import numpy as np
 
@@ -47,6 +57,114 @@ def lining_up(holdout):
                 units.append((f"{patch['id']}.{octant['index']}", octant["centre_zyx"],
                               octant["fine_zyx"]))
     return units
+
+
+def answers_used(holdout):
+    """What a score rests on: `[id, coarse centre, fine point]` of every unit answered "lines
+    up", by id. Like `lining_up`, but for any record (a unit's points are None where it has
+    none), and in an order of its own."""
+    found = []
+    for patch in holdout.get("patches") or []:
+        units = [(patch["id"], patch)] + [(f"{patch['id']}.{octant['index']}", octant)
+                                          for octant in patch.get("octants") or []]
+        for unit_id, unit in units:
+            if (unit.get("answer") or {}).get("answer") == LINES_UP:
+                found.append([unit_id, unit.get("centre_zyx"), unit.get("fine_zyx")])
+    return sorted(found, key=lambda unit: unit[0])
+
+
+def answers_digest(holdout):
+    """The digest of `answers_used`: which answers, and so which units, a score was made of.
+    A note, a picture, or another answer than "lines up" changed into another one that is not
+    either, leaves it as it was, since the score does not change."""
+    return hashlib.sha256(json.dumps(answers_used(holdout), sort_keys=True).encode()).hexdigest()
+
+
+def basis(fit_digest, scores, bar, answers):
+    """What a decision is made on, as one digest: the fit (by its stamp's digest), its scores
+    for every variant with the bar's verdict on each (`scores`, as `scores.json` holds them),
+    the bar, and the answers they used (`answers_digest`)."""
+    return hashlib.sha256(json.dumps({"fit_digest": fit_digest, "scores": scores, "bar": bar,
+                                      "answers": answers}, sort_keys=True).encode()).hexdigest()
+
+
+def legacy_approval_problem(events, decision):
+    """Why a record's event log (`events`, in the order written) does not show which scores
+    a decision from before decisions named their scores covers, or None if it shows they are
+    the scores there are.
+
+    Such a decision (a legacy approval) has no basis, and its time is in whole seconds, as
+    the scores' is: a score finished in the same second, or a stale page sent again after a
+    rescore, cannot be told from the scores the page showed by the clock. The log can tell
+    what the page could have shown. A page shows a blind round, so it was loaded after its
+    round was drawn, and it showed the scores finished by then, or later ones. The decision
+    covers the scores there are only if nothing those scores rest on changed since that
+    round was drawn: no answer changed whether a unit lines up (even if changed back), and
+    the hold-out set was not drawn again. Otherwise the page may have shown other scores
+    than the ones there are, and the decision is made again on them.
+
+    Which round: the first time the round the decision names was logged (`blind-round`),
+    from the start of the blind job that drew it; for a decision that names no round (main
+    named none), or a log that does not show it, the first blind job after the last fit before
+    it. The decision must be the last one the log holds (the same fit, variant, override and
+    round), logged after that round was drawn. One that names no round must also follow
+    rounds of its fit alone: main's page sent no fit, and approved the fit there was. Line
+    order, not the clock: the log is appended under the record lock, so its order is the
+    order things happened in."""
+    logged = [index for index, event in enumerate(events) if event["kind"] == "decision"]
+    if not logged:
+        return "its event log holds no decision"
+    last = events[logged[-1]]
+    if (any(last.get(key) != decision.get(key) for key in ("fit", "publish", "override"))
+            or (last.get("round") or None) != (decision.get("round") or None)):
+        return "it is not the last decision its event log holds"
+    if not decision.get("round"):
+        fits = {(event.get("candidates") or [None])[0] for event in events[:logged[-1]]
+                if event["kind"] == "blind-round"}
+        if fits != {decision.get("fit")}:
+            return (f"its event log does not show rounds of {decision.get('fit')} alone drawn before it, so "
+                    f"the page it was sent from may have shown another fit")
+
+    def job(index, kind, stage):
+        return events[index]["kind"] == kind and events[index].get("stage") == stage
+
+    drawn = None
+    if decision.get("round"):
+        named = next((index for index, event in enumerate(events)
+                      if event["kind"] == "blind-round" and event.get("round") == decision["round"]), None)
+        if named is not None:
+            drawn = next((index for index in range(named, -1, -1) if job(index, "job-started", "blind")), named)
+    if drawn is None:
+        fitted = max((index for index in range(logged[-1]) if job(index, "job-finished", "fit")), default=-1)
+        drawn = next((index for index in range(fitted + 1, len(events)) if job(index, "job-started", "blind")),
+                     None)
+    if drawn is None or logged[-1] < drawn:
+        return "its event log does not show the blind round it was made on"
+    finished = max((index for index in range(drawn) if job(index, "job-finished", "score")), default=None)
+    if finished is None:
+        return "its event log does not show the scores its blind round was drawn on"
+    since = max((index for index in range(finished) if job(index, "job-started", "score")), default=0)
+    if any(job(index, "job-started", "holdout") for index in range(since, len(events))):
+        return "the hold-out set was drawn again after the blind round it was made on"
+    lining = {}
+    for index, event in enumerate(events):
+        if event["kind"] != "holdout-answer":
+            continue
+        up = event.get("answer") == LINES_UP
+        if index < since:
+            lining[event["unit"]] = up
+        elif up != lining.get(event["unit"], False):
+            return (f"an answer changed whether {event['unit']} lines up after the blind round it was "
+                    f"made on was drawn, so the scores it saw may not be the ones there are")
+    return None
+
+
+def bar_failures(result):
+    """The parts of the bar a stored score misses, as its own check recorded them, sorted. A
+    score said to miss the bar without saying where misses "bar"."""
+    bar = (result or {}).get("bar") or {}
+    missed = sorted(part for part, ok in (bar.get("checks") or {}).items() if not ok)
+    return missed or (["bar"] if bar.get("passes") is False else [])
 
 
 def score(transform, holdout, fixed_is_coarse, fine_um, affine_only=False, units=None):

@@ -30,7 +30,6 @@ moving -> fixed -- so a session file reads like a transform file.
 
 import argparse
 import json
-import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -39,6 +38,7 @@ from typing import NamedTuple
 
 import numpy as np
 
+from .. import filelock
 from . import dense_correlation as dense
 from . import session_overview
 from .deformable import (
@@ -52,6 +52,7 @@ from .transform_io import (
     matrix_swap_xyz_zyx,
     points_swap_xyz_zyx,
     read_transform_json,
+    volume_name,
     write_transform_json,
 )
 from .volumes import open_volume_levels
@@ -288,8 +289,9 @@ class Session:
     @classmethod
     def load(cls, directory):
         directory = Path(directory)
-        with open(directory / "session.json") as handle:
-            state = json.load(handle)
+        # Read as the record files are: a read that lands while Windows replaces the file is
+        # refused, and asked again, so the viewer does not answer 500 meanwhile.
+        state = json.loads(filelock.retry((directory / "session.json").read_bytes))
         if state.get("schema") != SCHEMA:
             raise ValueError(f"unknown session schema {state.get('schema')!r}")
         return cls(directory, state)
@@ -325,7 +327,7 @@ class Session:
         scratch = target.with_suffix(".json.tmp")
         with open(scratch, "w") as handle:
             json.dump(self.state, handle, indent=1)
-        os.replace(scratch, target)
+        filelock.replace(scratch, target)
         self._as_read = (self._stamp(), json.loads(json.dumps(person_fields(self.state))))
 
     # -------------------------------------------------------------------- the volumes
@@ -1142,7 +1144,7 @@ class Session:
             raise ValueError("nothing has been fitted yet")
         with open(self.directory / record["transform"]) as handle:
             data = json.load(handle)
-        data["fixed_volume"] = data["fixed_volume"].rstrip("/").rsplit("/", 1)[-1]
+        data["fixed_volume"] = volume_name(data["fixed_volume"])
         if not affine_only:
             with open(out, "w") as handle:
                 json.dump(data, handle, indent=2)

@@ -2,11 +2,23 @@
 from `transform_utils.py` without its volume and SimpleITK imports."""
 
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
 import jsonschema
 import numpy as np
+
+
+def volume_name(location):
+    """The name of a volume from where it is read: the last part of a URL or a POSIX path, as
+    the atlas names it (its zarr). A Windows path (a drive letter, a UNC share, or backslashes
+    and no slash) is cut at either separator; anything else is cut at `/` only."""
+    text = str(location)
+    if "://" not in text and (re.match(r"[A-Za-z]:[\\/]", text) or text.startswith("\\\\")
+                              or ("\\" in text and "/" not in text)):
+        return re.split(r"[\\/]", text.rstrip("\\/"))[-1]
+    return text.rstrip("/").rsplit("/", 1)[-1]
 
 
 def invert_affine_matrix(matrix: np.ndarray) -> np.ndarray:

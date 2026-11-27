@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import filelock
 from . import record as rec
 from .scoring import BAR, bar_check, score
 
@@ -327,7 +328,7 @@ def import_session(session_dir, record_dir, pair_dir):
         state["current"] = fit_ids[old.state["current"]]
     scratch = target / "session.json.tmp"
     scratch.write_text(json.dumps(state, indent=1))
-    scratch.replace(target / "session.json")
+    filelock.replace(scratch, target / "session.json")
 
     record = rec.Record(pair)
     carried = 0
