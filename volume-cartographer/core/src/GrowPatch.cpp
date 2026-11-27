@@ -2,6 +2,7 @@
 #include <stdexcept>
 #include <utility>
 #include "vc/tracer/SheetGrowth.hpp"
+#include "GrowPatchStraightLoss.hpp"
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -1168,8 +1169,9 @@ static int conditional_straight_loss(int bit, const cv::Vec2i &p, const cv::Vec2
     cv::Mat_<uint16_t> &loss_status, ceres::Problem &problem, TraceParameters &params, const LossSettings &settings)
 {
     int set = 0;
-    if (!loss_mask(bit, p, o2, loss_status))
-        set += set_loss_mask(bit, p, o2, loss_status, gen_straight_loss(problem, p, o1, o2, o3, params, settings));
+    const cv::Vec2i key = straight_loss_key(p, o2);
+    if (!loss_mask(bit, key, {0,0}, loss_status))
+        set += set_loss_mask(bit, key, {0,0}, loss_status, gen_straight_loss(problem, p, o1, o2, o3, params, settings));
     return set;
 };
 
@@ -1499,25 +1501,8 @@ static int add_missing_losses(ceres::Problem &problem, cv::Mat_<uint16_t> &loss_
     //generate losses for point p
     int count = 0;
 
-    //horizontal
-    count += conditional_straight_loss(0, p, {0,-2},{0,-1},{0,0}, loss_status, problem, params, settings);
-    count += conditional_straight_loss(0, p, {0,-1},{0,0},{0,1}, loss_status, problem, params, settings);
-    count += conditional_straight_loss(0, p, {0,0},{0,1},{0,2}, loss_status, problem, params, settings);
-
-    //vertical
-    count += conditional_straight_loss(1, p, {-2,0},{-1,0},{0,0}, loss_status, problem, params, settings);
-    count += conditional_straight_loss(1, p, {-1,0},{0,0},{1,0}, loss_status, problem, params, settings);
-    count += conditional_straight_loss(1, p, {0,0},{1,0},{2,0}, loss_status, problem, params, settings);
-
-    //diag1
-    count += conditional_straight_loss(0, p, {-2,-2},{-1,-1},{0,0}, loss_status, problem, params, settings);
-    count += conditional_straight_loss(0, p, {-1,-1},{0,0},{1,1}, loss_status, problem, params, settings);
-    count += conditional_straight_loss(0, p, {0,0},{1,1},{2,2}, loss_status, problem, params, settings);
-
-    //diag2
-    count += conditional_straight_loss(1, p, {-2,2},{-1,1},{0,0}, loss_status, problem, params, settings);
-    count += conditional_straight_loss(1, p, {-1,1},{0,0},{1,-1}, loss_status, problem, params, settings);
-    count += conditional_straight_loss(1, p, {0,0},{1,-1},{2,-2}, loss_status, problem, params, settings);
+    for (const StraightLossSpec &t : kStraightLosses)
+        count += conditional_straight_loss(t.bit, p, t.o1, t.o2, t.o3, loss_status, problem, params, settings);
 
     //direct neighboars h
     count += conditional_dist_loss(2, p, {0,-1}, loss_status, problem, params, settings);
@@ -2930,7 +2915,7 @@ static QuadSurface *tracer_body(vcr::Array& volume, float scale, cv::Vec3f origi
             std::atomic<int> done = 0;
             LocalOptTimingAccumulator timing_accum;
             if (!opt_local.empty()) {
-                OmpThreadPointCol opt_local_threadcol(opt_step*2+1, opt_local);
+                OmpThreadPointCol opt_local_threadcol(LocalSolveConflicts(opt_radius), opt_local);
                 int total = opt_local.size();
                 auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -3273,7 +3258,9 @@ static QuadSurface *tracer_body(vcr::Array& volume, float scale, cv::Vec3f origi
 
             // Build a structure that allows parallel iteration over cands, while avoiding any two threads simultaneously
             // considering two points that are too close to each other...
-            OmpThreadPointCol cands_threadcol(local_opt_r*2+1, cands);
+            // Two solves run together only when neither reads a vertex the other moves (a loss reads up to two cells away).
+            const LocalSolveConflicts solve_conflicts(local_opt_r);
+            OmpThreadPointCol cands_threadcol([&solve_conflicts](const cv::Vec2i &a, const cv::Vec2i &b) { return solve_conflicts(a, b); }, cands);
 
             // ...then start iterating over candidates in parallel using the above to yield points
             #pragma omp parallel
@@ -3403,7 +3390,7 @@ static QuadSurface *tracer_body(vcr::Array& volume, float scale, cv::Vec3f origi
             int done = 0;
 
             if (!opt_local.empty()) {
-                OmpThreadPointCol opt_local_threadcol(17, opt_local);
+                OmpThreadPointCol opt_local_threadcol(LocalSolveConflicts(8), opt_local);
 
 #pragma omp parallel
                 while (true)

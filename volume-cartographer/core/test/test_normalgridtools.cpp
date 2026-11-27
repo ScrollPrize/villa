@@ -426,3 +426,166 @@ TEST_CASE("align_and_extract_umbilicus: a round third of a turn, uncrush 1.5 is 
     CHECK(uncrushed[0] == unchanged[0]);   // without the half-turn check: 20 seed median 5.38 to 12.05 mm
     CHECK(uncrushed[1] == unchanged[1]);
 }
+
+// fit_umbilicus_along_z, on estimates whose axis is known by construction: a line tilted in x
+// and y, one estimate per slice every 256 slices (about 2.4 mm at 9.4 um), the way
+// vc_gen_umbilicus reads them.
+namespace {
+
+cv::Vec2d tiltedAxis(double z) { return cv::Vec2d(3000.0 + 0.03 * z, 2500.0 - 0.01 * z); }
+
+// Each estimate is the axis plus Gaussian scatter of `sd` voxels; one slice in `every` lands
+// `jump` voxels off in a random direction, as when the hill climb leaves the grid.
+std::vector<cv::Vec3d> scatteredEstimates(std::uint32_t seed, double sd, int every, double jump,
+                                          std::vector<double>& slices)
+{
+    std::mt19937 rng(seed);
+    // libstdc++ asserts stddev > 0 when built without optimisation, so with sd 0 the
+    // distribution gets a placeholder stddev and is never drawn from.
+    std::normal_distribution<double> noise(0.0, sd > 0.0 ? sd : 1.0);
+    std::uniform_real_distribution<double> angle(0.0, 6.283185307179586);
+    std::vector<cv::Vec3d> e;
+    slices.clear();
+    for (int i = 0; i < 60; ++i) {
+        const double z = 256.0 * i;
+        cv::Vec2d p = tiltedAxis(z);
+        if (sd > 0.0)
+            p += cv::Vec2d(noise(rng), noise(rng));
+        if (every > 0 && i % every == every / 2) {
+            const double a = angle(rng);
+            p += cv::Vec2d(jump * std::cos(a), jump * std::sin(a));
+        }
+        e.emplace_back(z, p[0], p[1]);
+        slices.push_back(z);
+    }
+    return e;
+}
+
+double worstError(const std::vector<cv::Vec2d>& fit, const std::vector<double>& slices)
+{
+    double worst = 0.0;
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const cv::Vec2d d = fit[i] - tiltedAxis(slices[i]);
+        worst = std::max(worst, std::hypot(d[0], d[1]));
+    }
+    return worst;
+}
+
+} // namespace
+
+TEST_CASE("fit_umbilicus_along_z: a straight axis is returned as it is")
+{
+    std::vector<double> slices;
+    const auto e = scatteredEstimates(1u, 0.0, 0, 0.0, slices);
+    CHECK(worstError(fit_umbilicus_along_z(e, slices, 2000.0), slices) < 1e-6);
+}
+
+TEST_CASE("fit_umbilicus_along_z: at window 2000, slices that walked off the axis are outvoted")
+{
+    // One slice in seven lands 400 voxels off; the others scatter by 20. Over seeds 1-20 the
+    // worst slice of the fit, the end slices and the walked-off slices included, is 54.0 voxels
+    // from the axis at most (median 28.7). Without the robustness reweighting the walked-off
+    // slices drag the fit: at least 199 voxels (median 216).
+    for (std::uint32_t seed = 1; seed <= 5; ++seed) {
+        std::vector<double> slices;
+        const auto e = scatteredEstimates(seed, 20.0, 7, 400.0, slices);
+        const double robust = worstError(fit_umbilicus_along_z(e, slices, 2000.0), slices);
+        const double plain = worstError(fit_umbilicus_along_z(e, slices, 2000.0, 0), slices);
+        CHECK(robust < 60.0);
+        CHECK(plain > 150.0);
+    }
+}
+
+TEST_CASE("fit_umbilicus_along_z: at window 500, most slices that walked off keep their own estimate")
+{
+    // The recommended --zfit 500 at one slice every 256 puts one slice each side in the window.
+    // The end slices have 2 estimates in theirs, so they keep their own estimate. Once the
+    // reweighting drops a slice that walked off, its window has fewer than 3 weighted estimates
+    // left, and it keeps its own estimate too. Over seeds 1-20, all 160 interior walked-off slices
+    // come back unchanged. If this starts failing because they are outvoted, update the --zfit help
+    // and the comment at the top of vc_gen_umbilicus.cpp.
+    int kept = 0;
+    for (std::uint32_t seed = 1; seed <= 20; ++seed) {
+        std::vector<double> slices;
+        const auto e = scatteredEstimates(seed, 20.0, 7, 400.0, slices);
+        const auto fit = fit_umbilicus_along_z(e, slices, 500.0);
+        CHECK(fit.front()[0] == e.front()[1]);
+        CHECK(fit.front()[1] == e.front()[2]);
+        CHECK(fit.back()[0] == e.back()[1]);
+        CHECK(fit.back()[1] == e.back()[2]);
+        for (size_t i = 3; i + 1 < e.size(); i += 7) {
+            if (fit[i][0] == e[i][1] && fit[i][1] == e[i][2])
+                ++kept;
+        }
+    }
+    CHECK(kept >= 80);
+}
+
+TEST_CASE("fit_umbilicus_along_z: slices without a fit do not stop the reweighting elsewhere")
+{
+    std::vector<double> slices;
+    auto e = scatteredEstimates(1u, 20.0, 7, 400.0, slices);
+    for (int k = 0; k < 80; ++k)
+        e.emplace_back(1e5 + 1e4 * k, 0.0, 0.0);
+    const auto fit = fit_umbilicus_along_z(e, slices, 2000.0);
+    CHECK(worstError(fit, slices) < 60.0);
+}
+
+TEST_CASE("fit_umbilicus_along_z: repeats at one z alone keep the slice's median")
+{
+    const std::vector<cv::Vec3d> e = {{0.0, 10.0, 20.0}, {0.0, 11.0, 21.0}, {0.0, 40.0, 60.0}};
+    const auto fit = fit_umbilicus_along_z(e, {0.0}, 300.0);
+    CHECK(fit[0][0] == doctest::Approx(11.0));
+    CHECK(fit[0][1] == doctest::Approx(21.0));
+}
+
+TEST_CASE("fit_umbilicus_along_z: a window with too few estimates keeps the slice's median")
+{
+    // Two repeats per slice, 1,000 slices apart, and a 300 voxel window: no window holds the 3
+    // estimates a line needs.
+    const std::vector<cv::Vec3d> e = {{0.0, 10.0, 20.0}, {0.0, 14.0, 26.0},
+                                      {1000.0, 50.0, 60.0}, {1000.0, 52.0, 70.0}};
+    const auto fit = fit_umbilicus_along_z(e, {0.0, 1000.0, 500.0}, 300.0);
+    CHECK(fit[0][0] == doctest::Approx(12.0));
+    CHECK(fit[0][1] == doctest::Approx(23.0));
+    CHECK(fit[1][0] == doctest::Approx(51.0));
+    CHECK(fit[1][1] == doctest::Approx(65.0));
+    CHECK(std::isnan(fit[2][0]));   // no estimate in the window and none at that z
+}
+
+TEST_CASE("fit_umbilicus_along_z: no estimates or no window gives NaN")
+{
+    CHECK(std::isnan(fit_umbilicus_along_z({}, {0.0}, 1000.0)[0][0]));
+    CHECK(std::isnan(fit_umbilicus_along_z({{0.0, 1.0, 2.0}}, {0.0}, 0.0)[0][0]));
+}
+
+TEST_CASE("median: the middle value, the mean of the middle two for an even count, NaN when empty")
+{
+    using vc::core::util::median;
+    CHECK(median({3.0, 1.0, 2.0}) == 2.0);
+    CHECK(median({4.0, 1.0, 3.0, 2.0}) == 2.5);
+    CHECK(median({7.0}) == 7.0);
+    CHECK(median({1.0, 1.0, 2.0, 2.0}) == 1.5);
+    CHECK(median({-2.0, 5.0}) == 1.5);
+    CHECK(std::isnan(median({})));
+
+    // The same value as the sort-based median vc_gen_umbilicus used before. (A tie between 0.0 and
+    // -0.0 can come out with either sign, as it already could between the two old helpers.)
+    auto sorted_median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        const size_t mid = v.size() / 2;
+        return v.size() % 2 == 1 ? v[mid] : 0.5 * (v[mid - 1] + v[mid]);
+    };
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<double> value(-1e4, 1e4);
+    std::uniform_int_distribution<int> count(1, 60);
+    for (int trial = 0; trial < 2000; ++trial) {
+        std::vector<double> v(static_cast<size_t>(count(rng)));
+        for (auto& x : v) {
+            x = trial % 3 == 0 ? std::round(value(rng) / 1000.0) : value(rng);  // ties on every third trial
+        }
+        const double a = median(v);
+        const double b = sorted_median(v);
+        CHECK(a == b);
+    }
+}
