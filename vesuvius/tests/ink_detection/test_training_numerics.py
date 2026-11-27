@@ -290,6 +290,71 @@ def test_dilate_label_batch_within_valid_mask():
     torch.testing.assert_close(output[1], labels[1])
 
 
+_DEVICES = (
+    "cpu",
+    pytest.param(
+        "mps",
+        marks=pytest.mark.skipif(
+            not torch.backends.mps.is_available(), reason="requires an MPS device"
+        ),
+    ),
+)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_dilate_label_batch_on_device_matches_cpu(device):
+    labels = torch.zeros(2, 2, 5, 6, 7)
+    labels[0, 0, 2, 3, 3] = 1
+    labels[0, 1, 1, 1, 5] = 1
+    labels[0, 1, 3, 4, 1] = 2  # ignore labels are kept
+    labels[1, 0, 4, 0, 6] = 1
+    valid = torch.ones(2, 1, 5, 6, 7)
+    valid[0, 0, 2, 3, 5] = 0
+    expected = dilate_label_batch(labels, valid, 2.0)
+    assert (expected == 1).sum() > (labels == 1).sum()
+
+    output = dilate_label_batch(labels.to(device), valid.to(device), 2.0)
+
+    assert output.device.type == device
+    assert output.dtype == labels.dtype
+    assert torch.equal(output.cpu(), expected)
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_apply_label_dilation_on_device_matches_cpu(device):
+    labels = torch.zeros(1, 1, 5, 6, 7)
+    labels[0, 0, 2, 3, 3] = 1
+    supervision = torch.zeros_like(labels)
+    supervision[0, 0, 2, 3, 0] = 1
+    supervision[0, 0, 2, 3, 3] = 1
+    batch = {"inklabels": labels, "supervision_mask": supervision}
+    expected = apply_label_dilation(batch, 1.5, 2.0)
+    assert expected["supervision_mask"].sum() > supervision.sum()
+
+    output = apply_label_dilation(
+        {key: value.to(device) for key, value in batch.items()}, 1.5, 2.0
+    )
+
+    for key, value in expected.items():
+        assert output[key].device.type == device
+        assert torch.equal(output[key].cpu(), value)
+
+
+def test_dilate_label_batch_cuda_without_native_backend_matches_cpu(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    monkeypatch.setattr(dilation_module.vc_cuda, "is_available", lambda: False)
+    labels = torch.zeros(1, 1, 5, 6, 7)
+    labels[0, 0, 2, 3, 3] = 1
+    valid = torch.ones(1, 1, 5, 6, 7)
+    expected = dilate_label_batch(labels, valid, 2.0)
+
+    output = dilate_label_batch(labels.cuda(), valid.cuda(), 2.0)
+
+    assert output.device.type == "cuda"
+    assert torch.equal(output.cpu(), expected)
+
+
 def test_dilation_level_scaling_and_mixed_positive_levels():
     authored = _training_mapping()
     authored["mode"] = "full_3d"

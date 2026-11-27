@@ -7,6 +7,7 @@ from collections.abc import Mapping
 import torch
 
 import vc_reader.transforms as A
+from vc_reader import cuda as vc_cuda
 
 from vesuvius.ink_detection.config import TrainingConfig
 from vesuvius.ink_detection.data.geometry import native_volume_downsample_factor
@@ -46,8 +47,10 @@ def dilate_label_batch(
 ) -> torch.Tensor:
     """Set background voxels within ``distance`` of label 1 to 1, inside a validity mask.
 
-    Distances are exact Euclidean (vc_reader DistanceTransform) on the tensor's
-    device. A channel with no valid label 1 voxels is returned unchanged.
+    Distances are exact Euclidean (vc_reader DistanceTransform). MPS tensors, and
+    CUDA tensors when vc_reader has no CUDA build, are measured on a CPU copy and
+    the result comes back on the input device. A channel with no valid label 1
+    voxels is returned unchanged.
     """
 
     if distance in (None, 0):
@@ -57,9 +60,14 @@ def dilate_label_batch(
     batch, channels, *spatial = labels_BCZYX.shape
     valid_B1ZYX = valid_B1ZYX > 0
     source_BCZYX = (labels_BCZYX == 1) & valid_B1ZYX
-    distances_BCZYX = _OUTSIDE_DISTANCE.batch(
-        source_BCZYX.reshape(batch * channels, 1, *spatial).to(torch.uint8)
-    ).reshape(labels_BCZYX.shape)
+    source_N1ZYX = source_BCZYX.reshape(batch * channels, 1, *spatial).to(torch.uint8)
+    device = source_N1ZYX.device
+    if device.type == "mps" or (device.type == "cuda" and not vc_cuda.is_available()):
+        # vc_reader takes CPU tensors, and CUDA tensors only with its CUDA build.
+        distances_N1ZYX = _OUTSIDE_DISTANCE.batch(source_N1ZYX.cpu()).to(device)
+    else:
+        distances_N1ZYX = _OUTSIDE_DISTANCE.batch(source_N1ZYX)
+    distances_BCZYX = distances_N1ZYX.reshape(labels_BCZYX.shape)
     has_source_BC111 = source_BCZYX.flatten(2).any(-1).reshape(batch, channels, 1, 1, 1)
     fill_BCZYX = (
         (labels_BCZYX == 0)
