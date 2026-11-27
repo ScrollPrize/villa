@@ -1393,6 +1393,7 @@ int main(int argc, char *argv[])
             options.requireFinite = true;
             options.rowStride = points.step1();
             options.maxPairs = std::int64_t(1) << 20;
+            options.medians = vcr::tifxyz::kSpacingRows | vcr::tifxyz::kSpacingCols;  // the median over both axes is not used here
             const auto check = vcr::tifxyz::checkScale(reinterpret_cast<const float*>(points.ptr()), points.rows, points.cols, scale, options);
             const char* names[2] = {"rows", "columns"};
             const std::optional<double> spacing[2] = {check.measured.rows, check.measured.cols};

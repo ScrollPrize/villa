@@ -336,7 +336,9 @@ std::array<std::int64_t, 2> storedShape(const std::string& location, const sourc
 
 namespace {
 
-// The lower median of [first, last); reorders only that range.
+// The median of [first, last): the element at position n / 2 in sorted order, i.e. the upper of the two middle
+// elements when n is even (the element vc_grow_seg_from_segments' median_surface_step_vx took before it used this
+// helper, so its values are unchanged). Reorders only that range.
 std::optional<double> median(std::vector<double>::iterator first, std::vector<double>::iterator last)
 {
     if (first == last) return std::nullopt;
@@ -360,27 +362,42 @@ GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t col
                (!options.requireFinite || (std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2])));
     };
     // One axis: pairs (r, c)-(r + dr, c + dc) on a lattice with the same step in both directions, so a
-    // subsample covers the whole grid instead of aliasing with its width.
-    const auto stepOf = [&](std::int64_t dr, std::int64_t dc) {
-        const std::int64_t pairs = (rows - dr) * (cols - dc);
-        if (options.maxPairs > 0 && pairs > options.maxPairs)
-            return std::int64_t(std::ceil(std::sqrt(double(pairs) / double(options.maxPairs))));
-        return std::int64_t(1);
+    // subsample covers the whole grid instead of aliasing with its width. When the grid has more pairs than
+    // maxPairs, the step is chosen from the number of pairs whose two vertices are valid (one counting pass), not
+    // from the grid size: a large grid that is mostly invalid (a small surface in a big raster) still gets about
+    // maxPairs samples instead of a lattice that steps over most of its valid vertices. A fully valid grid gets
+    // the same step as from its size.
+    const auto validPairs = [&](std::int64_t dr, std::int64_t dc) {
+        std::int64_t n = 0;
+        for (std::int64_t r = 0; r + dr < rows; ++r)
+            for (std::int64_t c = 0; c + dc < cols; ++c) n += ok(r, c) && ok(r + dr, c + dc);
+        return n;
     };
-    const auto latticePairs = [&](std::int64_t dr, std::int64_t dc) -> std::size_t {
-        if (rows - dr <= 0 || cols - dc <= 0) return 0;
-        const std::int64_t step = stepOf(dr, dc);
-        return std::size_t((rows - dr + step - 1) / step) * std::size_t((cols - dc + step - 1) / step);
+    struct Lattice { std::int64_t step = 1; std::size_t reserve = 0; };
+    const auto latticeOf = [&](std::int64_t dr, std::int64_t dc) {
+        Lattice l;
+        if (rows - dr <= 0 || cols - dc <= 0) return l;
+        const std::int64_t pairs = (rows - dr) * (cols - dc);
+        std::int64_t valid = pairs;
+        if (options.maxPairs > 0 && pairs > options.maxPairs) {
+            valid = validPairs(dr, dc);
+            if (valid > options.maxPairs)
+                l.step = std::int64_t(std::ceil(std::sqrt(double(valid) / double(options.maxPairs))));
+        }
+        // At most one distance per lattice pair and per valid pair, so the buffer never reallocates.
+        const std::int64_t lattice = ((rows - dr + l.step - 1) / l.step) * ((cols - dc + l.step - 1) / l.step);
+        l.reserve = std::size_t(std::min(lattice, valid));
+        return l;
     };
     const unsigned want = options.medians;
     const bool needRows = want & (kSpacingRows | kSpacingBoth), needCols = want & (kSpacingCols | kSpacingBoth);
-    // All distances go into one buffer: those along rows first, then those along columns. Reserved for every
-    // lattice pair so it never reallocates; pages past the valid pairs are never written.
+    const Lattice rowLattice = needRows ? latticeOf(1, 0) : Lattice{};
+    const Lattice colLattice = needCols ? latticeOf(0, 1) : Lattice{};
+    // All distances go into one buffer: those along rows first, then those along columns.
     std::vector<double> d;
-    d.reserve((needRows ? latticePairs(1, 0) : 0) + (needCols ? latticePairs(0, 1) : 0));
-    const auto axis = [&](std::int64_t dr, std::int64_t dc) {
+    d.reserve(rowLattice.reserve + colLattice.reserve);
+    const auto axis = [&](std::int64_t dr, std::int64_t dc, std::int64_t step) {
         if (rows - dr <= 0 || cols - dc <= 0) return;
-        const std::int64_t step = stepOf(dr, dc);
         for (std::int64_t r = 0; r + dr < rows; r += step)
             for (std::int64_t c = 0; c + dc < cols; c += step) {
                 if (!ok(r, c) || !ok(r + dr, c + dc)) continue;
@@ -397,9 +414,9 @@ GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t col
                 if (std::isfinite(v) && v > 0) d.push_back(v);
             }
     };
-    if (needRows) axis(1, 0);
+    if (needRows) axis(1, 0, rowLattice.step);
     const std::size_t nRows = d.size();
-    if (needCols) axis(0, 1);
+    if (needCols) axis(0, 1, colLattice.step);
     // The per-axis medians reorder only their own part, so the median of the whole buffer is unaffected.
     if (want & kSpacingRows) out.rows = median(d.begin(), d.begin() + std::ptrdiff_t(nRows));
     if (want & kSpacingCols) out.cols = median(d.begin() + std::ptrdiff_t(nRows), d.end());

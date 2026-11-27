@@ -60,7 +60,7 @@ struct SpacingOptions {
     std::optional<float> invalidMarker;
     bool requireFinite = true;
     std::size_t rowStride = 0;            // floats from one row to the next; 0 means cols * 3
-    std::int64_t maxPairs = 0;            // > 0: each axis on a regular lattice of about this many pairs
+    std::int64_t maxPairs = 0;            // > 0: each axis on a regular lattice of about this many valid pairs
     unsigned medians = kSpacingAll;       // SpacingMedian bits
 };
 [[nodiscard]] GridSpacing measureSpacing(const float* xyz, std::int64_t rows, std::int64_t cols, const SpacingOptions& options = {});

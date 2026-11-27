@@ -47,7 +47,7 @@ static void scaleCheck()
     CHECK(exact.measured.rows && std::abs(*exact.measured.rows - 3) < 1e-9);
     CHECK(exact.measured.cols && std::abs(*exact.measured.cols - 2) < 1e-9);
     CHECK(std::abs(*exact.deviation[0]) < 1e-9 && std::abs(*exact.deviation[1]) < 1e-9);
-    // 39 x 50 pairs of 3 and 40 x 49 of 2: the lower median of both is 2.
+    // 39 x 50 pairs of 3 and 40 x 49 of 2: the median of both is 2.
     CHECK(exact.measured.both && std::abs(*exact.measured.both - 2) < 1e-9);
     const auto off = tifxyz::checkScale(xyz, 40, 50, {0.25, 0.25});
     CHECK(std::abs(*off.deviation[0] + 0.25) < 1e-9 && std::abs(*off.deviation[1] + 0.5) < 1e-9);
@@ -112,6 +112,23 @@ static void scaleCheck()
     lattice.maxPairs = 10000;
     const auto sampled = tifxyz::measureSpacing(wide.data(), rows, cols, lattice);
     CHECK(std::abs(*sampled.cols - 4) < 1e-9 && std::abs(*sampled.rows - 3) < 1e-9);
+
+    // An even number of distances gives the upper of the two middle ones (element n / 2), as
+    // vc_grow_seg_from_segments' median did before: one row with column gaps 1 and 3 reports 3.
+    const float two[9] = {0, 0, 0, 1, 0, 0, 4, 0, 0};
+    const auto even = tifxyz::measureSpacing(two, 1, 3);
+    CHECK(even.cols && *even.cols == 3);
+
+    // A large grid that is mostly invalid: only rows 100-109 are valid. The lattice from the grid size (step 11)
+    // would step over all of them (rows 99 and 110) and find nothing; the lattice from the valid pairs finds them.
+    std::vector<float> sparse(wide.size(), -1.0f);
+    for (int r = 100; r < 110; ++r)
+        for (int c = 0; c < cols; ++c) {
+            float* p = &sparse[(std::size_t(r) * cols + std::size_t(c)) * 3];
+            p[0] = float(c) * 2, p[1] = float(r) * 3, p[2] = 5;
+        }
+    const auto band = tifxyz::measureSpacing(sparse.data(), rows, cols, lattice);
+    CHECK(band.rows && std::abs(*band.rows - 3) < 1e-9 && band.cols && std::abs(*band.cols - 2) < 1e-9);
 
     // A single row has no spacing along rows; an empty grid has none at all.
     const auto row = tifxyz::checkScale(xyz, 1, 50, {1.0 / 3, 0.5});
