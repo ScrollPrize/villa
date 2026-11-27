@@ -1915,13 +1915,18 @@ static void run_fit_normals(
     auto t_last = t0;
 
     auto report_progress = [&]() {
+        int64_t done, ok;
+        #pragma omp atomic read
+        done = processed;
+        #pragma omp atomic read
+        ok = written;
         const auto now = std::chrono::steady_clock::now();
         const double elapsed = std::chrono::duration<double>(now - t0).count();
-        const double rate = (elapsed > 1e-9) ? (static_cast<double>(processed) / elapsed) : 0.0;
-        const double rem = static_cast<double>(std::max<int64_t>(0, total_samples - processed));
+        const double rate = (elapsed > 1e-9) ? (static_cast<double>(done) / elapsed) : 0.0;
+        const double rem = static_cast<double>(std::max<int64_t>(0, total_samples - done));
         const double eta = (rate > 1e-9) ? (rem / rate) : 0.0;
-        std::cerr << "fit-normals: " << processed << "/" << total_samples
-                  << " (written " << written << ")"
+        std::cerr << "fit-normals: " << done << "/" << total_samples
+                  << " (written " << ok << ")"
                   << " | elapsed " << elapsed << "s"
                   << " | rate " << rate << " samples/s"
                   << " | ETA " << eta << "s\n";
@@ -2139,7 +2144,7 @@ static void run_fit_normals(
                     written += 1;
                 }
 
-                // Only one thread reports.
+                // Only one thread reports. Workers keep writing stats, so those wait for the final report.
                 const auto now = std::chrono::steady_clock::now();
                 if (tid == 0 && now - t_last >= std::chrono::seconds(10)) {
                     #pragma omp critical
@@ -2147,7 +2152,6 @@ static void run_fit_normals(
                         const auto now2 = std::chrono::steady_clock::now();
                         if (now2 - t_last >= std::chrono::seconds(10)) {
                             report_progress();
-                            report_stats();
                             t_last = now2;
                         }
                     }
