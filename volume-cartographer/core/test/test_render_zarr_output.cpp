@@ -286,7 +286,7 @@ TEST_CASE("vc_render_tifxyz checks --voxel-size against the volume's own size")
     const auto forced = run(withSize, 1, "--voxel-size 2.258" + um + " --allow-voxel-size-mismatch");
     CHECK(forced.status == 0);
     CHECK(forced.declared.value_or(0) == doctest::Approx(4.516));
-    CHECK(forced.log.find("Output pixel size (group 1, scale 1): 4.516 micrometer") != std::string::npos);
+    CHECK(forced.log.find("Requested output pixel size (group 1, scale 1): 4.516 micrometer") != std::string::npos);
     CHECK(warned(forced));
 
     // The right value declares the right pixel size, silently. .zattrs keeps the caller's unit, so the number follows it.
@@ -317,6 +317,27 @@ TEST_CASE("vc_render_tifxyz checks --voxel-size against the volume's own size")
     CHECK(unit.status == 0);
     CHECK(warned(unit));
     CHECK(unit.log.find("--voxel-unit is nanometer") != std::string::npos);
+
+    // The level's declared placement decides, not 2^group-idx; a level not scaled equally on every axis only warns.
+    const auto placed = [&](const std::string& name, nlohmann::json scale) {
+        const auto volume = makeVolume(name, R"({"voxelsize": 1.129})");
+        const auto level = [](const char* path, nlohmann::json factors) {
+            return nlohmann::json{{"path", path}, {"coordinateTransformations", {{{"type", "scale"}, {"scale", factors}}}}};
+        };
+        vcr::zarr::writeAttributes(volume, {{"multiscales", {{{"version", "0.4"},
+            {"axes", {{{"name", "z"}, {"type", "space"}}, {{"name", "y"}, {"type", "space"}}, {{"name", "x"}, {"type", "space"}}}},
+            {"datasets", {level("0", {1, 1, 1}), level("1", scale)}}}}}});
+        return volume;
+    };
+    const auto tripled = placed("tripled.zarr", {3, 3, 3});
+    CHECK(run(tripled, 1, "--voxel-size 3.387" + um).status != 0);
+    const auto twoAtTriple = run(tripled, 1, "--voxel-size 2.258" + um);
+    CHECK(twoAtTriple.status == 0);
+    CHECK(warned(twoAtTriple));
+    const auto inPlane = run(placed("in-plane.zarr", {1, 2, 2}), 1, "--voxel-size 2.258" + um);
+    CHECK(inPlane.status == 0);
+    CHECK(warned(inPlane));
+    CHECK(run(placed("near.zarr", {2.019, 2, 2}), 1, "--voxel-size 2.300902" + um).status == 0);
 
     // No usable record to compare with: the flag is used and nothing is said.
     for (const auto* volume : {&noSize, &zeroSize, &textSize}) {
