@@ -967,13 +967,19 @@ def run_block_inference(
                 )
             if not bool(keep.any()):
                 continue
+            if not bool(keep.all()):
+                # Boolean indexing copies the batch into new pageable memory: the
+                # loader's pinned buffer is lost, so the copy below blocks, and the
+                # index runs as a parallel CPU op whose threads then spin between
+                # batches. Block selection already drops empty patches, so a whole
+                # batch is the usual case and goes to the device as it is.
+                images_BCZYX = images_BCZYX[keep]
+                metadata = metadata[keep]
             # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
-            # read this boolean-index temporary after it is freed
-            # (pytorch/pytorch#189690).
-            images_BCZYX = images_BCZYX[keep].to(
+            # read its host source after it is freed (pytorch/pytorch#189690).
+            images_BCZYX = images_BCZYX.to(
                 device, non_blocking=device.type == "cuda"
             )
-            metadata = metadata[keep]
             if tta_axes:
                 probabilities = predict_with_mirror_tta(
                     model,
