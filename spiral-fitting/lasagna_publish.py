@@ -227,7 +227,13 @@ def _prepare_lasagna_surface_object(surface_dir, object_store):
     destination = (Path(object_store) / ref["type"] / manifest
                    / quote(ref["name"], safe=""))
     destination.mkdir(parents=True, exist_ok=True)
-    (destination / "segment").symlink_to(surface_dir, target_is_directory=True)
+    try:
+        (destination / "segment").symlink_to(surface_dir, target_is_directory=True)
+    except OSError:
+        # Symlinks need a privilege or developer mode on Windows and do not
+        # exist on exFAT at all. The store entry is only ever read, so a copy
+        # serves the same reads.
+        shutil.copytree(surface_dir, destination / "segment", dirs_exist_ok=True)
     (destination / "object.json").write_text(
         json.dumps(ref, indent=2) + "\n", encoding="utf-8")
     return ref
