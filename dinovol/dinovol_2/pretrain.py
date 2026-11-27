@@ -142,6 +142,8 @@ class DinoIBOTPretrainer:
                 torch.cuda.set_device(0 if self.device.index is None else self.device.index)
         elif torch.cuda.is_available():
             self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
 
