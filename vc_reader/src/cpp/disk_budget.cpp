@@ -14,7 +14,14 @@ std::shared_ptr<DiskCache> diskBudget(const std::string& root, std::optional<std
         budgets.clear();
         owner = getpid();
     }
-    auto& budget = budgets[root];
+    // One budget per directory, however it is spelled: a symlinked parent (macOS's /tmp
+    // and /var), a trailing slash or a relative path would otherwise each get their own,
+    // and a limit or free-space floor set through one would not apply to the others.
+    std::error_code ec;
+    auto key = std::filesystem::weakly_canonical(root, ec).string();
+    if (ec || key.empty())
+        key = root;
+    auto& budget = budgets[key];
     if (!budget)
         budget = std::make_shared<DiskCache>(root, maxBytes.value_or(-1));
     else if (maxBytes)

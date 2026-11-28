@@ -10,6 +10,7 @@ import multiprocessing
 from pathlib import Path
 import pickle
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -605,6 +606,16 @@ class RemoteTests(RemoteFixtureCase):
             for read in reads:
                 read.result(timeout=30)
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+
+    @unittest.skipIf(sys.platform == 'win32', 'creating a symlink needs a privilege on Windows')
+    def test_one_disk_budget_per_directory_however_it_is_spelled(self):
+        self.cache.mkdir()
+        link = self.root / 'link'
+        link.symlink_to(self.cache, target_is_directory=True)
+        budget = disk_budget(str(self.cache), None)
+        self.assertIs(disk_budget(str(self.cache) + '/', None), budget)
+        self.assertIs(disk_budget(str(link), None), budget)
+        self.assertIs(disk_budget(str(self.root / 'other' / '..' / 'cache'), None), budget)
 
     def test_low_free_space_refuses_a_download_and_keeps_cached_files(self):
         from vc_reader import LowDiskSpaceError
