@@ -293,6 +293,92 @@ def test_composite_failure_leaves_no_published_or_partial_tiff(tmp_path: Path) -
     assert list(folder.glob("*.tif")) == []
 
 
+def test_composite_threads_share_one_reader_and_bound_inflight_futures(tmp_path: Path) -> None:
+    folder = tmp_path / "tiled"
+    folder.mkdir()
+    volume = np.arange(2 * 64 * 64, dtype=np.uint8).reshape(2, 64, 64)
+    _write_group(folder / "surface.zarr", {"0": volume}, chunks=(2, 16, 16))
+    args = composite_from_zarr.parse_args(
+        ["--input-root", str(folder), "--method", "max", "--workers", "2", "--no-progress"]
+    )
+    job = composite_from_zarr._build_jobs(
+        input_root=folder,
+        start_z=args.start_z,
+        end_z=args.end_z,
+        method=args.method,
+        resolution=args.resolution,
+        overwrite=args.overwrite,
+        parallelism=args.parallelism,
+        workers=args.workers,
+        no_progress=args.no_progress,
+        compression=args.compression,
+    )[0]
+
+    open_calls = 0
+    real_open_node = composite_from_zarr.open_node
+
+    def counting_open_node(path):
+        nonlocal open_calls
+        open_calls += 1
+        return real_open_node(path)
+
+    in_flight = 0
+    peak_in_flight = 0
+    real_submit = composite_from_zarr.ThreadPoolExecutor.submit
+
+    def tracking_submit(self, fn, *f_args, **f_kwargs):
+        nonlocal in_flight, peak_in_flight
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        fut = real_submit(self, fn, *f_args, **f_kwargs)
+
+        orig_result = fut.result
+
+        def tracked_result(*r_args, **r_kwargs):
+            nonlocal in_flight
+            try:
+                return orig_result(*r_args, **r_kwargs)
+            finally:
+                in_flight -= 1
+
+        fut.result = tracked_result
+        return fut
+
+    with (
+        patch.object(composite_from_zarr, "open_node", side_effect=counting_open_node),
+        patch.object(composite_from_zarr.ThreadPoolExecutor, "submit", tracking_submit),
+    ):
+        composite_from_zarr._write_projection(job)
+
+    # 16 tiles total, 2 workers -> open once and never queue more than 2 * workers futures.
+    assert open_calls == 1
+    assert peak_in_flight <= 4
+    np.testing.assert_array_equal(tifffile.imread(job.output_path), volume.max(axis=0))
+
+
+def test_composite_processes_mode_matches_reference(tmp_path: Path) -> None:
+    folder = tmp_path / "proc"
+    folder.mkdir()
+    volume = np.arange(3 * 48 * 48, dtype=np.uint8).reshape(3, 48, 48)
+    _write_group(folder / "surface.zarr", {"0": volume}, chunks=(3, 16, 16))
+    rc = composite_from_zarr.main(
+        [
+            "--input-root",
+            str(folder),
+            "--method",
+            "max",
+            "--parallelism",
+            "processes",
+            "--workers",
+            "2",
+            "--no-progress",
+        ]
+    )
+    assert rc == 0
+    out_path = folder / "proc_max_0_3.tif"
+    np.testing.assert_array_equal(tifffile.imread(out_path), volume.max(axis=0))
+
+
 def test_downloader_writes_v2_manifest_resumes_and_rejects_source_drift(
     tmp_path: Path,
 ) -> None:

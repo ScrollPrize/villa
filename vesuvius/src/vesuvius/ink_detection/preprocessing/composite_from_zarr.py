@@ -12,12 +12,14 @@ tile per worker is resident in memory at a time.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import os
 import threading
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 from vc_reader import images
@@ -33,6 +35,7 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 
 _THREAD_LOCAL = threading.local()
 _WORKER_CONFIG: "WorkerConfig | None" = None
+_SHARED_ARRAY: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,44 +173,47 @@ def _discover_zarr_dirs(root: Path) -> list[Path]:
 
 def _resolve_array_spec(zarr_path: Path, resolution: str) -> ArraySpec:
     root = open_node(zarr_path)
+    array = None
+    try:
+        if isinstance(root, ZarrReader):
+            array = root
+            array_key: str | None = None
+        else:
+            if resolution not in root:
+                available = root.keys()
+                raise ValueError(
+                    f"Resolution '{resolution}' not found in {zarr_path}. Available arrays: {available}"
+                )
+            array = root[resolution]
+            array_key = resolution
 
-    if isinstance(root, ZarrReader):
-        array = root
-        array_key: str | None = None
-    else:
-        if resolution not in root:
-            available = root.keys()
-            raise ValueError(
-                f"Resolution '{resolution}' not found in {zarr_path}. Available arrays: {available}"
+        if array.ndim == 3:
+            shape = tuple(int(v) for v in array.shape)
+            chunks = tuple(int(v) for v in array.chunks)
+            return ArraySpec(
+                zarr_path=zarr_path,
+                array_key=array_key,
+                shape=shape,
+                chunks=chunks,
             )
-        array = root[resolution]
-        array_key = resolution
 
-    if array.ndim == 3:
-        shape = tuple(int(v) for v in array.shape)
-        chunks = tuple(int(v) for v in array.chunks)
-        return ArraySpec(
-            zarr_path=zarr_path,
-            array_key=array_key,
-            shape=shape,
-            chunks=chunks,
+        if array.ndim == 4 and array.shape[0] == 1:
+            shape = tuple(int(v) for v in array.shape[1:])
+            chunks = tuple(int(v) for v in array.chunks[1:])
+            return ArraySpec(
+                zarr_path=zarr_path,
+                array_key=array_key,
+                shape=shape,
+                chunks=chunks,
+                leading_axis_index=0,
+            )
+
+        raise ValueError(
+            f"Expected a 3D array or a 4D array with a leading singleton axis in {zarr_path}, "
+            f"got shape {array.shape}."
         )
-
-    if array.ndim == 4 and array.shape[0] == 1:
-        shape = tuple(int(v) for v in array.shape[1:])
-        chunks = tuple(int(v) for v in array.chunks[1:])
-        return ArraySpec(
-            zarr_path=zarr_path,
-            array_key=array_key,
-            shape=shape,
-            chunks=chunks,
-            leading_axis_index=0,
-        )
-
-    raise ValueError(
-        f"Expected a 3D array or a 4D array with a leading singleton axis in {zarr_path}, "
-        f"got shape {array.shape}."
-    )
+    finally:
+        _close_opened_nodes(array, root)
 
 
 def _resolve_z_range(total: int, start_z: int | None, end_z: int | None) -> tuple[int, int]:
@@ -319,9 +325,27 @@ def _iter_chunk_tasks(shape: tuple[int, int, int], chunks: tuple[int, int, int])
     return tasks
 
 
-def _set_worker_config(config: WorkerConfig) -> None:
-    global _WORKER_CONFIG
+def _open_array(zarr_path: str | Path, array_key: str | None) -> tuple[Any, Any]:
+    root = open_node(zarr_path)
+    array = root if isinstance(root, ZarrReader) else root[array_key]
+    return root, array
+
+
+def _close_opened_nodes(*nodes: Any) -> None:
+    seen: set[int] = set()
+    for node in nodes:
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        close = getattr(node, "close", None)
+        if callable(close):
+            close()
+
+
+def _set_worker_config(config: WorkerConfig, shared_array: Any = None) -> None:
+    global _WORKER_CONFIG, _SHARED_ARRAY
     _WORKER_CONFIG = config
+    _SHARED_ARRAY = shared_array
     _THREAD_LOCAL.array = None
     _THREAD_LOCAL.key = None
 
@@ -329,14 +353,15 @@ def _set_worker_config(config: WorkerConfig) -> None:
 def _get_worker_array():
     if _WORKER_CONFIG is None:
         raise RuntimeError("Worker configuration has not been initialized.")
+    if _SHARED_ARRAY is not None:
+        return _SHARED_ARRAY
 
     cache_key = (
         _WORKER_CONFIG.zarr_path,
         _WORKER_CONFIG.array_key,
     )
     if getattr(_THREAD_LOCAL, "key", None) != cache_key:
-        root = open_node(_WORKER_CONFIG.zarr_path)
-        array = root if isinstance(root, ZarrReader) else root[_WORKER_CONFIG.array_key]
+        _, array = _open_array(_WORKER_CONFIG.zarr_path, _WORKER_CONFIG.array_key)
         _THREAD_LOCAL.array = array
         _THREAD_LOCAL.key = cache_key
 
@@ -393,9 +418,42 @@ def _project_chunk(task: ChunkTask) -> np.ndarray:
         )
 
     projected = _to_uint8(_project_block(block, config.method))
+    if projected.shape == config.tile_shape:
+        return projected
     tile = np.zeros(config.tile_shape, dtype=np.uint8)
     tile[: projected.shape[0], : projected.shape[1]] = projected
     return tile
+
+
+def _iter_projected_tiles(
+    executor: ThreadPoolExecutor | ProcessPoolExecutor,
+    tasks: Sequence[ChunkTask],
+    *,
+    max_in_flight: int,
+) -> Iterator[np.ndarray]:
+    pending: deque[Future[np.ndarray]] = deque()
+    task_iter = iter(tasks)
+    limit = max(1, int(max_in_flight))
+    try:
+        for _ in range(limit):
+            try:
+                task = next(task_iter)
+            except StopIteration:
+                break
+            pending.append(executor.submit(_project_chunk, task))
+
+        while pending:
+            tile = pending.popleft().result()
+            try:
+                next_task = next(task_iter)
+            except StopIteration:
+                next_task = None
+            if next_task is not None:
+                pending.append(executor.submit(_project_chunk, next_task))
+            yield tile
+    finally:
+        for future in pending:
+            future.cancel()
 
 
 def _write_projection(job: DatasetJob) -> None:
@@ -410,47 +468,60 @@ def _write_projection(job: DatasetJob) -> None:
     )
     tasks = _iter_chunk_tasks(job.shape, job.chunks)
 
-    if job.parallelism == "threads":
-        _set_worker_config(worker_config)
-        executor_cls = ThreadPoolExecutor
-        executor_kwargs = {"max_workers": job.workers}
-    else:
-        executor_cls = ProcessPoolExecutor
-        executor_kwargs = {
-            "max_workers": job.workers,
-            "initializer": _set_worker_config,
-            "initargs": (worker_config,),
-        }
-
+    shared_root = None
+    shared_array = None
     staged_output = create_staged_output(job.output_path)
     try:
+        if job.parallelism == "threads":
+            shared_root, shared_array = _open_array(job.zarr_path, job.array_key)
+            _set_worker_config(worker_config, shared_array=shared_array)
+            executor_cls = ThreadPoolExecutor
+            executor_kwargs = {"max_workers": job.workers}
+        else:
+            _set_worker_config(worker_config, shared_array=None)
+            executor_cls = ProcessPoolExecutor
+            executor_kwargs = {
+                "max_workers": job.workers,
+                "initializer": _set_worker_config,
+                "initargs": (worker_config,),
+            }
+
+        max_in_flight = max(1, job.workers * 2)
         with executor_cls(**executor_kwargs) as executor:
-            tile_iter = executor.map(_project_chunk, tasks, chunksize=1)
+            with closing(
+                _iter_projected_tiles(
+                    executor,
+                    tasks,
+                    max_in_flight=max_in_flight,
+                )
+            ) as tile_iter:
+                progress = tqdm(
+                    total=len(tasks),
+                    desc=job.folder.name,
+                    disable=job.no_progress,
+                    leave=False,
+                )
 
-            progress = tqdm(
-                total=len(tasks),
-                desc=job.folder.name,
-                disable=job.no_progress,
-                leave=False,
-            )
-
-            tile_h, tile_w = job.tile_shape
-            positions = ((y, x) for y in range(0, job.shape[1], tile_h) for x in range(0, job.shape[2], tile_w))
-            try:
-                with images.TiffWriter(
-                    str(staged_output),
-                    (job.shape[1], job.shape[2]),
-                    np.uint8,
-                    tile=job.tile_shape,
-                    compression=job.compression,
-                ) as writer:
-                    for (y, x), tile in zip(positions, tile_iter):
-                        progress.update(1)
-                        writer.write_tile(y, x, tile)
-            finally:
-                progress.close()
+                tile_h, tile_w = job.tile_shape
+                positions = ((y, x) for y in range(0, job.shape[1], tile_h) for x in range(0, job.shape[2], tile_w))
+                try:
+                    with images.TiffWriter(
+                        str(staged_output),
+                        (job.shape[1], job.shape[2]),
+                        np.uint8,
+                        tile=job.tile_shape,
+                        compression=job.compression,
+                    ) as writer:
+                        for (y, x), tile in zip(positions, tile_iter):
+                            progress.update(1)
+                            writer.write_tile(y, x, tile)
+                finally:
+                    progress.close()
         publish_staged_output(staged_output, job.output_path)
     finally:
+        if shared_array is not None or shared_root is not None:
+            _set_worker_config(worker_config, shared_array=None)
+            _close_opened_nodes(shared_array, shared_root)
         discard_staged_output(staged_output)
 
 
