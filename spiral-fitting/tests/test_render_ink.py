@@ -86,6 +86,25 @@ class RenderInkPathTests(unittest.TestCase):
 
         self.assertEqual(actual, Path("/checkout/lasagna"))
 
+    def test_lasagna_flatten_skips_intermediate_snapshots(self):
+        # The scratch dir holding the snapshots is deleted after the flatten, so they must not be written.
+        with CliRunner().isolated_filesystem():
+            commands = []
+
+            def fake_run(cmd, **_kwargs):
+                commands.append(cmd)
+                raise subprocess.CalledProcessError(1, cmd)
+
+            with patch.object(render_ink.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    render_ink.lasagna_flatten(
+                        "concat", "concat_flat", "lasagna", "cfg.json", "fit.py", "cuda")
+
+        self.assertEqual(len(commands), 1)
+        self.assertIn(["--snapshot-interval", "0"], [
+            commands[0][i:i + 2] for i in range(len(commands[0]) - 1)
+        ])
+
     def test_failed_full_scroll_flatten_fails_when_no_strips_are_rendered(self):
         with CliRunner().isolated_filesystem():
             meshes_dir = Path("meshes")
