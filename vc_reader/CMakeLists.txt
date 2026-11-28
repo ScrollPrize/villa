@@ -39,6 +39,21 @@ option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends"
 if(VC_READER_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    # ptxas from CUDA 12.8 miscompiles transform kernels for compute capability 12.x
+    # (ShotNoise returns wrong values when launched on its own); CUDA 12.9 and 13.0
+    # compile them correctly. Native GPUs and "all"/"all-major" include 12.x too.
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.9)
+        set(_vc_reader_cuda_archs "${CMAKE_CUDA_ARCHITECTURES}")
+        if(_vc_reader_cuda_archs MATCHES "native" AND DEFINED CMAKE_CUDA_ARCHITECTURES_NATIVE)
+            set(_vc_reader_cuda_archs "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+        endif()
+        if(_vc_reader_cuda_archs MATCHES "(^|;)(all|all-major|12[0-9])")
+            message(FATAL_ERROR
+                "CUDA ${CMAKE_CUDA_COMPILER_VERSION} miscompiles vc_reader's CUDA kernels for compute "
+                "capability 12.x (CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}). Build with "
+                "CUDA 12.9 or newer, or leave 12.x out of CMAKE_CUDA_ARCHITECTURES.")
+        endif()
+    endif()
 endif()
 
 
