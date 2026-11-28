@@ -1,20 +1,15 @@
-import dbm
-import pickle
-from pathlib import Path
-import tempfile
 import unittest
 
 import numpy as np
 import torch
 
-from build_track_crossings import build_cache
+from track_graph import TrackGraph
 from tracks import (
+    _build_crossing_partner_csr,
     _load_native_track_crossings,
     _mps_shape_bucket,
     _sample_prepared_track_points,
     _transform_shape_bucketed,
-    load_track_crossing_cache,
-    load_tracks_from_dbm,
     prepare_main_phase_tracks,
 )
 
@@ -42,18 +37,16 @@ class MpsTrackSamplingTests(unittest.TestCase):
     rejects with a TypeError.
     """
 
-    def prepare(self, root):
-        path = Path(root) / 'tracks.dbm'
+    def prepare(self):
         horizontal = line_track(20, z=10, y=10, axis=2)
         vertical = line_track(20, z=10, y=0, axis=1)
         vertical[:, 2] = 10
-        with dbm.open(str(path), 'c') as database:
-            database[b'h:0'] = pickle.dumps([horizontal])
-            database[b'vy:0'] = pickle.dumps([vertical])
-        build_cache(path, show_progress=False)
-        tracks, families, source_ids = load_tracks_from_dbm(
-            path, 0, 20, return_families=True,
-            return_source_ids=True, show_progress=False)
+        tracks = [horizontal, vertical]
+        families = ['horizontal', 'vertical']
+        source_ids = np.arange(len(tracks), dtype=np.uint64)
+        # Since #2485 a fit takes its crossings from a TrackGraph.
+        graph = TrackGraph(_build_crossing_partner_csr(
+            tracks, families, source_ids=source_ids))
         prepared = prepare_main_phase_tracks(
             tracks, None, 0.0, 'mps',
             sampling_config={
@@ -62,40 +55,38 @@ class MpsTrackSamplingTests(unittest.TestCase):
             },
             track_families=families,
             track_source_ids=source_ids,
-            crossing_cache=load_track_crossing_cache(path),
+            track_graph=graph,
         )
         return prepared, families
 
     def test_weighted_sampling_with_crossings_on_mps(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            prepared, families = self.prepare(temporary)
-            horizontal = families.index('horizontal')
-            vertical = families.index('vertical')
-            probabilities = torch.zeros(len(families), device='mps')
-            probabilities[horizontal] = 1
-            prepared['sampling_probabilities'] = probabilities
-            torch.manual_seed(1)
-            # Each draw takes a fresh crossing seed; without the fix about
-            # half of them are negative, so 16 draws all but guarantee one.
-            for _ in range(16):
-                sample = _sample_prepared_track_points(prepared, 1, 4)
-                self.assertEqual(sample['track_idx'].device.type, 'mps')
-                self.assertEqual(
-                    sample['track_idx'].tolist(), [horizontal, vertical])
+        prepared, families = self.prepare()
+        horizontal = families.index('horizontal')
+        vertical = families.index('vertical')
+        probabilities = torch.zeros(len(families), device='mps')
+        probabilities[horizontal] = 1
+        prepared['sampling_probabilities'] = probabilities
+        torch.manual_seed(1)
+        # Each draw takes a fresh crossing seed; without the fix about
+        # half of them are negative, so 16 draws all but guarantee one.
+        for _ in range(16):
+            sample = _sample_prepared_track_points(prepared, 1, 4)
+            self.assertEqual(sample['track_idx'].device.type, 'mps')
+            self.assertEqual(
+                sample['track_idx'].tolist(), [horizontal, vertical])
 
     def test_mps_weighted_sampling_is_reproducible(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            prepared, families = self.prepare(temporary)
-            prepared['sampling_probabilities'] = torch.full(
-                (len(families),), 0.5, device='mps')
-            draws = []
-            for _ in range(2):
-                torch.manual_seed(7)
-                draws.append([
-                    _sample_prepared_track_points(prepared, 8, 4)[
-                        'track_idx'][:8].tolist()
-                    for _ in range(4)])
-            self.assertEqual(draws[0], draws[1])
+        prepared, families = self.prepare()
+        prepared['sampling_probabilities'] = torch.full(
+            (len(families),), 0.5, device='mps')
+        draws = []
+        for _ in range(2):
+            torch.manual_seed(7)
+            draws.append([
+                _sample_prepared_track_points(prepared, 8, 4)[
+                    'track_idx'][:8].tolist()
+                for _ in range(4)])
+        self.assertEqual(draws[0], draws[1])
 
 
 class ShapeBucketTests(unittest.TestCase):
