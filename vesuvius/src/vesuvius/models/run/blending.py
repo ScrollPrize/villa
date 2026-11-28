@@ -254,7 +254,7 @@ class SpatialPatchGrid:
 
         if verbose:
             avg = sum(len(v) for v in self.grid.values()) / self.stats['num_cells'] if self.stats['num_cells'] > 0 else 0
-            print(f"  ✓ Grid complete: {self.stats['num_cells']} cells, {self.stats['total_patches']} non-empty patches")
+            print(f"  Grid complete: {self.stats['num_cells']} cells, {self.stats['total_patches']} non-empty patches")
             print(f"    Skipped {self.stats['skipped_empty']} empty patches, avg {avg:.1f} patches/cell")
 
     def _build_grid(self, patch_size):
