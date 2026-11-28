@@ -19,4 +19,9 @@ foreach(module __init__.py surfaces.py documents.py locations.py derivation.py s
     configure_file(vc_object_store/${module} "${CMAKE_CURRENT_BINARY_DIR}/vc_object_store/${module}" COPYONLY)
 endforeach()
 install(TARGETS vc_object_bindings LIBRARY DESTINATION vc_object_store COMPONENT python)
+if(WIN32)
+    # vc_reader's SFTP client is a DLL on Windows (one process-wide authenticator), and
+    # Windows has no RPATH: ship it next to the module so it imports without vc_reader.
+    install(FILES $<TARGET_FILE:vc_reader::sftp> DESTINATION vc_object_store COMPONENT python)
+endif()
 install(FILES vc_object_store/__init__.py vc_object_store/surfaces.py vc_object_store/documents.py vc_object_store/locations.py vc_object_store/derivation.py vc_object_store/selected.py DESTINATION vc_object_store COMPONENT python)
