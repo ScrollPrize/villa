@@ -725,6 +725,40 @@ layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
 the Lasagna repository is not in its standard sibling or `~/villa` location.
 An existing output path is never overwritten.
 
+## Snapping a fit onto the surface prediction
+
+A fit's windings sit a few voxels off the papyrus. `snap_to_surface.py` moves
+every winding of a fit's meshes folder onto a surface prediction at once, so
+that no two windings land on the same predicted sheet. It works on CPU (numba;
+on platforms where spiral-fitting does not install it, run `uv pip install numba`):
+
+```sh
+python snap_to_surface.py /path/to/meshes/fitted_<tag> /path/to/snapped \
+    --surface /path/to/surface-recto.zarr --level 2 \
+    --umbilicus /path/to/dataset/umbilicus.json
+```
+
+Per z slice, on rays from the umbilicus, an order-preserving one-to-one
+alignment (dynamic programming) matches the windings crossing each ray to the
+predicted sheets on it; a second pass realigns around a smoothed per-winding
+move field. By default only the nodes matched to a sheet are written (the rest
+become holes, `-1`); `--keep-unmatched` writes every node, and `snap_flag.tif`
+says which were matched (0), moved by the smoothed field (1) or left in place
+(3). `--spliced` snaps the `_spliced` meshes that `render_ink.py` renders.
+
+Matched-only output has holes wherever a winding found no sheet of its own
+(often half of a dense fit), which tears a flatten of the whole fit. For
+`render_ink.py`, use `--feather 1.0`: every unmatched node gets the mean of its
+winding's nearby matched moves, faded to no move away from them (flag 4), and a
+filled node is then dropped only if it would sit on a sheet that a neighbouring
+winding (w ± 1, w ± 2) already occupies: another winding has a node within 25
+voxels sideways and within 3.13 voxels along that node's normal. Matched nodes are
+the same as in the default output.
+`--surface-scale` handles a prediction stored at another level than the mesh
+coordinates (0.5 for one level coarser). `--bbox` limits the prediction read
+from memory; the box must contain the umbilicus, and windings outside it are
+left unmatched.
+
 ## Hover descriptions (descriptions.json)
 
 The text VC3D shows when hovering a Spiral tab control or a setting in the
