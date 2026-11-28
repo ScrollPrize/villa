@@ -1,5 +1,12 @@
 name: Test vesuvius Python
 
+# A new push to a pull request cancels that PR's older run (as in vc3d-ci.yml);
+# without it, superseded runs keep both runners until they finish or hit the
+# 6 h job limit. Runs from other events are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 on:
   pull_request:
     paths:
