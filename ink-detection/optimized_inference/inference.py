@@ -258,7 +258,10 @@ class SlidingWindowDataset(Dataset):
     """
     def __init__(self, source: LayersSource, xyxys: np.ndarray, reverse: bool, size: int, max_value: float):
         self.source = source
-        self.xyxys = xyxys.astype(np.int32, copy=False)
+        # A tensor is shared with spawned DataLoader workers; a numpy array is pickled into each worker's
+        # start-up message. __getitem__ still returns numpy rows, as before. Those rows alias this shared
+        # storage, so treat the boxes as immutable while iterating.
+        self.xyxys = torch.from_numpy(np.ascontiguousarray(xyxys, dtype=np.int32))
         self.reverse = reverse
         self.size = size
         self.max_value = max_value
@@ -289,7 +292,7 @@ class SlidingWindowDataset(Dataset):
                 tile = cv2.resize(tile, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
             image = tile.astype(np.float32) / self.max_value
             tens = torch.from_numpy(image.transpose(2, 0, 1)).unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
-            return tens, self.xyxys[idx], valid
+            return tens, self.xyxys[idx].numpy(), valid
 
 def create_inference_dataloader(
     source: LayersSource,
