@@ -2,7 +2,7 @@
 
 from collections import Counter
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -51,7 +51,7 @@ def test_manifest_matches_training_sources_without_duplicate_representations(ali
             assert set(source[key]) == set(segments)
         for segment in segments:
             assert source["surface_volume_paths"][segment] == str(
-                Path(source["segments_path"]) / segment / "surface-volume.zarr"
+                PurePosixPath(source["segments_path"]) / segment / "surface-volume.zarr"
             )
             training_rows.append((
                 segment, source["sampling_scroll"],
