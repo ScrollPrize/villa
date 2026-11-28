@@ -405,7 +405,7 @@ public:
     };
 
     PointCorrection() = default;
-    explicit PointCorrection(const PointCollections& corrections, float anchor_grid_scale = 1.0f) {
+    explicit PointCorrection(const PointCollections& corrections, const cv::Size& anchor_bounds, float anchor_grid_scale = 1.0f) {
         const auto& collections = corrections.getAllCollections();
         if (collections.empty()) return;
 
@@ -413,6 +413,19 @@ public:
             const auto& collection = pair.second;
             // Allow collections with anchor2d set even if they have no points (drag-and-drop case)
             if (collection.points.empty() && !collection.anchor2d.has_value()) continue;
+            // Stay valid when every anchor is rejected, so resume still drops masked points.
+            is_valid_ = true;
+
+            if (collection.anchor2d.has_value()) {
+                const cv::Vec2f anchor = *collection.anchor2d;
+                if (!(anchor[0] >= 0 && anchor[0] < anchor_bounds.width &&
+                      anchor[1] >= 0 && anchor[1] < anchor_bounds.height)) {
+                    std::cout << "Warning: skipping correction with out-of-bounds anchor2d: "
+                              << anchor << " (resume surface size: "
+                              << anchor_bounds.width << "x" << anchor_bounds.height << ")" << std::endl;
+                    continue;
+                }
+            }
 
             CorrectionCollection new_collection;
             new_collection.anchor2d_ = collection.anchor2d;
@@ -435,11 +448,9 @@ public:
             }
             collections_.push_back(new_collection);
         }
-
-        is_valid_ = !collections_.empty();
     }
 
-    void init(const cv::Mat_<cv::Vec3f> &points) {
+    void init(const cv::Mat_<cv::Vec3f>& points, const cv::Rect& resume_area) {
         if (!is_valid_ || points.empty()) {
             is_valid_ = false;
             return;
@@ -449,18 +460,13 @@ public:
 
         for (auto& collection : collections_) {
             if (collection.anchor2d_.has_value()) {
-                // Use the provided 2D anchor directly - this is the drag-and-drop case
-                cv::Vec2f anchor = collection.anchor2d_.value();
-
-                // Bounds check: skip collections where anchor2d is outside surface bounds
-                if (anchor[0] < 0 || anchor[0] >= points.cols ||
-                    anchor[1] < 0 || anchor[1] >= points.rows) {
-                    std::cout << "Warning: skipping correction with out-of-bounds anchor2d: "
-                              << anchor << " (surface size: " << points.cols << "x" << points.rows << ")" << std::endl;
-                    continue;
-                }
-
-                std::cout << "using provided anchor2d: " << anchor << std::endl;
+                const cv::Vec2f source_anchor = *collection.anchor2d_;
+                // Anchors are stored in resume-surface coordinates, while points
+                // and the local solver use the padded work grid.
+                const cv::Vec2f anchor = source_anchor + cv::Vec2f(
+                    static_cast<float>(resume_area.x), static_cast<float>(resume_area.y));
+                std::cout << "using provided anchor2d: " << source_anchor
+                          << " (work grid: " << anchor << ")" << std::endl;
 
                 // Convert 2D grid location to pointer coordinates
                 // pointer coords are relative to center: ptr = grid_loc - center
@@ -2600,7 +2606,8 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
         resume_pad_x = (w - resume_points.cols) / 2;
         resume_pad_y = (h - resume_points.rows) / 2;
 
-        used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
+        const cv::Rect resume_area(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
+        used_area = resume_area;
         // Stay within the requested expansion (none with disable_grid_expansion, as in
         // VC3D Fill) and two cells from the work grid edge, which add_losses requires.
         resume_growth_limit = cv::Rect(resume_pad_x - resume_extra_cols, resume_pad_y - resume_extra_rows,
@@ -2692,10 +2699,11 @@ QuadSurface *tracer(vcr::Array& volume, float scale, cv::Vec3f origin, const nlo
 
         trace_data.point_correction = PointCorrection(
             corrections,
+            use_growth_scale ? growth_source_size_from_meta(resume_surf->meta) : resume_points.size(),
             use_growth_scale ? (1.0f / static_cast<float>(growth_scale_factor)) : 1.0f);
 
         if (trace_data.point_correction.isValid()) {
-            trace_data.point_correction.init(trace_params.dpoints);
+            trace_data.point_correction.init(trace_params.dpoints, resume_area);
 
             std::cout << "Resuming with " << trace_data.point_correction.all_grid_locs().size() << " correction points." << std::endl;
             const auto mask = resume_surf->vertexMask();
