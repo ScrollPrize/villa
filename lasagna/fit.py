@@ -343,7 +343,37 @@ def _parse_init_grow_config(args_cfg: dict | None, *, target_depth: int) -> Init
 	)
 
 
+def _bool_index_sizes_ok(device: torch.device) -> bool:
+	"""False when nonzero() or x[mask] on the device returns the wrong number of rows.
+
+	Some Intel GPU drivers do that for a mask moved from the CPU, with no error
+	(pytorch/pytorch#199157, #200713). Flatten then dies steps later with a size
+	mismatch that points nowhere near the cause."""
+	gen = torch.Generator().manual_seed(0)
+	mask = torch.rand(20000, generator=gen) < 0.5
+	want = int(mask.sum())
+	m = mask.to(device)
+	v = torch.arange(mask.numel()).to(device)
+	for _ in range(4):
+		if int(torch.nonzero(m).shape[0]) != want or int(v[m].shape[0]) != want:
+			return False
+	return True
+
+
 def _require_torch_device_available(device: torch.device) -> None:
+	if device.type == "xpu":
+		if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+			raise RuntimeError(
+				"XPU device was requested, but this PyTorch build cannot access an Intel GPU."
+			)
+		if not _bool_index_sizes_ok(device):
+			raise RuntimeError(
+				"The Intel GPU returns the wrong number of rows from nonzero() / x[mask] "
+				"(a known graphics-driver fault, pytorch/pytorch#199157). Update the Intel "
+				"graphics driver, or run with --device cpu. Refusing to continue because "
+				"the fit would fail later with unrelated size mismatches or give a wrong map."
+			)
+		return
 	if device.type != "cuda":
 		return
 	if not torch.cuda.is_available():
@@ -1343,6 +1373,7 @@ def _run_flatten_mode(
 		raise ValueError("model-init=flatten must not set --model-input")
 
 	device = torch.device(str(getattr(args, "device", "cuda")))
+	_require_torch_device_available(device)
 	from tifxyz_io import load_tifxyz
 	xyz, valid, meta = load_tifxyz(
 		ext0["path"], device=device, store=args.store, volume=args.volume_uuid, target_scale=args.voxel_scale)
