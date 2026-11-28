@@ -579,12 +579,18 @@ static int run_main(int argc, char *argv[])
     else if (mode != "gen_neighbor") {
         if (resuming) {
             mode = "resume";
-        } else if (use_old_args && argc == 7) {
+        } else if ((use_old_args && argc == 7) || (!use_old_args && explicit_seed)) {
             mode = "explicit_seed";
-            const double v = volume_value(tracing_volume, origin);
-            std::cout << "seed location " << origin << " value is " << v << std::endl;
-        } else if (!use_old_args && explicit_seed) {
-            mode = "explicit_seed";
+            // Outside the volume every read is 0, yet growth still runs and saves a surface that
+            // lies wholly outside the scan, with exit status 0. The usual cause is z y x order.
+            if (!(origin[0] >= 0 && origin[0] < volume_shape_zyx[2] &&
+                  origin[1] >= 0 && origin[1] < volume_shape_zyx[1] &&
+                  origin[2] >= 0 && origin[2] < volume_shape_zyx[0])) {
+                std::cerr << "ERROR: seed " << origin << " is outside the volume (x < " << volume_shape_zyx[2]
+                          << ", y < " << volume_shape_zyx[1] << ", z < " << volume_shape_zyx[0]
+                          << "); --seed takes x y z" << std::endl;
+                return EXIT_FAILURE;
+            }
             const double v = volume_value(tracing_volume, origin);
             std::cout << "seed location " << origin << " value is " << v << std::endl;
         }
