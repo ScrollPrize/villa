@@ -166,7 +166,17 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
                     if (array.name == "valid") { validity = array.bytes; replaced = &validity; }
                     if (array.name == "growth_exclusions") completeCoordinateState = true;
                 }
-                request.operations.push_back(std::move(op));
+                // The store rejects relationship decisions on a no-op geometry write, so do not resubmit
+                // channels that are byte-identical to the pinned revision. Channels are written untransformed here.
+                std::erase_if(op.channels, [&](const auto& channel) {
+                    const auto current = std::find_if(revision->arrays.begin(), revision->arrays.end(),
+                        [&](const auto& array) { return array.name == channel.name; });
+                    return current != revision->arrays.end()
+                        && current->dtype == channel.dtype
+                        && current->shape == channel.shape
+                        && reader.readGeometryArray(revision->uuid, channel.name) == channel.bytes;
+                });
+                if (!op.channels.empty()) request.operations.push_back(std::move(op));
             }
             // A complete exclusion snapshot also records that an empty cell
             // has no hidden XYZ. Undo of a repair can restore ordinary padding
