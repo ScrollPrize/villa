@@ -2,7 +2,9 @@ import argparse
 import json
 from pathlib import Path
 import colorsys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from itertools import islice
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -25,7 +27,7 @@ def parse_args(argv=None):
         "--overlap",
         type=float,
         default=0.0,
-        help="Initial chunk overlap fraction in [0, 1). Example: 0.25 means 25% overlap.",
+        help="Initial chunk overlap fraction in [0, 1). Example: 0.25 means 25%% overlap.",
     )
     parser.add_argument("--napari", action="store_true")
     parser.add_argument("--napari-downsample", type=int, default=8)
@@ -278,34 +280,18 @@ def _points_within_bbox(points_zyx, bbox):
     )
 
 
-def _validate_band_coverage(points_zyx_band, bboxes):
-    if points_zyx_band.shape[0] == 0:
-        return True
-    covered = np.zeros((points_zyx_band.shape[0],), dtype=bool)
-    for bbox in bboxes:
-        covered |= _points_within_bbox(points_zyx_band, bbox)
-        if covered.all():
-            return True
-    return bool(covered.all())
-
-
-def _build_band_neighbor_map(records):
-    by_cell = {(int(r["grid_index"][1]), int(r["grid_index"][2])): i for i, r in enumerate(records)}
-    neighbor_map = [[] for _ in range(len(records))]
+def _build_band_neighbor_slots(cells):
+    # Per record, the indices of its (up, down, left, right) grid neighbors, -1 where there is none.
+    by_cell = {cell: i for i, cell in enumerate(cells)}
+    neighbor_slots = [(-1, -1, -1, -1)] * len(cells)
     for (gy, gx), idx in by_cell.items():
-        up = (gy - 1, gx)
-        down = (gy + 1, gx)
-        left = (gy, gx - 1)
-        right = (gy, gx + 1)
-        if up in by_cell:
-            neighbor_map[idx].append((by_cell[up], "up"))
-        if down in by_cell:
-            neighbor_map[idx].append((by_cell[down], "down"))
-        if left in by_cell:
-            neighbor_map[idx].append((by_cell[left], "left"))
-        if right in by_cell:
-            neighbor_map[idx].append((by_cell[right], "right"))
-    return neighbor_map
+        neighbor_slots[idx] = (
+            by_cell.get((gy - 1, gx), -1),
+            by_cell.get((gy + 1, gx), -1),
+            by_cell.get((gy, gx - 1), -1),
+            by_cell.get((gy, gx + 1), -1),
+        )
+    return neighbor_slots
 
 
 def _intervals_touch_or_overlap(min_a, max_a, min_b, max_b):
@@ -424,6 +410,410 @@ def _is_candidate_better(obj, axis, shift, best_obj, best_axis, best_shift):
     return int(shift) < int(best_shift)
 
 
+# Pruning re-optimizes a whole z-band for every removal attempt, and almost all of
+# that work repeats: the same record, in the same state, beside the same neighbor
+# bboxes. The helpers below memoize those pure sub-results for one band at a time.
+#
+# Every table is least-recently-used with a hard cap fixed when the band starts: a
+# few entries per record of the band, or per band point for the tables that hold
+# point indices. A band's caches therefore stay proportional to the records and
+# points the band already holds, however many removal attempts it needs, and they
+# are dropped together with the band's _BandCache.
+_STEP_MEMO_ENTRIES_PER_RECORD = 4
+_COVER_CACHE_ENTRIES_PER_RECORD = 2
+_COVER_CACHE_ELEMENTS_PER_POINT = 6
+_VARIANT_CACHE_ENTRIES_PER_RECORD = 1
+_VARIANT_CACHE_ELEMENTS_PER_POINT = 1
+_OBJECTIVE_MEMO_MAX_ENTRIES = 256
+_MIN_CACHE_ENTRIES = 64
+_NEAREST_CENTER_CHUNK_ELEMENTS = 1 << 15
+
+
+class _LruCache:
+    """Least-recently-used table with hard caps on its entry count and on the summed weight of its entries."""
+
+    __slots__ = ("_entries", "_max_entries", "_max_weight", "_weigh", "_weight")
+
+    def __init__(self, max_entries, max_weight, weigh):
+        self._entries = OrderedDict()
+        self._max_entries = int(max_entries)
+        self._max_weight = int(max_weight)
+        self._weigh = weigh
+        self._weight = 0
+
+    def __len__(self):
+        return len(self._entries)
+
+    @property
+    def weight(self):
+        return self._weight
+
+    def get(self, key):
+        value = self._entries.get(key)
+        if value is not None:
+            self._entries.move_to_end(key)
+        return value
+
+    def put(self, key, value):
+        """Store a key that is not in the table yet. An entry heavier than the weight cap is not stored."""
+        weight = self._weigh(key, value)
+        if weight > self._max_weight:
+            return
+        self._entries[key] = value
+        self._weight += weight
+        while len(self._entries) > self._max_entries or self._weight > self._max_weight:
+            self._weight -= self._weigh(*self._entries.popitem(last=False))
+
+
+class _ItemStats:
+    """Values reusable across trials without retaining a record or its point arrays."""
+
+    __slots__ = ("serial", "axis_stats", "limits", "initial")
+
+    def __init__(self, serial):
+        self.serial = serial
+        self.axis_stats = [None, None]
+        self.limits = None
+        self.initial = None
+
+
+class _BandItem:
+    """An active record and its lazily augmented points."""
+
+    __slots__ = ("stats", "record", "cell", "initial_bbox", "points", "extra_idx")
+
+    def __init__(self, stats, record, points, extra_idx=None):
+        self.stats = stats
+        self.record = record
+        self.cell = (int(record["grid_index"][1]), int(record["grid_index"][2]))
+        self.initial_bbox = record["initial_bbox"]
+        self.points = points
+        self.extra_idx = extra_idx
+
+    def get_points(self, band):
+        points = self.points
+        if points is None:
+            points = np.asarray(self.record["points"], dtype=np.float64)
+            if self.extra_idx.shape[0] > 0:
+                points = np.concatenate([points, band.points[self.extra_idx]], axis=0)
+            self.points = points
+            self.extra_idx = None
+        return points
+
+    def shift_range(self, band, axis):
+        """(low, high, ideal) shift along ``axis``; ideal is None when no shift fits (low > high)."""
+        slot = 0 if axis == "y" else 1
+        stats = self.stats.axis_stats[slot]
+        if stats is None:
+            points = self.get_points(band)
+            low, high = _axis_shift_bounds_from_points(points, self.initial_bbox, axis)
+            ideal = None
+            if low <= high:
+                _, _, base_center = _axis_min_and_size(self.initial_bbox, axis)
+                axis_idx = 1 if axis == "y" else 2
+                ideal = float(np.median(points[:, axis_idx])) - base_center
+            stats = self.stats.axis_stats[slot] = (low, high, ideal)
+        return stats
+
+    def contains(self, band, bbox):
+        # Same half-open test as np.all(_points_within_bbox(points, bbox)), on the
+        # per-axis extremes. np.min/np.max return NaN when any coordinate is NaN, and
+        # every comparison with NaN is False, exactly as in the per-point test.
+        limits = self.stats.limits
+        if limits is None:
+            points = self.get_points(band)
+            limits = self.stats.limits = tuple(
+                float(reduce(points[:, axis_idx])) for axis_idx in range(3) for reduce in (np.min, np.max)
+            )
+        return (
+            limits[0] >= float(bbox[0])
+            and limits[1] < float(bbox[1]) + 1.0
+            and limits[2] >= float(bbox[2])
+            and limits[3] < float(bbox[3]) + 1.0
+            and limits[4] >= float(bbox[4])
+            and limits[5] < float(bbox[5]) + 1.0
+        )
+
+    def objective(self, band, axis, shift, bbox):
+        key = (self.stats.serial, axis, shift)
+        memo = band.objectives
+        value = memo.get(key)
+        if value is None:
+            value = _axis_objective(self.get_points(band), bbox, axis)
+            memo[key] = value
+            if len(memo) > _OBJECTIVE_MEMO_MAX_ENTRIES:
+                memo.popitem(last=False)
+        else:
+            memo.move_to_end(key)
+        return value
+
+    def initial(self, band):
+        """The optimizer's start: no shift, on the axis with the smaller objective.
+
+        Returns (state, bbox, y_span, x_span), where a state is (axis, shift, objective).
+        """
+        initial = self.stats.initial
+        if initial is None:
+            obj_y = self.objective(band, "y", 0, self.initial_bbox)
+            obj_x = self.objective(band, "x", 0, self.initial_bbox)
+            state = ("y", 0, obj_y) if obj_y <= obj_x else ("x", 0, obj_x)
+            bbox = _bbox_from_state(self.initial_bbox, state[0], 0)
+            initial = self.stats.initial = (state, bbox, bbox[2:4], bbox[4:6])
+        return initial
+
+
+def _cover_weight(bbox, index):
+    return index.shape[0]
+
+
+def _variant_weight(key, stats):
+    return len(key[1])
+
+
+class _BandCache:
+    """Bounded memo tables for one z-band. Create one per band and let it go out of scope with the band."""
+
+    __slots__ = (
+        "points",
+        "steps",
+        "max_steps",
+        "objectives",
+        "_cover",
+        "_variants",
+        "_serial",
+        "_index_dtype",
+    )
+
+    def __init__(self, points_zyx_band, record_count):
+        self.points = np.asarray(points_zyx_band, dtype=np.float64)
+        records = max(1, int(record_count))
+        points = max(1, int(self.points.shape[0]))
+        # Step results, keyed by everything a step reads (see _solve_band_states).
+        self.steps = OrderedDict()
+        self.max_steps = max(_MIN_CACHE_ENTRIES, _STEP_MEMO_ENTRIES_PER_RECORD * records)
+        # (item serial, axis, shift) -> objective.
+        self.objectives = OrderedDict()
+        # bbox -> indices of the band points inside it, weighed by the number of indices.
+        self._cover = _LruCache(
+            max(_MIN_CACHE_ENTRIES, _COVER_CACHE_ENTRIES_PER_RECORD * records),
+            _COVER_CACHE_ELEMENTS_PER_POINT * points,
+            _cover_weight,
+        )
+        # Smallest unsigned type that can index the band.
+        self._index_dtype = np.min_scalar_type(max(int(self.points.shape[0]) - 1, 0))
+        # Only the key holds indices. Bound its bytes for this band's index dtype.
+        self._variants = _LruCache(
+            max(_MIN_CACHE_ENTRIES, _VARIANT_CACHE_ENTRIES_PER_RECORD * records),
+            _VARIANT_CACHE_ELEMENTS_PER_POINT * points * self._index_dtype.itemsize,
+            _variant_weight,
+        )
+        self._serial = 0
+
+    def _new_stats(self):
+        self._serial += 1
+        return _ItemStats(self._serial)
+
+    def item(self, record, points):
+        return _BandItem(self._new_stats(), record, points)
+
+    def variant(self, base, extra_idx):
+        """Reuse a variant's statistics while its points belong to the current trial."""
+        key = (base.stats.serial, extra_idx.tobytes())
+        stats = self._variants.get(key)
+        if stats is None:
+            stats = self._new_stats()
+            self._variants.put(key, stats)
+        return _BandItem(stats, base.record, None, extra_idx)
+
+    def cover_index(self, bbox):
+        """Indices of the band points inside ``bbox``."""
+        index = self._cover.get(bbox)
+        if index is None:
+            index = np.flatnonzero(_points_within_bbox(self.points, bbox)).astype(self._index_dtype, copy=False)
+            self._cover.put(bbox, index)
+        return index
+
+    def cover_count(self, bboxes):
+        """How many of ``bboxes`` contain each band point."""
+        count = np.zeros((self.points.shape[0],), dtype=np.int32)
+        for bbox in bboxes:
+            count[self.cover_index(bbox)] += 1
+        return count
+
+    def never_covered(self, count):
+        """Band points that ``count`` leaves without any bbox, in ascending order."""
+        return np.flatnonzero(count == 0).astype(self._index_dtype, copy=False)
+
+    def uncovered_without(self, count, never_covered, removed_cover):
+        """Band points, in ascending order, that no bbox covers once the bbox behind ``removed_cover`` is gone."""
+        uncovered = removed_cover[count[removed_cover] == 1]
+        if never_covered.shape[0] > 0:
+            uncovered = np.concatenate([never_covered, uncovered])
+        return np.sort(uncovered)
+
+    def still_covered(self, count, uncovered, removed_cover, old_bboxes, new_bboxes):
+        """Check trial coverage using at most one extra band-sized count array."""
+        if old_bboxes == new_bboxes:
+            return uncovered.size == 0
+
+        trial_count = count.copy()
+        trial_count[removed_cover] -= 1
+        for old_bbox, new_bbox in zip(old_bboxes, new_bboxes):
+            if new_bbox != old_bbox:
+                trial_count[self.cover_index(old_bbox)] -= 1
+                trial_count[self.cover_index(new_bbox)] += 1
+        return bool(np.all(trial_count > 0))
+
+
+def _item_cell(item):
+    return item.cell
+
+
+def _best_item_state(band, item, current, neighbor_bboxes, allow_overlap, require_overlap):
+    """One optimizer step for one record: its best feasible (axis, shift, objective) beside the given neighbors."""
+    init_bbox = item.initial_bbox
+    best_axis, best_shift, best_obj = current
+
+    for axis in ("y", "x"):
+        low, high, ideal_shift = item.shift_range(band, axis)
+        if low > high:
+            continue
+
+        cur_shift_for_axis = current[1] if axis == current[0] else 0
+        candidates = _generate_shift_candidates(low, high, ideal_shift, cur_shift_for_axis)
+
+        for shift in candidates:
+            cand_bbox = _bbox_from_state(init_bbox, axis, shift)
+            if not item.contains(band, cand_bbox):
+                continue
+
+            ok_touch = True
+            for nbr_bbox, relation in neighbor_bboxes:
+                if not _touching_relation_holds(
+                    cand_bbox,
+                    nbr_bbox,
+                    relation,
+                    allow_overlap=allow_overlap,
+                    require_overlap=require_overlap,
+                ):
+                    ok_touch = False
+                    break
+            if not ok_touch:
+                continue
+
+            cand_obj = item.objective(band, axis, shift, cand_bbox)
+            if _is_candidate_better(cand_obj, axis, shift, best_obj, best_axis, best_shift):
+                best_obj = cand_obj
+                best_axis = axis
+                best_shift = int(shift)
+
+    if best_axis != current[0] or best_shift != current[1]:
+        return (best_axis, best_shift, float(best_obj))
+    return current
+
+
+_NEIGHBOR_RELATIONS = ("up", "down", "left", "right")
+
+
+def _solve_band_states(band, items, neighbor_slots, max_passes, allow_overlap, require_overlap):
+    """Run the optimizer passes over ``items`` (sorted by cell); return their final states and bboxes."""
+    allow_overlap = bool(allow_overlap)
+    require_overlap = bool(require_overlap)
+    # _touching_relation_holds tests require_overlap first, then allow_overlap.
+    contact_mode = 2 if require_overlap else (1 if allow_overlap else 0)
+    steps = band.steps
+    max_steps = band.max_steps
+
+    states = []
+    bboxes = []
+    y_spans = []
+    x_spans = []
+    for item in items:
+        state, bbox, y_span, x_span = item.initial(band)
+        states.append(state)
+        bboxes.append(bbox)
+        y_spans.append(y_span)
+        x_spans.append(x_span)
+    # Slot -1 stands for "no neighbor on that side".
+    y_spans.append(None)
+    x_spans.append(None)
+
+    for _ in range(int(max_passes)):
+        changed = False
+        for idx, item in enumerate(items):
+            current = states[idx]
+            up, down, left, right = neighbor_slots[idx]
+            # A step reads the record, its state, the contact mode, the y-span of the
+            # up/down neighbors and the x-span of the left/right neighbors. Nothing else.
+            key = (
+                item.stats.serial,
+                contact_mode,
+                current[0],
+                current[1],
+                y_spans[up],
+                y_spans[down],
+                x_spans[left],
+                x_spans[right],
+            )
+            best = steps.get(key)
+            if best is None:
+                best = _best_item_state(
+                    band,
+                    item,
+                    current,
+                    [
+                        (bboxes[nbr_idx], relation)
+                        for nbr_idx, relation in zip(neighbor_slots[idx], _NEIGHBOR_RELATIONS)
+                        if nbr_idx >= 0
+                    ],
+                    allow_overlap,
+                    require_overlap,
+                )
+                steps[key] = best
+                if len(steps) > max_steps:
+                    steps.popitem(last=False)
+            else:
+                steps.move_to_end(key)
+
+            if best[0] != current[0] or best[1] != current[1]:
+                states[idx] = best
+                bbox = bboxes[idx] = _bbox_from_state(item.initial_bbox, best[0], best[1])
+                y_spans[idx] = bbox[2:4]
+                x_spans[idx] = bbox[4:6]
+                changed = True
+
+        if not changed:
+            break
+
+    return states, bboxes
+
+
+def _emit_band_records(band, items, states, bboxes):
+    out = []
+    for item, state, bbox in zip(items, states, bboxes):
+        out_item = dict(item.record)
+        out_item["points"] = item.get_points(band)
+        out_item["shift_axis"] = state[0]
+        out_item["shift_voxels"] = int(state[1])
+        out_item["bbox"] = bbox
+        item.record = out_item
+        out.append(out_item)
+    return out
+
+
+def _optimize_band_items(band, items, max_passes, allow_neighbor_overlap, require_neighbor_overlap):
+    if not items:
+        return [], []
+    items = sorted(items, key=_item_cell)
+    neighbor_slots = _build_band_neighbor_slots([item.cell for item in items])
+    states, bboxes = _solve_band_states(
+        band, items, neighbor_slots, max_passes, allow_neighbor_overlap, require_neighbor_overlap
+    )
+    if not np.all(band.cover_count(bboxes)):
+        raise RuntimeError("Band optimization violated full point coverage.")
+    return _emit_band_records(band, items, states, bboxes), items
+
+
 def _optimize_band_bboxes(
     records,
     points_zyx_band,
@@ -434,110 +824,55 @@ def _optimize_band_bboxes(
     if not records:
         return records
 
-    records = sorted(records, key=lambda r: (int(r["grid_index"][1]), int(r["grid_index"][2])))
-    neighbor_map = _build_band_neighbor_map(records)
-
-    states = []
-    for rec in records:
-        bbox = rec["initial_bbox"]
-        pts = rec["points"]
-        obj_y = _axis_objective(pts, bbox, "y")
-        obj_x = _axis_objective(pts, bbox, "x")
-        if obj_y <= obj_x:
-            states.append({"axis": "y", "shift": 0, "objective": obj_y})
-        else:
-            states.append({"axis": "x", "shift": 0, "objective": obj_x})
-
-    for _ in range(int(max_passes)):
-        changed = False
-        for idx, rec in enumerate(records):
-            pts = rec["points"]
-            init_bbox = rec["initial_bbox"]
-
-            current = states[idx]
-            best_axis = current["axis"]
-            best_shift = int(current["shift"])
-            best_obj = float(current["objective"])
-
-            for axis in ("y", "x"):
-                low, high = _axis_shift_bounds_from_points(pts, init_bbox, axis)
-                if low > high:
-                    continue
-
-                _, _, base_center = _axis_min_and_size(init_bbox, axis)
-                axis_idx = 1 if axis == "y" else 2
-                median_pt = float(np.median(pts[:, axis_idx]))
-                ideal_shift = median_pt - base_center
-                cur_shift_for_axis = int(current["shift"]) if axis == current["axis"] else 0
-                candidates = _generate_shift_candidates(low, high, ideal_shift, cur_shift_for_axis)
-
-                for shift in candidates:
-                    cand_bbox = _bbox_from_state(init_bbox, axis, shift)
-                    if not np.all(_points_within_bbox(pts, cand_bbox)):
-                        continue
-
-                    ok_touch = True
-                    for nbr_idx, relation in neighbor_map[idx]:
-                        nbr_state = states[nbr_idx]
-                        nbr_bbox = _bbox_from_state(
-                            records[nbr_idx]["initial_bbox"],
-                            nbr_state["axis"],
-                            nbr_state["shift"],
-                        )
-                        if not _touching_relation_holds(
-                            cand_bbox,
-                            nbr_bbox,
-                            relation,
-                            allow_overlap=bool(allow_neighbor_overlap),
-                            require_overlap=bool(require_neighbor_overlap),
-                        ):
-                            ok_touch = False
-                            break
-                    if not ok_touch:
-                        continue
-
-                    cand_obj = _axis_objective(pts, cand_bbox, axis)
-                    if _is_candidate_better(cand_obj, axis, shift, best_obj, best_axis, best_shift):
-                        best_obj = cand_obj
-                        best_axis = axis
-                        best_shift = int(shift)
-
-            if best_axis != current["axis"] or int(best_shift) != int(current["shift"]):
-                states[idx] = {"axis": best_axis, "shift": int(best_shift), "objective": float(best_obj)}
-                changed = True
-
-        if not changed:
-            break
-
-    out = []
-    final_bboxes = []
-    for rec, state in zip(records, states):
-        final_bbox = _bbox_from_state(rec["initial_bbox"], state["axis"], state["shift"])
-        out_item = dict(rec)
-        out_item["shift_axis"] = state["axis"]
-        out_item["shift_voxels"] = int(state["shift"])
-        out_item["bbox"] = final_bbox
-        out.append(out_item)
-        final_bboxes.append(final_bbox)
-
-    if not _validate_band_coverage(points_zyx_band, final_bboxes):
-        raise RuntimeError("Band optimization violated full point coverage.")
-
-    return out
+    band = _BandCache(points_zyx_band, len(records))
+    optimized, _ = _optimize_band_items(
+        band,
+        [band.item(rec, rec["points"]) for rec in records],
+        max_passes,
+        allow_neighbor_overlap,
+        require_neighbor_overlap,
+    )
+    return optimized
 
 
-def _prune_band_bboxes_via_reopt(
-    optimized_records,
-    points_zyx_band,
-    max_passes=5,
-    max_remove=None,
-    allow_neighbor_overlap=False,
-    require_neighbor_overlap=False,
+def _nearest_center_indices(centers_y, centers_x, points_zyx):
+    """For each point, the index of the center nearest in |dy| + |dx|; ties go to the first center."""
+    nearest = np.empty((points_zyx.shape[0],), dtype=np.intp)
+    rows = max(1, _NEAREST_CENTER_CHUNK_ELEMENTS // max(1, centers_y.shape[0]))
+    for start in range(0, points_zyx.shape[0], rows):
+        chunk = points_zyx[start:start + rows]
+        dist = np.abs(centers_y[None, :] - chunk[:, 1:2]) + np.abs(centers_x[None, :] - chunk[:, 2:3])
+        nearest[start:start + rows] = np.argmin(dist, axis=1)
+    return nearest
+
+
+def _is_float64_array(points):
+    return isinstance(points, np.ndarray) and points.dtype == np.float64
+
+
+_NO_EXTRA_POINTS = np.zeros((0,), dtype=np.intp)
+
+
+def _prune_band_items(
+    band,
+    kept,
+    kept_items,
+    max_passes,
+    max_remove,
+    allow_neighbor_overlap,
+    require_neighbor_overlap,
 ):
-    if not optimized_records:
-        return optimized_records, {"initial": 0, "removed": 0, "final": 0, "attempts": 0}
+    initial = len(kept)
+    if not kept:
+        return kept, {"initial": 0, "removed": 0, "final": 0, "attempts": 0}
 
-    kept = [dict(item) for item in optimized_records]
+    if bool(require_neighbor_overlap):
+        contact_modes = ((True, True),)
+    elif bool(allow_neighbor_overlap):
+        contact_modes = ((True, False), (False, False))
+    else:
+        contact_modes = ((False, False), (True, False))
+
     removed = 0
     attempts = 0
 
@@ -555,35 +890,62 @@ def _prune_band_bboxes_via_reopt(
             ),
         )
 
+        # Prefer current optimized bbox if available; otherwise use initial bbox.
+        bboxes = [tuple(int(v) for v in (rec["bbox"] if "bbox" in rec else rec["initial_bbox"])) for rec in kept]
+        count = band.cover_count(bboxes)
+        never_covered = band.never_covered(count)
+        centers_y = np.asarray([0.5 * (float(bbox[2]) + float(bbox[3])) for bbox in bboxes], dtype=np.float64)
+        centers_x = np.asarray([0.5 * (float(bbox[4]) + float(bbox[5])) for bbox in bboxes], dtype=np.float64)
+        needs_float64 = [i for i, item in enumerate(kept_items) if not _is_float64_array(item.points)]
+
+        # The optimizer works on records sorted by cell. Sort once per round; a trial
+        # is this order with one record left out.
+        order = sorted(range(len(kept)), key=lambda i: kept_items[i].cell)
+        rank = [0] * len(order)
+        for position, i in enumerate(order):
+            rank[i] = position
+        sorted_items = [kept_items[i] for i in order]
+        sorted_bboxes = [bboxes[i] for i in order]
+
         removed_one = False
         for idx in candidate_order:
-            trial_records = [kept[j] for j in range(len(kept)) if j != idx]
             attempts += 1
-            trial_records_seeded = _augment_records_with_uncovered_points(trial_records, points_zyx_band)
-            trial_optimized = None
-            if bool(require_neighbor_overlap):
-                contact_modes = ((True, True),)
-            elif bool(allow_neighbor_overlap):
-                contact_modes = ((True, False), (False, False))
-            else:
-                contact_modes = ((False, False), (True, False))
+            removed_rank = rank[idx]
+            trial_items = sorted_items[:removed_rank] + sorted_items[removed_rank + 1:]
+            trial_bboxes = sorted_bboxes[:removed_rank] + sorted_bboxes[removed_rank + 1:]
+
+            # Points only the removed bbox covered go to the remaining record whose
+            # bbox center is nearest, in ascending point order.
+            removed_cover = band.cover_index(bboxes[idx])
+            uncovered = band.uncovered_without(count, never_covered, removed_cover)
+            if uncovered.shape[0] > 0:
+                nearest = _nearest_center_indices(
+                    np.concatenate([centers_y[:idx], centers_y[idx + 1:]]),
+                    np.concatenate([centers_x[:idx], centers_x[idx + 1:]]),
+                    band.points[uncovered],
+                )
+                extra = {i: _NO_EXTRA_POINTS for i in needs_float64 if i != idx}
+                for target in np.unique(nearest).tolist():
+                    extra[target if target < idx else target + 1] = uncovered[nearest == target]
+                for i, extra_idx in extra.items():
+                    position = rank[i] - (1 if rank[i] > removed_rank else 0)
+                    trial_items[position] = band.variant(kept_items[i], extra_idx)
+
+            neighbor_slots = _build_band_neighbor_slots([item.cell for item in trial_items])
+            trial_states = None
             # Try contact modes in order; accept any full-coverage solution.
             for allow_overlap, require_overlap in contact_modes:
-                try:
-                    trial_optimized = _optimize_band_bboxes(
-                        trial_records_seeded,
-                        points_zyx_band,
-                        max_passes=max_passes,
-                        allow_neighbor_overlap=allow_overlap,
-                        require_neighbor_overlap=require_overlap,
-                    )
+                states, new_bboxes = _solve_band_states(
+                    band, trial_items, neighbor_slots, max_passes, allow_overlap, require_overlap
+                )
+                if band.still_covered(count, uncovered, removed_cover, trial_bboxes, new_bboxes):
+                    trial_states = states
                     break
-                except RuntimeError:
-                    trial_optimized = None
-            if trial_optimized is None:
+            if trial_states is None:
                 continue
 
-            kept = trial_optimized
+            kept = _emit_band_records(band, trial_items, trial_states, new_bboxes)
+            kept_items = trial_items
             removed += 1
             removed_one = True
             break
@@ -592,59 +954,35 @@ def _prune_band_bboxes_via_reopt(
             break
 
     return kept, {
-        "initial": int(len(optimized_records)),
+        "initial": int(initial),
         "removed": int(removed),
         "final": int(len(kept)),
         "attempts": int(attempts),
     }
 
 
-def _augment_records_with_uncovered_points(records, points_zyx_band):
-    if not records:
-        return []
+def _prune_band_bboxes_via_reopt(
+    optimized_records,
+    points_zyx_band,
+    max_passes=5,
+    max_remove=None,
+    allow_neighbor_overlap=False,
+    require_neighbor_overlap=False,
+):
+    if not optimized_records:
+        return optimized_records, {"initial": 0, "removed": 0, "final": 0, "attempts": 0}
 
-    points_zyx_band = np.asarray(points_zyx_band, dtype=np.float64)
-    if points_zyx_band.shape[0] == 0:
-        return [dict(item) for item in records]
-
-    # Prefer current optimized bbox if available; otherwise use initial bbox.
-    bboxes = []
-    for rec in records:
-        if "bbox" in rec:
-            bboxes.append(tuple(int(v) for v in rec["bbox"]))
-        else:
-            bboxes.append(tuple(int(v) for v in rec["initial_bbox"]))
-
-    covered = np.zeros((points_zyx_band.shape[0],), dtype=bool)
-    for bbox in bboxes:
-        covered |= _points_within_bbox(points_zyx_band, bbox)
-    uncovered_idx = np.where(~covered)[0]
-    if uncovered_idx.size == 0:
-        return [dict(item) for item in records]
-
-    centers = np.zeros((len(records), 2), dtype=np.float64)
-    for i, bbox in enumerate(bboxes):
-        centers[i, 0] = 0.5 * (float(bbox[2]) + float(bbox[3]))  # y
-        centers[i, 1] = 0.5 * (float(bbox[4]) + float(bbox[5]))  # x
-
-    assigned_points = [[] for _ in range(len(records))]
-    for p_idx in uncovered_idx:
-        p = points_zyx_band[p_idx]
-        d = np.abs(centers[:, 0] - float(p[1])) + np.abs(centers[:, 1] - float(p[2]))
-        tgt = int(np.argmin(d))
-        assigned_points[tgt].append(p)
-
-    out = []
-    for i, rec in enumerate(records):
-        rec_out = dict(rec)
-        base_points = np.asarray(rec["points"], dtype=np.float64)
-        extra = np.asarray(assigned_points[i], dtype=np.float64) if assigned_points[i] else np.zeros((0, 3), dtype=np.float64)
-        if extra.shape[0] > 0:
-            rec_out["points"] = np.concatenate([base_points, extra], axis=0)
-        else:
-            rec_out["points"] = base_points
-        out.append(rec_out)
-    return out
+    band = _BandCache(points_zyx_band, len(optimized_records))
+    kept = [dict(item) for item in optimized_records]
+    return _prune_band_items(
+        band,
+        kept,
+        [band.item(rec, rec["points"]) for rec in kept],
+        max_passes,
+        max_remove,
+        allow_neighbor_overlap,
+        require_neighbor_overlap,
+    )
 
 
 def _bbox_wireframe_segments(bbox):
@@ -799,18 +1137,22 @@ def _optimize_single_band(
     overlap,
 ):
     overlap_positive = bool(float(overlap) > 0.0)
-    optimized = _optimize_band_bboxes(
-        band_records,
-        band_points,
+    # One cache per band: pruning reuses what the first optimization computed, and
+    # all of it is released when this call returns.
+    band = _BandCache(band_points, len(band_records))
+    optimized, items = _optimize_band_items(
+        band,
+        [band.item(rec, rec["points"]) for rec in band_records],
         max_passes=5,
         allow_neighbor_overlap=overlap_positive,
         require_neighbor_overlap=overlap_positive,
     )
     prune_stats = None
     if prune_bboxes:
-        optimized, prune_stats = _prune_band_bboxes_via_reopt(
+        optimized, prune_stats = _prune_band_items(
+            band,
             optimized,
-            band_points,
+            items,
             max_passes=5,
             max_remove=prune_max_remove_per_band,
             allow_neighbor_overlap=overlap_positive,
@@ -852,22 +1194,23 @@ def _generate_segment_cover_records(
 
     by_band = _build_band_records(points_zyx, grouped, world_min_zyx, crop_size_zyx, stride_zyx=stride_zyx)
 
-    band_jobs = []
-    for z_band in sorted(by_band.keys()):
-        band_records = by_band[z_band]
-        band_point_indices = np.unique(np.concatenate([item["point_indices"] for item in band_records]))
-        band_points = points_zyx[band_point_indices]
-        band_jobs.append((int(z_band), band_records, band_points))
+    def band_jobs():
+        # Materialize each band's points when the serial loop or worker queue requests them.
+        for z_band in sorted(by_band.keys()):
+            band_records = by_band[z_band]
+            band_point_indices = np.unique(np.concatenate([item["point_indices"] for item in band_records]))
+            yield int(z_band), band_records, points_zyx[band_point_indices]
 
-    progress_enabled = bool(show_progress) and len(band_jobs) > 0
+    band_count = len(by_band)
+    progress_enabled = bool(show_progress) and band_count > 0
     progress_desc = str(progress_desc or "Optimizing z-bands")
 
-    if band_workers == 1 or len(band_jobs) <= 1:
-        band_iter = band_jobs
+    if band_workers == 1 or band_count <= 1:
+        band_iter = band_jobs()
         if progress_enabled:
             band_iter = tqdm(
-                band_jobs,
-                total=len(band_jobs),
+                band_iter,
+                total=band_count,
                 desc=progress_desc,
                 unit="band",
                 leave=False,
@@ -886,30 +1229,21 @@ def _generate_segment_cover_records(
             )
     else:
         with ProcessPoolExecutor(max_workers=band_workers) as executor:
-            futures = [
-                executor.submit(
-                    _optimize_single_band,
-                    z_band,
-                    band_records,
-                    band_points,
-                    prune_bboxes,
-                    prune_max_remove_per_band,
-                    overlap,
-                )
-                for z_band, band_records, band_points in band_jobs
-            ]
-            if progress_enabled:
-                band_results = []
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc=progress_desc,
-                    unit="band",
-                    leave=False,
-                ):
-                    band_results.append(future.result())
-            else:
-                band_results = [future.result() for future in futures]
+            submissions = (
+                executor.submit(_optimize_single_band, *job, prune_bboxes, prune_max_remove_per_band, overlap)
+                for job in band_jobs()
+            )
+            # Keep the workers fed without queuing a point array for every band.
+            pending = set(islice(submissions, 2 * band_workers))
+            band_results = []
+            with tqdm(
+                total=band_count, desc=progress_desc, unit="band", leave=False, disable=not progress_enabled
+            ) as progress:
+                while pending:
+                    completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    band_results.extend(future.result() for future in completed)
+                    progress.update(len(completed))
+                    pending.update(islice(submissions, len(completed)))
     band_results = sorted(band_results, key=lambda item: int(item[0]))
 
     final_records = []
