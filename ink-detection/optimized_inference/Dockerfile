@@ -23,6 +23,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg-dev \
     zlib1g-dev \
     nlohmann-json3-dev \
+    libboost-dev \
+    libconcurrentqueue-dev \
+    libblosc2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -89,6 +92,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg-dev \
     zlib1g-dev \
     nlohmann-json3-dev \
+    libboost-dev \
+    libconcurrentqueue-dev \
+    libblosc2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
