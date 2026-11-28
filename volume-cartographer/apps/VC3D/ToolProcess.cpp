@@ -38,7 +38,7 @@ void useBundledLoader(QString& program, QStringList& args)
     if (appDir.isEmpty()) return;
     const QDir usr(QDir(appDir).filePath(QStringLiteral("usr")));
     const QString libDir = usr.filePath(QStringLiteral("lib"));
-    const QString loader = QDir(libDir).filePath(QStringLiteral("ld-linux-x86-64.so.2"));
+    const QString loader = QDir(libDir).filePath(QString::fromLatin1(kAppImageLoaderName));
     const QString binDir = QFileInfo(usr.filePath(QStringLiteral("bin"))).canonicalFilePath();
     if (binDir.isEmpty() || !QFileInfo(loader).isFile() || QFileInfo(program).canonicalPath() != binDir) return;
     args.prepend(program);

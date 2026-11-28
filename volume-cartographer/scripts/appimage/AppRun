@@ -76,7 +76,11 @@ else
     esac
 fi
 
-LOADER="$LIBDIR/ld-linux-x86-64.so.2"
+# The glibc loader's file name depends on the architecture (vc3d::kAppImageLoaderName).
+case "$(uname -m)" in
+    aarch64) LOADER="$LIBDIR/ld-linux-aarch64.so.1" ;;
+    *)       LOADER="$LIBDIR/ld-linux-x86-64.so.2" ;;
+esac
 if [ -e "$LOADER" ]; then
     # glibc-bundle mode: charset modules; --library-path resolves NSS/glibc
     # satellites and dlopened Qt-plugin deps from our own libs.

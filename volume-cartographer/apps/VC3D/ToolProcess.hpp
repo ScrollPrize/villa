@@ -14,6 +14,14 @@
 
 namespace vc3d {
 
+// File name of the glibc dynamic loader that the Linux AppImage bundles in
+// usr/lib (scripts/build_appimage.sh, scripts/appimage/AppRun).
+#if defined(__aarch64__)
+inline constexpr const char* kAppImageLoaderName = "ld-linux-aarch64.so.1";
+#else
+inline constexpr const char* kAppImageLoaderName = "ld-linux-x86-64.so.2";
+#endif
+
 // One run of a command-line tool: VC3D's only way of launching one. Resolves
 // the executable, applies the run's environment, logs the run, splits its
 // merged output into lines, collects the surfaces it reports, and delivers

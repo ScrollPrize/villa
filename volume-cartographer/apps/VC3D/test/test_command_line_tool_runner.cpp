@@ -271,8 +271,9 @@ private slots:
     }
 
     // In the Linux AppImage (APPDIR set, glibc bundled) a bundled tool starts
-    // through usr/lib/ld-linux-x86-64.so.2, as AppRun starts it; any other
-    // executable starts directly. Shell stand-ins record how they were started.
+    // through the bundled loader in usr/lib (vc3d::kAppImageLoaderName), as
+    // AppRun starts it; any other executable starts directly. Shell stand-ins
+    // record how they were started.
     void appImageToolsStartThroughTheBundledLoader()
     {
 #if defined(Q_OS_UNIX)
@@ -283,7 +284,7 @@ private slots:
         const QString other = appDir.filePath("vc_tool");
         const QByteArray record = QFile::encodeName(appDir.filePath("record.txt"));
         QVERIFY(QDir().mkpath(lib) && QDir().mkpath(appDir.filePath("usr/bin")));
-        QVERIFY(writeScript(lib + "/ld-linux-x86-64.so.2",
+        QVERIFY(writeScript(lib + "/" + QString::fromLatin1(vc3d::kAppImageLoaderName),
                             "printf '%s\\n' loader \"$@\" > '" + record + "'\n"));
         for (const QString& path : {tool, other}) {
             QVERIFY(writeScript(path, "printf '%s\\n' direct \"$@\" > '" + record + "'\n"));
