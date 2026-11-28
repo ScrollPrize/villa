@@ -43,13 +43,16 @@ from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import seed_rows
 def to_device(batch, device, pad_blocks: bool = True):
     """A collated batch on ``device``, blocks padded there (``unpack_blocks``) as float, or a list of unpadded blocks
     with ``pad_blocks=False``."""
-    return dict(gt=batch['gt'].to(device, non_blocking=True), valid=batch['valid'].to(device, non_blocking=True),
+    # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can read this host batch after it is freed
+    # (pytorch/pytorch#189690).
+    nb = torch.device(device).type == 'cuda'
+    return dict(gt=batch['gt'].to(device, non_blocking=nb), valid=batch['valid'].to(device, non_blocking=nb),
                 block=unpack_blocks(batch['block'], device, pad=pad_blocks),
-                origin=batch['origin'].to(device, non_blocking=True), meta=batch['meta'],
+                origin=batch['origin'].to(device, non_blocking=nb), meta=batch['meta'],
                 # live-chain continuation batches; the front size of data.front_points_range batches; the neighbour
                 # side of data.neighbor_fraction batches
                 **{k: batch[k] for k in ('chains', 'front_points', 'neighbor_side') if k in batch},
-                **{k: batch[k].to(device, non_blocking=True) for k in ('seed', 'seed_mask')+FIBER_KEYS+NEIGHBOR_KEYS
+                **{k: batch[k].to(device, non_blocking=nb) for k in ('seed', 'seed_mask')+FIBER_KEYS+NEIGHBOR_KEYS
                    if k in batch})
 
 

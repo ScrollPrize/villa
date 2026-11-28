@@ -513,7 +513,9 @@ def unpack_blocks(packed: dict, device, dtype=torch.float32, pad: bool = True):
     its own origin, so sampling coordinates are unchanged; padding reads as outside the volume). ``pad=False``: a list
     of the B blocks at their own sizes instead (``data.unpadded_blocks``; ``shared.crop_sampling.gpu.sample_block`` reads either)."""
     shapes = packed['shapes'].tolist()
-    data = packed['data'].to(device, non_blocking=True)
+    # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can read the host buffer after it is freed
+    # (pytorch/pytorch#189690).
+    data = packed['data'].to(device, non_blocking=torch.device(device).type == 'cuda')
     if not pad:
         starts = np.cumsum([0]+[int(np.prod(s)) for s in shapes])
         return [data[a:b].view(*s).to(dtype) for a, b, s in zip(starts, starts[1:], shapes)]
