@@ -32,11 +32,11 @@ std::string readFile(const fs::path& path)
     return text.str();
 }
 
-void run(const std::string& command, const fs::path& log)
+void run(const std::string& command, const fs::path& log, bool succeeds = true)
 {
     const int status = std::system((command + " > \"" + log.string() + "\" 2>&1").c_str());
-    if (status != 0) MESSAGE(command << "\n" << readFile(log));
-    REQUIRE(status == 0);
+    if ((status == 0) != succeeds) MESSAGE(command << "\n" << readFile(log));
+    REQUIRE((status == 0) == succeeds);
 }
 
 std::string tool(const char* variable)
@@ -166,6 +166,19 @@ TEST_CASE("vc_tifxyz2obj writes a grid's vertices, UVs, normals and faces")
         "v 14.000000 24.000000 30.000000\nvt 4.000000 4.000000\nvn 0.000000 0.000000 1.000000\n"
         "f 10/10/10 4/4/4 6/6/6\nf 10/10/10 6/6/6 11/11/11\n";
     CHECK(readFile(dir.path / "plane.obj") == expected);
+}
+
+TEST_CASE("vc_tifxyz2obj fails when the OBJ cannot be written")
+{
+    Dir dir;
+    curvedSurface().save(dir.path / "curved", true);
+    // No such directory, a directory in the way, and (where there is one) a full disk.
+    std::vector<fs::path> targets = {dir.path / "missing" / "out.obj", dir.path};
+    if (fs::exists("/dev/full")) targets.push_back("/dev/full");
+    for (const auto& target : targets) {
+        run(tool("VC_TIFXYZ2OBJ_BIN") + " " + quoted(dir.path / "curved") + " " + quoted(target), dir.path / "obj.log", false);
+        CHECK_MESSAGE(readFile(dir.path / "obj.log").find("Failed to") != std::string::npos, target);
+    }
 }
 
 TEST_CASE("vc_tifxyz2obj --keep writes the decimated grid")
