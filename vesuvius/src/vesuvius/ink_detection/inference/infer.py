@@ -395,8 +395,17 @@ def choose_pyramid_array(
     return selected, root[selected]
 
 
-def compute_nonempty_mask_from_lowres_array(array: Any) -> np.ndarray:
-    """Collapse a 2D/3D low-resolution array to a 2D occupancy mask."""
+def compute_nonempty_mask_from_lowres_array(
+    array: Any,
+    *,
+    depth_axis_first: bool = True,
+) -> np.ndarray:
+    """Collapse a 2D/3D low-resolution array to a 2D occupancy mask.
+
+    The depth axis comes from the level-0 volume: pyramid levels keep the depth
+    and shrink only height and width, so at a coarse level of a narrow render
+    the smallest axis is no longer the depth.
+    """
 
     shape = tuple(int(value) for value in array.shape)
     values = np.asarray(array[:])
@@ -404,8 +413,7 @@ def compute_nonempty_mask_from_lowres_array(array: Any) -> np.ndarray:
         return values != 0
     if len(shape) != 3:
         raise ValueError(f"Occupancy array must be rank 2 or 3, got {shape!r}")
-    depth_axis = 0 if int(np.argmin(shape)) == 0 else 2
-    return np.any(values != 0, axis=depth_axis)
+    return np.any(values != 0, axis=0 if depth_axis_first else 2)
 
 
 def build_lowres_block_mask(
@@ -414,27 +422,42 @@ def build_lowres_block_mask(
     height: int,
     width: int,
     user_mask: np.ndarray | None,
+    depth_axis_first: bool = True,
+    input_level: str = "0",
 ) -> tuple[np.ndarray | None, tuple[int, int], str | None]:
     """Combine group occupancy and user mask at occupancy resolution."""
 
-    if hasattr(root, "shape"):
-        occupancy = None
-        occupancy_level = None
-        occupancy_h, occupancy_w = height, width
-    else:
-        occupancy_level, occupancy_array = choose_pyramid_array(
+    occupancy = None
+    occupancy_level = None
+    scale = 1
+    if not hasattr(root, "shape"):
+        level, occupancy_array = choose_pyramid_array(
             root,
             preferred_key=DEFAULT_OCCUPANCY_SCAN_LEVEL,
             purpose="occupancy scan",
         )
-        occupancy = compute_nonempty_mask_from_lowres_array(occupancy_array)
-        occupancy_h, occupancy_w = occupancy.shape
-    scale_y = max(1, int(round(height / max(1, occupancy_h))))
-    scale_x = max(1, int(round(width / max(1, occupancy_w))))
+        # Pyramid levels halve height and width; with no such mapping to the
+        # input level, schedule every tile.
+        if level.isdigit() and input_level.isdigit() and int(level) >= int(input_level):
+            factor = 2 ** (int(level) - int(input_level))
+            stored = compute_nonempty_mask_from_lowres_array(
+                occupancy_array,
+                depth_axis_first=depth_axis_first,
+            )
+            grid_h, grid_w = -(-height // factor), -(-width // factor)
+            if stored.shape[0] in (height // factor, grid_h) and stored.shape[1] in (width // factor, grid_w):
+                occupancy, occupancy_level, scale = stored, level, factor
+                if stored.shape != (grid_h, grid_w):
+                    # A floor-rounded level omits edge cells that may hold foreground.
+                    occupancy = np.pad(
+                        stored,
+                        ((0, grid_h - stored.shape[0]), (0, grid_w - stored.shape[1])),
+                        constant_values=True,
+                    )
     if user_mask is not None:
-        pooled = downsample_mask_any(user_mask, scale_y, scale_x)
+        pooled = downsample_mask_any(user_mask, scale, scale)
         occupancy = pooled if occupancy is None else np.logical_and(occupancy, pooled)
-    return occupancy, (scale_y, scale_x), occupancy_level
+    return occupancy, (scale, scale), occupancy_level
 
 
 class FlatPatchReader:
@@ -1326,6 +1349,8 @@ def infer_single_zarr(
         height=height,
         width=width,
         user_mask=mask,
+        depth_axis_first=depth_first,
+        input_level=resolution,
     )
     if occupancy is None:
         LOGGER.warning(
