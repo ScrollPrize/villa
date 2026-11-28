@@ -187,6 +187,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 vesuvius = [
     "install/configs/cubes.yaml",
+    "models/configuration/single_task/ps128_dicece.yaml",
     "ink_detection/configs/*.json",
     "tifxyz_label_transfer/*.cpp",
     "neural_tracing/fiber_trace_3d/fiber_lemon.cpp",

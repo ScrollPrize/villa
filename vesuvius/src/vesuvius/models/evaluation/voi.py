@@ -12,7 +12,8 @@ class VOIMetric(BaseMetric):
     Variation of Information (VOI) metric for 3D segmentation.
 
     Computes VOI between connected-component labelings derived from binary FG masks.
-    Uses 26-connectivity for 3D connected components.
+    Uses 26-connectivity for 3D connected components; on 2D patches
+    label_components reads it as 8-connectivity.
 
     Returns:
         voi_total: voi_split + voi_merge (lower is better)
@@ -47,17 +48,17 @@ class VOIMetric(BaseMetric):
         )
 
 
-def _bbox3d(mask: np.ndarray) -> Optional[Tuple[slice, slice, slice]]:
-    """Compute 3D bounding box of binary mask."""
-    assert mask.ndim == 3
+def _bbox3d(mask: np.ndarray) -> Optional[Tuple[slice, ...]]:
+    """Compute the bounding box of a binary 2D or 3D mask."""
+    assert mask.ndim in (2, 3)
     sls = []
-    for ax in range(3):
-        proj = mask.any(axis=tuple(i for i in range(3) if i != ax))
+    for ax in range(mask.ndim):
+        proj = mask.any(axis=tuple(i for i in range(mask.ndim) if i != ax))
         idx = np.flatnonzero(proj)
         if idx.size == 0:
             return None
         sls.append(slice(int(idx[0]), int(idx[-1]) + 1))
-    return (sls[0], sls[1], sls[2])
+    return tuple(sls)
 
 
 def _compute_voi_3d(
@@ -86,11 +87,7 @@ def _compute_voi_3d(
     if slc is not None:
         crop_ratio = 0.7
         full_n = int(np.prod(gt_bin.shape, dtype=np.int64))
-        bbox_n = int(
-            (slc[0].stop - slc[0].start) *
-            (slc[1].stop - slc[1].start) *
-            (slc[2].stop - slc[2].start)
-        )
+        bbox_n = int(np.prod([sl.stop - sl.start for sl in slc], dtype=np.int64))
         use_crop = (bbox_n <= int(crop_ratio * full_n))
 
         if use_crop:
