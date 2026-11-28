@@ -15,7 +15,8 @@ dependencies = [
     "libigl>=2.6.3",
     "matplotlib>=3.11.0",
     "networkx>=3.6.1",
-    "numba>=0.67.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # fast_tracks' compiled walk, for both track extraction backends; macOS arm64 has wheels too.
+    "numba>=0.67.0; (sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'darwin' and platform_machine == 'arm64')",
     "numcodecs>=0.16.0",
     "numpy>=2.5.0",
     "opencv-python-headless>=4.13.0.92",
@@ -60,9 +61,12 @@ cuda = [
     "cucim-cu12>=26.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "cupy-cuda12x>=14.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+# Apple-silicon GPU backend (`--backend metal`), from PyPI. Installed by a plain `uv sync`
+# (see default-groups); `--no-group metal` skips it.
+metal = ["teasar>=0.1.1; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [tool.uv]
-default-groups = ["dev", "cuda"]
+default-groups = ["dev", "cuda", "metal"]
 
 [tool.uv.sources]
 vc-reader = { path = "../vc_reader", editable = true }

@@ -73,7 +73,7 @@ __all__ = ['MIN_TRACK_VERTICES', 'ENGINES', 'default_engine', 'warmup', 'extract
 
 MIN_TRACK_VERTICES = 10          # get_skeleton_tracks drops paths of fewer vertices
 
-# numba is optional: `uv sync` installs it on Linux x86-64, and the 'numpy' engine covers
+# numba is optional: `uv sync` installs it on Linux x86-64 and macOS arm64, and the 'numpy' engine covers
 # environments set up without it.
 try:
     import numba as _numba

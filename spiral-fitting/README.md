@@ -90,16 +90,36 @@ track fit is not automatically equivalent to a new store-backed fit.
 Kimimaro skeletonization. The local `vc-reader` dependency requires its native
 build prerequisites (see [vc_reader](../vc_reader/README.md)).
 
-Use `--slab-workers N --kimimaro-parallel 1` to process multiple slabs concurrently
-on Linux with local predictions. Each worker holds a slab in RAM; the default is
-one worker and eight Kimimaro processes per slab.
+Slabs run in parallel in worker processes, each with one Kimimaro process and
+its own slab in RAM, on every platform. `--slab-workers auto`, the default,
+starts one worker for every two CPUs, at most 8 (each worker keeps more than one
+CPU busy, and more than 8 has not been measured). It starts only as many as fit
+in the memory available at the start less 4 GB, which stays free for other
+work (in a container, the memory its cgroup v2 limit leaves when that is
+less), at about 16 bytes per voxel of the largest slab plus 256 MB a worker (a
+full-width ribbon of a 7948 × 7948 scroll at downsample 2 peaked at 1.8 GB;
+1536 × 1536 crops take about 0.4 GB a worker), and runs one slab at a time when
+the predictions are remote. `--kimimaro-parallel auto`, also the default, gives
+each slab one Kimimaro process when several workers run. When slabs run one at
+a time, Linux gives each slab 8; Kimimaro starts its processes anew for every
+slab, which is slow on macOS and Windows, so there a slab still gets one. A set
+`--slab-workers N` or `--kimimaro-parallel N` always wins; with
+`--kimimaro-parallel` above 1 and no `--slab-workers`, slabs run one at a time.
+Pass `--slab-workers N` to leave CPUs or memory for other work.
 
 ```sh
 python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
+  --out /data/tracks.dbm --z-min 9048 --z-max 9548
+python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
   --out /data/tracks.dbm --z-min 9048 --z-max 9548 \
-  --slab-workers 4 --kimimaro-parallel 1
+  --slab-workers 4
 python -m pytest -q tests/test_cc_labels.py tests/test_extract_surface_tracks.py
 ```
+
+The CPU backend turns skeletons into tracks with `fast_tracks.py`, as the GPU
+backend does: compiled with numba where `uv sync` installs it (Linux x86-64 and
+macOS arm64), and with its vectorized NumPy engine elsewhere. With one Kimimaro
+process per slab the DBM does not depend on the number of slab workers.
 
 ## CUDA startup check
 
@@ -132,8 +152,17 @@ See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/k
 Fits run on CUDA whenever it is available. Without it they run on Apple's MPS
 backend, and without that on the CPU; `FIT_SPIRAL_DEVICE=cuda|mps|cpu` (or `cuda:1`)
 picks one explicitly (`devices.py`). A distributed (torchrun) fit needs CUDA or
-the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, so MPS and the
-CPU use the PyTorch paths, and the CUDA startup check is skipped.
+the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, and the CUDA
+startup check is skipped elsewhere. On MPS, the track radius loss and the
+nonfinite-gradient sanitize run as Metal kernels (`track_loss_metal.py`, `grad_metal.py`), and,
+when track length-bin weights are set and the resampled points fit in GPU memory, the track batch
+sampler plans each batch on the host and gathers it in one dispatch. Neither the radius loss nor
+the sampler compiles per-shape graphs or reads tensor shapes back from the GPU; the track DT loss,
+everything else, and the CPU use the PyTorch paths. On MPS the resampled track points stay on the
+device, as on CUDA, while they fit in a fifth of the Metal memory still free; otherwise the fit keeps
+them on the host. `FIT_SPIRAL_METAL=0` turns the Metal kernels off, and
+`FIT_SPIRAL_METAL_TRACKS=0` turns off only the track loss and sampler.
+`tests/test_track_radius_metal.py` checks the fused loss against the eager one.
 
 MPS has no float64. Device tensors that are float64 on CUDA take their dtype
 from `devices.float_hi()`, which is float32 on MPS;
@@ -1572,7 +1601,7 @@ backend reads a local zarr v2 array in the layout of the surface predictions
 (uint8, blosc, `/` chunk keys) straight from its chunk files instead. The z
 range is half-open (`[z-min, z-max)`).
 
-Two backends write the same keys in the same format:
+Three backends write the same keys in the same format:
 
 - `gpu`: Brook (`brook-cu12`) and cuCIM on NVIDIA GPUs, one worker process
   per GPU. It needs Linux x86-64, GPUs of compute capability 8.0 or newer
@@ -1585,23 +1614,50 @@ Two backends write the same keys in the same format:
   (`nvidia-smi` indices, PCI bus order); UUID and MIG entries are not accepted,
   so pass `--gpus` instead. With `--gpus`, `--backend auto` does not fall back
   to Kimimaro when the GPU backend cannot run.
-- `cpu`: Kimimaro, one slab at a time. `uv sync` installs it on every platform
+- `metal`: teasar (`teasar` on PyPI) on Apple-silicon GPUs. `uv sync` installs
+  it on Apple-silicon Macs as the default `metal` dependency group
+  (`--no-group metal` skips it). Slabs teasar declines run on Kimimaro.
+- `cpu`: Kimimaro, with slabs in parallel worker processes (see
+  [CPU surface-track extraction](#cpu-surface-track-extraction)). `uv sync` installs it on every platform
   except Linux x86-64, where it is the optional `cpu` extra
   (`uv sync --extra cpu`) for machines without a compatible GPU.
 
 `--backend auto` (the default) picks the GPU backend when its check passes
 (platform, packages, and the NVIDIA driver version and the compute capability
 of the selected GPUs, as reported by `nvidia-smi`) and `path_mode` is
-`'interjoint'`, and Kimimaro otherwise. The
-script prints the backend it uses and why. `--backend gpu` and `--backend cpu`
-stop with the reason when that backend cannot run. The GPU backend implements
-only the `'interjoint'` path mode.
+`'interjoint'`, then the metal backend when its check passes, and Kimimaro
+otherwise. The script prints the backend it uses and why. `--backend gpu`,
+`--backend metal` and `--backend cpu` stop with the reason when that backend
+cannot run. Both GPU backends implement only the `'interjoint'` path mode.
+
+The metal backend runs connected-component labelling, pooling and the size
+filter on the Mac's GPU with teasar, skeletonizes the pooled labels with
+teasar (on host threads with the default `kimimaro` target order), and walks
+the skeletons into tracks with `fast_tracks.py`. teasar supports the two slab
+configurations in `TEASAR_SETTINGS`: the defaults at the top of the script,
+and the published PHerc0211 configuration (downsample 2, 2-voxel ribbons every
+8, 4-voxel slabs every 16). Any other configuration uses Kimimaro. A slab
+teasar declines while preparing its labels (one over its size limits) runs
+through the CPU backend from the start. A slab it declines while skeletonizing
+(a call whose output would be too large, or a setting it does not support)
+runs on Kimimaro from the labels teasar already computed. The run prints how
+many slabs teasar declined. Keys are written in
+the same order as with the CPU backend, so a run resumes the same way.
+
+`--teasar-target-order` sets the order teasar traces each skeleton's branches
+in. The default, `kimimaro`, follows Kimimaro's order, so the tracks stay
+compatible with the CPU backend's; while the installed teasar does not
+implement it, the run says so and extracts with the CPU backend instead.
+`best` is teasar's own order: its skeletons are close to Kimimaro's but not
+identical, as with Brook.
 
 Brook implements Kimimaro's skeletonization on the GPU. Its skeletons are close
 to Kimimaro's but not always identical, so the two backends' DBMs agree closely
-rather than byte for byte (see the measurements below). Kimimaro collects the
-skeletons of its 8 worker processes as they finish, so the order of the tracks
-within a key can also differ between two CPU runs.
+rather than byte for byte (see the measurements below). With several Kimimaro
+processes per slab (Linux's default when slabs run one at a time), Kimimaro
+collects their skeletons as they finish, so the order of the tracks within a key
+can also differ between two CPU runs; with one per slab (the default whenever
+several slab workers run) it cannot.
 
 Every key (`h:{z}`, `vy:{y}`, `vx:{x}`) holds a pickled list of `(N, 3)` int32
 ZYX arrays in full-resolution voxels, and an empty slab holds an empty list.

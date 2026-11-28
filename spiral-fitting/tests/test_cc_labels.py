@@ -4,6 +4,7 @@ from __future__ import annotations
 import dbm
 import pickle
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +61,8 @@ def test_max_area_equal_cc3d(monkeypatch):
 
 def _run(out_dir, name, volume, **opts):
     pytest.importorskip('kimimaro')
+    # one slab at a time unless a test asks for workers: spawned workers would not see monkeypatches
+    opts = {'slab_workers': 1, **opts}
     out = str(Path(out_dir) / f'{name}.dbm')
     saved = {k: getattr(est, k) for k in ('z_min', 'z_max', *opts)}
     try:
@@ -109,6 +112,20 @@ def test_slab_workers_on_zarr(tmp_path):
     assert _canonical(got) == _canonical(want)
 
 
+def test_spawned_slab_workers_get_the_settings(tmp_path, monkeypatch):
+    # Outside Linux the slab workers are spawned: they import this module afresh, and the parent
+    # hands them its settings. Forced on every OS here. Each of the four settings changes the
+    # tracks of this volume, so a worker that missed one would write other tracks.
+    monkeypatch.setattr(est, 'sys', types.SimpleNamespace(platform='darwin'))
+    volume = _blobs((64, 128, 128), 0.06, 3)
+    opts = dict(downsample_factor=2, dust_threshold=100, max_area_threshold=20_000,
+                path_mode='maximal_chain', kimimaro_parallel=1)
+    want = _run(tmp_path, 'ref', volume, **opts)
+    assert _canonical(want) != _canonical(_run(tmp_path, 'default', volume, kimimaro_parallel=1))
+    got = _run(tmp_path, 'new', volume, slab_workers=2, **opts)
+    assert _canonical(got) == _canonical(want)
+
+
 @pytest.mark.parametrize('axis', [0, 1, 2])
 def test_real_scroll_labels_equal_cc3d(axis):
     fixture = Path(__file__).resolve().parents[2] / 'vesuvius/tests/ink_detection/fixtures/ink_roi_case.npz'
@@ -123,3 +140,56 @@ def test_real_scroll_labels_equal_cc3d(axis):
     want = _reference_labels(slab)
     assert np.count_nonzero(want)
     np.testing.assert_array_equal(est.prepare_cc_labels(slab), want)
+
+
+def test_auto_slab_workers(monkeypatch):
+    # auto: one worker for every two CPUs, at most 8 and one per slab, as many as the available
+    # memory less 4 GiB holds, and 1 when --kimimaro-parallel asks for several Kimimaro processes
+    monkeypatch.setattr(est, 'kimimaro_parallel', 'auto')
+    monkeypatch.setattr(est, 'z_min', 0)
+    monkeypatch.setattr(est, 'z_max', 1000)
+    monkeypatch.setattr(est, 'z_chunk_depth_h', 2)
+    cpus = 24
+    monkeypatch.setattr(est.os, 'cpu_count', lambda: cpus)
+    monkeypatch.setattr(est.os, 'process_cpu_count', lambda: cpus, raising=False)
+    gib = 2**30
+    available, total = 64 * gib, 64 * gib
+    monkeypatch.setattr(est, '_available_memory', lambda: available)
+    monkeypatch.setattr(est, '_physical_memory', lambda: total)
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 8
+    cpus = 14
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 7
+    assert est.auto_slab_workers((1000, 1000, 1000), 3) == 3
+    # a 2 x 8000 x 8000 ribbon is the largest slab: 16 B a voxel and 256 MiB, about 2.2 GiB a worker
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 7
+    available = 16 * gib
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 5
+    available = 6 * gib
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 1
+    # 2 GiB to spare at about 0.31 GiB a worker
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 6
+    available = 3 * gib
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 1
+    # available memory unknown: half of the RAM
+    available, total = None, 16 * gib
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 3
+    total = None
+    assert est.auto_slab_workers((1000, 8000, 8000), 500) == 7
+    cpus = 3
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 1
+    cpus = 14
+    monkeypatch.setattr(est, 'kimimaro_parallel', 1)
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 7
+    monkeypatch.setattr(est, 'kimimaro_parallel', 8)
+    assert est.auto_slab_workers((1000, 1000, 1000), 500) == 1
+
+
+def test_slab_workers_argument():
+    base = ['--predictions', 'p.zarr', '--out', 't.dbm', '--backend', 'cpu', '--kimimaro-parallel', '1']
+    assert est.parse_args(base).slab_workers == 'auto'
+    assert est.parse_args([*base, '--slab-workers', '3']).slab_workers == 3
+    assert est.parse_args([*base, '--predictions', 's3://b/p.zarr']).slab_workers == 1
+    assert est.parse_args(base[:-2]).kimimaro_parallel == 'auto'
+    for bad in (['--slab-workers', 'many'], ['--slab-workers', '0'], ['--kimimaro-parallel', '0']):
+        with pytest.raises(SystemExit):
+            est.parse_args([*base, *bad])

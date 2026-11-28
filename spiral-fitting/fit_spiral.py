@@ -51,6 +51,7 @@ from fit_session import (AUTOSAVE_INTERVAL_ITERATIONS, check_fit_volume,
                          resolve_lasagna_scale, scroll_at_fit_level,
                          shell_losses_enabled, winding_inference_enabled)
 from lazy_moment_adamw import LazyMomentAdamW, robust_clip_
+from grad_metal import NonfiniteGradSanitizer
 
 
 def _startup_resource_suffix(started_at=None):
@@ -1935,6 +1936,11 @@ class FitContext:
         and nonfinite_grad_by_param per affected parameter, then replaces
         NaN and +/-inf with zero in place.
         """
+        sanitizer = getattr(self, 'grad_sanitizer', None)
+        if sanitizer is not None and sanitizer.available():
+            # one fused dispatch per parameter on MPS (grad_metal)
+            sanitizer()
+            return
         step_had_nonfinite = torch.zeros((), dtype=torch.bool, device=self.nonfinite_grad_steps.device)
         for name, p in self.dist_grad_named:
             if p.grad is not None:
@@ -2599,6 +2605,8 @@ class FitContext:
         )
         self.nonfinite_grad_steps = torch.zeros((), device=self.dist_grad_params[0].device)
         self.nonfinite_grad_by_param = {name: torch.zeros((), device=p.device) for name, p in self.dist_grad_named}
+        self.grad_sanitizer = NonfiniteGradSanitizer(
+            self.dist_grad_named, self.nonfinite_grad_by_param, self.nonfinite_grad_steps)
         # Per-lattice, per-stage (threshold, clipped fraction) of the last
         # step's robust flow-gradient clip, for the step log (see
         # _clip_flow_grads).
@@ -2626,7 +2634,7 @@ class FitContext:
         'slice_to_spiral_transform', 'dr_per_winding',
         'dt_target_cache_manager', 'dist_grad_params', 'dist_grad_named',
         'step_timer', 'nonfinite_grad_steps', 'nonfinite_grad_by_param',
-        'run_dt_resume_iteration',
+        'grad_sanitizer', 'run_dt_resume_iteration',
     )
 
     def rebuild_model_state(self):

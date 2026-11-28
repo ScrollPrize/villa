@@ -17,17 +17,21 @@ DBM to recompute it. With --packed-store (default:
 ``write_native_packed_store``), the adjacent packed store read by
 ``fit_spiral.py`` is written at the end.
 
-Two backends write the same keys in the same format:
+Three backends write the same keys in the same format:
 
-  gpu  Brook (brook-cu12) and cuCIM on NVIDIA GPUs of compute capability 8.0 or
-       newer, Linux x86-64 only, one process per GPU (``surface_tracks_gpu.py``).
-  cpu  Kimimaro on the CPU, one slab at a time, or several with
-       --slab-workers; vc_reader labels connected components on the CPU.
+  gpu    Brook (brook-cu12) and cuCIM on NVIDIA GPUs of compute capability 8.0 or
+         newer, Linux x86-64 only, one process per GPU (``surface_tracks_gpu.py``).
+  metal  teasar on Apple GPUs, when it is installed. A slab teasar declines
+         runs on Kimimaro instead.
+  cpu    Kimimaro on the CPU, several slabs at once in worker processes
+         (--slab-workers); vc_reader labels connected components on the CPU.
 
-Brook implements Kimimaro's algorithm on the GPU; its skeletons are close to
-Kimimaro's but not guaranteed to be identical. ``--backend auto`` uses the GPU
-backend when a compatible GPU is present and ``path_mode`` is ``'interjoint'``,
-and Kimimaro otherwise.
+Brook implements TEASAR skeletonization on the GPU. teasar prepares the labels
+on the GPU and, with the default target order, skeletonizes on host threads.
+Their skeletons are close to Kimimaro's but not identical. ``--backend auto`` uses the first of
+gpu, metal and cpu that can run. Both GPU backends need ``path_mode``
+``'interjoint'``, and metal also needs one of the slab configurations teasar
+supports (``TEASAR_SETTINGS``).
 
 Example:
 
@@ -47,6 +51,7 @@ import importlib.util
 import os
 import pickle
 import re
+import sys
 
 import numpy as np
 
@@ -54,7 +59,7 @@ import numpy as np
 predictions_zarr_path = 's3://<bucket>/<volpkg>/volumes/<surface-predictions>.zarr/0'
 tracks_dbm_path = '/path/to/<dataset>/tracks/<name>.dbm'
 write_native_packed_store = True
-skeleton_backend = 'auto'  # 'gpu' = Brook, 'cpu' = Kimimaro, 'auto' = gpu when it can run, else cpu
+skeleton_backend = 'auto'  # 'gpu' = Brook, 'metal' = teasar, 'cpu' = Kimimaro, 'auto' = the first that can run
 
 # All wrt the original (full-resolution) volume; downsampling is applied internally after CC extraction
 downsample_factor = 4
@@ -66,10 +71,35 @@ yx_stride_v = 64  # stride between successive vertical slabs
 dust_threshold = 400  # remove components smaller than this many voxels
 max_area_threshold = 640_000  # drop components larger than this many voxels
 path_mode = 'interjoint'  # 'interjoint' = every chain between branch/terminal nodes; 'maximal_chain' = greedy longest-path peel
-slab_workers = 1  # CPU backend: slabs processed at once by forked workers
-kimimaro_parallel = 8  # CPU backend: Kimimaro processes per slab
+# CPU backend: slabs processed at once by worker processes; 'auto' picks the count from the CPUs
+# and memory (auto_slab_workers), and is 1 when kimimaro_parallel > 1 or predictions are remote
+slab_workers = 'auto'
+# CPU backend: Kimimaro processes per slab; 'auto' is 1 when several slab workers run, and
+# _SERIAL_KIMIMARO_PARALLEL when slabs run one at a time (cpu_parallelism)
+kimimaro_parallel = 'auto'
+# Kimimaro spawns a new pool of processes for every slab, which on Windows and macOS takes far
+# longer than the work they share out, so there a slab gets one even when slabs run one at a time
+_SERIAL_KIMIMARO_PARALLEL = 8 if sys.platform.startswith('linux') else 1
+# Metal backend: the order in which teasar traces a piece's targets. 'kimimaro' follows
+# Kimimaro's, so the tracks stay compatible with the CPU backend's; 'best' is teasar's own order,
+# whose skeletons differ from Kimimaro's. While a teasar release does not implement 'kimimaro',
+# the run uses the CPU backend instead
+teasar_target_order = 'kimimaro'
+TEASAR_TARGET_ORDERS = ('kimimaro', 'best')
 
-BACKENDS = ('auto', 'gpu', 'cpu')
+BACKENDS = ('auto', 'gpu', 'metal', 'cpu')
+# The slab configurations teasar supports, by the name it gives each: the whole geometry() must
+# equal one of them, slab depths and strides included, since teasar checks the shapes it is given
+TEASAR_SETTINGS = {
+    'published_0211': dict(downsample_factor=2, z_chunk_depth_h=2, z_chunk_stride_h=8,
+                           yx_chunk_thickness_v=4, yx_stride_v=16, dust_threshold=400,
+                           max_area_threshold=640_000),
+    'villa_default': dict(downsample_factor=4, z_chunk_depth_h=4, z_chunk_stride_h=16,
+                          yx_chunk_thickness_v=4, yx_stride_v=64, dust_threshold=400,
+                          max_area_threshold=640_000),
+}
+# teasar's limit on the pooled voxels of one call; slabs are packed into calls in order up to it
+TEASAR_CALL_POOLED_VOXELS = 2 ** 26
 # An unfilled placeholder such as '<bucket>' in a configured path.
 _PLACEHOLDER = re.compile(r'<[^<>/]+>')
 
@@ -86,16 +116,19 @@ def open_predictions(path):
 
 
 def downsample_maxpool(x, factor):
+    """Max over ``factor``-sized cells, cropping each axis to a multiple of ``factor``."""
     if factor == 1:
         return x
-    cropped = tuple(s - s % factor for s in x.shape)
-    x = x[tuple(slice(0, s) for s in cropped)]
-    reshape = []
-    for s in x.shape:
-        reshape += [s // factor, factor]
-    x = x.reshape(reshape)
-    for axis in range(len(reshape) - 1, 0, -2):
-        x = np.max(x, axis=axis)
+    x = x[tuple(slice(0, s - s % factor) for s in x.shape)]
+    # one axis at a time, as an element-wise maximum of strided views: a max over a length-factor
+    # inner axis of a reshaped array is several times slower, and each pass shrinks the next
+    for axis in range(x.ndim):
+        def phase(i):
+            return x[(slice(None),) * axis + (slice(i, None, factor),)]
+        out = np.maximum(phase(0), phase(1))
+        for i in range(2, factor):
+            np.maximum(out, phase(i), out=out)
+        x = out
     return x
 
 
@@ -153,13 +186,16 @@ def geometry():
     )
 
 
-def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
+def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None, parallel=None):
     """Tracks of one slab; ``skeletonize`` defaults to ``kimimaro.skeletonize``.
 
     Any function with Kimimaro's signature can be passed, e.g. ``brook.skeletonize``.
+    ``parallel`` is the number of Kimimaro processes; None takes ``kimimaro_parallel`` as for
+    slabs run one at a time.
     """
-    import networkx as nx
     kwargs = skeletonize_kwargs()
+    if parallel is None:
+        parallel = _SERIAL_KIMIMARO_PARALLEL if kimimaro_parallel == 'auto' else kimimaro_parallel
     if skeletonize is None:
         import kimimaro
         skeletonize = kimimaro.skeletonize
@@ -169,38 +205,34 @@ def get_skeleton_tracks(cc_labels, offset_zyx, verbose=False, skeletonize=None):
         cc_labels,
         **kwargs,
         progress=verbose,
-        parallel=kimimaro_parallel,
+        parallel=parallel,
         parallel_chunk_size=250,
         in_place=True,
     )
     offset = np.asarray(offset_zyx, dtype=np.int64)
+    if path_mode == 'interjoint':
+        # fast_tracks walks every skeleton as extract_inter_branch_paths does on its networkx graph,
+        # without building one (compiled with numba where it is installed): the same tracks, in
+        # the same order
+        import fast_tracks
+        return fast_tracks.tracks_from_skeletons(skeletons.values(), offset)
+    assert path_mode == 'maximal_chain', f'unknown path_mode {path_mode!r}'
     tracks = []
     for skeleton in skeletons.values():
-        if path_mode == 'interjoint':
-            graph = nx.Graph()
-            graph.add_edges_from(skeleton.edges)
-            for path_vertex_indices in extract_inter_branch_paths(graph):
-                if len(path_vertex_indices) < 10:
-                    continue
-                coords = skeleton.vertices[path_vertex_indices].astype(np.int64)
-                tracks.append((coords + offset).astype(np.int32))
-        elif path_mode == 'maximal_chain':
-            while True:
-                if len(skeleton.edges) == 0:
-                    break
-                paths = skeleton.interjoint_paths()
-                longest_path_vertex_zyxs = max(paths, key=len)
-                if len(longest_path_vertex_zyxs) < 10:
-                    break
-                coords = longest_path_vertex_zyxs.astype(np.int64)
-                tracks.append((coords + offset).astype(np.int32))
-                longest_path_vertex_indices = set(np.where((longest_path_vertex_zyxs[:, None, :] == skeleton.vertices[None, :, :]).all(axis=-1))[1])
-                skeleton.edges = np.asarray(
-                    [edge for edge in skeleton.edges if edge[0] not in longest_path_vertex_indices and edge[1] not in longest_path_vertex_indices],
-                    dtype=np.uint32,
-                )
-        else:
-            assert False, f'unknown path_mode {path_mode!r}'
+        while True:
+            if len(skeleton.edges) == 0:
+                break
+            paths = skeleton.interjoint_paths()
+            longest_path_vertex_zyxs = max(paths, key=len)
+            if len(longest_path_vertex_zyxs) < 10:
+                break
+            coords = longest_path_vertex_zyxs.astype(np.int64)
+            tracks.append((coords + offset).astype(np.int32))
+            longest_path_vertex_indices = set(np.where((longest_path_vertex_zyxs[:, None, :] == skeleton.vertices[None, :, :]).all(axis=-1))[1])
+            skeleton.edges = np.asarray(
+                [edge for edge in skeleton.edges if edge[0] not in longest_path_vertex_indices and edge[1] not in longest_path_vertex_indices],
+                dtype=np.uint32,
+            )
     return tracks
 
 
@@ -209,9 +241,13 @@ def prepare_cc_labels(predictions_binary):
     # Area thresholds are specified in full-res voxels; convert to downsampled by ds**3.
     import cc3d
     from vc_reader.geometry import label_components
-    cc_labels, _ = label_components(predictions_binary, connectivity=6)
-    # cc3d.dust and Kimimaro expect unsigned label arrays.
-    cc_labels = cc_labels.astype(np.uint32, copy=False)
+    cc_labels, _ = label_components(predictions_binary, connectivity=6, threads=cc_label_threads)
+    # cc3d.dust and Kimimaro expect unsigned label arrays; labels are non-negative, so a view of
+    # vc_reader's int32 labels saves a full-resolution copy
+    if cc_labels.dtype == np.int32:
+        cc_labels = cc_labels.view(np.uint32)
+    else:
+        cc_labels = cc_labels.astype(np.uint32, copy=False)
     cc_labels = downsample_maxpool(cc_labels, downsample_factor)
     scale = downsample_factor ** 3
     cc3d.dust(
@@ -223,22 +259,46 @@ def prepare_cc_labels(predictions_binary):
     return cc_labels
 
 
-def _slab_tracks(predictions_zarr_array, index, offset_zyx):
-    # Pickled tracks of one slab (read, binarize, CC, skeletonize), as stored in the DBM.
-    predictions = predictions_zarr_array[index]
-    predictions = (predictions > 0).astype(np.uint8)
+def _slab_tracks(predictions_zarr_array, index, offset_zyx, kimimaro_processes=None):
+    # Pickled tracks of one slab (read, binarize, CC, skeletonize), as stored in the DBM. None
+    # Kimimaro processes means the count for slabs run one at a time, as in the metal fallback
+    predictions = binarize(predictions_zarr_array[index])
     if predictions.max() == 0:
         return pickle.dumps([])
     cc_labels = prepare_cc_labels(predictions)
-    return pickle.dumps(get_skeleton_tracks(cc_labels, offset_zyx=offset_zyx))
+    # the full-resolution slab is the largest array of a slab; free it before skeletonizing
+    del predictions
+    return pickle.dumps(get_skeleton_tracks(cc_labels, offset_zyx=offset_zyx,
+                                            parallel=kimimaro_processes))
+
+
+def binarize(predictions):
+    """``(predictions > 0)`` as uint8, in place for the uint8 arrays zarr returns."""
+    if predictions.dtype == np.uint8 and predictions.flags.writeable and predictions.flags.owndata:
+        return np.minimum(predictions, 1, out=predictions)
+    return (predictions > 0).astype(np.uint8)
 
 
 _worker_array = None  # the opened array, inherited by forked workers
+# Threads vc_reader labels a slab's components with; 0 uses every CPU. Several slab workers split
+# the CPUs between them, since a pool of every CPU in each worker oversubscribes the machine and
+# can exceed a container's process limit
+cc_label_threads = 0
+# Module settings the slab workers read. Spawned workers re-import this file, so they get
+# the parent's values (possibly set from the command line) through _worker_init.
+_WORKER_SETTINGS = ('downsample_factor', 'dust_threshold', 'max_area_threshold', 'path_mode',
+                    'cc_label_threads')
 
 
-def _worker_slab(job):
+def _worker_init(array, settings):
+    global _worker_array
+    _worker_array = array
+    globals().update(settings)
+
+
+def _worker_slab(kimimaro_processes, job):
     key, index, offset_zyx = job
-    return key, _slab_tracks(_worker_array, index, offset_zyx)
+    return key, _slab_tracks(_worker_array, index, offset_zyx, kimimaro_processes)
 
 
 def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
@@ -248,17 +308,33 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
     jobs = [j for j in jobs if j[0] not in tracks_db]
     if not jobs:
         return
-    if slab_workers <= 1:
+    workers, processes = cpu_parallelism(predictions_zarr_array.shape, len(jobs))
+    print(f'  {len(jobs)} slabs, {workers} slab worker(s) with {processes} Kimimaro '
+          f'process(es) each')
+    global cc_label_threads
+    cc_label_threads = 0 if workers <= 1 else max(1, (_cpu_count() or 1) // workers)
+    if workers <= 1:
         for key, index, offset in tqdm(jobs, desc=desc):
-            tracks_db[key] = _slab_tracks(predictions_zarr_array, index, offset)
+            tracks_db[key] = _slab_tracks(predictions_zarr_array, index, offset, processes)
         return
+    import functools
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
     global _worker_array
-    _worker_array = predictions_zarr_array
-    pool = ProcessPoolExecutor(slab_workers, mp_context=multiprocessing.get_context('fork'))
+    if sys.platform.startswith('linux'):
+        # Forked workers inherit the opened array and the module settings.
+        _worker_array = predictions_zarr_array
+        pool = ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context('fork'))
+    else:
+        # Windows and macOS: spawned workers receive the array (a zarr array pickles as its
+        # path) and the settings once, when they start.
+        settings = {k: globals()[k] for k in _WORKER_SETTINGS}
+        pool = ProcessPoolExecutor(
+            workers, mp_context=multiprocessing.get_context('spawn'),
+            initializer=_worker_init, initargs=(predictions_zarr_array, settings))
     try:
-        for key, data in tqdm(pool.map(_worker_slab, jobs), total=len(jobs), desc=desc):
+        slabs = pool.map(functools.partial(_worker_slab, processes), jobs)
+        for key, data in tqdm(slabs, total=len(jobs), desc=desc):
             tracks_db[key] = data
     finally:
         # On an error or Ctrl-C, drop the slabs not started yet; running slabs finish first.
@@ -266,7 +342,9 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
         _worker_array = None
 
 
-def extract_horizontal(predictions_zarr_array, tracks_db):
+def horizontal_jobs(predictions_zarr_array, tracks_db):
+    """(key, index, offset) jobs of the horizontal ribbons; ribbons too thin to have tracks are
+    written as empty at once."""
     z_limit = predictions_zarr_array.shape[0]
     jobs = []
     for z_chunk_min in range(z_min, z_max, z_chunk_stride_h):
@@ -281,7 +359,12 @@ def extract_horizontal(predictions_zarr_array, tracks_db):
                 tracks_db[key] = pickle.dumps([])
             continue
         jobs.append((key, slice(z_chunk_min, z_chunk_max), (z_chunk_min, 0, 0)))
-    _run_slabs(predictions_zarr_array, tracks_db, jobs, 'horizontal ribbons')
+    return jobs
+
+
+def extract_horizontal(predictions_zarr_array, tracks_db):
+    _run_slabs(predictions_zarr_array, tracks_db, horizontal_jobs(predictions_zarr_array, tracks_db),
+               'horizontal ribbons')
 
 
 def find_yx_range(predictions_zarr_array):
@@ -303,7 +386,9 @@ def find_yx_range(predictions_zarr_array):
     return min_yx, max_yx
 
 
-def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
+def vertical_jobs(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
+    """(key, index, offset) jobs of the vertical slabs along ``axis``; slabs too thin to have
+    tracks are written as empty at once."""
     # axis='y': iterate over y, slicing zx slabs. axis='x': iterate over x, slicing zy slabs.
     # min_yx / max_yx / yx_stride_v and w are all in full-resolution units; the slab thickness
     # in full-res voxels is yx_chunk_thickness_v * downsample_factor.
@@ -325,7 +410,7 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
     z_range_min = min(z_min, z_limit)
     z_range_max = min(z_max, z_limit)
     if z_range_max <= z_range_min:
-        return
+        return []
     shape_along = predictions_zarr_array.shape[axis_idx]
 
     jobs = []
@@ -344,6 +429,11 @@ def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
             index = (slice(z_range_min, z_range_max), slice(None), slice(w, w_max))  # (z, y, t)
             offset_zyx = (z_range_min, 0, w)
         jobs.append((db_key, index, offset_zyx))
+    return jobs
+
+
+def extract_vertical(predictions_zarr_array, tracks_db, axis, min_yx, max_yx):
+    jobs = vertical_jobs(predictions_zarr_array, tracks_db, axis, min_yx, max_yx)
     _run_slabs(predictions_zarr_array, tracks_db, jobs, f'vertical {axis}-stride slabs')
 
 
@@ -364,6 +454,143 @@ def check_vertical_slab_grid(tracks_dbm_path):
                 'rebuild its crossings with build_track_crossings.py --force.')
 
 
+# Peak memory of one slab worker: a base for the interpreter and its modules, plus this much per
+# voxel of the slab. Measured on PHerc0211 at downsample 2 (macOS arm64): a 2 x 7948 x 7948
+# ribbon peaked at 1.8 GB, a 1532 x 7948 x 4 slab at 1.0 GB
+_WORKER_BASE_BYTES = 256 * 2**20
+_WORKER_BYTES_PER_VOXEL = 16
+# --slab-workers auto starts one worker for every two CPUs, and at most this many. A worker keeps
+# more than one CPU busy (8 workers kept about 11 of 24 busy on Linux x86-64), so half of the CPUs
+# fills the machine without oversubscribing it. On PHerc0211 at downsample 2, 1532 slices of
+# 1536 x 1536, 8 workers ran about 1.8x faster than 4 on Linux x86-64 and 1.2x faster than 6 on an
+# Apple M4 Pro, at about 0.37 GB each; more than 8 was not measured, while each adds a slab's memory
+_MAX_AUTO_SLAB_WORKERS = 8
+# Memory --slab-workers auto leaves free: available memory is read once, at the start of a run that
+# can take hours, so this keeps room for the parent process (about 0.3 GB on the crop above) and for
+# whatever the user opens meanwhile. A 16 GB Mac with 8 GB available keeps 4 GB free: ten workers'
+# worth on that crop, and one worker on full-width 7948 x 7948 ribbons
+_MEMORY_RESERVE_BYTES = 4 * 2**30
+
+
+def _windows_memory_status():
+    # GlobalMemoryStatusEx's report, or None when it fails
+    import ctypes
+
+    class _MemoryStatus(ctypes.Structure):
+        _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+    status = _MemoryStatus(dwLength=ctypes.sizeof(_MemoryStatus))
+    if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        return status
+    return None
+
+
+def _physical_memory():
+    # Bytes of RAM, or None when this platform does not report it.
+    try:
+        return os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+    except (AttributeError, ValueError, OSError):
+        pass
+    if sys.platform == 'win32':
+        status = _windows_memory_status()
+        return status.ullTotalPhys if status else None
+    return None
+
+
+def _cgroup_memory_headroom(cgroup_root='/sys/fs/cgroup', proc_cgroup='/proc/self/cgroup'):
+    # Bytes this process's cgroup v2 and its ancestors let it add (memory.max less memory.current,
+    # the lowest along the path), or None outside cgroup v2 or with no limit. Containers often
+    # limit memory below what the host reports as available.
+    try:
+        with open(proc_cgroup) as f:
+            path = next(line[3:].strip() for line in f if line.startswith('0::'))
+    except (OSError, StopIteration):
+        return None
+    headroom = None
+    parts = [p for p in path.split('/') if p]
+    for depth in range(len(parts), -1, -1):
+        group = os.path.join(cgroup_root, *parts[:depth])
+        try:
+            with open(os.path.join(group, 'memory.max')) as f:
+                limit = f.read().strip()
+            with open(os.path.join(group, 'memory.current')) as f:
+                current = int(f.read())
+        except (OSError, ValueError):
+            continue
+        if limit != 'max':
+            left = max(0, int(limit) - current)
+            headroom = left if headroom is None else min(headroom, left)
+    return headroom
+
+
+def _available_memory():
+    # Bytes of RAM new processes can take now without swapping (free plus reclaimable), bounded by
+    # the cgroup's headroom, or None when unknown. psutil comes with Kimimaro outside Windows.
+    if sys.platform == 'win32':
+        status = _windows_memory_status()
+        return status.ullAvailPhys if status else None
+    try:
+        import psutil
+        available = psutil.virtual_memory().available
+    except ImportError:
+        available = None
+    headroom = _cgroup_memory_headroom()
+    if headroom is None:
+        return available
+    return headroom if available is None else min(available, headroom)
+
+
+def _slab_worker_memory():
+    # Bytes the slab workers of --slab-workers auto may take: the available memory less
+    # _MEMORY_RESERVE_BYTES, half of the RAM when only that is known, or None when neither is
+    available = _available_memory()
+    if available is not None:
+        return max(0, available - _MEMORY_RESERVE_BYTES)
+    total = _physical_memory()
+    return total // 2 if total else None
+
+
+def _cpu_count():
+    return os.process_cpu_count() if hasattr(os, 'process_cpu_count') else os.cpu_count()
+
+
+def auto_slab_workers(shape, n_jobs):
+    """Slab workers for ``--slab-workers auto``: one for every two CPUs, at most
+    ``_MAX_AUTO_SLAB_WORKERS``, as many as fit with the largest slab of this extraction in the
+    available memory less ``_MEMORY_RESERVE_BYTES``, at most one per slab, and 1 when
+    ``--kimimaro-parallel`` asks for several Kimimaro processes per slab."""
+    if kimimaro_parallel != 'auto' and kimimaro_parallel > 1 or n_jobs <= 1:
+        return 1
+    cpus = _cpu_count()
+    z_range = max(0, min(z_max, shape[0]) - min(z_min, shape[0]))
+    largest = max(z_chunk_depth_h * shape[1] * shape[2],
+                  z_range * yx_chunk_thickness_v * shape[2],
+                  z_range * shape[1] * yx_chunk_thickness_v)
+    workers = min((cpus or 1) // 2, _MAX_AUTO_SLAB_WORKERS, n_jobs)
+    memory = _slab_worker_memory()
+    if memory is not None:
+        per_worker = _WORKER_BASE_BYTES + _WORKER_BYTES_PER_VOXEL * largest
+        workers = min(workers, memory // per_worker)
+    return max(1, workers)
+
+
+def cpu_parallelism(shape, n_jobs):
+    """(slab workers, Kimimaro processes per slab) for ``n_jobs`` slabs of an array of ``shape``:
+    ``slab_workers`` and ``kimimaro_parallel`` with ``'auto'`` resolved. A set value always wins;
+    auto Kimimaro processes are 1 when several slab workers run, since the workers already keep
+    the CPUs busy, and ``_SERIAL_KIMIMARO_PARALLEL`` when slabs run one at a time."""
+    workers = slab_workers
+    if workers == 'auto':
+        workers = auto_slab_workers(shape, n_jobs)
+    processes = kimimaro_parallel
+    if processes == 'auto':
+        processes = 1 if workers > 1 else _SERIAL_KIMIMARO_PARALLEL
+    return workers, processes
+
+
 def run_cpu(predictions_path, tracks_dbm_path):
     """Extract every slab on the CPU (Kimimaro), writing each key as it completes."""
     check_vertical_slab_grid(tracks_dbm_path)
@@ -372,18 +599,17 @@ def run_cpu(predictions_path, tracks_dbm_path):
 
     with dbm.open(tracks_dbm_path, 'c') as tracks_db:
 
-        print('extracting horizontal ribbons')
-        extract_horizontal(predictions_zarr_array, tracks_db)
-
         print('finding yx range for vertical passes')
         min_yx, max_yx = find_yx_range(predictions_zarr_array)
         print(f'  yx range (full-res): {min_yx} .. {max_yx}')
 
-        print('extracting vertical zx-plane tracks')
-        extract_vertical(predictions_zarr_array, tracks_db, axis='y', min_yx=min_yx, max_yx=max_yx)
-
-        print('extracting vertical zy-plane tracks')
-        extract_vertical(predictions_zarr_array, tracks_db, axis='x', min_yx=min_yx, max_yx=max_yx)
+        # All three passes go through one pool, so workers start once and no pass waits for
+        # the last slabs of the one before it. Keys are still written in pass order.
+        jobs = (horizontal_jobs(predictions_zarr_array, tracks_db)
+                + vertical_jobs(predictions_zarr_array, tracks_db, 'y', min_yx, max_yx)
+                + vertical_jobs(predictions_zarr_array, tracks_db, 'x', min_yx, max_yx))
+        print('extracting horizontal ribbons, then zx- and zy-plane slabs')
+        _run_slabs(predictions_zarr_array, tracks_db, jobs, 'slabs')
 
 
 def run_gpu(predictions_path, tracks_dbm_path, gpus=None):
@@ -393,6 +619,191 @@ def run_gpu(predictions_path, tracks_dbm_path, gpus=None):
     return surface_tracks_gpu.run(
         predictions_path, tracks_dbm_path, z_min=z_min, z_max=z_max, geometry=geometry(),
         skeletonize_kwargs=skeletonize_kwargs(), open_array=open_predictions, gpus=gpus)
+
+
+def teasar_settings_name():
+    """The name of the teasar settings set equal to the current configuration, or None."""
+    current = geometry()
+    return next((name for name, values in TEASAR_SETTINGS.items() if values == current), None)
+
+
+def metal_available():
+    """``(ok, reason)`` for the metal backend in the current configuration."""
+    if path_mode != 'interjoint':
+        return False, f"the metal backend supports path_mode 'interjoint' only, not {path_mode!r}"
+    if teasar_settings_name() is None:
+        return False, ('teasar supports only the slab configurations in TEASAR_SETTINGS '
+                       f'({", ".join(TEASAR_SETTINGS)})')
+    try:
+        import teasar
+    except ImportError as exc:
+        return False, f'teasar cannot be imported ({exc})'
+    return teasar.check_available()
+
+
+def _slab_shape(shape, index):
+    # The shape of array[index] for a job's index: one slice, or one per axis.
+    index = index if isinstance(index, tuple) else (index,)
+    index = index + (slice(None),) * (len(shape) - len(index))
+    return tuple(len(range(*s.indices(n))) for s, n in zip(index, shape))
+
+
+def _pooled_voxels(shape):
+    return int(np.prod([n // downsample_factor for n in shape]))
+
+
+class MetalSlabs:
+    """Tracks of slab jobs on a teasar device, with Kimimaro for each slab teasar declines.
+
+    teasar's labels equal ``prepare_cc_labels``' bit for bit, so a declined slab is skeletonized
+    from them without being read again.
+    """
+
+    def __init__(self, device, teasar, settings):
+        self.device = device
+        self.teasar = teasar
+        self.settings = settings
+        self.unsupported = None  # teasar's reason when accepts_settings() is False
+        kwargs = skeletonize_kwargs()
+        self.skeletonize_kwargs = dict(
+            settings=settings, anisotropy=kwargs['anisotropy'],
+            scale=kwargs['teasar_params']['scale'], const=kwargs['teasar_params']['const'],
+            dust_threshold=kwargs['dust_threshold'], fix_borders=kwargs['fix_borders'],
+            fix_branching=kwargs['fix_branching'], target_order=teasar_target_order)
+        self.declined = 0
+
+    def accepts_settings(self):
+        """Whether teasar accepts these skeletonize settings, the target order included; checked
+        once on an empty slab, since teasar checks settings before any work."""
+        try:
+            self.device.skeletonize([np.zeros((1, 1, 1), np.uint32)], **self.skeletonize_kwargs)
+        except self.teasar.UnsupportedSettings as error:
+            self.unsupported = str(error)
+            return False
+        return True
+
+    def batches(self, predictions_zarr_array, jobs):
+        """Jobs packed in order into calls of at most TEASAR_CALL_POOLED_VOXELS pooled voxels."""
+        batch, total = [], 0
+        for job in jobs:
+            n = _pooled_voxels(_slab_shape(predictions_zarr_array.shape, job[1]))
+            if batch and total + n > TEASAR_CALL_POOLED_VOXELS:
+                yield batch
+                batch, total = [], 0
+            batch.append(job)
+            total += n
+        if batch:
+            yield batch
+
+    def labels(self, predictions):
+        """Pooled labels of one binarized slab, or None when teasar declines it."""
+        try:
+            # teasar takes C-order arrays only, and a Fortran-order Zarr v2 slab binarizes to
+            # Fortran order; a no-op for the usual C-order slab
+            return self.device.prepare_labels(
+                np.ascontiguousarray(predictions), downsample_factor, max(1, dust_threshold // downsample_factor ** 3),
+                max(1, max_area_threshold // downsample_factor ** 3), settings=self.settings)
+        except (self.teasar.UnsupportedSettings, self.teasar.InputTooLarge):
+            return None
+
+    def tracks(self, predictions_zarr_array, batch):
+        """Pickled tracks of each job of ``batch``, in order."""
+        results = [None] * len(batch)
+        pending = []  # (position, labels, offset) of the slabs left for one skeletonize call
+        for i, (_, index, offset) in enumerate(batch):
+            predictions = binarize(predictions_zarr_array[index])
+            # a slab thinner than one max-pool cell pools to nothing, so it has no tracks, as the
+            # job lists record for the thin slabs they skip
+            if predictions.max() == 0 or min(predictions.shape) < downsample_factor:
+                results[i] = pickle.dumps([])
+                continue
+            labels = self.labels(predictions)
+            del predictions
+            if labels is None:
+                self.declined += 1
+                results[i] = _slab_tracks(predictions_zarr_array, index, offset)
+                continue
+            pending.append((i, labels, offset))
+        for (i, _, _), data in zip(pending, self.skeletonize(pending)):
+            results[i] = data
+        return results
+
+    def skeletonize(self, slabs):
+        """Pickled tracks of ``(position, labels, offset)`` slabs, in order, falling back to
+        Kimimaro slab by slab as teasar's exceptions direct."""
+        if not slabs:
+            return []
+        teasar = self.teasar
+        try:
+            packed = self.device.skeletonize([labels for _, labels, _ in slabs],
+                                             **self.skeletonize_kwargs)
+        except teasar.UnsupportedSettings:
+            # a settings refusal applies to every slab of the call
+            return [self.kimimaro(slab) for slab in slabs]
+        except (teasar.OutputTooLarge, teasar.SomaUnsupported) as exc:
+            # the slabs before exc.slab fit in one call; a slab whose output is too large on its
+            # own, or that has a soma, runs on Kimimaro, and the rest continue in a new call
+            k = exc.slab
+            if k > 0 and isinstance(exc, teasar.OutputTooLarge):
+                return self.skeletonize(slabs[:k]) + self.skeletonize(slabs[k:])
+            return (self.skeletonize(slabs[:k]) + [self.kimimaro(slabs[k])]
+                    + self.skeletonize(slabs[k + 1:]))
+        except teasar.InputTooLarge:
+            if len(slabs) == 1:
+                return [self.kimimaro(slabs[0])]
+            return [data for slab in slabs for data in self.skeletonize([slab])]
+        import fast_tracks
+        return [pickle.dumps(fast_tracks.tracks_from_packed(
+                    p.v_off, p.e_off, p.vertices, p.edges, np.asarray(offset, np.int64)))
+                for p, (_, _, offset) in zip(packed, slabs)]
+
+    def kimimaro(self, slab):
+        self.declined += 1
+        _, labels, offset = slab
+        return pickle.dumps(get_skeleton_tracks(labels, offset_zyx=offset))
+
+
+def run_metal(predictions_path, tracks_dbm_path):
+    """Extract every slab with teasar on the Mac's GPU, and Kimimaro for slabs it declines."""
+    import teasar
+    from tqdm import tqdm
+    check_vertical_slab_grid(tracks_dbm_path)
+    settings = teasar_settings_name()
+    with teasar.Device() as device:
+        slabs = MetalSlabs(device, teasar, settings)
+        if slabs.accepts_settings():
+            print(f'opening {predictions_path}')
+            predictions_zarr_array = open_predictions(predictions_path)
+            with dbm.open(tracks_dbm_path, 'c') as tracks_db:
+                print('finding yx range for vertical passes')
+                min_yx, max_yx = find_yx_range(predictions_zarr_array)
+                print(f'  yx range (full-res): {min_yx} .. {max_yx}')
+                jobs = (horizontal_jobs(predictions_zarr_array, tracks_db)
+                        + vertical_jobs(predictions_zarr_array, tracks_db, 'y', min_yx, max_yx)
+                        + vertical_jobs(predictions_zarr_array, tracks_db, 'x', min_yx, max_yx))
+                jobs = [j for j in jobs if j[0] not in tracks_db]
+                print(f'extracting {len(jobs)} slabs on {device.name} (teasar '
+                      f'{teasar.__version__}, settings {settings!r}, target order '
+                      f'{teasar_target_order!r})')
+                with tqdm(total=len(jobs), desc='slabs') as progress:
+                    for batch in slabs.batches(predictions_zarr_array, jobs):
+                        # keys are written in job order once their call returns, so a run
+                        # resumes as the CPU backend's does
+                        results = slabs.tracks(predictions_zarr_array, batch)
+                        for (key, _, _), data in zip(batch, results):
+                            tracks_db[key] = data
+                        progress.update(len(batch))
+            if slabs.declined:
+                print(f'  {slabs.declined} slab(s) ran on Kimimaro, which teasar declined')
+            return
+
+    # every call would decline, and the CPU backend runs slabs in parallel where the fallback
+    # inside this loop cannot
+    # the slab geometry was checked before this backend was picked, so this is usually the target
+    # order; teasar's own reason says which setting it refused
+    print(f'teasar {teasar.__version__} does not support target order {teasar_target_order!r} with these '
+          f'settings ({slabs.unsupported}); extracting with the CPU backend (Kimimaro) instead')
+    run_cpu(predictions_path, tracks_dbm_path)
 
 
 def _have_kimimaro():
@@ -407,10 +818,10 @@ def _kimimaro_missing(context):
 
 
 def select_backend(requested, gpus=None):
-    """Return ``'gpu'`` or ``'cpu'`` for ``requested`` (``'auto'``, ``'gpu'`` or ``'cpu'``).
+    """Return ``'gpu'``, ``'metal'`` or ``'cpu'`` for ``requested`` (one of ``BACKENDS``).
 
     Prints the backend and the reason; raises ``SystemExit`` when the requested
-    backend cannot run. With ``gpus`` given, ``'auto'`` does not fall back to the CPU.
+    backend cannot run. With ``gpus`` given, ``'auto'`` does not fall back to metal or the CPU.
     """
     if requested not in BACKENDS:
         raise SystemExit(f'unknown backend {requested!r}; expected one of {", ".join(BACKENDS)}')
@@ -419,6 +830,14 @@ def select_backend(requested, gpus=None):
             raise _kimimaro_missing('--backend cpu was requested')
         print('backend: cpu (Kimimaro), as requested')
         return 'cpu'
+    if requested == 'metal':
+        ok, reason = metal_available()
+        if not ok:
+            raise SystemExit(f'--backend metal was requested, but it cannot run: {reason}')
+        if not _have_kimimaro():
+            raise _kimimaro_missing('The metal backend runs slabs teasar declines on Kimimaro')
+        print(f'backend: metal (teasar), as requested: {reason}')
+        return 'metal'
 
     # The GPU backend turns skeletons into tracks with fast_tracks, which implements
     # the 'interjoint' walk only.
@@ -446,7 +865,11 @@ def select_backend(requested, gpus=None):
         raise SystemExit(f'--gpus was given, but the GPU backend cannot run: {reason}')
     if not _have_kimimaro():
         raise _kimimaro_missing(f'The GPU backend cannot run ({reason})')
-    print(f'backend: cpu (Kimimaro), because {reason}')
+    metal_ok, metal_reason = metal_available()
+    if metal_ok:
+        print(f'backend: metal (teasar), because {reason}: {metal_reason}')
+        return 'metal'
+    print(f'backend: cpu (Kimimaro), because {reason}, and {metal_reason}')
     return 'cpu'
 
 
@@ -480,6 +903,15 @@ def check_downsample_factor(tracks_dbm_path, factor):
     os.replace(record + '.tmp', record)
 
 
+def _count_or_auto(value):
+    if value == 'auto':
+        return value
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected a number or auto, not {value!r}') from None
+
+
 def parse_args(argv=None):
     from runners.run_single import parse_gpu_ids
 
@@ -509,8 +941,8 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         '--backend', choices=BACKENDS, default=skeleton_backend,
-        help='Brook on NVIDIA GPUs, Kimimaro on the CPU, or auto: the GPU backend '
-             'when it can run, else Kimimaro (default: %(default)s)',
+        help='Brook on NVIDIA GPUs, teasar on Apple GPUs, Kimimaro on the CPU, or auto: '
+             'the first of gpu, metal and cpu that can run (default: %(default)s)',
     )
     parser.add_argument(
         '--gpus', metavar='DEVICE[,DEVICE...]', type=parse_gpu_ids,
@@ -519,14 +951,24 @@ def parse_args(argv=None):
              '(default: all visible GPUs)',
     )
     parser.add_argument(
-        '--slab-workers', metavar='N', type=int, default=slab_workers,
-        help='CPU backend: slabs processed at once in forked workers, each holding its own '
-             'slab in memory; Linux and local predictions only (default: %(default)s)',
+        '--slab-workers', metavar='N|auto', type=_count_or_auto, default=slab_workers,
+        help='CPU backend: slabs processed at once in worker processes, each holding its own '
+             'slab in memory; local predictions only. auto: one for every two CPUs, at most '
+             f'{_MAX_AUTO_SLAB_WORKERS}, as many as the available memory holds less '
+             f'{_MEMORY_RESERVE_BYTES // 2**30} GB, and 1 with --kimimaro-parallel > 1 or remote '
+             'predictions (default: %(default)s)',
     )
     parser.add_argument(
-        '--kimimaro-parallel', metavar='N', type=int, default=kimimaro_parallel,
-        help='CPU backend: Kimimaro processes per slab; use 1 with --slab-workers > 1 '
-             '(default: %(default)s)',
+        '--kimimaro-parallel', metavar='N|auto', type=_count_or_auto, default=kimimaro_parallel,
+        help='CPU backend: Kimimaro processes per slab. auto: 1 with more than one slab worker, '
+             f'else {_SERIAL_KIMIMARO_PARALLEL} on this OS (default: %(default)s)',
+    )
+    parser.add_argument(
+        '--teasar-target-order', choices=TEASAR_TARGET_ORDERS, default=teasar_target_order,
+        help="metal backend: the order teasar traces each skeleton's branches in; kimimaro "
+             "keeps the tracks compatible with the CPU backend's, and runs on the CPU backend "
+             "while teasar does not implement it; best is teasar's own order, whose skeletons "
+             "differ from Kimimaro's (default: %(default)s)",
     )
     parser.add_argument(
         '--packed-store', action=argparse.BooleanOptionalAction,
@@ -551,24 +993,29 @@ def parse_args(argv=None):
         parser.error(f'--downsample-factor must be at most the slab thickness '
                      f'({min(z_chunk_depth_h, yx_chunk_thickness_v)}) and divide the slab '
                      f'strides ({z_chunk_stride_h} and {yx_stride_v})')
-    if args.backend == 'cpu' and args.gpus is not None:
-        parser.error('--gpus applies to the GPU backend only, not to --backend cpu')
+    if args.backend in ('cpu', 'metal') and args.gpus is not None:
+        parser.error(f'--gpus applies to the GPU backend only, not to --backend {args.backend}')
     cpu_opts = ('slab_workers', 'kimimaro_parallel')
     if args.backend != 'cpu' and any(getattr(args, k) != parser.get_default(k) for k in cpu_opts):
         parser.error('--slab-workers and --kimimaro-parallel apply to --backend cpu only')
-    if args.slab_workers < 1 or args.kimimaro_parallel < 1:
+    if (args.backend in ('cpu', 'gpu')
+            and args.teasar_target_order != parser.get_default('teasar_target_order')):
+        parser.error(f'--teasar-target-order applies to the metal backend only, not to '
+                     f'--backend {args.backend}')
+    if args.slab_workers == 'auto' and '://' in args.predictions:
+        args.slab_workers = 1
+    if any(count != 'auto' and count < 1 for count in (args.slab_workers, args.kimimaro_parallel)):
         parser.error('--slab-workers and --kimimaro-parallel must be at least 1')
-    if args.slab_workers > 1 and not sys.platform.startswith('linux'):
-        parser.error('--slab-workers > 1 needs Linux (forked workers)')
-    if args.slab_workers > 1 and '://' in args.predictions:
-        parser.error('--slab-workers > 1 needs local predictions; forked workers cannot share a remote store')
+    if args.slab_workers != 'auto' and args.slab_workers > 1 and '://' in args.predictions:
+        parser.error('--slab-workers > 1 needs local predictions; workers cannot share a remote store')
     return args
 
 
 def main(argv=None):
     # The slab functions above read the z range and downsample factor from the module configuration.
-    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel
+    global z_min, z_max, downsample_factor, slab_workers, kimimaro_parallel, teasar_target_order
     args = parse_args(argv)
+    teasar_target_order = args.teasar_target_order
     z_min, z_max = args.z_min, args.z_max
     downsample_factor = args.downsample_factor
     slab_workers, kimimaro_parallel = args.slab_workers, args.kimimaro_parallel
@@ -578,6 +1025,8 @@ def main(argv=None):
     check_downsample_factor(args.out, args.downsample_factor)
     if backend == 'gpu':
         run_gpu(args.predictions, args.out, gpus=args.gpus)
+    elif backend == 'metal':
+        run_metal(args.predictions, args.out)
     else:
         run_cpu(args.predictions, args.out)
 

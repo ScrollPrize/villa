@@ -94,7 +94,7 @@ Alongside the meshes, a fit writes a model checkpoint, *satisfaction metrics* �
 
 ### How to run it
 
-The code lives in the villa repository under [`spiral-fitting`](https://github.com/ScrollPrize/villa/tree/main/spiral-fitting); the main entry point is [`fit_spiral.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py). You'll need Python ≥ 3.14 and an NVIDIA GPU.
+The code lives in the villa repository under [`spiral-fitting`](https://github.com/ScrollPrize/villa/tree/main/spiral-fitting); the main entry point is [`fit_spiral.py`](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/fit_spiral.py). You'll need Python ≥ 3.14. Fits run on an NVIDIA GPU (CUDA) when there is one, otherwise on an Apple-silicon Mac's GPU (MPS), and otherwise on the CPU; set `FIT_SPIRAL_DEVICE=cuda|mps|cpu` to pick one. A multi-GPU (`torchrun`) fit needs CUDA. The [spiral-fitting README](https://github.com/ScrollPrize/villa/blob/main/spiral-fitting/README.md#running-without-cuda) describes the MPS and CPU paths.
 
 ```bash
 git clone https://github.com/ScrollPrize/villa.git
@@ -148,7 +148,7 @@ Tracks are skeletonized 2D curves through a binarized surface prediction, cut on
     --z-min 4000 --z-max 17000
 ```
 
-With a supported NVIDIA GPU (Linux x86-64, compute capability ≥ 8.0) this uses a fast GPU backend — a 4000-slice range takes seconds on a few H100s — and otherwise falls back to a much slower CPU skeletonizer (`--backend`, `--gpus` to choose). It also writes the packed `<name>.dbm.vctracks/` store the fit loads fastest. Runs resume: slabs already in the database are skipped.
+With a supported NVIDIA GPU (Linux x86-64, compute capability ≥ 8.0) this uses a fast GPU backend — a 4000-slice range takes seconds on a few H100s. On an Apple-silicon Mac it skeletonizes on the Mac's GPU with teasar, and otherwise it falls back to a much slower CPU skeletonizer (`--backend`, `--gpus` to choose). It also writes the packed `<name>.dbm.vctracks/` store the fit loads fastest. Runs resume: slabs already in the database are skipped.
 
 **3. Optionally, cache the track crossings** (the fit otherwise computes them in memory):
 
