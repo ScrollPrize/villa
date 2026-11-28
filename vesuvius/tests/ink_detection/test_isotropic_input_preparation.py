@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -94,6 +95,21 @@ def test_preparation_uses_bankers_rounding_at_half_values(tmp_path):
     assert int(output_ZYX[1, 0, 0]) == 2
 
 
+def test_preparation_matches_float32_for_every_four_voxel_sum(tmp_path):
+    sums = np.arange(1021)
+    planes = np.clip(sums[None, :] - 255 * np.arange(4)[:, None], 0, 255)
+    source = np.tile(planes[:, None, :], (21, 1, 1)).astype(np.uint8)
+    input_path = tmp_path / "all-sums.zarr"
+    output_path = tmp_path / "pooled.zarr"
+    group = create_group(input_path, overwrite=True)
+    group.create_array("2", shape=source.shape, chunks=(21, 1, 128), dtype=source.dtype)[...] = source
+
+    prepare_isotropic_input(str(input_path), output_path, workers=2)
+
+    reference = np.rint(source.reshape(21, 4, 1, -1).astype(np.float32).mean(axis=1))
+    np.testing.assert_array_equal(open_group(output_path)["0"][:], reference.astype(np.uint8))
+
+
 def test_preparation_refuses_destination_and_partial_on_rerun(tmp_path):
     source_ZYX = np.zeros((84, 1, 1), dtype=np.uint8)
     input_path = tmp_path / "source.zarr"
@@ -139,7 +155,8 @@ def test_preparation_command_and_cli_module_help(tmp_path):
         ],
         check=False,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
     )
     assert completed.returncode == 0
     assert "--workers" in completed.stdout

@@ -23,6 +23,19 @@ CHUNK_XY = 128
 FORMAT_TAG = "level2-zmean4-21slice-v1"
 
 
+# Four uint8 planes sum to at most 1020. Use the same ties-to-even rule
+# as the float32 mean without expanding every source voxel to float32.
+_ROUNDED_MEANS = np.rint(
+    np.arange(POOL_Z * 255 + 1, dtype=np.float32) / POOL_Z
+).astype(np.uint8)
+
+
+def _pool_z_uint8(block_ZYX: np.ndarray) -> np.ndarray:
+    planes = block_ZYX.reshape(OUTPUT_Z, POOL_Z, *block_ZYX.shape[1:])
+    sums = planes.sum(axis=1, dtype=np.uint16)
+    return _ROUNDED_MEANS[sums]
+
+
 def centered_slice(length: int, requested: int) -> tuple[int, int]:
     """Return a centered half-open slice with an odd margin before the slice."""
     if requested > length:
@@ -102,15 +115,8 @@ def prepare_isotropic_input(
 
     def process(tile: tuple[int, int, int, int]) -> None:
         y0, y1, x0, x1 = tile
-        block_ZYX = np.asarray(
-            source[z0:z1, y0:y1, x0:x1], dtype=np.float32
-        )
-        pooled_ZYX = np.rint(
-            block_ZYX.reshape(
-                OUTPUT_Z, POOL_Z, y1 - y0, x1 - x0
-            ).mean(axis=1)
-        ).astype(np.uint8)
-        target[:, y0:y1, x0:x1] = pooled_ZYX
+        block_ZYX = np.asarray(source[z0:z1, y0:y1, x0:x1])
+        target[:, y0:y1, x0:x1] = _pool_z_uint8(block_ZYX)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for completed, _ in enumerate(pool.map(process, tiles), start=1):
