@@ -302,6 +302,11 @@ int main()
         require(safePathComponent("..a/b c") == "a_b_c" && safePathComponent("._") == "unnamed", "path component");
         require(joinOpenDataUrl("s3://vesuvius-challenge-open-data/", "/a/b") == "s3://vesuvius-challenge-open-data/a/b",
                 "join");
+        require(joinOpenDataUrl("/", "/a/b") == "/a/b", "join under the local root");
+#ifdef _WIN32
+        require(joinOpenDataUrl("/", "E:/a/b") == "E:/a/b" && joinOpenDataUrl("/", "E:\\a\\b") == "E:\\a\\b",
+                "join keeps a drive-absolute path");
+#endif
 
         // Models.
         require(manifest.models.size() == 1, "models");
