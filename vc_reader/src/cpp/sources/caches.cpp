@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "../disk_cache.hpp"
+#include "../zarr/files.hpp"
 #include "../output_pool.hpp"
 #include "../utf8_path.hpp"
 #include "../reader_types.hpp"
@@ -200,6 +201,7 @@ void EncodedFiles::close()
     std::lock_guard guard(mutex_);
     process();
     if (!temporary_.empty()) {
+        zarr::detail::releaseDiskBudget(temporary_);
         std::error_code ignored;
         fs::remove_all(utf8Path(temporary_), ignored);
         temporary_.clear();
