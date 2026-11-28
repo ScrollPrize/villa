@@ -26,7 +26,8 @@ from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
-from vesuvius.models.run.tta import infer_with_tta
+from vesuvius.models.run.orientation import axis_head_channels
+from vesuvius.models.run.tta import infer_with_tta, is_axis_head, tta_channel_groups
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.models.run.blending import InMemoryBlender, part_z_range, patches_in_z_range
 from vesuvius.utils.k8s import get_tqdm_kwargs
@@ -320,6 +321,8 @@ class Inferer():
     # Off unless __init__ is given in_memory_blend (class-level so partially built instances work too).
     in_memory_blend = None
     blender = None
+    # Vector / tensor channels the TTA must transform, not only move (see tta_channel_groups).
+    tta_channel_groups = None
 
     def __init__(self,
                  model_path: str = None,
@@ -578,6 +581,9 @@ class Inferer():
                     'start_channel': self.num_classes,
                     'end_channel': self.num_classes + target_channels
                 }
+                if target_config.get('auxiliary_task', False):
+                    # a regression head: multiclass finalization takes classes from the others
+                    self.target_info[target_name]['auxiliary_task'] = True
                 self.num_classes += target_channels
             if self.verbose:
                 print(f"Detected multi-task model with targets: {list(model_info['targets'].keys())}")
@@ -592,6 +598,16 @@ class Inferer():
             if self.verbose and self.patch_size != self.model_patch_size:
                 print(f"Warning: Using user-provided patch size {self.patch_size} instead of model's default: {self.model_patch_size}")
         
+        if self.is_multi_task and self.target_info and self.patch_size is not None:
+            targets = model_info.get('targets') or {}
+            self.tta_channel_groups = tta_channel_groups(targets, self.target_info, len(self.patch_size))
+            for target_name, info in self.target_info.items():
+                if is_axis_head(targets.get(target_name), info['out_channels'], len(self.patch_size)):
+                    # a direction without sign: TTA and blending average it as an axis
+                    info['sign_invariant'] = True
+            if self.verbose and self.tta_channel_groups:
+                print(f"TTA transforms the components of {len(self.tta_channel_groups)} vector/tensor head(s)")
+
         # Validate patch size for rotation TTA if needed
         if self.patch_size is not None and self.tta_type == 'rotation':
             if len(self.patch_size) != 3:
@@ -990,7 +1006,9 @@ class Inferer():
             raise RuntimeError("In-memory blending needs the input volume shape, which the dataset does not expose.")
         coords = np.asarray(self.patch_start_coords_list, dtype=np.int64).reshape(-1, 3)
         z_range = getattr(self, '_blend_z_range', None)
-        needed = InMemoryBlender.required_bytes(coords, self.patch_size, self.num_classes, volume_shape, z_range)
+        axis_channels = axis_head_channels(self.target_info) if self.is_multi_task else []
+        needed = InMemoryBlender.required_bytes(coords, self.patch_size, self.num_classes, volume_shape, z_range,
+                                                axis_channels=axis_channels)
         available = psutil.virtual_memory().available
         print(f"In-memory blending: the blend sums need {needed / 2**30:.1f} GiB "
               f"({available / 2**30:.1f} GiB available)")
@@ -1001,7 +1019,7 @@ class Inferer():
                 f"or drop --blend_in_memory and blend the written logits with blend_and_finalize.")
         self.blender = InMemoryBlender(coords, self.patch_size, self.num_classes, volume_shape,
                                        sigma_scale=self.in_memory_blend.get('sigma_scale', 8.0),
-                                       z_range=z_range)
+                                       z_range=z_range, axis_channels=axis_channels)
         self.coords_store_path = None
         self._prepare_in_memory_blend()
         return self.blender
@@ -1199,7 +1217,8 @@ class Inferer():
                                     non_empty_input,
                                     self.tta_type,
                                     is_multi_task=self.is_multi_task,
-                                    concat_multi_task_outputs=self._concat_multi_task_outputs
+                                    concat_multi_task_outputs=self._concat_multi_task_outputs,
+                                    channel_groups=self.tta_channel_groups,
                                 )
                             else:
                                 non_empty_output = self.model(non_empty_input)

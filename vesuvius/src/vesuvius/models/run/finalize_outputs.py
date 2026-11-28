@@ -23,6 +23,29 @@ class FinalizeConfig:
     target_info: Optional[dict] = None
 
 
+def class_channels(num_classes, config: FinalizeConfig):
+    """Channels that hold class scores in multiclass mode.
+
+    Auxiliary heads of a multi-task model (`auxiliary_task` in `target_info`: surface normals,
+    directions, distances, structure tensors) are regressions, not class scores; they are left
+    out of the softmax and argmax. Without such heads every channel is a class.
+    """
+    if config.is_multi_task and config.target_info:
+        heads = sorted(config.target_info.values(), key=lambda info: info['start_channel'])
+        seg = [info for info in heads if not info.get('auxiliary_task', False)]
+        if seg and len(seg) < len(heads):
+            return [c for info in seg for c in range(info['start_channel'], info['end_channel'])]
+    return list(range(num_classes))
+
+
+def multiclass_scores(num_classes, config: FinalizeConfig):
+    """Number of class channels in multiclass mode, which needs at least two."""
+    num_scores = len(class_channels(num_classes, config))
+    if num_scores < 2:
+        raise ValueError(f"Multiclass mode expects at least 2 class channels, but input has {num_scores}.")
+    return num_scores
+
+
 def _is_constant(logits_np):
     """`np.allclose(logits_np, logits_np.flat[0], rtol=1e-6)` and whether every value is finite.
 
@@ -141,6 +164,10 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
             else:
                 output_data = _softmax_foreground(logits_np, all_finite)
     else:  # multiclass
+        channels = class_channels(num_classes, config)
+        if len(channels) < logits_np.shape[0]:
+            logits_np = logits_np[channels]
+        num_classes = len(channels)
         # Quantise on fixed, chunk-independent scales: the class index is
         # written raw and the softmax probabilities use the same [0, 1] ->
         # [0, 255] scale as the binary path, so a byte means the same thing in
@@ -167,9 +194,11 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
         if uncovered is not None:
             output_np[:, uncovered] = 0
 
-        # Empty chunks were caught above; skip a finalized chunk only when
-        # every byte is identical, which is what the old path did after scaling.
-        if np.all(output_np == output_np.flat[0]):
+        # Empty chunks were caught above. Skip a finalized chunk only when every
+        # byte is the output's fill value 0: a chunk whose voxels all select
+        # class 1 (with --threshold only the argmax is written) is not empty,
+        # and skipping it would read back as class 0.
+        if not np.any(output_np):
             return None, True
         return output_np, False
 
@@ -203,10 +232,11 @@ def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
         else:
             return (1, *spatial_shape)
     else:  # multiclass
+        num_scores = multiclass_scores(num_classes, config)
         if threshold:
             return (1, *spatial_shape)
         else:
-            return (num_classes + 1, *spatial_shape)
+            return (num_scores + 1, *spatial_shape)
 
 
 # --- Worker Process State ---
@@ -353,8 +383,10 @@ def finalize_logits(
             raise ValueError(f"Binary mode expects 1 or 2 channels, but input has {num_classes} channels.")
         elif num_classes == 1:
             print("Detected single-channel binary logits. Using sigmoid finalization (or thresholded mask with --threshold).")
-    elif mode == "multiclass" and num_classes < 2:
-        raise ValueError(f"Multiclass mode expects at least 2 channels, but input has {num_classes} channels.")
+    elif mode == "multiclass":
+        num_scores = multiclass_scores(num_classes, FinalizeConfig(is_multi_task=is_multi_task, target_info=target_info))
+        if num_scores < num_classes:
+            print(f"Class scores: {num_scores} segmentation channels (auxiliary heads left out)")
     
     if chunk_size is None:
         try:
@@ -398,10 +430,10 @@ def finalize_logits(
             output_shape = (1, *spatial_shape)
             print("Output will have 1 channel: [argmax]")
         else:
-            # For multiclass, we'll output num_classes channels (all softmax values)
+            # For multiclass, we'll output one channel per class (all softmax values)
             # Plus 1 channel for the argmax
-            output_shape = (num_classes + 1, *spatial_shape)
-            print(f"Output will have {num_classes + 1} channels: [softmax_c0...softmax_cN, argmax]")
+            output_shape = (num_scores + 1, *spatial_shape)
+            print(f"Output will have {num_scores + 1} channels: [softmax_c0...softmax_cN, argmax]")
 
     output_chunks = (1, *output_chunks)  # Chunk each channel separately
 

@@ -84,11 +84,20 @@ def test_chunk_encoding_is_continuous_across_chunks():
     np.testing.assert_array_equal(np.concatenate([left, right], axis=-1), whole)
 
 
-def test_homogeneous_chunk_is_still_skipped():
+def test_homogeneous_background_chunk_is_still_skipped():
+    logits = np.zeros((NUM_CLASSES, 1, 2, 2), dtype=np.float32)
+    logits[0] = 30.0  # every voxel class 0, the output's fill value
+    out, is_empty = apply_finalization(logits, NUM_CLASSES, FinalizeConfig(mode="multiclass", threshold=0.5))
+    assert is_empty and out is None
+
+
+def test_homogeneous_nonzero_class_chunk_is_written():
+    """A skipped chunk reads back as the fill value 0, i.e. class 0."""
     logits = np.zeros((NUM_CLASSES, 1, 2, 2), dtype=np.float32)
     logits[2] = 30.0  # every voxel class 2 with probability 1
     out, is_empty = apply_finalization(logits, NUM_CLASSES, FinalizeConfig(mode="multiclass", threshold=0.5))
-    assert is_empty and out is None
+    assert not is_empty
+    assert out.ravel().tolist() == [2, 2, 2, 2]
 
 
 def test_too_many_classes_for_uint8_is_rejected():
