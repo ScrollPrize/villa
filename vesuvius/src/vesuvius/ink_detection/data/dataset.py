@@ -1,4 +1,66 @@
-"""Ink sample assembly for flat, full_3d, and full_3d_single_wrap modes."""
+"""Ink sample assembly for flat, full_3d, and full_3d_single_wrap modes.
+
+v6 (PR #2677, review 5, point 3) -- read failures stay loud for
+layouts main already discovers, and zero-patch segments stop
+invalidating the cache:
+
+1. The warn-and-skip resilience now applies ONLY to segments the PR
+   admits (TIFF-free flat mirrors main would not discover). A patch-
+   finding failure on a segment main discovers -- native tifxyz
+   geometry or an explicit surface volume -- re-raises, as main does:
+   silently dropping one would train or score a subset while
+   reporting the full set (and the broad catch also reached native
+   discovery, where removing a segment changes which neighbours
+   contribute labels). Selected segments keep the v5 re-raise.
+2. A failure that only says the segment yielded no patches
+   ("produced no valid patches", "contains no nonzero voxels") is a
+   legitimate zero-patch outcome, not a read failure: a complete
+   mirror below the ink-coverage threshold. Such a segment is kept
+   (its stores were read successfully) and recorded in the patch-cache
+   sidecar (``patch_cache.py``), so an unchanged rerun reuses the
+   cache instead of re-discovering it on every run. The run still
+   fails loudly if NO segment yields patches.
+
+v5 (PR #2677) -- cache behaviour restored to main (review 4, point 6):
+
+The v3 unlabeled cache-coverage check and the v4 probe that replaced
+it are both REMOVED. ``load_patch_cache`` (``patch_cache.py``,
+unchanged) already verifies segment coverage in labeled modes, so a
+newly ready mirror enters the cache there; in unlabeled mode main
+reuses the cache as written, calling the finder zero times on
+unchanged reruns. The v3 check and the v4 probe both rescanned on
+unchanged reruns whenever a segment legitimately yielded zero
+patches (v3: full re-discovery; v4: one probe call per uncovered
+segment) -- that rescan is what review 4 blocks. Restoring main's
+behaviour is the reviewer's explicit recommendation ("the wider
+changes to cache reuse ... add maintenance beyond that workflow"), and
+the unlabeled-mode staleness it leaves behind (a newly ready mirror
+does not enter an existing unlabeled cache until the cache is
+invalidated by other means) is main's behaviour, not a regression
+introduced here. ``patch_cache.py`` itself is untouched.
+
+v3 (PR #2677) -- two targeted fixes on top of the v2 resilience patch
+(a segment that fails patch finding no longer aborts the run):
+
+1. A failed segment is excluded from later sample assembly. Without
+   this, a segment skipped at discovery time is still listed in
+   ``self.segments`` and ``_segments_by_volume``, so ``_merge_intersecting``
+   reopens its (unfinished) supervision store at the first sample of a
+   neighbouring segment and the run fails there instead of at discovery
+   time. A failed segment from a held-out source (``split ==
+   "validation"``) re-raises its original error at discovery time,
+   exactly as main did: held-out patches must be complete or the run
+   must fail, never silently partial. v5 extends that re-raise to any
+   EXPLICITLY SELECTED segment (allowlisted, explicitly mapped, or
+   held-out -- review 4, point 5): a read failure on one must stop
+   the run before it trains or scores a subset, as main does when
+   patch finding opens its masks. An auto-discovered segment in the
+   same state is still warned about and skipped.
+
+2. (REMOVED in v5 -- see the v5 section above.) The patch-cache
+   coverage check in unlabeled mode, and the v4 probe that replaced
+   it, are gone: cache reuse is exactly main's again.
+"""
 
 from __future__ import annotations
 
@@ -53,7 +115,11 @@ from vesuvius.ink_detection.data.patch_finding_default import (
 from vesuvius.ink_detection.data.patch_finding_subtiling import (
     find_segment_patches as find_subtiling_patches,
 )
-from vesuvius.ink_detection.data.segment import gather_segments
+from vesuvius.ink_detection.data.segment import (
+    _is_main_discovered_segment,
+    _is_selected_segment,
+    gather_segments,
+)
 from vesuvius.ink_detection.types import Patch, Segment
 from vesuvius.ink_detection.volume_io import open_volume, read_bbox_with_padding
 
@@ -127,6 +193,26 @@ def _read_flat_surface(volume, *, y0: int, y1: int, x0: int, x1: int):
     return patch[0]
 
 
+# Selection helpers live in segment.py (single definition, review 7,
+# point 6); this module imports them from there.
+
+
+def _is_no_patch_outcome(exc: BaseException) -> bool:
+    """True when patch finding failed only because nothing qualified.
+
+    The default and subtiling finders raise ValueError with one of
+    these messages when a segment's stores were read successfully but
+    no patch met the criteria (empty supervision, or ink below the
+    coverage threshold): the segment is complete, it simply yields
+    zero patches. Any other failure (unreadable store, missing chunk,
+    group where an array belongs) is a read failure, not this.
+    """
+    return isinstance(exc, ValueError) and (
+        "produced no valid patches" in str(exc)
+        or "contains no nonzero voxels" in str(exc)
+    )
+
+
 class InkDataset(Dataset):
     """Assemble samples using resolved data settings and an optional patch list."""
 
@@ -177,7 +263,12 @@ class InkDataset(Dataset):
             )
 
         if patches is None:
-            self.segments = list(gather_segments(config))
+            # Cache-first (review 7, point 6): gather lightly
+            # (filesystem checks only, no chunk decoding) so a cache
+            # hit never decodes image/label chunks; on a cache miss
+            # _discover_or_load_patches re-gathers with full content
+            # validation before patch finding.
+            self.segments = list(gather_segments(config, light=True))
             self.patches = self._discover_or_load_patches()
             if has_heldout_validation(config):
                 self.patches = partition_heldout(self.patches)
@@ -231,39 +322,112 @@ class InkDataset(Dataset):
             )
             if cached is not None:
                 return cached
+        # Cache miss (or no cache file): the segments above came from
+        # a light gather, which skips the content gates. Re-gather
+        # with full content validation before patch finding, so an
+        # unfinished mirror (a chunk removed after caching, a store
+        # that never completed) is caught here, not at the first
+        # sample. The store-fingerprint check in load_patch_cache is
+        # what routes a tampered cache here; the full gather is what
+        # rejects the tampered segment.
+        self.segments = list(gather_segments(self.config))
 
         def process(segment: Segment):
             try:
                 if self.config.discovery_mode == "unlabeled":
-                    return find_segment_unlabeled_patches(segment, self._open)
-                if self.config.patch_finding.kind == "subtiling":
-                    return find_subtiling_patches(segment, self._open)
-                return find_default_patches(segment, self._open)
+                    training, validation = find_segment_unlabeled_patches(
+                        segment, self._open
+                    )
+                elif self.config.patch_finding.kind == "subtiling":
+                    training, validation = find_subtiling_patches(
+                        segment, self._open
+                    )
+                else:
+                    training, validation = find_default_patches(
+                        segment, self._open
+                    )
+                return training, validation, None
             except Exception as exc:
-                raise RuntimeError(
-                    "Failed finding patches for "
+                # One defective segment (e.g. an explicitly configured
+                # mirror whose stores are still syncing) must not abort
+                # patch finding for the whole run: warn and skip it. The
+                # run still fails loudly below if no segment yields patches.
+                warnings.warn(
+                    "Skipping segment "
                     f"dataset_idx={segment.dataset_idx!r}, "
-                    f"segment={segment.segment_relpath!r}, "
-                    f"image_volume={segment.image_volume!r}, "
-                    f"volume_scale={segment.scale!r}, "
-                    f"supervision_mask={segment.supervision_mask!r}, "
-                    f"inklabels={segment.inklabels!r}, "
-                    f"validation_mask={segment.validation_mask!r}"
-                ) from exc
+                    f"segment={segment.segment_relpath!r}: {exc}",
+                    stacklevel=2,
+                )
+                return [], [], (segment, exc)
 
         training: list[Patch] = []
         validation: list[Patch] = []
+        failed: list[tuple[Segment, Exception]] = []
         # Discovery threads are not DataLoader workers: dataloader_workers 0 still needs one.
         with ThreadPoolExecutor(
             max_workers=max(1, self.config.dataloader_workers)
         ) as executor:
-            for segment_training, segment_validation in executor.map(
+            for segment_training, segment_validation, segment_failed in executor.map(
                 process, self.segments
             ):
                 training.extend(segment_training)
                 validation.extend(segment_validation)
+                if segment_failed is not None:
+                    failed.append(segment_failed)
         patches = training + validation
-        save_patch_cache(path, patches)
+        for segment, exc in failed:
+            if _is_selected_segment(segment) or _is_main_discovered_segment(segment):
+                # A selected segment (allowlisted, explicitly mapped,
+                # or held-out) that fails patch finding must fail the
+                # run at discovery time, as main did: main gathers
+                # such a segment and stops when its masks cannot be
+                # read, so a partial training or validation set must
+                # never be reported as complete. The same holds for
+                # any segment main discovers on its own (review 5,
+                # point 3): silently dropping one would train or
+                # score a subset, and the broad catch also reaches
+                # native discovery, where removing a segment changes
+                # which neighbours contribute labels. Only an
+                # auto-discovered PR mirror is warned about and
+                # skipped instead -- and a PR mirror that merely
+                # yielded no patches is not a failure at all (see
+                # below).
+                raise exc
+        if not patches and self.segments:
+            raise RuntimeError(
+                "Failed finding patches: no segment yielded any patches "
+                f"({len(self.segments)} segment(s) discovered; see warnings "
+                "above for skipped segments)"
+            )
+        if failed:
+            # Exclude failed segments from later sample assembly: a
+            # segment skipped here is still listed in self.segments, so
+            # _merge_intersecting would reopen its (unfinished)
+            # supervision store at the first sample of a neighbouring
+            # segment and fail there instead of at discovery time. A
+            # no-patch outcome is NOT excluded: the segment is complete
+            # (its stores were read successfully), it simply yields zero
+            # patches, and keeping it keeps a first run and a cache-hit
+            # rerun consistent.
+            failed_keys = {
+                segment.cache_key
+                for segment, exc in failed
+                if not _is_no_patch_outcome(exc)
+            }
+            self.segments = [
+                segment
+                for segment in self.segments
+                if segment.cache_key not in failed_keys
+            ]
+        patched_keys = {patch.segment.cache_key for patch in patches}
+        zero_patch_segments = [
+            segment
+            for segment in self.segments
+            if segment.cache_key not in patched_keys
+        ]
+        save_patch_cache(
+            path, patches, zero_patch_segments=zero_patch_segments
+        )
         return patches
 
     def _tifxyz(self, segment: Segment):
