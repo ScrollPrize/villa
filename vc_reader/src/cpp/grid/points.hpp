@@ -26,11 +26,13 @@ namespace vcr::grid {
 // How grid positions become points: `physical` maps vertex coordinates to physical
 // space (where normals are taken), `destination` maps physical points to the output
 // space; both row-major 3x4. `orientation` (+-1) flips the patch normal.
+// `patchNormalFallback` takes the patch normal where vertex normals blend to none.
 struct PointMap {
     int height = 0, width = 0;
     float physical[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     float destination[12]{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
     float orientation = 1;
+    bool patchNormalFallback = false;
 };
 
 // A grid's vertices (height x width x 3 floats, rows contiguous) and what
@@ -170,7 +172,9 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
         V m[4];
         for (int k = 0; k < 4; ++k)
             m[k] = vector(v.normals + 3 * at[k]);
-        n = (m[0] * (1 - u) + m[1] * u) * (1 - w) + (m[2] * (1 - u) + m[3] * u) * w;
+        const V blend = (m[0] * (1 - u) + m[1] * u) * (1 - w) + (m[2] * (1 - u) + m[3] * u) * w;
+        if (!g.patchNormalFallback || (geometry::finite(blend) && geometry::dot(blend, blend) > 0))
+            n = blend;
     }
     if (!geometry::finite(n))
         return false;

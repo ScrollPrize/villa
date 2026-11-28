@@ -517,6 +517,12 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_tifxyz_logging PROPERTIES TIMEOUT 90)
     vc_register_ctest(test_render_tifxyz_logging vc_render_tifxyz)
+    add_test(NAME test_render_tifxyz_normals
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_tifxyz_normals.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_tifxyz_normals PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
+    vc_register_ctest(test_render_tifxyz_normals vc_render_tifxyz)
     vc_add_test(NAME test_render_zarr_output)
     add_dependencies(test_render_zarr_output vc_render_tifxyz)
     set_tests_properties(test_render_zarr_output PROPERTIES
