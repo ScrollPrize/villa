@@ -10,8 +10,10 @@
 #
 # Everything is ad-hoc signed (codesign -s -): arm64 macOS refuses to load
 # binaries whose linker signature was invalidated by install-name rewriting.
-# There is no Developer ID / notarization, so downloads stay quarantined —
-# first launch of the app is right-click -> Open.
+# A Developer ID signature and notarization are added afterwards when the
+# release workflow has the Apple secrets (.github/mac-app/sign-macos.sh);
+# without them downloads stay quarantined, and the first launch of the app is
+# right-click -> Open.
 
 if(NOT APPLE OR NOT VC_BUILD_APPS)
     return()
@@ -39,6 +41,20 @@ install(FILES "${CMAKE_BINARY_DIR}/Info.plist"
     DESTINATION "${_vc_app_dir}/Contents" COMPONENT vc_runtime)
 install(FILES "${CMAKE_SOURCE_DIR}/apps/VC3D/logo.icns"
     DESTINATION "${_vc_app_dir}/Contents/Resources" COMPONENT vc_runtime)
+
+# The Python tools installer that make-assets.sh fills in for this build's
+# wheels (.github/mac-app). Inside the bundle the app's signature covers it, and
+# VC3D runs it when a feature first needs its Python environment. Builds
+# without it never offer the install
+set(VC_MACOS_PYTHON_TOOLS_INSTALLER "$ENV{VC_MACOS_PYTHON_TOOLS_INSTALLER}" CACHE FILEPATH
+    "Python tools installer to ship in VC3D.app (from .github/mac-app/make-assets.sh)")
+if(VC_MACOS_PYTHON_TOOLS_INSTALLER)
+    if(NOT EXISTS "${VC_MACOS_PYTHON_TOOLS_INSTALLER}")
+        message(FATAL_ERROR "VC_MACOS_PYTHON_TOOLS_INSTALLER does not exist: ${VC_MACOS_PYTHON_TOOLS_INSTALLER}")
+    endif()
+    install(PROGRAMS "${VC_MACOS_PYTHON_TOOLS_INSTALLER}"
+        DESTINATION "${_vc_app_dir}/Contents/Resources" RENAME install-python-tools.sh COMPONENT vc_runtime)
+endif()
 
 # ---- Dependency dylib closure + Qt runtime --------------------------------
 # macdeployqt does both jobs windeployqt + RUNTIME_DEPENDENCY_SET split on

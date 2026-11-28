@@ -1,5 +1,6 @@
 #include "LasagnaServiceManager.hpp"
 #include "ObjectStoreRegions.hpp"
+#include "PythonExecutable.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include <QCoreApplication>
@@ -90,7 +91,8 @@ bool isTransportError(const QNetworkReply* reply)
         && !reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).isValid();
 }
 
-QString findPythonExecutable()
+// interpreters the user named, before the ones VC3D looks for on its own
+QStringList chosenPythonCandidates()
 {
     QStringList candidates;
 
@@ -103,6 +105,17 @@ QString findPythonExecutable()
     if (!condaPrefix.isEmpty()) {
         candidates.append(QDir(condaPrefix).filePath("bin/python"));
         candidates.append(QDir(condaPrefix).filePath("bin/python3"));
+    }
+    return candidates;
+}
+
+QString findPythonExecutable()
+{
+    QStringList candidates = chosenPythonCandidates();
+
+    const QString installed = vc3d::installedPythonEnvironment(QStringLiteral("lasagna"));
+    if (!installed.isEmpty()) {
+        candidates.append(installed);
     }
 
     QString home = QDir::homePath();
@@ -140,6 +153,8 @@ QString findLasagnaServiceScript()
         QDir(appDir).filePath("../share/vesuvius/exps_2d_model/fit_service.py"),
         // Environment variable
         qEnvironmentVariable("LASAGNA_SERVICE_PATH"),
+        // The installed Python tools
+        vc3d::installedPythonToolsSource(QStringLiteral("lasagna/fit_service.py")),
     };
 
     for (const QString& path : searchPaths) {
@@ -384,7 +399,7 @@ bool LasagnaServiceManager::startService(const QString& pythonPath,
     QDir scriptDir(QFileInfo(scriptPath).absolutePath());
     QString exps2dPath = scriptDir.absolutePath();
 
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment env = vc3d::pythonServiceEnvironment();
     QString existing = env.value("PYTHONPATH");
     if (existing.isEmpty()) {
         env.insert("PYTHONPATH", exps2dPath);
@@ -565,6 +580,16 @@ bool LasagnaServiceManager::isRunning() const
         return _serviceReady;
     }
     return _process && _process->state() == QProcess::Running && _serviceReady;
+}
+
+QString LasagnaServiceManager::chosenPython()
+{
+    for (const QString& candidate : chosenPythonCandidates()) {
+        if (QFileInfo(candidate).isExecutable()) {
+            return QFileInfo(candidate).absoluteFilePath();
+        }
+    }
+    return {};
 }
 
 QString LasagnaServiceManager::findConfigFile(const QString& fileName)

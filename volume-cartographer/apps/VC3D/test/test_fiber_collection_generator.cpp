@@ -147,7 +147,18 @@ private slots:
         const QString app = root.filePath("villa/volume-cartographer/build/bin");
         QVERIFY(QDir().mkpath(app));
         QCOMPARE(vesuviusSourceDirectory(app), QDir::cleanPath(source));
+        // no source tree beside the app: the installed Python tools' copy, if any
+        QTemporaryDir tools;
+        qputenv("VC3D_PYTHON_TOOLS", tools.path().toUtf8());
         QVERIFY(vesuviusSourceDirectory(root.path()).isEmpty());
+        const QString installed = tools.filePath("villa/vesuvius/src");
+        QVERIFY(QDir().mkpath(installed + "/vesuvius/fiber_spline_generator"));
+        QFile installedModule(installed + "/vesuvius/fiber_spline_generator/__main__.py");
+        QVERIFY(installedModule.open(QIODevice::WriteOnly));
+        installedModule.close();
+        QCOMPARE(vesuviusSourceDirectory(root.path()), QDir::cleanPath(installed));
+        QCOMPARE(vesuviusSourceDirectory(app), QDir::cleanPath(source));
+        qunsetenv("VC3D_PYTHON_TOOLS");
 
         QVERIFY(checkoutPython(source).isEmpty());
 #ifdef Q_OS_WIN

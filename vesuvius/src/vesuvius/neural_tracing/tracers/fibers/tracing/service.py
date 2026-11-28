@@ -45,7 +45,8 @@ import numpy as np
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_seed_heading, trace_heading
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import predict_frames, trace_family_kwargs
 from vesuvius.neural_tracing.tracers.fibers.frames.ct import ct_frame
-from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_checkpoint_argument, add_volume_arguments, checkpoint_source
+from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
+    add_checkpoint_argument, add_device_argument, add_volume_arguments, checkpoint_source)
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume import build_tracer
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, normalize, resample_polyline, interp_at
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
@@ -284,7 +285,7 @@ def main(argv=None):
     add_checkpoint_argument(ap)
     ap.add_argument('--socket', required=True)
     ap.add_argument('--parent-pid', type=int, help='exit when this process ends (VC3D)')
-    ap.add_argument('--device', default='cuda')
+    add_device_argument(ap)
     ap.add_argument('--precision', choices=('bf16', 'fp32'), default='bf16')
     ap.add_argument('--confidence', type=float, default=0.5)
     ap.add_argument('--base-um', type=float, help='base voxel size of the checkpoint CT (default: from its location)')

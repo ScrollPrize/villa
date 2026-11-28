@@ -107,3 +107,8 @@ void LasagnaServiceManager::fetchDatasets()
 {
     emit datasetsReceived(QJsonArray{});
 }
+
+QString LasagnaServiceManager::chosenPython()
+{
+    return {};
+}

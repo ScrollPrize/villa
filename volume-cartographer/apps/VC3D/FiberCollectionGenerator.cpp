@@ -1,5 +1,7 @@
 #include "FiberCollectionGenerator.hpp"
 
+#include "PythonExecutable.hpp"
+
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -141,6 +143,10 @@ QString vesuviusSourceDirectory(const QString& applicationDirectory)
         if (QFileInfo::exists(source.filePath("vesuvius/fiber_spline_generator/__main__.py")))
             return QDir::cleanPath(source.absolutePath());
     }
+    // the installed Python tools, whose vesuvius environment imports this tree
+    const QString installed = installedPythonToolsSource(QStringLiteral("vesuvius/src"));
+    if (QFileInfo::exists(QDir(installed).filePath("vesuvius/fiber_spline_generator/__main__.py")))
+        return QDir::cleanPath(installed);
     return {};
 }
 

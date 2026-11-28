@@ -148,7 +148,9 @@ chunks; a larger cache loads fewer chunks).
 
 VC3D's Line Annotation can trace its Fiber model lines with this model (hamburger menu, "Fiber follow model" → "Use
 for the Fiber model"; off by default) through `tracing/service.py`, which VC3D starts with the Python environment it
-was launched from: the default checkpoint unless one is chosen there.
+was launched from: the default checkpoint unless one is chosen there. The tracing CLIs (`inference.py`,
+`volume.py`, `service.py`) run on CUDA, then an Apple GPU (MPS), then the CPU, whichever is available first, unless
+`--device` names one.
 
 ## Evaluation
 

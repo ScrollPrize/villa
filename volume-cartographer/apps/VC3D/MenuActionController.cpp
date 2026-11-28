@@ -23,6 +23,7 @@
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "SettingsDialog.hpp"
+#include "PythonToolsInstaller.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
@@ -191,6 +192,14 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _aboutAct = new QAction(QObject::tr("&About..."), this);
     connect(_aboutAct, &QAction::triggered, this, &MenuActionController::showAboutDialog);
 
+    // only builds that ship the installer (the macOS release app) offer it
+    if (!vc3d::bundledPythonToolsInstaller().isEmpty()) {
+        _installPythonToolsAct = new QAction(QObject::tr("Install or Update Python Tools..."), this);
+        connect(_installPythonToolsAct, &QAction::triggered, this, [qWindow] { vc3d::installPythonTools(qWindow); });
+        _removePythonToolsAct = new QAction(QObject::tr("Remove Python Tools..."), this);
+        connect(_removePythonToolsAct, &QAction::triggered, this, [qWindow] { vc3d::removePythonTools(qWindow); });
+    }
+
     _resetViewsAct = new QAction(QObject::tr("Reset Segmentation Views"), this);
     connect(_resetViewsAct, &QAction::triggered, this, &MenuActionController::resetSegmentationViews);
 
@@ -287,6 +296,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     _helpMenu = new QMenu(QObject::tr("&Help"), qWindow);
     _helpMenu->addAction(_keybindsAct);
+    if (_installPythonToolsAct) {
+        _helpMenu->addAction(_installPythonToolsAct);
+        _helpMenu->addAction(_removePythonToolsAct);
+    }
     _helpMenu->addAction(_aboutAct);
 
     menuBar->addMenu(_fileMenu);

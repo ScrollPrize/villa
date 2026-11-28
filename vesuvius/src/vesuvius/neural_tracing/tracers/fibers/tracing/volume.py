@@ -72,7 +72,8 @@ from vesuvius.neural_tracing.tracers.fibers.frames.ct import SEED_HEADING_POLICY
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 from vesuvius.neural_tracing.tracers.fibers.tracing.inference import make_fiber_json
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
-    add_checkpoint_argument, add_volume_arguments, checkpoint_source, configure_volume, resolve_checkpoint, use_gpu_crops)
+    add_checkpoint_argument, add_device_argument, add_volume_arguments, checkpoint_source, configure_volume,
+    resolve_checkpoint, use_gpu_crops)
 from vesuvius.neural_tracing.tracers.shared.annotations.open_data import file_sha256
 from vesuvius.neural_tracing.tracers.fibers.tracing.trace import FiberTracer, TraceParams
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume_store import export_store
@@ -656,7 +657,7 @@ def main(argv=None):
     ap.add_argument('--no-fibers', dest='fibers', action='store_false')
     ap.add_argument('--status-every', type=float, default=60., help='seconds between status lines')
     ap.add_argument('--base-um', type=float, default=2.4, help='base voxel size for reported lengths (Paris4 2.4)')
-    ap.add_argument('--device', default='cuda')
+    add_device_argument(ap)
     args = ap.parse_args(argv)
     if args.axis_workers < 1:
         raise SystemExit('--axis-workers must be at least 1 (seed headings run in worker processes)')

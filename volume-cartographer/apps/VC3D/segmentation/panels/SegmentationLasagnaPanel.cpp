@@ -5,6 +5,7 @@
 #include "LasagnaServiceManager.hpp"
 #include "SurfaceCatalog.hpp"
 #include "VCSettings.hpp"
+#include "PythonToolsInstaller.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -1446,6 +1447,12 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             return SubmissionResult::failure(msg);
         }
     } else {
+        if (!vc3d::requirePythonTools(tr("Lasagna"), QStringLiteral("lasagna"),
+                                      LasagnaServiceManager::chosenPython(), this)) {
+            auto msg = vc3d::pythonToolsMissingMessage(tr("Lasagna"));
+            showStatus(msg, 5000);
+            return SubmissionResult::failure(msg);
+        }
         if (!mgr.ensureServiceRunning(
                 {}, QFileInfo(dataInput).absolutePath())) {
             auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());

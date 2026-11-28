@@ -249,6 +249,8 @@ set(srcs
     FiberFollowService.hpp
     PythonExecutable.cpp
     PythonExecutable.hpp
+    PythonToolsInstaller.cpp
+    PythonToolsInstaller.hpp
     SocketRequest.cpp
     SocketRequest.hpp
     LasagnaServiceManager.cpp

@@ -34,7 +34,8 @@ from vesuvius.neural_tracing.tracers.fibers.frames.ct import (
 from vesuvius.neural_tracing.tracers.shared.ct_structure import SeedHeadingError
 from vesuvius.neural_tracing.tracers.fibers.frames.learned import trace_family_kwargs
 from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import (
-    add_checkpoint_argument, add_volume_arguments, checkpoint_source, configure_volume, resolve_checkpoint, use_gpu_crops)
+    add_checkpoint_argument, add_device_argument, add_volume_arguments, checkpoint_source, configure_volume,
+    resolve_checkpoint, use_gpu_crops)
 
 
 DEFAULT_CONFIDENCE = 0.5  # a3ms 50k (scrollprize/fiber_single_small): usable 0.3-0.5, its confidence collapses above 0.6
@@ -197,7 +198,7 @@ def main(argv=None, *, checkpoint_loader=load_checkpoint, tracer_class=FiberTrac
     ap.add_argument("--policy", help="calibration selection.json with the operating policy to deploy")
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--device", default="cuda")
+    add_device_argument(ap)
     ap.add_argument('--crops', choices=('gpu', 'cpu'),
                     help="gpu (default on CUDA): crops sampled by vc_reader's CUDA reader and the frame model on the GPU; "
                          'cpu: the CPU sampler and the CPU frame model')

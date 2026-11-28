@@ -92,7 +92,7 @@ bool FiberFollowService::ensureRunning(const QString& checkpoint, const QString&
         .filePath(QStringLiteral("vc3d_fiber_follow_%1.sock")
                       .arg(QUuid::createUuid().toString(QUuid::WithoutBraces).left(8)));
     _process = std::make_unique<QProcess>();
-    auto environment = QProcessEnvironment::systemEnvironment();
+    auto environment = vc3d::pythonServiceEnvironment();
     // The service's CT reads (vc_reader) share the viewer's configured disk
     // cache. Keep this opt-in scoped to the service.
     environment.insert(QStringLiteral("VC3D_CONFIG_DIR"), QFileInfo(vc3d::settingsFilePath()).absolutePath());

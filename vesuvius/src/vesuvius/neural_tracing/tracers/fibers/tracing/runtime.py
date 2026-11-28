@@ -53,6 +53,23 @@ def resolve_checkpoint(checkpoint):
     return str(followers[0])
 
 
+def add_device_argument(ap):
+    ap.add_argument('--device', default='auto', type=resolve_device,
+                    help='torch device (default auto: cuda, then mps, then cpu)')
+
+
+def resolve_device(name):
+    """``name``, or for ``auto`` the first available of cuda, mps (an Apple GPU) and cpu."""
+    if str(name).strip().lower() != 'auto':
+        return name
+    import torch
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
 def add_volume_arguments(ap):
     ap.add_argument('--ct', help="CT zarr (local path or s3://); default: the checkpoint's")
     ap.add_argument('--ct-level', type=int, help="CT pyramid level read; default: the checkpoint's")

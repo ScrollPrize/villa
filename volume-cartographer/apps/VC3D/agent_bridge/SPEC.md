@@ -260,6 +260,32 @@ dispatch. Other reusable cores take explicit non-interactive options or
 optional status/error sinks. A bridge handler must never call `exec()` on a
 dialog.
 
+`ui.dialog` answers prompts the application raises on its own, such as the
+macOS release app's offer to install its Python tools. It reports the active
+modal dialog (`open`; `title`, the `texts` of its visible labels, and its
+`buttons` as `{label, enabled}`), and with `click` presses the enabled button
+with that label once the reply is sent. It fails with NOT_FOUND when no dialog
+is open or no enabled button has that label. It has no MCP tool.
+
+`ui.menus` reports the menu bar as shown. On the macOS (cocoa) platform it
+reads AppKit's menus (`source: "native"`), after Qt has moved items such as
+Settings, About and Quit into the application menu; elsewhere it reads Qt's
+(`source: "qt"`), with each action's menu `role`. Each entry has `title`,
+`enabled`, and when set `shortcut`, `checked` and `items`; separators are
+`{separator: true}`. Hidden entries are left out.
+
+`ui.dock` reads the dock titled `title`: `visible`, `floating`, `statusBar`
+(true when the segment workspace shows the dock as a panel that opens from a
+status bar button), the `labels` of the labels it shows when on screen, its
+`buttons` as `{label, enabled, checked}` and its `combos` as `{label, items,
+current, enabled}`, where a list's label is the row label beside it. `show`
+opens the panel, or shows and raises the dock as its View menu entry does,
+and false closes it; `combo` with `item` picks that item in the list with
+that label, as a click does. Every check runs before any change: an unknown
+title, list or item fails with NOT_FOUND and changes nothing, and `combo`
+without `item` (or the reverse) fails with INVALID_PARAMS. Neither method
+has an MCP tool.
+
 ## Domain semantics
 
 ### Session, volumes, and catalog
@@ -543,8 +569,8 @@ not include inline image data.
 
 ## MCP tool map
 
-The following rows are checked against the descriptor snapshot. `rpc.describe`
-is the sole bridge method without an MCP tool.
+The following rows are checked against the descriptor snapshot. `rpc.describe`,
+`ui.dialog`, `ui.menus` and `ui.dock` are the bridge methods without an MCP tool.
 
 | MCP tool | RPC method | Agent-facing purpose |
 |---|---|---|

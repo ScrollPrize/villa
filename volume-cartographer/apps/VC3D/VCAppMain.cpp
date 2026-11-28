@@ -14,6 +14,7 @@
 #include <QSurfaceFormat>
 
 #include "CWindow.hpp"
+#include "PythonExecutable.hpp"
 #include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
@@ -60,9 +61,12 @@
 #include <unistd.h>
 #endif
 
-// POSIX setenv with an MSVCRT/UCRT fallback (Windows has no setenv).
+// POSIX setenv with an MSVCRT/UCRT fallback (Windows has no setenv). The
+// launch value is remembered first, so the Python services VC3D starts get
+// the user's settings rather than VC3D's own (vc3d::pythonServiceEnvironment).
 static void vcSetEnv(const char* name, const char* value, int overwrite)
 {
+    vc3d::rememberLaunchEnvironmentValue(name);
 #if defined(_WIN32)
     if (!overwrite && std::getenv(name)) return;
     _putenv_s(name, value);

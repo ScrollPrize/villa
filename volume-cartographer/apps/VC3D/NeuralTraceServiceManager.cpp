@@ -200,6 +200,8 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
         QDir(appDir).filePath("../share/vesuvius/neural_tracing/trace_service.py"),
         // Environment variable
         qEnvironmentVariable("NEURAL_TRACE_SERVICE_PATH"),
+        // The installed Python tools
+        vc3d::installedPythonToolsSource(QStringLiteral("vesuvius/src/vesuvius/neural_tracing/trace_service.py")),
     };
 
     QString traceServicePath;
@@ -227,7 +229,7 @@ bool NeuralTraceServiceManager::startService(const QString& checkpointPath,
     traceServiceDir.cdUp();  // vesuvius -> src
     QString vesuviusSrcPath = traceServiceDir.absolutePath();
 
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment env = vc3d::pythonServiceEnvironment();
     QString existingPythonPath = env.value("PYTHONPATH");
     if (existingPythonPath.isEmpty()) {
         env.insert("PYTHONPATH", vesuviusSrcPath);

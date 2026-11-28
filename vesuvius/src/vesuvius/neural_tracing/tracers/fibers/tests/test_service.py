@@ -105,3 +105,18 @@ def test_target_behind_head_does_not_reverse_trusted_heading():
     result = model.segment(dict(history=[[0, 0, 0], [40, 0, 0]], target=[-40, 0, 0], base_um=2.))
     assert not result['accepted']
     assert result['points'][-1][0] > 40
+
+
+@pytest.mark.parametrize(('cuda', 'mps', 'expected'), [(True, True, 'cuda'), (False, True, 'mps'), (False, False, 'cpu')])
+def test_default_device_prefers_cuda_then_mps(monkeypatch, cuda, mps, expected):
+    import argparse
+
+    import torch
+
+    from vesuvius.neural_tracing.tracers.fibers.tracing.runtime import add_device_argument
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: cuda)
+    monkeypatch.setattr(torch.backends.mps, 'is_available', lambda: mps)
+    ap = argparse.ArgumentParser()
+    add_device_argument(ap)
+    assert ap.parse_args([]).device == expected
+    assert ap.parse_args(['--device', 'cpu']).device == 'cpu'
