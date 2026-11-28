@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <utility>
 
 
@@ -311,8 +313,12 @@ struct NormalConstraintPlane {
  
          bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::NormalGridVolume* current_grid_source, const std::shared_ptr<const vc::core::util::GridStore>& current_grid) const {
              if (grid_source != current_grid_source) return false;
-             const auto prior_grid = selected_grid_owner.lock();
-             if (!prior_grid || prior_grid.get() != current_grid.get() || selected_grid_owner.owner_before(current_grid) || current_grid.owner_before(selected_grid_owner)) return false;
+             // Same store as when the payload was put: the weak reference keeps the
+             // store's control block alive, so sharing it with the live current_grid
+             // identifies the object without locking the weak reference (two atomic
+             // updates of a count every solver thread on this slice shares, on every
+             // evaluation).
+             if (!current_grid || selected_grid_owner.owner_before(current_grid) || current_grid.owner_before(selected_grid_owner)) return false;
              cv::Point2f d1 = p1 - p1_;
              cv::Point2f d2 = p2 - p2_;
              return (d1.dot(d1) + d2.dot(d2)) < th * th;
@@ -340,6 +346,29 @@ struct NormalConstraintPlane {
          bool best_is_next = false;
      };
      mutable std::array<PointPairCache<SnapLossPayload>, 2> snap_loss_caches_;
+
+     // The slice store of the last evaluation. A functor nearly always stays on one
+     // slice during a solve, while NormalGridVolume::get_grid() takes the grid
+     // cache's process-wide lock and updates counters that every solver thread
+     // shares, so the volume is asked again only when the slice index changes. A
+     // slice store is an immutable file: keeping one changes no result, also when
+     // the cache has evicted it in the meantime.
+     mutable bool slice_store_known_ = false;
+     mutable int slice_idx_ = 0;
+     mutable std::shared_ptr<const vc::core::util::GridStore> slice_store_;
+
+     const std::shared_ptr<const vc::core::util::GridStore>& slice_store(const cv::Point3f& point) const {
+         const std::optional<int> slice_idx = normal_grid_volume.nearest_slice_index(point, plane_idx);
+         if (!slice_idx) {
+             slice_store_.reset();
+             slice_store_known_ = false;
+         } else if (!slice_store_known_ || *slice_idx != slice_idx_) {
+             slice_store_ = normal_grid_volume.get_grid(plane_idx, *slice_idx);
+             slice_idx_ = *slice_idx;
+             slice_store_known_ = true;
+         }
+         return slice_store_;
+     }
  
      const float cache_radius_normal_ = 16.0f;
      const float cache_radius_snap_ = 1.0f;
@@ -347,6 +376,9 @@ struct NormalConstraintPlane {
      const float query_radius_ = roi_radius_ + 16.0f;
      const double snap_trig_th_ = 4.0;
      const double snap_search_range_ = 16.0;
+     // Fixed when the volume is opened; read here once instead of through the volume on
+     // every evaluation.
+     const double grid_coordinate_scale_;
  
      NormalConstraintPlane(const vc::core::util::NormalGridVolume& normal_grid_volume,
                            int plane_idx,
@@ -363,7 +395,8 @@ struct NormalConstraintPlane {
            direction_aware_(direction_aware),
            z_min(z_min),
            z_max(z_max),
-           invert_dir(invert_dir) {}
+           invert_dir(invert_dir),
+           grid_coordinate_scale_(normal_grid_volume.coordinateScale()) {}
 
     template <typename T>
     bool operator()(const T* const pA, const T* const pB1, const T* const pB2, const T* const pC, T* residual) const {
@@ -431,12 +464,11 @@ struct NormalConstraintPlane {
             pA_2d[0] = pA[1]; pA_2d[1] = pA[2];
             pE_2d[0] = pE[1]; pE_2d[1] = pE[2];
         }
-        const double grid_coordinate_scale = normal_grid_volume.coordinateScale();
-        if (grid_coordinate_scale != 1.0) {
-            pA_2d[0] *= T(grid_coordinate_scale);
-            pA_2d[1] *= T(grid_coordinate_scale);
-            pE_2d[0] *= T(grid_coordinate_scale);
-            pE_2d[1] *= T(grid_coordinate_scale);
+        if (grid_coordinate_scale_ != 1.0) {
+            pA_2d[0] *= T(grid_coordinate_scale_);
+            pA_2d[1] *= T(grid_coordinate_scale_);
+            pE_2d[0] *= T(grid_coordinate_scale_);
+            pE_2d[1] *= T(grid_coordinate_scale_);
         }
 
         // Query the normal grids.
@@ -456,7 +488,7 @@ struct NormalConstraintPlane {
         // T loss2 = calculate_normal_snapping_loss(pA_2d, pE_2d, grid_query->grid2, 1);
         // T interpolated_loss = (T(1.0) - T(grid_query->weight)) * loss1 + T(grid_query->weight) * loss2;
 
-        auto grid_ptr = normal_grid_volume.query_nearest(query_point, plane_idx);
+        const std::shared_ptr<const vc::core::util::GridStore>& grid_ptr = slice_store(query_point);
         if (!grid_ptr)
             return true;
 

@@ -119,6 +119,24 @@ int vc_normal_cache_fixture_main(int argc, char** argv) {
                 compare("projected-motion", motion(quad(30, 20)), bx, ad, true);
             }
         }
+        // A functor that stays on one slice asks the volume's grid cache for the store
+        // once; only a change of slice sends it back there.
+        for (bool ad : {false, true}) {
+            Evaluator functor(volume, 1, 0.1, false, ad);
+            auto lookups = [&]() {
+                const auto stats = volume.cacheStats();
+                return stats.gridHits + stats.gridMisses;
+            };
+            const Values first = functor(quad(10));
+            const auto after_first = lookups();
+            for (int repeat = 0; repeat < 8; ++repeat)
+                compare("one-slice-repeat", functor(quad(10)), first, ad, true);
+            require(lookups() == after_first, "repeated evaluations on one slice asked the grid cache again");
+            (void)functor(quad(30));
+            require(lookups() == after_first + 1, "a change of slice must ask the grid cache once");
+            (void)functor(quad(30, 20));
+            require(lookups() == after_first + 1, "a move inside the slice asked the grid cache again");
+        }
         std::cout << "summary," << comparisons << ',' << controls_failed << ',' << histories_failed << '\n';
         return controls_failed || histories_failed ? 1 : 0;
     } catch (const std::exception& error) {

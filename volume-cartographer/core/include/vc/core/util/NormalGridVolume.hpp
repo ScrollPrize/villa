@@ -62,6 +62,12 @@ namespace vc::core::util {
 
         std::optional<GridQueryResult> query(const cv::Point3f& point, int plane_idx) const;
         std::shared_ptr<const GridStore> query_nearest(const cv::Point3f& point, int plane_idx) const;
+        // The slice query_nearest() selects for `point` on `plane_idx`, as the index
+        // get_grid() takes; nullopt for a plane other than 0, 1 or 2. Arithmetic on
+        // the volume's constants only: no lock, no cache access. A caller that stays
+        // on one slice can keep the store it got for that index instead of asking
+        // the cache again.
+        std::optional<int> nearest_slice_index(const cv::Point3f& point, int plane_idx) const;
         std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx) const;
         CacheStats cacheStats() const;
         void resetCacheStats() const;
