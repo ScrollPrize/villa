@@ -1016,6 +1016,7 @@ class BindingOwnershipTests(unittest.TestCase):
         self.assertEqual(rebuilt_run.config["model_linear_z_resolution"], 24)
         self.assertEqual(rebuilt_paths.manifest(),
                          self.state.session_request["paths"])
+        self.assertEqual(self.state.session_paths.volume_uuid, VOLUME)
         self.assertEqual(
             self.state.session_request["run"]["config"]
             ["model_linear_z_resolution"], 24)

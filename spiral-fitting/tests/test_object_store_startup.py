@@ -15,7 +15,7 @@ from vc_object_store import ObjectStore  # noqa: E402
 import object_store_inputs as osi  # noqa: E402
 import object_store_reference as reference  # noqa: E402
 from object_store_fixture import (  # noqa: E402
-    VOLUME, edges, fit_config, names, on_plane, plane, put_fiber, put_patch, put_pcl)
+    VOLUME, edges, fit_config, frame, names, on_plane, plane, put_fiber, put_patch, put_pcl)
 
 pytestmark = pytest.mark.usefixtures('cpu')
 
@@ -456,9 +456,11 @@ def _context(store_path, tmp_path, **options):
     from fit_spiral import FitContext
     umbilicus = str(tmp_path / 'umbilicus.json')
     reference.write_umbilicus(umbilicus)
+    # ``volume_uuid``: the input manifest's volume (SpiralInputPaths).
+    paths = SpiralInputPaths(umbilicus=umbilicus, volume_uuid=options.pop('volume_uuid', ''))
     return FitContext(
         FitConfig(fit_config(store_path, **options.pop('config', {}))),
-        scroll=reference.scroll_spec(), paths=SpiralInputPaths(umbilicus=umbilicus),
+        scroll=reference.scroll_spec(), paths=paths,
         cache_dir=str(tmp_path / 'cache'), out_base_dir=str(tmp_path / 'out'), **options)
 
 
@@ -495,6 +497,100 @@ def test_a_resumed_fit_reads_the_checkpoints_pinned_inputs(store_path, tmp_path)
     assert current.object_store_inputs.digest != recorded.digest
     assert current.object_store_inputs.manifest['position']['commit_sequence'] \
         > recorded.manifest['position']['commit_sequence']
+
+
+def _empty_store(tmp_path):
+    """A store with no objects: a fit on its input manifest's inputs alone."""
+    path = str(tmp_path / 'empty.vcobj')
+    with ObjectStore.create(path, author='ingest', hostname='host'):
+        pass
+    return path
+
+
+def test_a_volume_the_input_manifest_names_resumes_as_a_configured_one(tmp_path):
+    """Equal inputs resume whichever way their volume is named: by the input
+    manifest (volume_source 'default') or by fit_volume_uuid ('configured').
+    Another volume is still refused."""
+    store = _empty_store(tmp_path)
+    configured = load(store, fit_volume_uuid=VOLUME)
+    default = osi.load_fit_inputs(fit_config(store), log=lambda line: None,
+                                  default_volume_uuid=VOLUME)
+    assert [inputs.manifest['volume_source'] for inputs in (configured, default)] == [
+        'configured', 'default']
+    assert default.digest == configured.digest
+    assert osi.resume_problems({'object_store': configured.manifest}, default) == []
+    assert osi.resume_problems({'object_store': default.manifest}, configured) == []
+    other = osi.load_fit_inputs(fit_config(store), log=lambda line: None,
+                                default_volume_uuid='other-volume')
+    [problem] = osi.resume_problems({'object_store': configured.manifest}, other)
+    assert 'volume_uuid' in problem and 'volume_source' not in problem
+
+
+def test_a_resume_records_its_inputs_once_the_checkpoint_accepts_them(tmp_path):
+    """A checkpoint of a fit with fit_volume_uuid set resumes without it when
+    the input manifest names the same volume; a refused resume leaves the
+    run's input manifest as the checkpoint's."""
+    store = _empty_store(tmp_path)
+    run = str(tmp_path / 'run')
+    recorded = os.path.join(run, 'object_store_inputs.json')
+    trained = _context(store, tmp_path, run_dir=run, volume_uuid=VOLUME,
+                       config={'fit_volume_uuid': VOLUME})
+    trained.load_host_inputs()
+    trained.prepare_output()
+    trained.build_device_state()
+    checkpoint = trained.save_checkpoint(os.path.join(run, 'checkpoint.ckpt'), 1)
+
+    def manifest():
+        with open(recorded) as stream:
+            return json.load(stream)['manifest']
+    assert manifest()['volume_source'] == 'configured'
+    resumed = _context(store, tmp_path, run_dir=run, volume_uuid=VOLUME,
+                       resume_path=checkpoint)
+    resumed.load_host_inputs()
+    assert resumed.object_store_inputs.manifest['volume_source'] == 'default'
+    resumed.prepare_output()
+    assert manifest()['volume_source'] == 'configured'
+    resumed.build_device_state()
+    assert resumed.start_iteration == 1
+    assert manifest()['volume_source'] == 'default'
+    # A genuine change is refused before the run's manifest is written.
+    before = _sha256(recorded)
+    changed = _context(store, tmp_path, run_dir=run, volume_uuid=VOLUME,
+                       resume_path=checkpoint, config={'z_end': 56})
+    changed.load_host_inputs()
+    changed.prepare_output()
+    with pytest.raises(RuntimeError, match='materialization.z_end'):
+        changed.build_device_state()
+    assert _sha256(recorded) == before
+
+
+def test_a_replacement_reads_an_undeclared_selection_in_the_resident_volume(tmp_path):
+    """An input update of a fit in its input manifest's volume reads a
+    selection that declares no volume in the resident inputs' volume;
+    geometry declaring another volume is refused."""
+    from fit_spiral import InputReplacementRefused
+    store = _empty_store(tmp_path)
+    context = _context(store, tmp_path, volume_uuid=VOLUME)
+    context.load_host_inputs()
+    resident = context.object_store_inputs
+    assert (resident.manifest['volume_uuid'], resident.manifest['volume_source']) == (
+        VOLUME, 'default')
+    pins = osi.InputPins.from_manifest(resident.manifest).provenance()
+    # The resident inputs' volume decides, not the paths'.
+    context.paths = dataclasses.replace(context.paths, volume_uuid='')
+    replacement = context.load_replacement_inputs(pins)
+    assert replacement.manifest['volume_uuid'] == VOLUME
+    assert replacement.digest == resident.digest
+    context.prepare_input_replacement(replacement)
+    with ObjectStore.open(store, author='editor') as db:
+        put_pcl(db, {0: ([20.0, 100.0, 12.0], None)},
+                coordinates=frame(volume='other-volume'), name='elsewhere')
+    with ObjectStore.open(store, read_only=True) as db:
+        moved = osi.read_snapshot(db, osi.request_from_config(fit_config(store))).pins()
+    elsewhere = context.load_replacement_inputs(moved.provenance())
+    assert elsewhere.manifest['volume_uuid'] == 'other-volume'
+    with pytest.raises(InputReplacementRefused, match='volume_uuid differs'):
+        context.prepare_input_replacement(elsewhere)
 
 
 @pytest.mark.skipif(not os.environ.get('OBJECT_STORE_SMOKE_STORE'),

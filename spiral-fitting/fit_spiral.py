@@ -1727,11 +1727,14 @@ class FitContext:
         progress_or_null(self.progress).begin(
             'loading', 'Reading object-store inputs',
             detail=os.path.basename(str(self.config['object_store_location'])))
+        # The input manifest's volume is the fit volume of a selection no
+        # object of which declares one (a fit on manifest inputs alone).
         return load_fit_inputs(
             self.config, lasagna=self._lasagna_normal_inputs(),
             external_frames=self._external_input_frames(), dist=self.dist,
             cache_directory=self.cache_path, log=self.input_log,
-            pins=self._resume_input_pins())
+            pins=self._resume_input_pins(),
+            default_volume_uuid=getattr(self.paths, 'volume_uuid', None) or None)
 
     def _resume_input_pins(self):
         """The pins (object_store_inputs.InputPins) the resumed checkpoint's
@@ -2472,6 +2475,9 @@ class FitContext:
                 resume_checkpoint, source=resume_path)
             if not verdict.accepted:
                 raise RuntimeError(verdict.message())
+            # The inputs are recorded once the checkpoint accepts them
+            # (prepare_output leaves a resumed run's manifest to this).
+            self._write_object_store_manifest()
             print(f'resuming from {resume_path} at iteration '
                   f'{verdict.completed_iterations}')
             progress.begin(
@@ -3968,9 +3974,12 @@ class FitContext:
     def prepare_output(self):
         """Resolve the run's output directory and record the frozen inputs
         in it: the step every driver takes between loading the inputs and
-        building device state."""
+        building device state. A resumed fit records them once
+        build_device_state has accepted its checkpoint, so a refused resume
+        leaves the run's manifest as it was."""
         self.resolve_output_path()
-        self._write_object_store_manifest()
+        if not self.resume_path:
+            self._write_object_store_manifest()
         return self.out_path
 
     # ==========================================================================
@@ -3995,14 +4004,20 @@ class FitContext:
         pins' provenance: object_store_inputs.InputPins, the position and
         the versions the links left the objects at) exactly as pinned
         (object_store_inputs.load_fit_inputs, which checks that the ranks
-        agree on their digest). Allocates host memory only."""
+        agree on their digest). A selection no object of which declares a
+        volume is read in the resident inputs' volume; geometry declaring
+        another is refused by prepare_input_replacement. Allocates host
+        memory only."""
         from object_store_inputs import load_fit_inputs
         config = dict(self.config)
         config['object_store_input_position'] = dict(position)
+        resident = getattr(self, 'object_store_inputs', None)
+        volume = (resident.manifest or {}).get('volume_uuid') if resident is not None else None
         return load_fit_inputs(
             config, lasagna=self._lasagna_normal_inputs(),
             external_frames=self._external_input_frames(), dist=self.dist,
-            cache_directory=self.cache_path, log=self.input_log)
+            cache_directory=self.cache_path, log=self.input_log,
+            default_volume_uuid=volume)
 
     def prepare_input_replacement(self, inputs):
         """Derive every input-dependent host structure for ``inputs``
