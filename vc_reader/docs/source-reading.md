@@ -42,6 +42,38 @@ before inheriting the parent's placement. Changing a parent selection does not
 silently change independently declared companion selections: declare matching
 companion grids when choosing a different pyramid level.
 
+Remote Zarr v3 whole-chunk reads can combine adjacent or overlapping payloads
+from the same shard when its index has a strong ETag. Only requested chunks
+that miss the cache participate; with `memory_cache` disabled, warm raw disk
+cache hits still use partial `slab` reads or cached `mmap` mappings before
+batching remote misses. The reader checks the response range, keeps per-chunk
+decoding and disk cache entries, and isolates per-chunk failures so healthy
+chunks remain available to concurrent callers and subsequent cached reads. A
+plan admits at most 16 chunks at a time and a merged request never exceeds
+512 KiB or crosses an unrequested gap. Within one read or `read_many` call, a
+per-read session pins each touched remote shard's revision across all ranges,
+16-chunk windows, and joined in-flight claims: a stale retained index may
+refresh at most once before any chunk or missing marker of that shard is
+committed (sibling workers observing `HTTP 412` on that same superseded index
+share the completed refresh), and any incompatible shard replacement after
+commitment raises rather than returning mixed-revision chunks or persisting
+contradictory offline cache entries. Full byte-level revision consistency across
+ranges and windows requires strong ETags (enforced via `If-Match`); when a
+server provides only a weak ETag or omits `ETag`, the reader disables range
+merging and cross-visit index retention, revalidates the shard index across
+windows, and checks `ETag`, `Last-Modified`, object length, and shard index
+bytes, but weaker validators, lengths, and index hashes cannot conclusively
+prove byte identity against same-size in-place payload overwrites whose
+validator and index remain unchanged. (Pre-existing entries already present in
+memory or disk caches from earlier reads remain trusted without remote
+revalidation.) An HTTP 416 on
+a merged range falls back to individual ranges for the same shard version.
+Cancelable, cache-only, streaming and selective-channel reads keep their
+regular chunk path. A reused index from another shard visit requires a strong
+ETag and valid present entries for the requested chunks, revokes trust in any
+previously active shard immediately, and never trusts missing entries without a
+fresh index fetch.
+
 ## Plain image files
 
 `vc_reader.images` needs no descriptor. `read(path)` is the whole file, `read(path, page=0)` one
@@ -220,8 +252,9 @@ A strong ETag binds payload ranges to the index version. Missing inner chunks
 retain the normal fill/cache behavior. Decoded inner chunks use the existing
 v2 disk-cache representation, including offline reads and shared budgets.
 
-Index working storage is limited to 64 MiB. One remote index of at most 8 MiB
-can be retained per array; larger indexes are reread within the working limit.
+Index working storage is limited to 64 MiB. The remote index cache has an
+8 MiB budget charged for buffer capacity and per-entry data. Larger indexes
+are reread within the working limit.
 Encoded payloads are capped at twice the decoded inner-chunk size plus 1 MiB.
 Arrays requiring larger indexes or unusual oversized encoded payloads raise.
 These limits never materialize an entire shard. Source chunk sizes and worker
