@@ -3,13 +3,19 @@
 // reads never wait on this index.
 #pragma once
 
+#include "vc_reader/file_ownership.hpp"
 #include "chunk_io.hpp"
 #include "http.hpp"
 #include "vc_reader/zarr.hpp"
 
+#include <functional>
+#include <optional>
 #include <atomic>
 #include <iostream>
 #include <sqlite3.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -141,7 +147,9 @@ public:
             const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
             if (size > static_cast<std::uint64_t>(available))
                 return;  // A chunk larger than the budget is served without caching.
-            evict_to(available - static_cast<std::int64_t>(size));
+            if (!evict_to(available - static_cast<std::int64_t>(size)))
+                return;  // nor one with no room left beside files in use
+
             file.publish();
             record(path, static_cast<std::int64_t>(size));
             if (owned_file) {
@@ -283,6 +291,194 @@ public:
         }
     }
 
+    // A file its owner writes in place under the root, such as a sparse mirror
+    // holding parts of a remote file: charges its `bytes` (what it occupies, not
+    // its apparent size) against the budget, newest, evicting older files to make
+    // room, and registers it, so it is evicted and found at startup like the
+    // files open_file downloads. Called again as the file grows. False, charging
+    // nothing new, when it would not fit or would leave the disk under its floor.
+    bool account_file(const std::string& path, std::int64_t bytes)
+    {
+        check_path(path);
+        if (bytes < 0) throw std::invalid_argument("negative file size");
+        std::lock_guard lock(mutex_);
+        if (!reconciled_) transaction([&] { reconcile(); });
+        bool charged = false;
+        transaction([&] {
+            std::int64_t before = 0;
+            {
+                Statement s(db_, "SELECT size FROM chunks WHERE path=?");
+                s.text(1, path);
+                if (s.step()) before = sqlite3_column_int64(s.get(), 0);
+            }
+            if (bytes > before && !leaves_free_space(static_cast<std::size_t>(bytes - before)))
+                return;
+            const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
+            if (bytes > available)
+                return;
+            record(path, bytes);  // the newest entry, so the last one eviction takes
+            Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+            f.text(1, path);
+            f.step();
+            evict_to(available);
+            charged = true;
+        });
+        return charged;
+    }
+
+    // Runs `write` for a file its owner writes in place under the root (as
+    // account_file's). `write(fits)` writes only after fits(total) accepts what
+    // the file will occupy (the floor, and the budget less reservations; older
+    // files are evicted to make room), and returns what the file occupies once
+    // done (nullopt: none there), which is then charged as the newest entry.
+    // The growth fits() accepts is held as a reservation, as a download's bytes
+    // are, until that charge is settled: a reservation is not rebuilt from the
+    // disk when another process reconciles the index (a file mid-write is
+    // still short there), and its lock file keeps it while the writer lives;
+    // when the writer is interrupted, the next cleanup releases it and charges
+    // the file as it was left. The owner keeps other writers of the file out
+    // until with_file returns (RemoteGridFile holds the pack's lock), so what
+    // is settled is what the file holds.
+    void with_file(const std::string& path,
+                   const std::function<std::optional<std::int64_t>(const std::function<bool(std::int64_t)>&)>& write)
+    {
+        check_path(path);
+        std::lock_guard lock(mutex_);
+        if (!reconciled_) transaction([&] { reconcile(); });
+        std::unique_ptr<AtomicFile> reservation;  // its temporary: `path`.tmp.*, never published
+        const std::function<bool(std::int64_t)> fits = [&](std::int64_t total) {
+            if (reservation) return false;  // one write per call
+            bool accepted = false;
+            transaction([&] {
+                std::int64_t before = 0;
+                {
+                    Statement s(db_, "SELECT size FROM chunks WHERE path=?");
+                    s.text(1, path);
+                    if (s.step()) before = sqlite3_column_int64(s.get(), 0);
+                }
+                const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
+                const auto available = limit - reserved_bytes();
+                if (total < 0 || total > available) return;
+                const auto growth = std::max<std::int64_t>(total - before, 0);
+                if (growth > 0 && !leaves_free_space(static_cast<std::size_t>(growth))) return;
+                record(path, before);  // the newest: room is made from older files
+                Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                f.text(1, path);
+                f.step();
+                if (growth > 0) {
+                    if (!evict_to(available - growth)) return;  // what is left is owned by live writers
+                    reservation = std::make_unique<AtomicFile>(path);
+                    lock_file(reservation->fd());
+                    record_download(reservation->temporary_path(), static_cast<std::size_t>(growth));
+                }
+                accepted = true;
+            });
+            return accepted;
+        };
+        std::optional<std::int64_t> after;
+        try {
+            after = write(fits);
+        } catch (...) {
+            after.reset();
+            std::error_code ec;
+            const auto there = utf8Path(path);
+            if (std::filesystem::is_regular_file(std::filesystem::symlink_status(there, ec)))
+                after = static_cast<std::int64_t>(std::filesystem::file_size(there, ec));
+        }
+        transaction([&] {
+            if (after) {
+                record(path, *after);
+                Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                f.text(1, path);
+                f.step();
+            } else {
+                Statement s(db_, "DELETE FROM chunks WHERE path=?");
+                s.text(1, path);
+                s.step();
+                Statement f(db_, "DELETE FROM files WHERE path=?");
+                f.text(1, path);
+                f.step();
+            }
+            if (reservation) {
+                forget_download(reservation->temporary_path());
+                reservation.reset();  // removes its temporary
+            }
+            evict_to(number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes());
+        });
+    }
+
+    // Writes `size` bytes as `path`, a file its owner rewrites whole under the
+    // root, the way open_file publishes a download: the bytes are reserved
+    // first (older files evicted to make room; the old file, if any, stays
+    // charged while both are on disk) and the free-space floor kept for all
+    // of them; `fill(fd)` writes them to a temporary that holds its lifetime
+    // lock, so an interrupted write is removed at the next start; `path` is
+    // registered before the temporary is renamed over it, so a file published
+    // just before an interruption is measured when the index is reconciled.
+    // False when it does not fit or `fill` fails (nothing is published).
+    bool publish_file(const std::string& path, std::size_t size, const std::function<bool(int fd)>& fill)
+    {
+        check_path(path);
+        std::unique_ptr<AtomicFile> output;
+        std::string temporary;
+        {
+            std::lock_guard lock(mutex_);
+            if (!reconciled_) transaction([&] { reconcile(); });
+            bool admitted = false;
+            transaction([&] {
+                const auto limit = number("SELECT max_bytes FROM budget WHERE id=1");
+                if (size > static_cast<std::uint64_t>(limit) || !leaves_free_space(size)) return;
+                auto reserved = reserved_bytes();
+                if (size > static_cast<std::uint64_t>(limit - reserved)) {
+                    clean_downloads();
+                    reserved = reserved_bytes();
+                    if (size > static_cast<std::uint64_t>(limit - reserved)) return;
+                }
+                if (!evict_to(limit - reserved - static_cast<std::int64_t>(size))) return;
+                output = std::make_unique<AtomicFile>(path);
+                temporary = output->temporary_path();
+                lock_file(output->fd());
+                record_download(temporary, size);
+                Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                f.text(1, path);
+                f.step();
+                admitted = true;
+            });
+            if (!admitted) return false;
+        }
+        bool filled = false;
+        try {
+            filled = fill(output->fd());
+        } catch (...) {
+            filled = false;
+        }
+        std::lock_guard lock(mutex_);
+        bool published = false;
+        try {
+            transaction([&] {
+                if (filled) {
+                    output->publish();
+                    // Its length, not its allocation: a file just written may
+                    // have none yet (APFS allocates later), and this one is dense.
+                    record(path, static_cast<std::int64_t>(std::filesystem::file_size(utf8Path(path))));
+                    Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
+                    f.text(1, path);
+                    f.step();
+                    published = true;
+                }
+                output.reset();
+                forget_download(temporary);
+                evict_to(number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes());
+            });
+        } catch (...) {
+            try {
+                transaction([&] { output.reset(); forget_download(temporary); });
+            } catch (...) {}  // startup reclaims abandoned reservations
+            return false;
+        }
+        return published;
+    }
+
 private:
     class Statement {
     public:
@@ -402,7 +598,17 @@ private:
         }
         for (const auto& path : paths) {
             check_path(path);
-            if (remove_abandoned(path)) forget_download(path);
+            if (!remove_abandoned(path)) continue;
+            forget_download(path);
+            // Its writer was interrupted: the file it wrote to (a download
+            // renamed into place, or a pack it was growing) is charged as it
+            // was left.
+            const auto tmp = path.rfind(".tmp.");
+            if (tmp == std::string::npos) continue;
+            const auto published = path.substr(0, tmp);
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(std::filesystem::symlink_status(utf8Path(published), ec)))
+                record(published, static_cast<std::int64_t>(std::filesystem::file_size(utf8Path(published), ec)));
         }
     }
 
@@ -422,7 +628,9 @@ private:
                         reserved = reserved_bytes();
                     }
                     if (needed <= static_cast<std::uint64_t>(limit - reserved)) {
-                        evict_to(limit - reserved - static_cast<std::int64_t>(needed));
+                        if (!evict_to(limit - reserved - static_cast<std::int64_t>(needed)))
+                            throw std::runtime_error("disk cache is full of files in use (range-read packs); "
+                                                     "increase cache_max_bytes");
                         record_download(path, needed);
                         admitted = true;
                     }
@@ -463,8 +671,13 @@ private:
                         if (wanted > limit - others) return;  // sized downloads hold it; they finish
                     }
                     const auto spare = limit - others - number("SELECT total FROM budget WHERE id=1") - wanted;
-                    const auto target = wanted + std::clamp<std::int64_t>(spare, 0, step);
-                    evict_to(limit - others - target);
+                    auto target = wanted + std::clamp<std::int64_t>(spare, 0, step);
+                    if (!evict_to(limit - others - target)) {
+                        target = wanted;  // no spare beside files in use
+                        if (!evict_to(limit - others - target))
+                            throw std::runtime_error("disk cache is full of files in use (range-read packs); "
+                                                     "increase cache_max_bytes");
+                    }
                     record_download(path, static_cast<std::size_t>(target));
                     granted = static_cast<std::size_t>(target);
                 });
@@ -474,17 +687,32 @@ private:
         }
     }
 
-    void evict_to(std::int64_t limit)
+    // A file a live reader owns (vcr::ownFile: a range-read pack while it is
+    // used). Eviction leaves it, since its owner may be writing it, and
+    // unlinking it would leave the bytes on disk uncounted.
+    static bool owned(const std::string& path) { return vcr::fileOwned(path); }
+
+    // Evicts the oldest files not owned by a live process until the files
+    // charged come to `limit`; false when the owned ones leave it short.
+    bool evict_to(std::int64_t limit)
     {
+        std::int64_t skipped = 0;
         while (number("SELECT total FROM budget WHERE id=1") > limit) {
             std::string path;
             {
-                Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1");
-                if (!s.step())
+                Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1 OFFSET ?");
+                s.integer(1, skipped);
+                if (!s.step()) {
+                    if (skipped) return false;
                     throw std::runtime_error("disk cache accounting is inconsistent");
+                }
                 path = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
             }
             check_path(path);
+            if (owned(path)) {
+                ++skipped;
+                continue;
+            }
             std::filesystem::remove(utf8Path(path));  // unlink, never truncate a mapped file
             Statement s(db_, "DELETE FROM chunks WHERE path=?");
             s.text(1, path);
@@ -492,6 +720,7 @@ private:
             Statement f(db_, "DELETE FROM files WHERE path=?");
             f.text(1, path); f.step();
         }
+        return true;
     }
 
     // One pooled client per set of credentials, so files downloaded one after another
@@ -570,16 +799,36 @@ private:
                 check_path(utf8String(path));
                 std::error_code ec;
                 if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)))
+                    // Whole files their owners write (downloads, packs) are dense:
+                    // charged their length, which a file just written may not
+                    // have allocated yet (APFS allocates later).
                     files.emplace_back(std::filesystem::last_write_time(path), utf8String(path),
-                                       std::filesystem::file_size(path));
+                                       static_cast<std::int64_t>(std::filesystem::file_size(path)));
             }
         }
         std::sort(files.begin(), files.end());
         for (const auto& [time, file, size] : files)
             record(file, size);
-        exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM chunks);");
+        // A file whose publication is pending (its temporary, named after it,
+        // is reserved) stays registered though it is not there yet: renamed
+        // into place and then interrupted, it is still found (clean_downloads).
+        exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM chunks) AND NOT EXISTS "
+             "(SELECT 1 FROM downloads WHERE substr(downloads.path, 1, length(files.path) + 5) = files.path || '.tmp.');");
         evict();
         reconciled_ = true;
+    }
+
+    // What a file occupies on disk: its size, or less for a sparse file
+    // (account_file's mirrors), whose holes take no space.
+    static std::int64_t occupied_bytes(const std::filesystem::path& path)
+    {
+        const auto size = static_cast<std::int64_t>(std::filesystem::file_size(path));
+#ifndef _WIN32
+        struct stat st{};
+        if (::stat(path.c_str(), &st) == 0)
+            return std::min<std::int64_t>(size, static_cast<std::int64_t>(st.st_blocks) * 512);
+#endif
+        return size;
     }
 
     template<class Entries> void scan(const std::filesystem::path& base, Entries& files)

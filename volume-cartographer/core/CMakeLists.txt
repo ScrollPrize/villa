@@ -15,6 +15,7 @@ add_library(vc_core
         src/OutputDirectory.cpp
         src/TexturedMesh.cpp
         src/GridStore.cpp
+        src/RemoteGridFile.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
         src/Volume.cpp

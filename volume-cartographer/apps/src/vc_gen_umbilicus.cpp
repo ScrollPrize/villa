@@ -417,12 +417,14 @@ int main(int argc, char** argv)
                 Estimate e;
                 e.slice = slice;
                 e.repeat = task.repeat;
-                e.gridSize = grid->size();
                 if (baseSeed) {
                     e.seed = static_cast<std::uint32_t>(*baseSeed + slice +
                                                         1000 * static_cast<std::uint32_t>(task.repeat));
                 }
                 e.point = align_and_extract_umbilicus(*grid, e.seed, static_cast<float>(uncrush));
+                // After the read: a slice read a part at a time may have been
+                // read whole meanwhile, and then its dimensions are that copy's.
+                e.gridSize = grid->size();
                 if (std::isnan(e.point[0]) || std::isnan(e.point[1])) {
                     std::lock_guard<std::mutex> lock(reportMutex);
                     std::cerr << "slice " << slice << ": no segments, skipped" << std::endl;

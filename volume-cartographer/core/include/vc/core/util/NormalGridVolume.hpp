@@ -65,6 +65,12 @@ namespace vc::core::util {
         std::shared_ptr<const GridStore> get_grid(int plane_idx, int slice_idx) const;
         CacheStats cacheStats() const;
         void resetCacheStats() const;
+        // Reads of slices read a part at a time (range reads) that failed for
+        // good: the region could not be fetched and the slice could not be
+        // read whole either, so the query answered with no paths. A caller
+        // must not take such an answer for an empty region; GrowPatch checks
+        // this before it saves a patch.
+        uint64_t readFailures() const;
         double coordinateScale() const;
         double outputSpiralStep() const;
         int level() const;

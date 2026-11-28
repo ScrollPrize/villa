@@ -4,11 +4,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include "../lru.hpp"
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 
 #include "../disk_cache.hpp"
@@ -240,6 +243,237 @@ std::string EncodedFiles::identity(const std::string& location, int fd)
     return token;
 }
 
+zarr::OpenOptions EncodedFiles::resolve(const std::string& location, std::vector<fs::path>& roots)
+{
+    std::lock_guard guard(mutex_);
+    process();
+    auto known = resolved_.find(location);
+    if (known == resolved_.end()) known = resolved_.emplace(location, options_(location)).first;
+    const auto& options = known->second;
+    if (std::find(options.cacheDirs.begin(), options.cacheDirs.end(), "vc3d") != options.cacheDirs.end())
+        throw std::invalid_argument("image files need explicit cache directories, not the vc3d chunk-cache alias");
+    for (const auto& dir : options.cacheDirs) {
+        std::string path = dir;
+        if (path.starts_with("~/"))
+            if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
+        roots.push_back(fs::weakly_canonical(utf8Path(path)));
+    }
+    return options;
+}
+
+namespace {
+// One pooled client per credentials and connection count, shared by every reader in
+// the process, so successive range reads reuse connections.
+std::shared_ptr<HttpClient> rangeClient(const Auth& auth, int connections)
+{
+    static std::mutex mutex;
+    static std::map<std::string, std::shared_ptr<HttpClient>> clients;
+    const auto key = auth.kind + '\0' + auth.user + '\0' + auth.secret + '\0' + auth.token + '\0' + auth.region + '\0' +
+                     std::to_string(connections);
+    std::lock_guard lock(mutex);
+    auto& client = clients[key];
+    if (!client) {
+        HttpOptions options;
+        options.auth = auth;
+        options.connections = connections;
+        client = std::make_shared<HttpClient>(options);
+    }
+    return client;
+}
+
+// The total of a Content-Range answer ("bytes 0-51/7340032"); nullopt for "*".
+std::optional<std::uint64_t> rangeTotal(const std::string& contentRange)
+{
+    const auto slash = contentRange.rfind('/');
+    if (slash == std::string::npos || slash + 1 >= contentRange.size()) return std::nullopt;
+    std::uint64_t total = 0;
+    const auto* first = contentRange.data() + slash + 1;
+    const auto* last = contentRange.data() + contentRange.size();
+    const auto [end, error] = std::from_chars(first, last, total);
+    if (error != std::errc() || end != last) return std::nullopt;
+    return total;
+}
+}  // namespace
+
+EncodedFiles::Ranges EncodedFiles::readRanges(const std::string& location,
+                                              const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges,
+                                              const std::string& version)
+{
+    Ranges out;
+    out.parts.resize(ranges.size());
+    const auto inPlace = [&](int fd, const std::string& where) {
+        File file(fd);
+        platform::FileStat st;
+        if (platform::fstat(fd, st) != 0) throw std::system_error(errno, std::generic_category(), "fstat " + where);
+        const auto size = static_cast<std::uint64_t>(st.size);
+        for (std::size_t i = 0; i < ranges.size(); ++i) {
+            const auto [offset, length] = ranges[i];
+            if (offset > size || length > size - offset)
+                throw std::out_of_range(where + ": range past the end of the file");
+            auto& part = out.parts[i];
+            part.resize(length);
+            std::uint64_t done = 0;
+            while (done < length) {
+                const auto n = platform::pread(fd, part.data() + done, length - done, std::int64_t(offset + done));
+                if (n < 0) throw std::system_error(errno, std::generic_category(), "read " + where);
+                if (n == 0) throw std::runtime_error(where + ": file shrank while it was read");
+                done += std::uint64_t(n);
+            }
+        }
+        out.size = size;
+    };
+    if (!zarr::isRemote(location)) {
+        std::string path = location;
+        if (path.starts_with("~/") || path == "~")
+            if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
+        const int fd = platform::open_file(utf8Path(path), O_RDONLY);
+        if (fd < 0) {
+            if (errno == ENOENT || errno == ENOTDIR) throw zarr::NotFound(path + ": no such file");
+            throw fs::filesystem_error("open", utf8Path(path), std::error_code(errno, std::generic_category()));
+        }
+        inPlace(fd, path);
+        return out;
+    }
+    std::vector<fs::path> roots;
+    const auto options = resolve(location, roots);
+    {
+        std::lock_guard guard(mutex_);
+        if (!temporary_.empty()) roots.push_back(utf8Path(temporary_));
+    }
+    // A reader that asks for one version reads only that version's bytes: a
+    // cached copy has none known, so it is not read in place then.
+    for (const auto& root : version.empty() ? roots : std::vector<fs::path>{}) {
+        const auto path = zarr::decodedCachePath(root, location);
+        const int fd = platform::open_file(path, O_RDONLY);
+        if (fd < 0) {
+            if (errno == ENOENT || errno == ENOTDIR) continue;
+            throw fs::filesystem_error("open", path, std::error_code(errno, std::generic_category()));
+        }
+        inPlace(fd, utf8String(path));
+        std::lock_guard guard(mutex_);
+        ++cacheHits_;
+        return out;
+    }
+    if (options.offline) throw CacheMiss(location + ": encoded file is not cached (offline)");
+
+    const auto url = options.access.url(location);
+    auto client = rangeClient(options.access.auth, std::max(1, options.connections));
+    std::mutex answers;
+    std::exception_ptr failure;
+    bool missing = false;
+    std::optional<std::string> seen = version.empty() ? std::nullopt : std::optional<std::string>(version);
+    std::size_t received = 0;
+    std::atomic<std::size_t> next{0};
+    const auto work = [&] {
+        for (std::size_t i; (i = next.fetch_add(1)) < ranges.size();) {
+            {
+                std::lock_guard lock(answers);
+                if (failure || missing) return;
+            }
+            const auto [offset, length] = ranges[i];
+            if (length == 0) continue;
+            try {
+                std::vector<std::uint8_t> body;
+                const auto response = client->get_range(url, body,
+                                                        std::to_string(offset) + "-" + std::to_string(offset + length - 1),
+                                                        length);
+                std::lock_guard lock(answers);
+                if (response.status == 404) {
+                    missing = true;
+                    return;
+                }
+                if (seen && response.etag != *seen)  // no ETag: not known to be that version
+                    throw Changed(location + ": the object changed between range reads (ETag " + *seen + " then " +
+                                  (response.etag.empty() ? std::string("none") : response.etag) + ")");
+                if (!seen && !response.etag.empty()) seen = response.etag;
+                if (!out.size) out.size = rangeTotal(response.content_range);
+                out.parts[i].assign(reinterpret_cast<const char*>(body.data()), body.size());
+                received += body.size();
+            } catch (...) {
+                std::lock_guard lock(answers);
+                if (!failure) failure = std::current_exception();
+                return;
+            }
+        }
+    };
+    const auto workers = std::min<std::size_t>(ranges.size(), std::size_t(std::max(1, options.connections)));
+    std::vector<std::thread> threads;
+    for (std::size_t w = 1; w < workers; ++w) {
+        try {
+            threads.emplace_back(work);
+        } catch (const std::system_error&) {
+            break;  // out of threads: the ones started (and this one) read the rest
+        }
+    }
+    work();
+    for (auto& thread : threads) thread.join();
+    {
+        std::lock_guard guard(mutex_);
+        bytesRead_ += received;
+    }
+    if (failure) std::rethrow_exception(failure);
+    if (missing) throw zarr::NotFound(location + ": remote file does not exist");
+    out.version = seen.value_or(std::string());
+    return out;
+}
+
+bool EncodedFiles::chargeFile(const std::string& location, const std::string& path, std::int64_t bytes)
+{
+    if (!zarr::isRemote(location)) return true;
+    std::vector<fs::path> roots;
+    const auto options = resolve(location, roots);
+    if (roots.empty() || !options.cacheWrites) return true;
+    auto budget = zarr::diskBudget(utf8String(roots.front()), options.cacheMaxBytes);
+    if (options.cacheMinFreeBytes) budget->set_min_free_bytes(*options.cacheMinFreeBytes);
+    return budget->account_file(utf8String(fs::weakly_canonical(utf8Path(path))), bytes);
+}
+
+void EncodedFiles::writeFile(const std::string& location, const std::string& path,
+                             const std::function<std::optional<std::int64_t>(const Fits& fits)>& write)
+{
+    std::vector<fs::path> roots;
+    std::optional<zarr::OpenOptions> options;
+    if (zarr::isRemote(location)) options = resolve(location, roots);
+    if (!options || roots.empty() || !options->cacheWrites) {
+        static std::mutex mutex;
+        static std::map<std::string, std::shared_ptr<std::mutex>> perPath;
+        std::shared_ptr<std::mutex> one;
+        {
+            std::lock_guard guard(mutex);
+            auto& slot = perPath[path];
+            if (!slot) slot = std::make_shared<std::mutex>();
+            one = slot;
+        }
+        std::lock_guard guard(*one);
+        (void)write([](std::int64_t) { return true; });
+        return;
+    }
+    auto budget = zarr::diskBudget(utf8String(roots.front()), options->cacheMaxBytes);
+    if (options->cacheMinFreeBytes) budget->set_min_free_bytes(*options->cacheMinFreeBytes);
+    budget->with_file(utf8String(fs::weakly_canonical(utf8Path(path))), write);
+}
+
+bool EncodedFiles::publishFile(const std::string& location, const std::string& path, std::size_t size,
+                               const std::function<bool(int fd)>& fill)
+{
+    std::vector<fs::path> roots;
+    std::optional<zarr::OpenOptions> options;
+    if (zarr::isRemote(location)) options = resolve(location, roots);
+    if (!options || roots.empty() || !options->cacheWrites) {
+        AtomicFile output(path);
+        try {
+            if (!fill(output.fd())) return false;
+            output.publish();
+        } catch (const std::exception&) {
+            return false;
+        }
+        return true;
+    }
+    auto budget = zarr::diskBudget(utf8String(roots.front()), options->cacheMaxBytes);
+    if (options->cacheMinFreeBytes) budget->set_min_free_bytes(*options->cacheMinFreeBytes);
+    return budget->publish_file(utf8String(fs::weakly_canonical(utf8Path(path))), size, fill);
+}
+
 EncodedFiles::Opened EncodedFiles::open(const std::string& location)
 {
     if (!zarr::isRemote(location)) {
@@ -262,23 +496,11 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
     }
     // The lock covers this object's state only: downloads of different files overlap, and
     // concurrent misses for one file wait on the budget's per-file lock instead.
-    zarr::OpenOptions options;
     std::vector<fs::path> roots, lookIn;
+    const auto options = resolve(location, roots);
+    lookIn = roots;
     {
         std::lock_guard guard(mutex_);
-        process();
-        auto known = resolved_.find(location);
-        if (known == resolved_.end()) known = resolved_.emplace(location, options_(location)).first;
-        options = known->second;
-        if (std::find(options.cacheDirs.begin(), options.cacheDirs.end(), "vc3d") != options.cacheDirs.end())
-            throw std::invalid_argument("image files need explicit cache directories, not the vc3d chunk-cache alias");
-        for (const auto& dir : options.cacheDirs) {
-            std::string path = dir;
-            if (path.starts_with("~/"))
-                if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
-            roots.push_back(fs::weakly_canonical(utf8Path(path)));
-        }
-        lookIn = roots;
         if (!temporary_.empty()) lookIn.push_back(utf8Path(temporary_));
     }
     for (const auto& root : lookIn) {

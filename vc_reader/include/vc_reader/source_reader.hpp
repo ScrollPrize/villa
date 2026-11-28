@@ -163,6 +163,61 @@ public:
         ~Opened();
     };
     [[nodiscard]] Opened open(const std::string& location);
+
+    // Parts of one file, without downloading or caching it whole: for a reader that
+    // needs a small part of a large file. Each range is (offset, length) and its part
+    // holds exactly that many bytes. A local file, or a remote file with a cached copy,
+    // is read in place; otherwise the parts come from storage with open()'s access and
+    // credentials, up to the options' connections at a time, and nothing is cached.
+    // NotFound when the file does not exist, CacheMiss offline when no cache holds it;
+    // a range past its end raises (std::out_of_range when read in place).
+    struct Ranges {
+        std::vector<std::string> parts;
+        // The remote object's ETag, or empty for a file read in place. Pass it back as
+        // `version` on later reads of the same file: an object replaced in between then
+        // raises Changed instead of mixing two versions' bytes. With a version given, a
+        // cached copy is not read in place (its version is not known), and a response
+        // without an ETag is not taken for that version (Changed).
+        std::string version;
+        std::optional<std::uint64_t> size;  // the whole file's, when storage says
+    };
+    struct Changed : std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
+    [[nodiscard]] Ranges readRanges(const std::string& location,
+                                    const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges,
+                                    const std::string& version = {});
+
+    // A file the caller keeps under `location`'s cache root and writes itself (a
+    // sparse mirror of part of it, at `path`): charges the `bytes` it occupies to
+    // that root's budget, as open() charges a download, evicting older files to
+    // make room. Called again as it grows. False when it does not fit or would
+    // leave the disk under the floor; true when nothing is budgeted (no cache
+    // root, or a local location).
+    [[nodiscard]] bool chargeFile(const std::string& location, const std::string& path, std::int64_t bytes);
+
+    // Writes to such a file with its budget held: no eviction, no download's
+    // publication and no other writeFile of the budget, in this process or
+    // another, comes between the write and its accounting. `write(fits)` may
+    // write only after fits(total) accepts what the file will then occupy (the
+    // floor and the budget, as chargeFile); it returns what the file at `path`
+    // occupies once done, written or not (nullopt: no file there), and that is
+    // what the budget charges. `write` must not throw. Without a budget (no
+    // cache root, or a local location) fits() accepts anything, and writes to
+    // one path in this process are still made one at a time.
+    using Fits = std::function<bool(std::int64_t total)>;
+    void writeFile(const std::string& location, const std::string& path,
+                   const std::function<std::optional<std::int64_t>(const Fits& fits)>& write);
+
+    // Writes such a file whole: `size` bytes, reserved in the budget before
+    // `fill(fd)` writes them to a temporary that is renamed over `path` (see
+    // DiskCache::publish_file: an interrupted write is reclaimed at the next
+    // start, and one published just before an interruption is still counted).
+    // Without a budget, a plain temporary-and-rename. False when it does not
+    // fit, or `fill` fails; then nothing is published.
+    [[nodiscard]] bool publishFile(const std::string& location, const std::string& path, std::size_t size,
+                                   const std::function<bool(int fd)>& fill);
+
     [[nodiscard]] std::size_t bytesRead() const { return bytesRead_; }
     [[nodiscard]] std::size_t cacheHits() const { return cacheHits_; }
     // Where files live when nothing can be kept; empty until one is needed.
@@ -171,6 +226,8 @@ public:
 private:
     void process();
     std::string identity(const std::string& location, int fd);
+    // `location`'s options and its configured cache roots.
+    zarr::OpenOptions resolve(const std::string& location, std::vector<std::filesystem::path>& roots);
     OptionsFor options_;
     std::mutex mutex_;
     long pid_;

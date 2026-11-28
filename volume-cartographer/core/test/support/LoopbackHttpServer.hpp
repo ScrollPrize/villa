@@ -103,6 +103,10 @@ public:
 
     // Files below `root` at paths below `prefix`: GET and HEAD with Content-Length, byte
     // ranges, 404 when missing. "/" serves the root at the server's root.
+    // Sends a strong ETag (a hash of the file's bytes) with every file served,
+    // as S3 does, so a client can tell versions of a file apart.
+    void sendETags(bool on = true) { etags_ = on; }
+
     void serveDirectory(std::filesystem::path root, std::string prefix = "/")
     {
         std::lock_guard lock(mutex_);
@@ -362,16 +366,16 @@ private:
                 return {403, "<Error><Code>AccessDenied</Code><Message>unsigned request</Message></Error>", {{"Content-Type", "application/xml"}}, false};
             if (request.query.count("list-type")) return listing(bucket, request);
             if (request.path.size() <= base.size() + 1) return {404, "", {}, false};
-            return file(bucket.root / request.path.substr(base.size() + 1), request);
+            return file(bucket.root / request.path.substr(base.size() + 1), request, etags_);
         }
         for (const auto& directory : directories) {
             if (!request.path.starts_with(directory.prefix)) continue;
-            return file(directory.root / request.path.substr(directory.prefix.size()), request);
+            return file(directory.root / request.path.substr(directory.prefix.size()), request, etags_);
         }
         return {404, "not found: " + request.path, {}, false};
     }
 
-    static Response file(const std::filesystem::path& path, const Request& request)
+    static Response file(const std::filesystem::path& path, const Request& request, bool etag = false)
     {
         std::error_code ec;
         if (!std::filesystem::is_regular_file(path, ec)) return {404, "", {}, false};
@@ -381,6 +385,11 @@ private:
         Response response;
         response.headers.emplace_back("Content-Type", "application/octet-stream");
         response.headers.emplace_back("Accept-Ranges", "bytes");
+        if (etag) {
+            std::uint64_t h = 1469598103934665603ull;  // FNV-1a
+            for (const unsigned char c : data) h = (h ^ c) * 1099511628211ull;
+            response.headers.emplace_back("ETag", "\"" + std::to_string(h) + "\"");
+        }
         if (const auto range = request.header("range"); range.starts_with("bytes=")) {
             const auto dash = range.find('-');
             const std::string firstText = range.substr(6, dash - 6), lastText = range.substr(dash + 1);
@@ -461,6 +470,7 @@ private:
     std::atomic<bool> stop_{false};
     std::thread acceptThread_;
     mutable std::mutex mutex_;
+    std::atomic<bool> etags_{false};
     std::vector<int> connectionFds_;
     std::vector<std::thread> connectionThreads_;
     std::vector<Directory> directories_;

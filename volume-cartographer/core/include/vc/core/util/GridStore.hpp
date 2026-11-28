@@ -9,6 +9,8 @@
 
 namespace vc::core::util {
 
+class RemoteGridFile;
+
 class GridStore {
 public:
     struct SaveOptions {
@@ -34,6 +36,17 @@ public:
 
     GridStore(const cv::Rect& bounds, int cell_size);
     explicit GridStore(const std::string& path);
+    // A read-only store over a remote file read a part at a time: each query
+    // first fetches what its region needs (see RemoteGridFile). Its `meta` is
+    // not read. The store reads one version of the file only (the one the
+    // RemoteGridFile is pinned to). When a region cannot be fetched (after a
+    // retry), or the file is no longer that version, the failure is reported
+    // (`events.failed` is called) and the region reads as empty; a later
+    // query tries again. generation() changes on each failed read.
+    struct RemoteEvents {
+        std::function<void()> failed;
+    };
+    explicit GridStore(std::shared_ptr<RemoteGridFile> remote, RemoteEvents events = {});
     ~GridStore();
 
     void add(const std::vector<cv::Point>& points);
@@ -52,8 +65,14 @@ public:
     // grow as the store is used; each keeps a running byte count, so for a
     // mapped store this is O(1).
     size_t residentBytes() const;
+    // Bytes held in memory for a store read a part at a time (0 for others).
+    size_t remoteResidentBytes() const;
     size_t numSegments() const;
     size_t numNonEmptyBuckets() const;
+    // Changes when what this store answers may have changed (see the remote
+    // constructor); constant for other stores. A caller that keeps results
+    // reads it before its query and keeps them only while it is unchanged.
+    uint64_t generation() const;
     CacheStats cacheStats() const;
     void resetCacheStats() const;
 
