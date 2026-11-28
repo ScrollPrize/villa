@@ -745,6 +745,15 @@ move field. By default only the nodes matched to a sheet are written (the rest
 become holes, `-1`); `--keep-unmatched` writes every node, and `snap_flag.tif`
 says which were matched (0), moved by the smoothed field (1) or left in place
 (3). `--spliced` snaps the `_spliced` meshes that `render_ink.py` renders.
+
+Matched-only output has holes wherever a winding found no sheet of its own
+(often half of a dense fit), which tears a flatten of the whole fit. For
+`render_ink.py`, use `--feather 1.0`: every unmatched node gets the mean of its
+winding's nearby matched moves, faded to no move away from them (flag 4), and a
+filled node is then dropped only if it would sit on a sheet that a neighbouring
+winding (w ± 1, w ± 2) already occupies: another winding has a node within 25
+voxels sideways and within 3.13 voxels along that node's normal. Matched nodes are
+the same as in the default output.
 `--surface-scale` handles a prediction stored at another level than the mesh
 coordinates (0.5 for one level coarser). `--bbox` limits the prediction read
 from memory; the box must contain the umbilicus, and windings outside it are

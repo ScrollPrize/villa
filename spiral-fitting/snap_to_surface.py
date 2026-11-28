@@ -325,6 +325,66 @@ def smooth_field(F, med, sig):
     return np.where(vm, Mf, fill).astype(np.float32)
 
 
+def feather_field(F, sig, s0):
+    """Complete move field for one winding over (slices, rays): matched moves where the second pass matched, elsewhere
+    the Gaussian-normalised mean of the matched moves scaled by min(support / s0, 1), so the fill fades to no move
+    away from matched rays. Unlike the median-field fill, a winding that lost its sheet to a neighbour is not pushed
+    the whole way onto that sheet."""
+    vm = np.isfinite(F)
+    if not vm.any():
+        return np.zeros_like(F, dtype=np.float32)
+    sup = gaussian_filter(vm.astype(np.float32), sig, mode=('nearest', 'wrap'))
+    num = gaussian_filter(np.where(vm, F, 0.0).astype(np.float32), sig, mode=('nearest', 'wrap'))
+    fill = num / np.maximum(sup, 1e-6) * np.clip(sup / s0, 0.0, 1.0)
+    return np.where(vm, F, np.where(sup > 1e-6, fill, 0.0)).astype(np.float32)
+
+
+def _grid_normals(P, valid):
+    gi, gj = np.gradient(np.where(valid[..., None], P, 0.0), axis=0), np.gradient(np.where(valid[..., None], P, 0.0), axis=1)
+    n = np.cross(gi, gj)
+    ln = np.linalg.norm(n, axis=-1)
+    ok = valid & np.isfinite(ln) & (ln > 0)
+    return n / np.where(ok, ln, 1.0)[..., None], ok
+
+
+def drop_stacked_fill(res, perp=3.13, lateral=25.0, k=64, reach=2, workers=8):
+    """In complete (--feather) output, a filled node (flag 4) that sits on a sheet already occupied by a nearby winding
+    (w +- 1 .. w +- reach has a node within `lateral` voxels whose normal plane is within `perp` voxels) becomes NaN.
+    Matched nodes are never removed. Modifies res in place; returns the number of nodes removed."""
+    from scipy.spatial import cKDTree
+    wids = sorted(res)
+    geo = {}
+    for w in wids:
+        P = res[w][0].astype(np.float64)
+        v = np.isfinite(P).all(-1)
+        n, ok = _grid_normals(P, v)
+        geo[w] = (P, n, ok)
+    removed = 0
+    drops = {}
+    for i, w in enumerate(wids):
+        P, _, _ = geo[w]
+        q = np.isfinite(P).all(-1) & (res[w][1] == 4)
+        nb = [geo[wids[j]] for j in range(i - reach, i + reach + 1) if j != i and 0 <= j < len(wids)]
+        drop = np.zeros(q.shape, bool)
+        if q.any() and nb:
+            X = np.concatenate([g[0][g[2]] for g in nb])
+            N = np.concatenate([g[1][g[2]] for g in nb])
+            rr, cc = np.nonzero(q)
+            Q = P[rr, cc]
+            dist, idx = cKDTree(X).query(Q, k=k, distance_upper_bound=lateral, workers=workers)
+            j = np.minimum(idx, len(X) - 1)
+            hit = (np.isfinite(dist) & (np.abs(((X[j] - Q[:, None, :]) * N[j]).sum(-1)) < perp)).any(1)
+            drop[rr[hit], cc[hit]] = True
+        drops[w] = drop
+    for w in wids:  # decided on the unmodified output, applied together
+        Pn, flag, move = res[w]
+        Pn = Pn.copy()
+        Pn[drops[w]] = np.nan
+        removed += int(drops[w].sum())
+        res[w] = (Pn, flag, move)
+    return removed
+
+
 # ------------------------------------------------------------------------------------------------ driver
 
 
@@ -338,7 +398,7 @@ def open_surface(surface, level):
 
 
 def snap(windings, S, umb_yx, z_range, *, dz=4, rays=2048, step=0.5, rmax=4000.0, threshold=127.0, densify_f=2,
-         sigma=0.35, dmax=0.6, dmax2=0.45, cs=1.0, med=(3, 9), sig=(1.5, 6.0), bbox=None, log=print):
+         sigma=0.35, dmax=0.6, dmax2=0.45, cs=1.0, med=(3, 9), sig=(1.5, 6.0), bbox=None, feather=None, log=print):
     """windings: {w: (name, P (H, W, 3) x, y, z in surface-array voxels, meta)}. Returns {w: (P_densified_moved,
     flag, move)} plus run statistics. umb_yx(z) -> (y, x) in surface-array voxels."""
     t0 = time.time()
@@ -415,8 +475,12 @@ def snap(windings, S, umb_yx, z_range, *, dz=4, rays=2048, step=0.5, rmax=4000.0
     F1, st1 = run_pass(None, dmax, cw1, 'pass 1')
     Fs = np.stack([smooth_field(F1[i], med, sig) for i in range(NW)])
     F2, st2 = run_pass(Fs, dmax2, cw2, 'pass 2')
-    Ffin = np.where(np.isfinite(F2), F2, Fs)
-    Fsrc = np.where(np.isfinite(F2), 0, np.where(np.isfinite(Fs), 1, 3)).astype(np.uint8)
+    if feather is None:
+        Ffin = np.where(np.isfinite(F2), F2, Fs)
+        Fsrc = np.where(np.isfinite(F2), 0, np.where(np.isfinite(Fs), 1, 3)).astype(np.uint8)
+    else:
+        Ffin = np.stack([feather_field(F2[i], sig, feather) for i in range(NW)])
+        Fsrc = np.where(np.isfinite(F2), 0, 4).astype(np.uint8)
 
     out = {}
     for w in wids:
@@ -466,12 +530,15 @@ def snap(windings, S, umb_yx, z_range, *, dz=4, rays=2048, step=0.5, rmax=4000.0
 @click.option('--spliced', is_flag=True, help='Snap the `_spliced` meshes (the ones render_ink.py renders).')
 @click.option('--keep-unmatched', is_flag=True,
               help='Write every node (matched, moved by the smoothed field, or unmoved) instead of matched nodes only.')
+@click.option('--feather', type=float, default=None,
+              help='Write complete windings: nodes without a one-to-one match get the mean of nearby matched moves, '
+                   'faded to no move where the matched support is below this value (flag 4).')
 @click.option('--densify', 'densify_f', type=int, default=2, help='Grid densification before snapping.')
 @click.option('--dz', type=int, default=4, help='Slice spacing, in surface-array voxels.')
 @click.option('--rays', type=int, default=2048)
 @click.option('--threads', type=int, default=8)
 def main(meshes_dir, out_dir, surface, level, surface_scale, umbilicus_path, umbilicus_scale, threshold, z_range,
-         bbox, spliced, keep_unmatched, densify_f, dz, rays, threads):
+         bbox, spliced, keep_unmatched, feather, densify_f, dz, rays, threads):
     """Snap all windings in MESHES_DIR onto the surface prediction; write them to OUT_DIR."""
     if not HAVE_NUMBA:
         raise click.ClickException('snap_to_surface.py needs numba (installed with spiral-fitting on Linux x86-64; '
@@ -499,7 +566,10 @@ def main(meshes_dir, out_dir, surface, level, surface_scale, umbilicus_path, umb
     click.echo(f'{len(windings)} windings, z {zr[0]}-{zr[1]} (surface voxels), bbox y {bbox[0]}-{bbox[1]} '
                f'x {bbox[2]}-{bbox[3]}, {gb:.1f} GB per z chunk row held in memory')
     res, stats = snap(win_s, S, umb, zr, dz=dz, rays=rays, threshold=threshold, densify_f=densify_f, bbox=bbox,
-                      log=click.echo)
+                      feather=feather, log=click.echo)
+    if feather is not None:
+        stats['stacked_fill_removed'] = drop_stacked_fill(res, workers=threads)
+        click.echo(f'{stats["stacked_fill_removed"]} filled nodes removed: they sat on a sheet a neighbouring winding occupies')
     os.makedirs(out_dir, exist_ok=True)
     report = dict(args=dict(meshes_dir=meshes_dir, surface=surface, level=level, surface_scale=s,
                             umbilicus=umbilicus_path, umbilicus_scale=umbilicus_scale, threshold=threshold,
@@ -509,7 +579,7 @@ def main(meshes_dir, out_dir, surface, level, surface_scale, umbilicus_path, umb
         Pn, flag, move = res[w]
         Pn = Pn / s
         move = move / s
-        if not keep_unmatched:
+        if not keep_unmatched and feather is None:
             Pn[flag != 0] = np.nan
         write_winding(out_dir, name, Pn, flag, move, meta, densify_f)
         valid = flag != 3

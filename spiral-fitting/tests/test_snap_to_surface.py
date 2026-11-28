@@ -77,6 +77,34 @@ class SnapToSurfaceTests(unittest.TestCase):
 
 
 @unittest.skipUnless(snap_to_surface.HAVE_NUMBA, 'snap_to_surface needs numba')
+class FeatherTests(unittest.TestCase):
+    def test_feather_keeps_matched_nodes_and_never_stacks_fill(self):
+        S = sheet_volume().view(ChunkedArray)
+        radii = [44.0, 46.5, 49.0, 61.0, 71.0]
+        windings = {w: (f'w{w:03d}', cylinder(r), {}) for w, r in enumerate(radii, start=1)}
+        kw = dict(rays=256, rmax=100.0, densify_f=1, log=lambda *_: None)
+        plain, _ = snap_to_surface.snap(windings, S, lambda z: (CENTRE, CENTRE), (2, 30), **kw)
+        res, _ = snap_to_surface.snap(windings, S, lambda z: (CENTRE, CENTRE), (2, 30), feather=1.0, **kw)
+        snap_to_surface.drop_stacked_fill(res, workers=1)
+        for w in res:
+            P, flag, _ = res[w]
+            m = plain[w][1] == 0
+            self.assertTrue(np.array_equal(flag == 0, m))
+            np.testing.assert_array_equal(P[m], plain[w][0][m])          # matched nodes are untouched
+            self.assertTrue(np.isfinite(P).all(-1)[m].all())
+            self.assertTrue(np.isin(flag, (0, 3, 4)).all())              # matched, out of band or filled; no flag 1
+        ws = sorted(res)
+        for i, w in enumerate(ws):  # no node of a winding within 1 voxel radially of a neighbour's node at the same grid cell
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(ws):
+                    a, b = res[w][0], res[ws[j]][0]
+                    both = np.isfinite(a).all(-1) & np.isfinite(b).all(-1)
+                    ra = np.hypot(a[..., 0] - CENTRE, a[..., 1] - CENTRE)
+                    rb = np.hypot(b[..., 0] - CENTRE, b[..., 1] - CENTRE)
+                    self.assertGreater(np.abs(ra - rb)[both].min(), 1.0)
+
+
+@unittest.skipUnless(snap_to_surface.HAVE_NUMBA, 'snap_to_surface needs numba')
 class SnapToSurfaceCliTests(unittest.TestCase):
     def test_cli_writes_tifxyz_meshes_render_ink_can_read(self):
         import tempfile
