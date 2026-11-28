@@ -9,7 +9,10 @@ On a few slices of the binarized surface prediction this walks outwards from
 the umbilicus at every angle and takes the median distance between the centres
 of neighbouring predicted sheets. On scrolls whose pitch people have fixed, the
 median is 2-11 % above it (missed sheets make gaps wider, sheets met at an
-angle make them longer), close enough to replace the default start.
+angle make them longer). It beats the default start but is not the best one:
+the fit's count scales as one over its start, and on PHerc. Paris 4 a start
+above the sheet spacing counted best. Once a fit has been scored along one
+traced sheet, --refit gives the start that counts that sheet right.
 
     .venv/bin/python estimate_winding_pitch.py \\
         --predictions /path/to/surface-prediction.zarr/0 \\
@@ -19,6 +22,11 @@ Prints the per-slice medians and the override to start a fit from, e.g.
 {"model_initial_dr_per_winding": 18.5}. Give --scale when the prediction is
 not in the fit's voxels (fit voxels per prediction voxel, e.g. 4 for a level-2
 prediction of a level-0 fit); the umbilicus is read in the fit's voxels.
+
+    .venv/bin/python estimate_winding_pitch.py --refit 18.5 1.14
+
+prints the start to refit with, {"model_initial_dr_per_winding": 21.1}, from a
+fit started at 18.5 that put 1.14 windings per turn along a traced sheet.
 """
 
 from __future__ import annotations
@@ -53,15 +61,26 @@ def radial_gaps(sheet_mask, centre_yx, angles=720):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--predictions", required=True,
+    parser.add_argument("--predictions",
                         help="binarized surface-prediction zarr array: local path, http(s) or s3:// URL")
-    parser.add_argument("--umbilicus", required=True, help="the fit's umbilicus.json")
-    parser.add_argument("--z", type=int, nargs="+", required=True,
+    parser.add_argument("--umbilicus", help="the fit's umbilicus.json")
+    parser.add_argument("--z", type=int, nargs="+",
                         help="slices to read, in the fit's voxels (two or three across the band to fit)")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="fit voxels per prediction voxel (default 1)")
     parser.add_argument("--angles", type=int, default=720)
+    parser.add_argument("--refit", type=float, nargs=2, metavar=("START", "WINDINGS_PER_TURN"),
+                        help="skip the prediction: the start a fit used and its windings per turn along "
+                             "a traced sheet; prints the start that counts that sheet right")
     args = parser.parse_args(argv)
+    if args.refit:
+        start, windings_per_turn = args.refit
+        if start <= 0 or windings_per_turn <= 0:
+            parser.error("--refit needs a positive start and windings per turn")
+        print(json.dumps({"model_initial_dr_per_winding": round(start * windings_per_turn, 1)}))
+        return
+    if not (args.predictions and args.umbilicus and args.z):
+        parser.error("--predictions, --umbilicus and --z are required unless --refit is given")
 
     predictions = open_predictions(args.predictions)
     z_to_yx = json_umbilicus_z_to_yx(args.umbilicus)
