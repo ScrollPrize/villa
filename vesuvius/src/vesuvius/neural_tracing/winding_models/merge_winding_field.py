@@ -506,7 +506,13 @@ def accumulate_registration(archive, plan, blocks, patch_grid, num_patches,
         omega = joined["omega"][selected]
         winding = joined["winding"][selected]
         xyz = joined["xyz"][selected]
-        unique, inverse = torch.unique(key, return_inverse=True)
+        # Not torch.unique: on MPS it narrows int64 keys to int32.
+        sorted_key, order = torch.sort(key)
+        first = torch.ones_like(sorted_key, dtype=torch.bool)
+        first[1:] = sorted_key[1:] != sorted_key[:-1]
+        unique = sorted_key[first]
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.cumsum(first, 0) - 1
         stats = torch.zeros((len(unique), 6), device=device)
         columns = torch.stack([
             omega, omega * winding, omega * winding * winding,
@@ -514,7 +520,7 @@ def accumulate_registration(archive, plan, blocks, patch_grid, num_patches,
         ], dim=1)
         stats.index_add_(0, inverse, columns)
         key_chunks.append(unique.cpu().numpy())
-        stat_chunks.append(stats.double().cpu().numpy())
+        stat_chunks.append(stats.cpu().double().numpy())
         if position % 25 == 0:
             elapsed = time.time() - started
             _log(f"registration block {position + 1}/{len(blocks)}"
@@ -1413,7 +1419,8 @@ def parse_args(argv=None):
     parser.add_argument("--no-patches", action="store_true")
     parser.add_argument("--scratch-dir", default=None)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default=None,
+                        help="torch device (default: cuda, else mps, else cpu)")
     parser.add_argument("--margin", type=int, default=140)
     parser.add_argument("--z-crop", type=int, nargs=2, default=None)
     parser.add_argument("--limit-blocks", type=int, default=None)
@@ -1448,7 +1455,13 @@ def parse_args(argv=None):
     parser.add_argument("--checkpoint-minutes", type=float, default=30.0)
     parser.add_argument("--zstd-level", type=int, default=5)
     parser.add_argument("--agreement-samples", type=int, default=0)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.device is None:
+        import torch
+
+        args.device = ("cuda" if torch.cuda.is_available()
+                       else "mps" if torch.backends.mps.is_available() else "cpu")
+    return args
 
 
 def main(argv=None):

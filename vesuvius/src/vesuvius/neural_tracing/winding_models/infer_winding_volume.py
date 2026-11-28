@@ -230,6 +230,18 @@ def _supplied_options(options):
     })
 
 
+def _default_device(gpus_given, prob_volume):
+    """cuda when available (or when --gpus asks for it), else an Apple GPU,
+    else cpu. --prob-volume needs float64 on the device, so it skips mps."""
+    import torch
+
+    if gpus_given or torch.cuda.is_available():
+        return "cuda"
+    if not prob_volume and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -437,6 +449,12 @@ def parse_args():
                              "relative to scale-0")
     parser.add_argument("--gpus", default=None,
                         help="comma-separated GPU indices (default: all visible)")
+    parser.add_argument("--device", choices=("cuda", "mps", "cpu"),
+                        default=None,
+                        help="device the workers run the model on (default: "
+                             "cuda when available or with --gpus, one worker "
+                             "per --gpus entry; else mps, else cpu); mps "
+                             "(Apple GPU) and cpu run one worker")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile the model in each worker (adds "
@@ -487,6 +505,15 @@ def parse_args():
              "above 1 reduces cache reads but requires --max-level to cover "
              "the wider retained-anchor gap")
     args = parser.parse_args()
+    if args.device is None:
+        args.device = _default_device(args.gpus is not None, args.prob_volume)
+    if args.device != "cuda" and args.gpus is not None:
+        parser.error("--gpus selects CUDA devices; drop it with --device "
+                     f"{args.device}")
+    if args.device == "mps" and args.prob_volume:
+        parser.error("--prob-volume reduces observations in float64 on the "
+                     "device, which MPS does not support; run it with "
+                     "--device cuda or cpu")
     if args.native_phase_only:
         supplied = _supplied_options(_RECONSTRUCTION_OPTIONS)
         if supplied:
@@ -1250,6 +1277,14 @@ class _SpiralSupervisionWriter:
         self._write_through(np.inf)
 
 
+def _worker_device(args, gpu):
+    """Torch device of worker ``gpu``: ``cuda:<gpu>``, or --device mps/cpu."""
+    import torch
+
+    kind = getattr(args, "device", "cuda")
+    return torch.device(f"cuda:{gpu}" if kind == "cuda" else kind)
+
+
 def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
     """One inference process per GPU: extract slabs, run the model, decode."""
     import torch
@@ -1268,7 +1303,7 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
         if "phase_offset" in shard
         else np.zeros(len(seeds), dtype=np.float32))
 
-    device = torch.device(f"cuda:{gpu}")
+    device = _worker_device(args, gpu)
     phase_reader = None
     if getattr(args, "phase_cache", None):
         from vc_reader.reader import open_group
@@ -1291,6 +1326,8 @@ def gpu_worker(gpu, args, shard_path, result_path, progress_queue=None):
         model = WindingModel(model_cfg.get("model"))
         model.load_state_dict(checkpoint["model"])
         model.to(device).eval()
+        from vesuvius.models.utilities.mps_conv3d import speed_up_3d_convs_on_mps
+        speed_up_3d_convs_on_mps(model, device)
         if args.compile:
             model = torch.compile(model)
 
@@ -1670,6 +1707,9 @@ def _prepare_spiral_supervision(args, rays, model_cfg):
         "num_slabs": int(total),
         "seed_rays_sha256": seed_digest.hexdigest(),
     }
+    if getattr(args, "device", "cuda") != "cuda":
+        # Resume must not mix parts decoded on different backends.
+        attributes["device"] = args.device
     identity = _canonical_digest(attributes)
     name = "shard_0"
     signature = {
@@ -2754,7 +2794,10 @@ def _aggregate_winding_cuda(keys, totals, maxima):
     maxima = torch.cat(maxima)
     keys, order = torch.sort(keys)
     totals, maxima = totals[order], maxima[order]
-    unique, inverse = torch.unique_consecutive(keys, return_inverse=True)
+    # Not unique_consecutive: on MPS it narrows int64 keys to int32.
+    first = torch.ones_like(keys, dtype=torch.bool)
+    first[1:] = keys[1:] != keys[:-1]
+    unique, inverse = keys[first], torch.cumsum(first, 0) - 1
     out_total = torch.zeros(
         len(unique), dtype=torch.float32, device=keys.device)
     out_max = torch.zeros(
@@ -3016,7 +3059,12 @@ def _forward_batch(batch, model, device, column_upsample=1, *, args=None,
 
     images = torch.from_numpy(np.stack([b[1] for b in batch])).to(device)
     valid = torch.from_numpy(np.stack([b[2] for b in batch])).to(device)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
+    # bf16 autocast on CUDA only. On Apple GPUs it moves decoded crossings
+    # by a median 0.3 samples from fp32 (PHerc. Paris 4 gen-19 rays), while
+    # fp32 there reproduces a store made on CUDA to 0.01 samples, so MPS and
+    # the CPU run the model in fp32.
+    with torch.autocast(device.type, dtype=torch.bfloat16,
+                        enabled=device.type == "cuda"):
         out = model(images, valid.bool())
     return _postprocess_model_fields(
         out["phase"], out.get("crossing_logits"), batch, column_upsample,
@@ -3080,7 +3128,8 @@ def _render_winding_aggregates_cuda(
 
     if not len(voxels):
         return None
-    device = torch.device(f"cuda:{gpu}")
+    # ``gpu`` is a CUDA index, or "mps"/"cpu" for a --device mps/cpu run.
+    device = torch.device(gpu if isinstance(gpu, str) else f"cuda:{gpu}")
     offsets = torch.cartesian_prod(*[
         torch.arange(-1, 2, device=device, dtype=torch.int64)
     ] * 3)
@@ -3215,7 +3264,8 @@ def _write_winding_aggregate_bucket(task, gpu):
 def _winding_aggregate_gpu_worker(gpu, tasks, progress_queue):
     import torch
 
-    torch.cuda.set_device(gpu)
+    if not isinstance(gpu, str):
+        torch.cuda.set_device(gpu)
     for task in tasks:
         _write_winding_aggregate_bucket(task, gpu)
         progress_queue.put(1)
@@ -3818,7 +3868,9 @@ def write_output(args, rays, shard_results, result_paths, elapsed_total):
     raster_started = time.time()
     winding_spill_dirs = sorted(
         Path(args.output).with_suffix(".tmp").glob("winding_spill_*"))
-    raster_gpus = list(getattr(args, "worker_gpus", ()))
+    raster_gpus = (
+        list(getattr(args, "worker_gpus", ()))
+        if getattr(args, "device", "cuda") == "cuda" else [args.device])
     _rasterize_winding_aggregate_spills(
         args.output, winding_spill_dirs, out_shape, chunk, raster_gpus)
     raster_elapsed = time.time() - raster_started
@@ -4107,7 +4159,11 @@ def main():
             "overlaps; fitted seed winding is a weak gauge prior only",
             flush=True)
 
-    if args.gpus is not None:
+    if args.device != "cuda":
+        # One worker owns the Apple GPU or the CPU; the slot number only
+        # names its shard and result files.
+        gpus = [0]
+    elif args.gpus is not None:
         gpus = [int(g) for g in args.gpus.split(",") if g != ""]
     else:
         import torch
@@ -4168,7 +4224,7 @@ def main():
         rays = build_seed_rays_from_meshes(args)
         np.savez(rays_path, **rays)
     else:
-        rays = build_seed_rays(args, device=f"cuda:{gpus[0]}")
+        rays = build_seed_rays(args, device=_worker_device(args, gpus[0]))
         np.savez(rays_path, **rays)
     total = len(rays["seed_xyz"])
     if args.max_slabs is not None and total > args.max_slabs:
