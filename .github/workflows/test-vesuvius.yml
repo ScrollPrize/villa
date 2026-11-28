@@ -10,6 +10,18 @@ on:
       - 'vc_object_store/**'
       - 'vc_reader/**'
       - '.github/workflows/test-vesuvius.yml'
+  # Trusted main builds populate sccache entries that pull requests can read
+  # (as in vc3d-ci.yml). Caches written by pull_request runs are scoped to that
+  # PR's merge ref, so without main builds every PR compiles from scratch.
+  push:
+    branches: [main]
+    paths:
+      - 'vesuvius/**'
+      - 'lasagna/**'
+      - 'volume-cartographer/**'
+      - 'vc_object_store/**'
+      - 'vc_reader/**'
+      - '.github/workflows/test-vesuvius.yml'
 
 jobs:
   test-vesuvius-python:
@@ -25,6 +37,19 @@ jobs:
       run:
         shell: bash
         working-directory: ./vesuvius
+    env:
+      # uv rebuilds the native packages (vc_reader, vc_object_store,
+      # volume-cartographer) on every run: their uv cache-keys compare file
+      # modification times, which a fresh checkout always changes. Route their
+      # CMake compiles through sccache so unchanged objects come from the cache.
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      # A fixed build directory per package keeps compiler command lines, and so
+      # sccache keys, identical between runs (scikit-build-core otherwise builds
+      # in a fresh temporary directory).
+      SKBUILD_BUILD_DIR: build/{wheel_tag}
 
     steps:
       - name: Checkout code
@@ -63,6 +88,11 @@ jobs:
             qt6-base-dev \
             zlib1g-dev
 
+      - name: Set up shared compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+
       - name: Install uv and restore dependency cache
         uses: astral-sh/setup-uv@v10.3.3
         with:
@@ -85,7 +115,10 @@ jobs:
             segmentation/models/arch/nnunet/pyproject.toml
 
       - name: Sync dependencies
-        run: uv sync --extra all
+        run: |
+          sccache --zero-stats
+          uv sync --extra all
+          sccache --show-stats
 
       - name: Select Zarr version
         run: uv pip install "zarr==${{ matrix.zarr }}"
