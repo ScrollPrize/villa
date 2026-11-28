@@ -123,7 +123,9 @@ public:
     void setStorePinResolver(StorePinResolver resolver) { _storePinResolver = std::move(resolver); }
     // Synchronously publish `surface` to its store object: its changed vertices
     // (with `vertices`) and its loaded `channels` (every channel when empty).
-    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {});
+    // With `geometryRevision`, only over that stored geometry (SurfaceStoreEdit::save).
+    bool saveSurface(QuadSurface* surface, bool vertices = true, const std::vector<std::string>& channels = {},
+                     const std::optional<std::string>& geometryRevision = std::nullopt);
     // The store revisions the surface's edits continue from.
     std::optional<vc::objects::PinnedObject> storePin(QuadSurface* surface);
     void endEditingSession();
@@ -133,6 +135,7 @@ public:
     void refreshSessionFromSurface(QuadSurface* surface);
     bool applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect);
     void requestAutosaveFromGrowth();
+    [[nodiscard]] bool captureSurfaceUndoSnapshot();
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
     // The active surface's correction point collections in the store.
     void loadCorrections(QuadSurface* surface);
@@ -415,8 +418,7 @@ private:
                      const cv::Vec3f& worldPos);
     void onSurfaceCollectionChanged(std::string name, std::shared_ptr<Surface> surface);
 
-    [[nodiscard]] bool captureUndoSnapshot();
-    [[nodiscard]] bool captureUndoDelta();  // Capture delta from current edited vertices
+    [[nodiscard]] bool captureUndoDelta(bool activateRepairedCells = false);
     void discardLastUndoSnapshot();
     bool restoreUndoSnapshot();
     void clearUndoStack();

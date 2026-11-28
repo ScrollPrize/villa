@@ -11,10 +11,18 @@ import os
 import numpy as np
 import torch
 
+from . import _reader
 from .cuda import DeviceArray
 from .transforms._pipeline import _batch_params as _params, _batch_seeds as _seeds
 
 __all__ = ["CudaLoader", "structure_tensor", "sample_array", "surface_points", "surface_derivatives"]
+
+
+_NATIVE_CUDA = hasattr(_reader, '_dlpack_stream')
+
+
+def _uses_cpu_staging(device):
+    return device.type == 'mps' or (device.type == 'cuda' and not _NATIVE_CUDA)
 
 
 def _main_process():
@@ -342,14 +350,14 @@ def sample_array(values, points, *, order=1, boundary="zeros", fill=0):
     Native CPU/CUDA forward and first-order gradients for values and coordinates.
     CUDA value gradients use atomic addition, like torch grid_sample. Coordinate
     gradients and forward values have no competing floating-point writes.
-    MPS stages through CPU and retains autograd. Double backward is unsupported.
+    MPS, or CUDA when built without the native CUDA backend, stages through CPU and retains autograd. Double backward is unsupported.
     """
     if values.ndim not in (4, 5) or points.ndim < 3 or points.shape[0] != values.shape[0] or points.shape[-1] != values.ndim-2:
         raise ValueError('expected B,C,[Z,]Y,X values and B,...,D points')
     if values.device != points.device:
         raise ValueError('values and points must be on the same device')
     device = values.device
-    if device.type == 'mps':
+    if _uses_cpu_staging(device):
         return sample_array(values.cpu(), points.cpu(), order=order, boundary=boundary, fill=fill).to(device)
     shape = points.shape[1:-1]
     result = _SampleArray.apply(values.float().contiguous(), points.float().reshape(values.shape[0], -1, points.shape[-1]).contiguous(), int(order), boundary, float(fill))
@@ -378,8 +386,9 @@ def surface_points(xyz, valid, rc, *, derivatives=None, border=False):
     if any(t.requires_grad for t in (xyz, rc)):
         raise ValueError('surface_points takes fixed supervision grids and queries')
     device = xyz.device
-    if device.type == 'mps':
-        return tuple(t.to(device) for t in surface_points(xyz.cpu(), valid.cpu(), rc.cpu(), border=border))
+    if _uses_cpu_staging(device):
+        cpu_derivs = None if derivatives is None else derivatives.cpu()
+        return tuple(t.to(device) for t in surface_points(xyz.cpu(), valid.cpu(), rc.cpu(), derivatives=cpu_derivs, border=border))
     xyz, valid, rc = xyz.float().contiguous(), valid.bool().contiguous(), rc.float().contiguous()
     if derivatives is None:
         derivatives = surface_derivatives(xyz, valid)
@@ -416,6 +425,6 @@ def surface_derivatives(xyz, valid):
     """Reusable bicubic derivatives for fixed B,H,W,3 supervision grids."""
     if xyz.requires_grad:
         raise ValueError('surface_derivatives takes fixed supervision grids')
-    if xyz.device.type == 'mps':
+    if _uses_cpu_staging(xyz.device):
         return surface_derivatives(xyz.cpu(), valid.cpu()).to(xyz.device)
     return torch.ops.vc_reader.resident_derivatives(xyz.float().contiguous(), valid.bool().contiguous())

@@ -1,4 +1,5 @@
 #include "SurfaceGridEdit.hpp"
+#include "SegmentationUndoHistory.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -6,6 +7,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <utility>
 
@@ -42,6 +44,21 @@ int channelFactor(int channelDim, int gridDim)
         return 0;
     }
     return channelDim / gridDim;
+}
+
+cv::Mat editableMask(QuadSurface& surface, const cv::Size& size)
+{
+    auto mask = surface.channel("mask", SURF_CHANNEL_NORESIZE);
+    if (!mask.empty() && (!channelFactor(mask.rows, size.height) || !channelFactor(mask.cols, size.width)))
+        cv::resize(mask, mask, size, 0, 0, cv::INTER_NEAREST);
+    return mask;
+}
+
+cv::Mat maskBlock(cv::Mat& mask, const cv::Size& size, int row, int col)
+{
+    const int fy = mask.rows / size.height;
+    const int fx = mask.cols / size.width;
+    return mask(cv::Rect(col * fx, row * fy, fx, fy));
 }
 
 } // namespace
@@ -84,6 +101,13 @@ bool resizeSurfaceGrid(QuadSurface& surface, int top, int bottom, int left, int 
     for (const auto& [name, channel] : resizedChannels) {
         surface.setChannel(name, channel);
     }
+    const cv::Rect resizedBounds(0, 0, newCols, newRows);
+    QuadSurface::MaskedVertices maskedVertices;
+    for (const auto& vertex : surface.maskedVertices.all()) {
+        const auto cell = vertex.cell + cv::Point(left, top);
+        if (resizedBounds.contains(cell)) maskedVertices.set(cell, vertex.coords);
+    }
+    surface.maskedVertices = std::move(maskedVertices);
     *points = cv::Mat_<cv::Vec3f>(resized);
     surface.invalidateCache();
     return true;
@@ -99,24 +123,16 @@ bool markMaskCellsValid(QuadSurface& surface, const std::vector<cv::Point>& cell
     if (std::find(names.begin(), names.end(), std::string("mask")) == names.end()) {
         return false;
     }
-    cv::Mat mask = surface.channel("mask", SURF_CHANNEL_NORESIZE);
+    auto mask = editableMask(surface, points->size()).clone();
     if (mask.empty()) {
         return false;
     }
-    int fy = channelFactor(mask.rows, points->rows);
-    int fx = channelFactor(mask.cols, points->cols);
-    if (fy == 0 || fx == 0) {
-        cv::resize(mask, mask, points->size(), 0, 0, cv::INTER_NEAREST);
-        fy = 1;
-        fx = 1;
-    }
-    mask = mask.clone();
     bool changed = false;
     for (const auto& cell : cells) {
         if (cell.x < 0 || cell.y < 0 || cell.x >= points->cols || cell.y >= points->rows) {
             continue;
         }
-        cv::Mat block = mask(cv::Rect(cell.x * fx, cell.y * fy, fx, fy));
+        cv::Mat block = maskBlock(mask, points->size(), cell.y, cell.x);
         block.setTo(cv::Scalar::all(255));
         changed = true;
     }
@@ -125,6 +141,147 @@ bool markMaskCellsValid(QuadSurface& surface, const std::vector<cv::Point>& cell
         surface.invalidateCache();
     }
     return changed;
+}
+
+cv::Rect excludeSurfaceVertices(QuadSurface& surface, const std::vector<cv::Point>& cells)
+{
+    auto* points = surface.rawPointsPtr();
+    if (!points || points->empty() || cells.empty()) return {};
+
+    const auto size = points->size();
+    const cv::Rect bounds(cv::Point{}, size);
+    auto mask = editableMask(surface, size);
+    if (mask.empty()) mask = surface.validMask();
+    mask = mask.clone();
+    cv::Mat_<uint8_t> exclusions = surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (exclusions.empty()) exclusions = cv::Mat_<uint8_t>(size, uint8_t{0});
+    else if (exclusions.size() == size) exclusions = exclusions.clone();
+    else return {};
+
+    cv::Rect changed;
+    for (const auto& cell : cells) {
+        if (!bounds.contains(cell)) continue;
+        auto& point = (*points)(cell);
+        auto block = maskBlock(mask, size, cell.y, cell.x);
+        if (!vc::geometry::validSurfacePoint(point)) {
+            // In registered views the mask carries canonical validity, even
+            // when a usable point lands at negative Z or at the display sentinel.
+            if (!surface.hasTransformedCoordinates || !std::isfinite(point[0]) ||
+                !std::isfinite(point[1]) || !std::isfinite(point[2])) continue;
+            double lowest;
+            cv::minMaxLoc(block, &lowest);
+            if (lowest < 255) continue;
+        }
+        surface.maskedVertices.set(cell, point);
+        point = {-1, -1, -1};
+        block.setTo(0);
+        exclusions(cell) = 255;
+        changed |= cv::Rect(cell, cv::Size(1, 1));
+    }
+    if (!changed.empty()) {
+        surface.setChannel("mask", mask);
+        surface.setChannel("growth_exclusions", exclusions);
+        surface.invalidateCache();
+    }
+    return changed;
+}
+
+bool activateRepairedVertices(QuadSurface& surface, std::vector<VertexDelta>& deltas)
+{
+    const auto& points = *std::as_const(surface).rawPointsPtr();
+    const auto size = points.size();
+    const cv::Rect bounds(cv::Point{}, size);
+    auto mask = editableMask(surface, size);
+    cv::Mat_<uint8_t> exclusions = surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    bool maskChanged = false;
+    bool exclusionsChanged = false;
+    bool hiddenChanged = false;
+    for (auto& delta : deltas) {
+        const cv::Point cell(delta.col, delta.row);
+        if (!bounds.contains(cell) || !vc::geometry::validSurfacePoint(points(cell))) continue;
+        if (const auto retained = surface.maskedVertices.erase(cell)) {
+            delta.previousHiddenWorld = *retained;
+            hiddenChanged = true;
+        }
+        if (!mask.empty()) {
+            const auto previous = maskBlock(mask, size, delta.row, delta.col);
+            if (size_t(cv::countNonZero(previous)) < previous.total()) {
+                delta.previousMask = previous.clone();
+                if (!maskChanged) mask = mask.clone();
+                maskBlock(mask, size, delta.row, delta.col).setTo(255);
+                maskChanged = true;
+            }
+        }
+        if (exclusions.size() == size && exclusions(cell)) {
+            delta.previousExclusion = exclusions(cell);
+            if (!exclusionsChanged) exclusions = exclusions.clone();
+            exclusions(cell) = 0;
+            exclusionsChanged = true;
+        }
+    }
+    // A repaired padding cell had no XYZ or exclusion before the edit. Keep
+    // an explicit sidecar, even when all markers are zero, so Undo/save and
+    // checkpoint recovery can replace that coordinate with true absence.
+    if (maskChanged && exclusions.empty()) {
+        exclusions = cv::Mat_<uint8_t>(size, uint8_t{0});
+        exclusionsChanged = true;
+    }
+    if (maskChanged) surface.setChannel("mask", mask);
+    if (exclusionsChanged) surface.setChannel("growth_exclusions", exclusions);
+    if (maskChanged || exclusionsChanged || hiddenChanged) surface.invalidateCache();
+    return maskChanged || exclusionsChanged || hiddenChanged;
+}
+
+bool restoreRepairedVertices(QuadSurface& surface, const std::vector<VertexDelta>& deltas)
+{
+    if (std::none_of(deltas.begin(), deltas.end(), [](const auto& delta) {
+        return !delta.previousMask.empty() || delta.previousExclusion || delta.previousHiddenWorld.has_value();
+    })) return false;
+
+    const auto size = std::as_const(surface).rawPointsPtr()->size();
+    const cv::Rect bounds(cv::Point{}, size);
+    auto mask = editableMask(surface, size);
+    cv::Mat_<uint8_t> exclusions = surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    bool maskChanged = false;
+    bool exclusionsChanged = false;
+    bool hiddenChanged = false;
+    for (const auto& delta : deltas) {
+        const cv::Point cell(delta.col, delta.row);
+        if (!bounds.contains(cell)) continue;
+        if (!delta.previousMask.empty() && !mask.empty()) {
+            if (!maskChanged) mask = mask.clone();
+            delta.previousMask.copyTo(maskBlock(mask, size, delta.row, delta.col));
+            maskChanged = true;
+        }
+        if (delta.previousExclusion && exclusions.size() == size) {
+            if (!exclusionsChanged) exclusions = exclusions.clone();
+            exclusions(cell) = delta.previousExclusion;
+            exclusionsChanged = true;
+        }
+        if (delta.previousHiddenWorld) {
+            surface.maskedVertices.set(cell, *delta.previousHiddenWorld);
+            hiddenChanged = true;
+        }
+    }
+    if (maskChanged) surface.setChannel("mask", mask);
+    if (exclusionsChanged) surface.setChannel("growth_exclusions", exclusions);
+    if (maskChanged || exclusionsChanged || hiddenChanged) surface.invalidateCache();
+    return maskChanged || exclusionsChanged || hiddenChanged;
+}
+
+void applyGrowthChannels(QuadSurface& surface, QuadSurface& result)
+{
+    const auto generations = result.channel("generations", SURF_CHANNEL_NORESIZE);
+    if (!generations.empty()) surface.setChannel("generations", generations);
+
+    auto mask = result.channel("mask", SURF_CHANNEL_NORESIZE);
+    if (mask.empty()) mask = surface.validMask();
+    surface.setChannel("mask", mask);
+
+    auto exclusions = result.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (exclusions.empty()) exclusions = cv::Mat_<uint8_t>(surface.rawPointsPtr()->size(), uint8_t{0});
+    surface.setChannel("growth_exclusions", exclusions);
+    surface.maskedVertices = result.maskedVertices;
 }
 
 } // namespace segmentation

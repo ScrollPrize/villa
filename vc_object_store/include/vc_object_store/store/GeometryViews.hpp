@@ -1,4 +1,5 @@
 #pragma once
+#include <span>
 #include <stdexcept>
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
@@ -103,6 +104,9 @@ struct TransformedSurfaceTile {
     std::vector<geometry::Point> points;
     std::vector<uint8_t> validity;
     std::array<double,2> scale{1,1};
+    // Filled when reading with applyValidity=false. Computed in the canonical
+    // frame, so even a displayed (-1,-1,-1) can have a retained coordinate.
+    std::vector<uint8_t> coordinatePresence;
 };
 // The frame a transformed view reads in: `volume`'s voxels at `scale`, mapped
 // by `mapping` from the object's stored coordinates. A value to keep with what
@@ -135,7 +139,12 @@ public:
         const std::vector<geometry::SurfacePoint>& desired, const std::vector<GeometryEdgeEdit>& edges={}) const;
     // Float32 surface consumer adapter. Validity remains separate from XYZ;
     // unchanged displayed vertices reuse the exact canonical float32 values.
-    geometry::Surface canonicalSurface(const geometry::Surface& desired) const;
+    // This is a replacement grid: missing vertices clear old hidden coordinates,
+    // and validity comes from the replacement rather than the old grid indices.
+    // An optional presence byte per desired vertex can identify retained
+    // coordinates that happen to equal the missing sentinel in the target frame.
+    geometry::Surface canonicalSurface(const geometry::Surface& desired,
+        std::span<const uint8_t> retainedCoordinates = {}) const;
     // A whole edited fiber (points in the target volume) in canonical
     // coordinates. Control points keep their exact canonical values while
     // their displayed position is unchanged, matched by stable ID (by index
@@ -147,12 +156,21 @@ public:
     geometry::PointCollection canonicalPointCollection(const geometry::PointCollection& desired) const;
     // `validity`, when given, is the whole grid's validity the edits apply to
     // instead of the stored one (an earlier operation of the same request
-    // replaces the valid channel).
+    // replaces the valid channel). It remains authoritative when XYZ changes.
+    // `clearMaskedCoordinates` marks cells whose coordinate state is replaced:
+    // a missing desired XYZ under explicit zero validity clears its hidden XYZ,
+    // including an empty padding cell with no exclusion marker. Optional
+    // retainedCoordinates (one byte per desired tile vertex) distinguishes a
+    // hidden XYZ at the target frame's sentinel from such an empty cell.
     std::vector<GeometryArrayEdit> surfaceEdits(int64_t row, int64_t column,
         int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired,
-        const std::vector<uint8_t>* validity = nullptr) const;
+        const std::vector<uint8_t>* validity = nullptr,
+        const std::vector<uint8_t>* clearMaskedCoordinates = nullptr,
+        std::span<const uint8_t> retainedCoordinates = {}) const;
     std::vector<geometry::Point> points(const std::string& array,int64_t start,int64_t count) const;
-    TransformedSurfaceTile readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const;
+    // With applyValidity=false, transform all present coordinates and return validity separately.
+    TransformedSurfaceTile readTile(int64_t row, int64_t column, int64_t rows, int64_t columns,
+                                    bool applyValidity = true) const;
     // Encode only explicitly changed positions; unchanged values reuse their
     // original bytes. Track edits round to nearest, with ties away from zero.
     std::vector<GeometryArrayEdit> coordinateEdits(const std::string& array,int64_t start,

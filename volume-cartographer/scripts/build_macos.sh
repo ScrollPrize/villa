@@ -201,14 +201,20 @@ fi
 
 # lapack and openblas are keg-only on macOS (Accelerate ships LAPACK but not
 # LAPACKE, which PaStiX requires; openblas would otherwise be masked by
-# Accelerate). openssl@3 is keg-only and needed by vc_object_store. Make them
-# discoverable by pkg-config and cmake's find_package.
-for keg in lapack openblas openssl@3; do
+# Accelerate). openssl@3 is keg-only and needed by vc_object_store. sqlite is
+# keg-only too: without it vc_object_store links the system SQLite, which
+# cannot open a store read-only once its -wal and -shm files are gone (a
+# sealed or copied .vcobj). Make them discoverable by pkg-config and cmake's
+# find_package.
+for keg in lapack openblas openssl@3 sqlite; do
   if [[ -d "$brew_prefix/opt/$keg" ]]; then
     export PKG_CONFIG_PATH="$brew_prefix/opt/$keg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     export CMAKE_PREFIX_PATH="$brew_prefix/opt/$keg${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
   fi
 done
+# Re-find SQLite so build dirs configured before the keg was added drop the
+# cached system copy.
+extra_cmake_args+=("-USQLite3_INCLUDE_DIR" "-USQLite3_LIBRARY")
 # Force PaStiX onto OpenBLAS instead of letting morse_cmake fall back to
 # Accelerate.framework — see openblas note in required_formulae above.
 extra_cmake_args+=("-DBLA_VENDOR=OpenBLAS")

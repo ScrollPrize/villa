@@ -41,7 +41,8 @@ add_executable(test_catalog_project_dialog
 set_target_properties(test_catalog_project_dialog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_catalog_project_dialog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
 target_link_libraries(test_catalog_project_dialog PRIVATE
-    Qt6::Core Qt6::Widgets Qt6::Test Qt6::Concurrent vc_core vc_lasagna vc_object_store::vc_objects vc_object_store::vc_object_geometry)
+    Qt6::Core Qt6::Widgets Qt6::Test Qt6::Concurrent Qt6::Network
+    vc_core vc_lasagna vc_object_store::vc_objects vc_object_store::vc_object_geometry)
 add_test(NAME catalog_project_dialog COMMAND test_catalog_project_dialog)
 vc_register_test_target(test_catalog_project_dialog)
 vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
@@ -706,12 +707,13 @@ if(TARGET VC3D)
 endif()
 
 add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp
+    ../segmentation/SurfaceGridEdit.cpp ../segmentation/SurfaceGridEdit.hpp
     ../segmentation/SurfaceStoreEdit.cpp ../segmentation/SurfaceStoreEdit.hpp
     ../segmentation/SurfaceCorrections.cpp ../segmentation/SurfaceCorrections.hpp
     ../OpenDataResourceSelection.cpp ../VolumeRegistrations.cpp ../SessionDrafts.cpp ../SessionDrafts.hpp)
 set_target_properties(test_surface_catalog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_surface_catalog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
-target_link_libraries(test_surface_catalog PRIVATE vc_core Qt6::Core Qt6::Concurrent)
+target_link_libraries(test_surface_catalog PRIVATE vc_core vc_object_store::vc_object_geometry Qt6::Core Qt6::Concurrent)
 if(TARGET vc_object_server)
     target_link_libraries(test_surface_catalog PRIVATE vc_object_server)
     target_compile_definitions(test_surface_catalog PRIVATE VC3D_TEST_HOSTED=1)

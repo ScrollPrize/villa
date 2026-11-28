@@ -3,6 +3,7 @@
 #include "vc_reader/computed.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/array.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 
 #include <cstdio>
 #include <fstream>
@@ -72,19 +73,19 @@ std::unique_ptr<Array> open(const Options& options, ChunkCompute compute)
         fs::create_directories(dir);
         if (auto existing = readJson(dir / ".zarray")) {
             if (*existing != stored)
-                throw std::runtime_error(dir.string() + " holds computed chunks of another shape, dtype or fill: " +
+                throw std::runtime_error(utf8String(dir) + " holds computed chunks of another shape, dtype or fill: " +
                                          existing->dump());
             const auto attrs = readJson(dir / ".zattrs");
             if (!attrs || *attrs != attributes)
-                throw std::runtime_error(dir.string() + " holds computed chunks of another identity");
+                throw std::runtime_error(utf8String(dir) + " holds computed chunks of another identity");
         } else {
             zarr::atomicWrite(dir / ".zattrs", attributes.dump());
             zarr::atomicWrite(dir / ".zarray", stored.dump());
         }
-        spec.layers.push_back(LayerSpec{"decoded", dir.string(), options.compressCache ? "vc-delta3d" : "", "", false});
+        spec.layers.push_back(LayerSpec{"decoded", utf8String(dir), options.compressCache ? "vc-delta3d" : "", "", false});
         spec.write_layer = 0;
         if (options.cacheMaxBytes)
-            spec.disk_cache = zarr::diskBudget(options.cacheDir->string(), options.cacheMaxBytes);
+            spec.disk_cache = zarr::diskBudget(utf8String(*options.cacheDir), options.cacheMaxBytes);
     }
     return std::make_unique<Array>(std::move(spec), options.memoryCache);
 }

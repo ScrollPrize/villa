@@ -9,6 +9,7 @@
 #include <QFuture>
 #include <QObject>
 #include <QString>
+#include <opencv2/core/types.hpp>
 
 #include <filesystem>
 #include <memory>
@@ -45,6 +46,13 @@ public:
 
     // Apply the recovered grid and validity together before the editor saves it.
     static void restoreSurface(QuadSurface& surface, const vc::geometry::Surface& draft);
+    // A resized draft must include every existing annexed channel and explicit exclusions.
+    static bool canRestoreSurface(QuadSurface& surface, const vc::geometry::Surface& draft);
+    // Preserve the grid and explicit growth exclusions in a recoverable draft.
+    static vc::geometry::Surface surfaceForDraft(QuadSurface& surface, bool fullChannels = false);
+    // Publish changed vertices while retaining masked XYZ inside the rectangle.
+    static void updateSurfaceDraft(vc::objects::ObjectStoreSession& session, QuadSurface& surface,
+                                    const cv::Rect& rectangle);
 
     // Resolve, in the background, pending saves of attached stores: those
     // recovered at start, and those still pending one tick after they were

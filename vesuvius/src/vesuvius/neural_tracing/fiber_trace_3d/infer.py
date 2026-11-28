@@ -4,12 +4,14 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import platform
 import subprocess
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import vc_reader
 
@@ -380,6 +382,49 @@ def _select_and_expand_crop(
     )
 
 
+# Each output store records the tiling its chunks were predicted with, because
+# resume reuses every stored chunk and inference.json is shared by the directory.
+TILING_ATTR = "fiber_inference_tiling"
+
+
+def _store_has_chunks(store: Path) -> bool:
+    """Whether a local Zarr v2 store holds any chunk (metadata files start with '.')."""
+    return any(
+        not name.startswith(".") for _dirpath, _dirs, files in os.walk(store) for name in files
+    )
+
+
+def _refuse_other_tiling(
+    stores: list[Path], tiling: dict[str, int], adopt_unrecorded: bool = False,
+) -> None:
+    """Refuse stores holding chunks predicted with another or an unrecorded tiling.
+
+    Stores without chunks (such as after an interruption during setup) are adopted,
+    as are stores without a recorded tiling when the caller vouches for them.
+    """
+    def describe(value: object) -> str:
+        return " ".join(f"{k}={v}" for k, v in value.items()) if isinstance(value, dict) else repr(value)
+
+    for store in stores:
+        try:
+            recorded = json.loads((store / ".zattrs").read_text()).get(TILING_ATTR)
+        except (OSError, ValueError, AttributeError):
+            recorded = None
+        if recorded == tiling or (recorded is None and adopt_unrecorded) or not _store_has_chunks(store):
+            continue
+        if recorded is None:
+            raise ValueError(
+                f"{store} holds prediction chunks but records no tiling (written before tilings "
+                "were recorded), so they cannot be reused safely; pass --adopt-unrecorded-tiling "
+                "if they were predicted with this tiling, or use a new output path or remove the store."
+            )
+        raise ValueError(
+            f"{store} holds prediction chunks from tiling {describe(recorded)}, but this run "
+            f"uses {describe(tiling)}; rerun with the recorded tiling to resume, or use a new "
+            "output path or remove the store."
+        )
+
+
 def run_fiber_trace_3d_inference(
     *,
     config_path: str | Path | None = None,
@@ -390,14 +435,14 @@ def run_fiber_trace_3d_inference(
     devices: str | tuple[str, ...] | None = None,
     crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None,
     tile_size: int | None = None,
-    overlap: int = 16,
+    overlap: int | None = None,
     border: int = 16,
     inference_scaledown_power: int | None = None,
     base_ref: str | None = None,
     base_scale: int | None = None,
     levels: int = 5,
     ome_chunk: int = 64,
-    ome_compressor: str = DEFAULT_OME_COMPRESSOR,
+    ome_compressor: str | None = DEFAULT_OME_COMPRESSOR,
     pyramid_workers: int = 0,
     recurrent_steps: int | None = None,
     prefetch_workers: int = 0,
@@ -417,6 +462,7 @@ def run_fiber_trace_3d_inference(
     output_format: str = "compact",
     blank_invalid: bool = False,
     width_uint8_base: bool = True,
+    adopt_unrecorded_tiling: bool = False,
     provenance_context_path: str | Path | None = None,
 ) -> None:
     if int(input_connections) <= 0:
@@ -435,8 +481,16 @@ def run_fiber_trace_3d_inference(
         raise ValueError("input_cache_gib must be finite and >= 0")
     if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0:
         raise ValueError("prefetch_tiles_per_gpu and input_io_threads must be > 0")
+    min_overlap = 2 * max(0, int(border))
+    overlap = max(16, min_overlap) if overlap is None else int(overlap)
+    if overlap < min_overlap:
+        # Tiles discard `border` voxels on every side, so a smaller overlap leaves
+        # gaps between tile cores that are written as presence 0.
+        raise ValueError(f"overlap={overlap} must be >= 2 * border={border}")
     config, config_source = _checkpoint_config_for_inference(checkpoint, config_path)
     tile_size_i = _tile_size_from_config(config, tile_size)
+    if overlap >= tile_size_i:
+        raise ValueError(f"overlap={overlap} must be < tile_size={tile_size_i}")
     output_manifest = Path(output_path)
     from lasagna.compact_zarr import CompactOutputAdapter, resolve_output
     output_manifest, output_format = resolve_output(output_manifest, output_format)
@@ -533,27 +587,46 @@ def run_fiber_trace_3d_inference(
         emit_width="width" in annotation_heads,
         emit_normals="normal" in annotation_heads,
     )
+    if ome_compressor == "vc-delta3d" and any(np.dtype(p.dtype) != np.uint8 for p in predict_adapter.output_products):
+        raise ValueError("vc-delta3d stores uint8 output only; float32 widths need --ome-compressor blosc-zstd")
+    # Stored chunks are reused as complete, so a store's chunks must come from this tiling.
+    tiling = {
+        "tile_size": int(tile_size_i), "overlap": int(overlap), "border": int(border),
+        "input_scaledown": int(input_sd), "output_scaledown": int(output_sd_input),
+        "ome_chunk": int(ome_chunk),
+    }
+    if output_format == "compact":
+        tiled_stores = [output_manifest]
+    else:
+        tiled_stores = sorted({Path(OmeZarrOutputAdapter.channel_path(channel))
+                               for product in predict_adapter.output_products
+                               for channel in product.channels})
+    _refuse_other_tiling(tiled_stores, tiling, adopt_unrecorded_tiling)
     if output_format == "compact":
         from lasagna.lasagna_volume import VALIDITY_BY_CHUNKS
+        from vc_reader.reader import create_group
         products = predict_adapter.output_products
         output_adapter = CompactOutputAdapter(root=output_manifest, products=products, n_levels=n_levels,
             validity_channel=VALIDITY_BY_CHUNKS, blank_invalid=blank_invalid)
         output_adapter.prepare(base_shape_zyx=base_shape_zyx, ome_chunk=int(ome_chunk),
             ome_compressor=ome_compressor, crop=crop_xyzwhd,
             provenance="../inference.json", extra_fields={"width_encoding": "uint8-base-voxels" if width_uint8_base else "float32-input-voxels"})
+        create_group(output_manifest).attrs[TILING_ATTR] = tiling
     else:
         output_adapter = OmeZarrOutputAdapter(
             products=predict_adapter.output_products,
             n_levels=n_levels,
         )
         output_adapter.blank_invalid = blank_invalid
-        create_product_omezarr_groups(
+        channel_groups = create_product_omezarr_groups(
             products=predict_adapter.output_products,
             base_shape_zyx=base_shape_zyx,
             n_levels=n_levels,
             ome_chunk=int(ome_chunk),
             ome_compressor=ome_compressor,
         )
+        for group in channel_groups.values():
+            group.attrs[TILING_ATTR] = tiling
         write_lasagna_product_manifest(
             output_path=output_manifest,
             products=predict_adapter.output_products,
@@ -630,7 +703,7 @@ def run_fiber_trace_3d_inference(
             "border": int(border),
             "overlap": int(overlap),
             "ome_chunk": int(ome_chunk),
-            "ome_compressor_requested": str(ome_compressor),
+            "ome_compressor_requested": ome_compressor,
             "precision": precision_mode,
             "product_accumulator_dtype": str(product_accumulator_dtype),
             "recurrent_steps": predict_adapter.recurrent_steps,
@@ -787,8 +860,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Export width rounded/clamped to uint8 base-volume voxels.")
     parser.add_argument("--checkpoint", required=True, help="Fiber trace 3D model checkpoint (.pt).")
     parser.add_argument("--tile-size", type=int, default=None, help="Inference tile cube size.")
-    parser.add_argument("--overlap", type=int, default=16, help="Tile overlap in input voxels.")
+    parser.add_argument("--overlap", type=int,
+                        help="Tile overlap in input voxels (default: max(16, 2 * border)); "
+                             "must be at least twice the border and smaller than the tile size.")
     parser.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
+    parser.add_argument("--adopt-unrecorded-tiling", action="store_true",
+                        help="Resume output stores that record no tiling as if predicted with this tiling; "
+                             "only for chunks you know were.")
     parser.add_argument(
         "--inference-scaledown-power", type=int, default=None,
         help="Total power-of-two output reduction relative to input, including model stride. "
@@ -931,18 +1009,19 @@ def main(argv: list[str] | None = None) -> int:
         output_format=args.output_format,
         blank_invalid=args.blank_invalid,
         width_uint8_base=args.width_uint8_base,
+        adopt_unrecorded_tiling=args.adopt_unrecorded_tiling,
         device=args.device,
         devices=args.devices,
         crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
         tile_size=args.tile_size,
-        overlap=int(args.overlap),
+        overlap=args.overlap,
         border=int(args.border),
         inference_scaledown_power=args.inference_scaledown_power,
         base_ref=args.base_ref,
         base_scale=args.base_scale,
         levels=int(args.levels),
         ome_chunk=int(args.ome_chunk),
-        ome_compressor=str(args.ome_compressor),
+        ome_compressor=args.ome_compressor,
         pyramid_workers=int(args.pyramid_workers),
         recurrent_steps=args.recurrent_steps,
         prefetch_workers=int(args.prefetch_workers),

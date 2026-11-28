@@ -8,8 +8,11 @@ namespace vc::objects { class TransformedGeometryView; class StoreReader; }
 #include <functional>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <ranges>
+#include <span>
 #include <set>
 #include <tuple>
 #include <unordered_map>
@@ -454,6 +457,44 @@ public:
 
     void setChannel(const std::string& name, const cv::Mat& channel);
     cv::Mat channel(const std::string& name, int flags = 0);
+    struct MaskedVertex {
+        cv::Point cell;
+        cv::Vec3f coords;
+    };
+    // Rows are sparse; within a row, retained vertices are sorted by column.
+    // Lookups and small draft writes never visit unrelated rows or columns.
+    class MaskedVertices {
+    public:
+        MaskedVertices() = default;
+        MaskedVertices(std::initializer_list<MaskedVertex> vertices) {
+            for (const auto& vertex : vertices) set(vertex.cell, vertex.coords);
+        }
+        void set(cv::Point cell, cv::Vec3f coords);
+        std::optional<cv::Vec3f> get(cv::Point cell) const;
+        std::optional<cv::Vec3f> erase(cv::Point cell);
+        std::span<const MaskedVertex> row(int row, int firstColumn, int endColumn) const;
+        auto all() const { return _rows | std::views::values | std::views::join; }
+        bool empty() const { return _rows.empty(); }
+        std::size_t size() const;
+        void flipRows(int height);
+        void flipColumns(int width);
+        void clear() { _rows.clear(); }
+    private:
+        std::map<int, std::vector<MaskedVertex>> _rows;
+    };
+    MaskedVertices maskedVertices;
+    // Present when the editor grid is expressed in a different frame from the stored XYZ.
+    bool hasTransformedCoordinates = false;
+    // Per-vertex input mask using the store's reduction for oversampled masks.
+    cv::Mat_<uint8_t> vertexMask();
+    cv::Mat_<uint8_t> vertexMask(const cv::Rect& rectangle);
+    // Retain coordinates behind the mask only when writing a surface.
+    cv::Mat_<cv::Vec3f> pointsForStorage();
+    // The requested grid rectangle, with hidden coordinates restored for storage.
+    cv::Mat_<cv::Vec3f> pointsForStorage(const cv::Rect& rectangle);
+    // Row-major presence bits for hidden XYZ equal to the display sentinel.
+    // Empty when no retained coordinate in this area needs disambiguation.
+    std::vector<uint8_t> retainedDisplaySentinels(const cv::Rect& area) const;
     // Loads a registered channel that has no data yet (e.g. from its stored
     // geometry revision) on first access.
     void setChannelLoader(std::function<cv::Mat(const std::string&)> loader) { _channelLoader = std::move(loader); }
@@ -496,6 +537,7 @@ protected:
 
 private:
 
+    cv::Mat* loadChannel(const std::string& name);
     void saveWithUuid(const std::filesystem::path& path, const std::string& uuid, bool force_overwrite);
     std::string objectUuidOrNew() const;
     // Flag for lazy loading - true if points need to be loaded from path
@@ -549,14 +591,19 @@ std::vector<vc::objects::TransactionOperation> create_quad_operations(const std:
 vc::geometry::Surface quad_surface_grid(QuadSurface&);
 // Geometry for putGeometry: quad_surface_grid and the other channels.
 vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
+// A native stored surface channel in OpenCV's existing channel order.
+cv::Mat quad_channel_mat(const vc::objects::GeometryArray& channel);
 // The sparse edit publishing the vertices of `rect` (grid rows/columns) that
 // differ from the revision `view` shows (its stored frame or a transformed
-// one): new coordinates also mark the vertex valid; a vertex cleared to the
-// sentinel loses its coordinates. Relationships the edit affects are kept as
-// recorded. nullopt when nothing changed. `validity` is the grid's validity
+// one): new coordinates mark the vertex valid unless explicit validity is
+// supplied; a vertex cleared to the sentinel loses its coordinates. Affected
+// relationships are kept as recorded. nullopt when nothing changed. `validity` is the grid's validity
 // when an earlier operation of the request replaces it (quad_channels_operation).
+// Explicit coordinate-state replacement may clear hidden XYZ at missing cells,
+// including padding restored by Undo without an exclusion marker.
 std::optional<vc::objects::EditGeometryOp> quad_rect_edit(const vc::objects::TransformedGeometryView& view,
-    QuadSurface&, const cv::Rect& rect, const std::vector<uint8_t>* validity = nullptr);
+    QuadSurface&, const cv::Rect& rect, const std::vector<uint8_t>* validity = nullptr,
+    const std::vector<uint8_t>* clearMaskedCoordinates = nullptr);
 // Replace the named channels ("mask" is `valid`) of a rows x columns surface
 // with the surface's and remove `remove`, keeping affected relationships as
 // recorded.

@@ -474,6 +474,9 @@ struct CatalogLoadOptions {
 struct CatalogLoadResult {
     OpenDataManifest manifest;
     bool fromCache = false;
+    // The manifest is the one in options.cacheFile, so cachedManifest(cacheFile)
+    // reads the same catalog. False when the download could not be written there.
+    bool onDisk = false;
     std::string warning;
 };
 CatalogLoadResult loadCatalog(const std::string& source = std::string(kDefaultManifestUrl),

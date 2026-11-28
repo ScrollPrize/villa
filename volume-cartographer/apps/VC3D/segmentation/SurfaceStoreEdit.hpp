@@ -26,6 +26,8 @@ public:
     // Publish `surface`: with the stored grid size, the named channels ("mask"
     // is validity) and then the vertices of `rect` that changed; with another
     // grid size (growth), a new geometry of points, validity and channels.
+    // Supplying both mask and growth_exclusions replaces coordinate state too:
+    // a missing XYZ without a retained hidden vertex restores empty padding.
     // A durable save (ObjectStoreSession::submitDurably): written to the
     // session's draft directory before it is sent. `draftRevision` is the
     // revision of the surface's session draft that `surface` was copied at:
@@ -33,8 +35,16 @@ public:
     // not change since. When a hosted store does not answer, the save stays
     // pending and the next save first resolves it (its receipt, or the
     // identical request again), so saves never skip one another.
+    // With `geometryRevision` (the geometry `surface` was derived from), the
+    // save is refused unless this edit is still at that geometry, also when a
+    // previous save committed or was resolved meanwhile.
     void save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels = {},
-              std::optional<uint64_t> draftRevision = std::nullopt);
+              std::optional<uint64_t> draftRevision = std::nullopt,
+              const std::optional<std::string>& geometryRevision = std::nullopt);
+
+    // Freeze the live geometry, loaded channels and separately retained hidden
+    // coordinates before an autosave worker starts, without loading other channels.
+    static std::shared_ptr<QuadSurface> snapshotForSave(QuadSurface& surface);
 
     vc::objects::PinnedObject pin() const;
     // The pin the edit started from (the opened surface's).

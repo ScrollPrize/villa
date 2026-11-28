@@ -7,9 +7,9 @@ portable provenance, and atomic Atlas staging/ingestion.
 
 New inference outputs default to [compact schema v3](volume_schema_v3.md):
 one Zarr store with an embedded manifest and full-channel CZYX chunks grouped
-by resolution. Existing sidecar outputs remain resumable. Atlas staging and
-Fiberlet discovery below still require legacy output until those consumers
-support v3; append `-- --output-format legacy` when creating those runs.
+by resolution. Existing sidecar outputs remain resumable. Atlas staging,
+Fiberlet inputs (local runs and published normals) and VC3D's open-data catalog
+accept both layouts.
 
 ## Configuration
 
@@ -188,9 +188,9 @@ This skips the prefetch phase and launches inference immediately; past the
 bound the least recently used cached chunks are removed. The input settings
 and final reader counters are copied from portable inference provenance
 (`inference.input`) into manager run metadata (`input`).
-This includes output-format overrides such as `--ome-compressor none`; newly
-created outputs otherwise use the shared Blosc/Zstd default. Resumed arrays
-retain their persisted compressor; compact resumes reject incompatible codec
+This includes output-format overrides such as `--ome-compressor blosc-zstd`; newly
+created packed uint8 outputs otherwise use lossless Delta3D, and others Blosc/Zstd.
+Resumed arrays retain their persisted compressor; compact resumes reject incompatible codec
 or layout requests. `inference.json` inventories the
 actual compressor of every generated level.
 The configured venv is used via its absolute `bin/python`; no interactive

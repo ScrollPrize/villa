@@ -1,6 +1,7 @@
 #include "SegmentationEditManager.hpp"
 
 #include "../../ViewerManager.hpp"
+#include "../../SessionDrafts.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -102,7 +103,7 @@ void SegmentationEditManager::publishWholeDraft()
     }
     // Only the first publication sets the base (saves move it on) and may
     // hold the committed surface.
-    _draft->session->setDraft(_baseSurface->id, quad_surface_grid(*_baseSurface), _draft->coordinates,
+    _draft->session->setDraft(_baseSurface->id, SessionDrafts::surfaceForDraft(*_baseSurface), _draft->coordinates,
                               _draft->attachment, std::exchange(_draft->base, std::nullopt));
     if (std::exchange(_draft->saved, false))
         _draft->session->markDraftSaved(_baseSurface->id, _draft->session->draftRevision(_baseSurface->id));
@@ -135,15 +136,7 @@ void SegmentationEditManager::flushDraft()
     if (rect.empty()) {
         return;
     }
-    std::vector<vc::geometry::SurfacePoint> changed;
-    changed.reserve(size_t(rect.area()));
-    for (int r = rect.y; r < rect.y + rect.height; ++r)
-        for (int c = rect.x; c < rect.x + rect.width; ++c) {
-            const auto& p = (*points)(r, c);
-            changed.push_back(vc::geometry::validSurfacePoint(p) ? vc::geometry::SurfacePoint{p[0], p[1], p[2]}
-                                                                 : vc::geometry::SurfacePoint{-1, -1, -1});
-        }
-    _draft->session->updateDraft(_baseSurface->id, rect.y, rect.x, rect.height, rect.width, changed);
+    SessionDrafts::updateSurfaceDraft(*_draft->session, *_baseSurface, rect);
 }
 
 void SegmentationEditManager::setRadius(float radiusSteps)

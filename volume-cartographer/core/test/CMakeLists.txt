@@ -71,6 +71,10 @@ vc_add_test(NAME test_fiber_constraint_geometry LIBS doctest::doctest vc_object_
 
 vc_add_test(NAME test_omp_thread_point_collection)
 
+# Repeated pool construction/destruction; hung on Windows before the
+# destructor held the pool mutex around request_stop() (#1686).
+vc_add_test(NAME test_thread_pool_lifecycle)
+
 vc_add_test(NAME test_surface_area_units)
 
 
@@ -337,6 +341,7 @@ vc_add_test(NAME test_post_process SOURCES test_post_process.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_surface_meshing)
+vc_add_test(NAME test_inpaint_surface LIBS doctest::doctest vc_inpaint)
 
 # These spawn the built command-line tools, so they only exist in
 # configurations that build the apps -- the test shards configure with
@@ -349,7 +354,7 @@ if(VC_BUILD_APPS)
         TIMEOUT 180)
 
     # Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
-    vc_add_test(NAME test_grow_seg_store_mode)
+    vc_add_test(NAME test_grow_seg_store_mode LIBS doctest::doctest vc_core vc_tracer vc_object_store::vc_object_geometry)
     add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)
     set_tests_properties(test_grow_seg_store_mode PROPERTIES
         ENVIRONMENT "VC_GROW_SEG_FROM_SEED_BIN=$<TARGET_FILE:vc_grow_seg_from_seed>")
@@ -549,6 +554,10 @@ vc_add_test(NAME test_quadsurface_save_paths)
 
 vc_add_test(NAME test_growth_config
     LIBS doctest::doctest vc_tracer
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+vc_add_test(NAME test_growpatch_straight_loss
+    LIBS doctest::doctest opencv_core OpenMP::OpenMP_CXX
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 vc_add_test(NAME test_growth_helpers

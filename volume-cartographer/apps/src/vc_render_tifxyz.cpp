@@ -819,7 +819,7 @@ int main(int argc, char *argv[])
     optional.add_options()
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
-        ("cache-gb", po::value<size_t>()->default_value(16), "Memory cache size in GB")
+        ("cache-gb", po::value<size_t>(), "Memory cache size in GB (default: 16, or half the memory available to this process if that is less)")
         ("cuda", po::bool_switch(), "Sample on the GPU (3-D uint8 volumes; fails without a device)")
         ("cuda-cache-gb", po::value<size_t>()->default_value(vc::cuda::kDefaultToolCacheGb), "Device memory for the volume with --cuda, in GB")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
@@ -837,8 +837,10 @@ int main(int argc, char *argv[])
         ("affine", po::value<std::vector<std::string>>()->multitoken()->composing(), "Affine JSON files (append :inv to invert)")
         ("affine-invert", po::value<std::vector<int>>()->multitoken()->composing(), "0-based indices to invert")
         ("scale-segmentation", po::value<float>()->default_value(1.0), "Scale segmentation")
-        ("rotate", po::value<double>()->default_value(0.0), "Rotate output (0/90/180/270)")
-        ("flip", po::value<int>()->default_value(-1), "Flip: 0=V, 1=H, 2=Both")
+        ("rotate", po::value<double>()->default_value(0.0),
+            "Rotate output image counter-clockwise (0/90/180/270). Applied to rendered pixels, not the mesh node grid (on an uncropped render, a 180 deg pixel rotation sits one node step, in output pixels, off a node-grid rotation).")
+        ("flip", po::value<int>()->default_value(-1),
+            "Flip output image: 0=V, 1=H, 2=Both. Applied to rendered pixels after --rotate, not the mesh node grid.")
         // The geometric normal is N = dP/dU x dP/dV (as vcr::grid's patch normals),
         // so (U, V, N) is right-handed. With the standard segment orientation (V down-screen
         // aligned with +z, text readable, U winding outside->inside) that normal points toward
@@ -1124,10 +1126,22 @@ int main(int argc, char *argv[])
     std::optional<double> tifPixelUm;
 
     // --- Open source volume ---
-    const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
-    if (const size_t mem = usableMemoryBytes(); mem > 0 && cache_bytes >= mem)
-        logPrintf(stderr, "Warning: --cache-gb %llu is not below the memory available to this process (%.1f GB): the render can stall without any output. Lower --cache-gb.\n",
-                  (unsigned long long)parsed["cache-gb"].as<size_t>(), double(mem) / (1024.0 * 1024.0 * 1024.0));
+    // Without --cache-gb: 16 GB, or half the memory this process can use if that is less.
+    // A cache as large as the memory limit gets the render killed or stalled (#1404), and
+    // VC3D's Render segment never passes --cache-gb.
+    constexpr size_t gib = 1024ull * 1024ull * 1024ull;
+    const size_t mem = usableMemoryBytes();
+    size_t cache_bytes = 16 * gib;
+    if (parsed.count("cache-gb")) {
+        cache_bytes = parsed["cache-gb"].as<size_t>() * gib;
+        if (mem > 0 && cache_bytes >= mem)
+            logPrintf(stderr, "Warning: --cache-gb %llu is not below the memory available to this process (%.1f GB): the render can stall without any output. Lower --cache-gb.\n",
+                      (unsigned long long)parsed["cache-gb"].as<size_t>(), double(mem) / double(gib));
+    } else if (mem > 0 && cache_bytes > mem / 2) {
+        cache_bytes = mem / 2;
+        logPrintf(stdout, "Chunk cache: %.1f GB, half the memory available to this process (%.1f GB). Pass --cache-gb to change it.\n",
+                  double(cache_bytes) / double(gib), double(mem) / double(gib));
+    }
 
     // A remote volume opens through Volume so the renderer shares VC3D's remote
     // cache: the globally configured cache root and the URL-derived source

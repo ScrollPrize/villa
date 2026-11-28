@@ -394,6 +394,9 @@ std::shared_ptr<QuadSurface> SegmentationCommandHandler::activeSurface(const std
 
 bool SegmentationCommandHandler::publishSurface(QuadSurface* surface, const QString& action)
 {
+    if (_state)
+        if (const auto live = activeSurface(surface->id))
+            _state->setSurface("segmentation", live, false, true, CState::SurfaceDraftMode::Full);
     if (_surfaceSaver && _surfaceSaver(surface)) {
         return true;
     }
@@ -1614,6 +1617,8 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
     const int origCols = points->cols;
     const int origRows = points->rows;
 
+    // Crop is defined by visible geometry, trimming an excluded-only border.
+    // Hidden coordinates and markers inside this ROI are remapped below.
     const auto boundsOpt = computeValidSurfaceBounds(*points);
     if (!boundsOpt) {
         return fail(tr("Surface %1 does not contain any valid vertices to crop.")
@@ -1676,6 +1681,11 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
 
     // The cropped grid replaces the stored geometry (a dropped channel goes with it).
     croppedPoints.copyTo(*points);
+    QuadSurface::MaskedVertices maskedVertices;
+    for (int y = roi.y; y < roi.br().y; ++y)
+        for (const auto& vertex : surface->maskedVertices.row(y, roi.x, roi.br().x))
+            maskedVertices.set(vertex.cell - roi.tl(), vertex.coords);
+    surface->maskedVertices = std::move(maskedVertices);
     for (const auto& ch : croppedChannels) {
         surface->setChannel(ch.name, ch.data);
     }
@@ -1683,6 +1693,7 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
         surface->setChannel("generations", cv::Mat());
     }
     surface->invalidateCache();
+    if (_state) _state->setSurface("segmentation", surf, false, true, CState::SurfaceDraftMode::Full);
     if (!_surfaceSaver || !_surfaceSaver(surface)) {
         return fail(tr("Failed to save the cropped surface %1.").arg(QString::fromStdString(segmentId)));
     }

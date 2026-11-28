@@ -5,6 +5,7 @@ from datetime import datetime
 
 import torch
 
+from vesuvius.models.utilities.compilation import has_triton
 from vesuvius.neural_tracing.inference.displacement_tta import run_model_tta
 from vesuvius.neural_tracing.nets.models import load_checkpoint, resolve_checkpoint_path
 
@@ -143,7 +144,10 @@ def load_model(args):
     compile_requested = bool(getattr(args, "compile_model", False))
     compile_mode = str(getattr(args, "compile_mode", "default"))
     compiled = False
-    if compile_requested:
+    if compile_requested and str(args.device).startswith("cuda") and not has_triton():
+        # Inductor needs Triton for CUDA (absent on native Windows) and would only fail at the first forward.
+        warnings.warn("Triton is not installed; running the CUDA model without torch.compile.", stacklevel=2)
+    elif compile_requested:
         model = torch.compile(model, mode=compile_mode)
         compiled = True
 

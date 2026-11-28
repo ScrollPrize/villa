@@ -8447,10 +8447,8 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
     double workingToBaseScale = 1.0;
     const auto normalPreference = vpkg->annotationNormalSource();
     if (normalPreference != "lasagna") {
-        std::string fiberLocation = vpkg->selectedFiberInferenceDataset();
+        const std::string fiberLocation = vpkg->selectedFiberInferenceDataset();
         const auto entries = vpkg->fiberInferenceDatasetEntries();
-        if (fiberLocation.empty() && entries.size() == 1)
-            fiberLocation = entries.front().location;
         if (!fiberLocation.empty()) {
             try {
                 if (session.usingFiberNormals && session.normalSampler &&
@@ -8488,8 +8486,6 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
                     session.workingToBaseScale = session.dataset->manifest().workingToBaseScale;
                     session.traceNormalDataset.reset();
                     session.traceNormalSampler.reset();
-                    if (vpkg->selectedFiberInferenceDataset() != fiberLocation)
-                        vpkg->setSelectedFiberInferenceDataset(fiberLocation);
                     return true;
                 }
             } catch (const std::exception& ex) {
@@ -8599,6 +8595,10 @@ bool LineAnnotationController::resolveDatasetForSession(LineAnnotationSession& s
             return false;
         }
         vpkg->setSelectedLasagnaDataset(selected);
+        // Only reached without a usable Lasagna dataset, so no session holds
+        // normals from another one: record the new inputs without invalidating.
+        if (_annotationInputs && !_annotationInputsSyncDeferred)
+            _annotationInputs = currentAnnotationInputs();
     } else {
         if (session.normalSampler && session.selectedDatasetLocation == selected &&
             annotationShapeZYX(_state) && session.dataset->manifest().baseShapeZYX) {
@@ -8728,8 +8728,61 @@ void LineAnnotationController::invalidateAnnotationInputs(bool predictionsChange
         if (normalsChanged) updateGeneratedViewMetricsForFiber(session.fiberId);
     }
     if (normalsChanged) scheduleStaleViewRefresh();
+    _annotationInputs = currentAnnotationInputs();
     refreshLineAnnotationDatasetMenus();
     if (predictionsChanged || normalsChanged) emit fibersChanged();
+}
+
+LineAnnotationController::AnnotationInputs LineAnnotationController::currentAnnotationInputs() const
+{
+    if (!_state || !_state->vpkg()) return {};
+    const auto vpkg = _state->vpkg();
+    return {vpkg.get(), vpkg->selectedFiberInferenceDataset(), vpkg->annotationNormalSource(),
+            vpkg->selectedLasagnaDataset()};
+}
+
+void LineAnnotationController::scheduleDeferredAnnotationInputsSync()
+{
+    if (_annotationInputsSyncDeferred)
+        QTimer::singleShot(0, this, [this] { syncAnnotationInputsWithProject(); });
+}
+
+bool LineAnnotationController::lasagnaMaySupplyNormals() const
+{
+    if (!_state || !_state->vpkg()) return true;
+    const auto vpkg = _state->vpkg();
+    return vpkg->annotationNormalSource() != "fiber" ||
+        !vpkg->hasPredictedFiberNormals(vpkg->selectedFiberInferenceDataset());
+}
+
+void LineAnnotationController::syncAnnotationInputsWithProject()
+{
+    const auto current = currentAnnotationInputs();
+    if (!_annotationInputs || _annotationInputs->project != current.project) {
+        // A newly opened project: nothing was resolved against it yet.
+        _annotationInputs = current;
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    const auto previous = *_annotationInputs;
+    if (previous == current) {
+        _annotationInputsSyncDeferred = false;
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    // A running solve would land a result computed from the previous inputs
+    // after the invalidation; apply the change once it has landed.
+    _annotationInputsSyncDeferred = std::any_of(_panes.begin(), _panes.end(), [](const auto& pane) {
+        return pane.session && pane.session->taskState == LineAnnotationSession::TaskState::Running;
+    });
+    if (_annotationInputsSyncDeferred) {
+        refreshLineAnnotationDatasetMenus();
+        return;
+    }
+    const bool predictionsChanged = previous.fiberDataset != current.fiberDataset;
+    const bool normalsChanged = previous.normalSource != current.normalSource || predictionsChanged ||
+        (previous.lasagnaDataset != current.lasagnaDataset && lasagnaMaySupplyNormals());
+    invalidateAnnotationInputs(predictionsChanged, normalsChanged);
 }
 
 void LineAnnotationController::handleNormalSourceSelectionChanged(const std::string& source)
@@ -8738,8 +8791,7 @@ void LineAnnotationController::handleNormalSourceSelectionChanged(const std::str
     auto vpkg = _state->vpkg();
     const bool changed = vpkg->annotationNormalSource() != source;
     try {
-        // Persist an explicit Lasagna choice even when it equals the unset
-        // project's fallback, so a later attachment cannot override it.
+        // The only place Lasagna normals are ever chosen.
         vpkg->setAnnotationNormalSource(source);
     } catch (const std::exception& ex) {
         showError(tr("Could not save normal source: %1").arg(QString::fromUtf8(ex.what())),
@@ -8757,7 +8809,7 @@ void LineAnnotationController::handleLasagnaDatasetSelectionChanged(
     auto vpkg = _state->vpkg();
     if (vpkg->selectedLasagnaDataset() == location) return;
     vpkg->setSelectedLasagnaDataset(location);
-    invalidateAnnotationInputs(false, vpkg->annotationNormalSource() == "lasagna");
+    invalidateAnnotationInputs(false, lasagnaMaySupplyNormals());
 }
 
 void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
@@ -8765,11 +8817,17 @@ void LineAnnotationController::handleFiberInferenceDatasetSelectionChanged(
 {
     if (location.empty() || !canChangeAnnotationInputs()) return;
     auto vpkg = _state->vpkg();
-    if (vpkg->selectedFiberInferenceDataset() == location) {
+    // Saved even when it is already the default, so attachments cannot change it.
+    const auto previousDataset = vpkg->selectedFiberInferenceDataset();
+    const auto previous = vpkg->annotationNormalSource();
+    vpkg->setSelectedFiberInferenceDataset(location);
+    if (previousDataset == location) {
+        refreshLineAnnotationDatasetMenus();
         return;
     }
-    vpkg->setSelectedFiberInferenceDataset(location);
-    invalidateAnnotationInputs(true, vpkg->annotationNormalSource() == "fiber");
+    // The normal choice belongs to the fiber dataset, so it may change too.
+    const auto current = vpkg->annotationNormalSource();
+    invalidateAnnotationInputs(true, current == "fiber" || current != previous);
 }
 
 bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
@@ -8785,10 +8843,6 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     auto vpkg = _state->vpkg();
     std::string selected = vpkg->selectedFiberInferenceDataset();
     const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
-    if (selected.empty() && fiberEntries.size() == 1) {
-        selected = fiberEntries.front().location;
-        vpkg->setSelectedFiberInferenceDataset(selected);
-    }
     std::string selectedIdentity = selected;
     const auto selectedEntry = std::find_if(
         fiberEntries.begin(), fiberEntries.end(), [&](const auto& entry) {
@@ -8849,6 +8903,10 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
                     headless);
                 return false;
             }
+            // Picked here, so it is the user's choice, not the default. Other
+            // sessions follow it; this one resolves its fields below.
+            vpkg->setSelectedFiberInferenceDataset(selected);
+            syncAnnotationInputsWithProject();
             manifestPath = openedDataset.manifest().manifestPath;
             refreshLineAnnotationDatasetMenus();
         } catch (const std::exception& error) {
@@ -10490,6 +10548,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                         survivor->watcher = nullptr;
                         survivor->runningSolveCancel.reset();
                         survivor->taskState = LineAnnotationSession::TaskState::Idle;
+                        scheduleDeferredAnnotationInputsSync();
                         (void)survivor->solveQueue.finishSolve();
                     }
                     watcher->deleteLater();
@@ -11017,6 +11076,7 @@ void LineAnnotationController::startFiberModeOptimization(
                         survivor->watcher = nullptr;
                         survivor->runningSolveCancel.reset();
                         survivor->taskState = LineAnnotationSession::TaskState::Idle;
+                        scheduleDeferredAnnotationInputsSync();
                         (void)survivor->solveQueue.finishSolve();
                     }
                     watcher->deleteLater();
@@ -11204,6 +11264,8 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     if (join) joinPublication();
     // Tag edits queued behind this solve apply after its landing.
     const auto editsAfter = qScopeGuard([this] { scheduleDeferredControlEdits(); });
+    // So do project input changes made while it ran.
+    const auto inputsAfter = qScopeGuard([this] { scheduleDeferredAnnotationInputsSync(); });
     const HostedStatusScope statusScope(*this);
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session || !pane->session->watcher) {
@@ -12728,10 +12790,7 @@ LineAnnotationController::resolveFiberOptimizationInputs(
 
     ResolvedFiberOptimizationInputs result;
     QStringList failures;
-    auto selectedFiber = vpkg->selectedFiberInferenceDataset();
-    const auto fiberEntries = vpkg->fiberInferenceDatasetEntries();
-    if (selectedFiber.empty() && fiberEntries.size() == 1)
-        selectedFiber = fiberEntries.front().location;
+    const auto selectedFiber = vpkg->selectedFiberInferenceDataset();
     const std::vector<std::string> fiberCandidates = {
         selectedFiber, fallbackFiberLocation};
     for (const auto& candidate : fiberCandidates) {

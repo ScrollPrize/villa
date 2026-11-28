@@ -155,50 +155,94 @@ TEST_CASE("Compound project preparation accepts packed CZYX channels")
         CHECK_THROWS(prepared[0].volume->channelView(-1, "invalid"));
     }
 
-    SUBCASE("first attachment selects fiber normals and persists across reopening") {
+    SUBCASE("predicted normals are the default whatever is attached, in any order") {
+        // Without predicted normals there is nothing to prefer over Lasagna.
+        CHECK(package->annotationNormalSource() == "lasagna");
+        package->attachPreparedLasagnaDataset("normals.lasagna.json", {}, false, {});
+        package->setSelectedLasagnaDataset("normals.lasagna.json");
+        package->attachPreparedLasagnaDataset("old-fiber.lasagna.json", {}, true, {});
+        CHECK(package->annotationNormalSource() == "lasagna");
+        CHECK_THROWS_AS(package->setAnnotationNormalSource("fiber"), std::invalid_argument);
+        CHECK(package->annotationNormalSource() == "lasagna");
+        CHECK(package->selectedFiberInferenceDataset() == "old-fiber.lasagna.json");
+        // A fiber dataset with its own normals comes before one without.
         package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
         CHECK(package->annotationNormalSource() == "fiber");
-        CHECK(project.open()->annotationNormalSource() == "fiber");
+        CHECK(package->selectedFiberInferenceDataset() == manifest);
+        package = project.open();
+        CHECK(package->annotationNormalSource() == "fiber");
+        CHECK(package->selectedFiberInferenceDataset() == manifest);
+    }
+    SUBCASE("a choice written automatically by earlier versions is not explicit") {
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        auto data = package->document().data();
+        data["view"]["annotation_normal_source"] = "lasagna";
+        package->document().replace(data);
+        package = project.open();
+        CHECK(package->annotationNormalSource() == "fiber");
+    }
+    SUBCASE("an explicit Lasagna choice is stored and survives reopening and attachments") {
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
         package->setAnnotationNormalSource("lasagna");
+        CHECK(project.open()->annotationNormalSource() == "lasagna");
         package = project.open();
         package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        package->attachPreparedLasagnaDataset("normals.lasagna.json", {}, false, {});
         CHECK(package->annotationNormalSource() == "lasagna");
-        CHECK(project.open()->annotationNormalSource() == "lasagna");
+        package->setAnnotationNormalSource("fiber");
+        CHECK(project.open()->annotationNormalSource() == "fiber");
         // Other projects remain independent; this is not a global preference.
         auto other = vc::test::emptyProject();
         other->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
         CHECK(other->annotationNormalSource() == "fiber");
     }
-    SUBCASE("legacy selected Lasagna is never overridden") {
-        package->setSelectedLasagnaDataset("existing-normal.json");
+    SUBCASE("the choice belongs to one fiber dataset") {
         package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
-        CHECK(package->annotationNormalSource() == "lasagna");
-    }
-    SUBCASE("explicit choice before attachment is respected") {
         package->setAnnotationNormalSource("lasagna");
-        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
         CHECK(package->annotationNormalSource() == "lasagna");
-    }
-    SUBCASE("attaching normal data never changes an explicit fiber choice") {
-        package->setAnnotationNormalSource("fiber");
-        package->attachPreparedLasagnaDataset(manifest, {}, false, attachments);
+        const auto second = (dir / "second.zarr").string();
+        auto secondAttachments = attachments;
+        for (auto& item : secondAttachments)
+            for (auto& tag : item.tags)
+                if (tag.starts_with(vc::lasagna::kLasagnaVolumeManifestTagPrefix))
+                    tag = std::string(vc::lasagna::kLasagnaVolumeManifestTagPrefix) + second;
+        package->attachPreparedLasagnaDataset(second, {}, true, secondAttachments);
+        package->setSelectedFiberInferenceDataset(second);
+        CHECK(package->annotationNormalSource() == "fiber");
+        package->setSelectedFiberInferenceDataset(manifest);
+        CHECK(package->annotationNormalSource() == "lasagna");
+        // Removing a dataset forgets its choice.
+        CHECK(package->removeEntry(manifest));
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        package->setSelectedFiberInferenceDataset(manifest);
         CHECK(package->annotationNormalSource() == "fiber");
     }
-    SUBCASE("background attachment does not initialize the choice") {
-        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments, false);
+    SUBCASE("an explicitly selected fiber dataset is kept") {
+        // An older model without predicted normals, over volumes of its own.
+        package->attachPreparedLasagnaDataset("old-fiber.lasagna.json", {}, true, {});
+        CHECK_FALSE(package->hasPredictedFiberNormals("old-fiber.lasagna.json"));
+        package->setSelectedFiberInferenceDataset("old-fiber.lasagna.json");
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->hasPredictedFiberNormals(manifest));
+        CHECK(package->selectedFiberInferenceDataset() == "old-fiber.lasagna.json");
         CHECK(package->annotationNormalSource() == "lasagna");
+    }
+    SUBCASE("reattachment recomputes whether a dataset has predicted normals") {
+        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
+        CHECK(package->hasPredictedFiberNormals(manifest));
+        // Same location, now without normal heads (and no volumes claiming them).
         package = project.open();
-        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
-        CHECK(package->annotationNormalSource() == "fiber");
+        auto data = package->document().data();
+        data["volumes"] = nlohmann::json::array();
+        package->document().replace(data);
+        REQUIRE(package->reload());
+        CHECK(package->attachPreparedLasagnaDataset(manifest, {}, true, {}) == VolumePkg::AttachLasagnaResult::Attached);
+        CHECK_FALSE(package->hasPredictedFiberNormals(manifest));
+        CHECK(package->annotationNormalSource() == "lasagna");
     }
-    SUBCASE("fiber data without normal heads defaults to Lasagna permanently") {
-        auto withoutNormals = attachments;
-        for (auto& item : withoutNormals)
-            std::erase(item.tags, vc::project::kPredictedFiberNormalsTag);
-        package->attachPreparedLasagnaDataset(manifest, {}, true, withoutNormals);
-        CHECK(package->annotationNormalSource() == "lasagna");
-        package->attachPreparedLasagnaDataset(manifest, {}, true, attachments);
-        CHECK(package->annotationNormalSource() == "lasagna");
+    SUBCASE("choosing Lasagna without a fiber dataset stores nothing") {
+        package->setAnnotationNormalSource("lasagna");
+        CHECK_FALSE(package->document().data()["view"].contains("lasagna_normal_choices"));
     }
     SUBCASE("invalid source including auto is rejected") {
         CHECK_THROWS_AS(package->setAnnotationNormalSource("auto"), std::invalid_argument);
@@ -238,6 +282,8 @@ TEST_CASE("Lasagna project preparation attaches group zarrs as regular volumes")
     auto package = vc::test::emptyProject();
     package->attachPreparedLasagnaDataset(manifestPath.string(), {}, true,
         {{prepared[0].location, prepared[0].tags, prepared[0].volume}});
+    // Without predicted normals the tracer uses Lasagna.
+    CHECK_FALSE(package->hasPredictedFiberNormals(manifestPath.string()));
     CHECK(package->annotationNormalSource() == "lasagna");
 
     fs::remove_all(dir);

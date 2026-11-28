@@ -11,14 +11,6 @@ namespace {
 using vc::geometry::SurfacePoint;
 using vc::geometry::validSurfacePoint;
 
-void checkVertex(const SurfacePoint& p)
-{
-    for (const auto v : p)
-        if (!std::isfinite(v)) throw std::invalid_argument("surface draft vertices must be finite");
-    if (!validSurfacePoint(p) && p != SurfacePoint{-1, -1, -1})
-        throw std::invalid_argument("invalid surface vertices must use (-1,-1,-1)");
-}
-
 // The tile's validity and bounds from its points and channel. Bounds cover the
 // vertices with coordinates, as stored tiles are indexed (coordinateBounds).
 void finish(SurfaceDraft::Tile& tile, SurfaceDraft::TileData& data)
@@ -28,7 +20,7 @@ void finish(SurfaceDraft::Tile& tile, SurfaceDraft::TileData& data)
     tile.bounds.reset();
     for (size_t i = 0; i < t.points.size(); ++i) {
         const auto& p = t.points[i];
-        const bool has = validSurfacePoint(p);
+        const bool has = data.coordinatePresence.empty() ? validSurfacePoint(p) : data.coordinatePresence[i] != 0;
         t.valid[i] = has && data.channel[i];
         if (!has) continue;
         if (!tile.bounds) tile.bounds = Bounds{p[0], p[1], p[2], p[0], p[1], p[2]};
@@ -64,12 +56,13 @@ std::vector<size_t> SurfaceDraft::tilesIn(const Bounds& box) const
 std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface& surface, const CoordinateJson& coordinates,
                                                      const std::optional<AttachmentIdentity>& attachment)
 {
-    surface.validate();
+    surface.validateDraft();
     auto draft = std::make_shared<SurfaceDraft>();
     draft->rows = surface.rows;
     draft->columns = surface.columns;
     draft->coordinates = geometryCoordinates(coordinates);
     draft->attachment = attachment;
+    draft->channels = std::make_shared<const std::vector<GeometryArray>>(surface.channels);
     for (const auto& rect : surfaceTiles(surface.rows, surface.columns)) {
         SurfaceDraft::Tile tile{rect, std::nullopt, nullptr};
         auto data = std::make_shared<SurfaceDraft::TileData>();
@@ -77,6 +70,7 @@ std::shared_ptr<const SurfaceDraft> makeSurfaceDraft(const vc::geometry::Surface
             for (int64_t c = 0; c < rect.columns; ++c) {
                 const auto index = size_t((rect.row + r) * surface.columns + rect.column + c);
                 data->tile.points.push_back(surface.points[index]);
+                if (!surface.coordinatePresence.empty()) data->coordinatePresence.push_back(surface.coordinatePresence[index]);
                 data->channel.push_back(surface.validity.empty() || surface.validity[index] ? 1 : 0);
             }
         finish(tile, *data);
@@ -93,6 +87,11 @@ vc::geometry::Surface draftGrid(const SurfaceDraft& draft)
     vc::geometry::Surface surface{draft.rows, draft.columns, {1, 1}, {}};
     surface.points.resize(count);
     surface.validity.assign(count, 1);
+    if (draft.channels) surface.channels = *draft.channels;
+    if (std::any_of(draft.tiles.begin(), draft.tiles.end(), [](const auto& tile) {
+            return !tile.data->coordinatePresence.empty();
+        }))
+        surface.coordinatePresence.resize(count);
     for (const auto& tile : draft.tiles)
         for (int64_t r = 0; r < tile.rect.rows; ++r)
             for (int64_t c = 0; c < tile.rect.columns; ++c) {
@@ -100,19 +99,22 @@ vc::geometry::Surface draftGrid(const SurfaceDraft& draft)
                 const auto target = std::size_t((tile.rect.row + r) * draft.columns + tile.rect.column + c);
                 surface.points[target] = tile.data->tile.points[source];
                 surface.validity[target] = tile.data->channel[source];
+                if (!surface.coordinatePresence.empty())
+                    surface.coordinatePresence[target] = tile.data->coordinatePresence.empty()
+                        ? validSurfacePoint(surface.points[target]) : tile.data->coordinatePresence[source];
             }
     return surface;
 }
 
 std::shared_ptr<const SurfaceDraft> editSurfaceDraft(const SurfaceDraft& draft, int64_t row, int64_t column, int64_t rows,
                                                      int64_t columns, std::span<const SurfacePoint> points,
-                                                     std::span<const uint8_t> validity)
+                                                     std::span<const uint8_t> validity, std::span<const uint8_t> coordinatePresence)
 {
-    if (row < 0 || column < 0 || rows < 0 || columns < 0 || row + rows > draft.rows || column + columns > draft.columns)
+    if (row < 0 || column < 0 || rows < 0 || columns < 0 || row > draft.rows - rows || column > draft.columns - columns)
         throw std::out_of_range("surface draft edit outside the grid");
     if (points.size() != size_t(rows * columns) || (!validity.empty() && validity.size() != points.size()))
         throw std::invalid_argument("surface draft edit must have one vertex (and validity byte) per grid position");
-    for (const auto& p : points) checkVertex(p);
+    vc::geometry::validateSurfacePoints(points, coordinatePresence);
     auto edited = std::make_shared<SurfaceDraft>(draft);
     for (auto& tile : edited->tiles) {
         const auto& rect = tile.rect;
@@ -120,11 +122,18 @@ std::shared_ptr<const SurfaceDraft> editSurfaceDraft(const SurfaceDraft& draft, 
         const int64_t c0 = std::max(column, rect.column), c1 = std::min(column + columns, rect.column + rect.columns);
         if (r0 >= r1 || c0 >= c1) continue;
         auto data = std::make_shared<SurfaceDraft::TileData>(*tile.data);
+        if (!coordinatePresence.empty() && data->coordinatePresence.empty()) {
+            data->coordinatePresence.reserve(data->tile.points.size());
+            for (const auto& point : data->tile.points) data->coordinatePresence.push_back(validSurfacePoint(point));
+        }
         for (int64_t r = r0; r < r1; ++r)
             for (int64_t c = c0; c < c1; ++c) {
                 const auto source = size_t((r - row) * columns + c - column);
                 const auto target = size_t((r - rect.row) * rect.columns + c - rect.column);
                 data->tile.points[target] = points[source];
+                if (!data->coordinatePresence.empty())
+                    data->coordinatePresence[target] = coordinatePresence.empty()
+                        ? validSurfacePoint(points[source]) : coordinatePresence[source];
                 if (!validity.empty()) data->channel[target] = validity[source] ? 1 : 0;
             }
         finish(tile, *data);

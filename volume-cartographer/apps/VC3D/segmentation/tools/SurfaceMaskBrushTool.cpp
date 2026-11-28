@@ -1,6 +1,7 @@
 #include "SurfaceMaskBrushTool.hpp"
 
 #include "../SegmentationModule.hpp"
+#include "../SurfaceGridEdit.hpp"
 #include "SegmentationEditManager.hpp"
 #include "../../ViewerManager.hpp"
 
@@ -8,7 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <exception>
+#include <utility>
 
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -86,7 +87,6 @@ void SurfaceMaskBrushTool::setSurface(QuadSurface* surface)
         return;
     }
     _surface = surface;
-    _mask.release();
     _lastGridPosition.reset();
     _undoSnapshotCaptured = false;
     _paintedCells.clear();
@@ -119,8 +119,7 @@ void SurfaceMaskBrushTool::startStroke(const QPointF& surfacePos)
     const int row = static_cast<int>(std::lround(gridPos->first));
     const int col = static_cast<int>(std::lround(gridPos->second));
 
-    ensureMask();
-    _undoSnapshotCaptured = _module.captureUndoSnapshot();
+    _undoSnapshotCaptured = _module.activeBaseSurface() == _surface && _module.captureSurfaceUndoSnapshot();
     _strokeActive = true;
     _paintedCells.clear();
     _pendingCells.clear();
@@ -188,7 +187,7 @@ void SurfaceMaskBrushTool::finishStroke()
     _strokeActive = false;
     _lastGridPosition.reset();
     fillEnclosedStrokeArea();
-    const cv::Rect changedRegion = applyPendingCells();
+    const auto changedRegion = _surface ? segmentation::excludeSurfaceVertices(*_surface, _pendingCells) : cv::Rect{};
     if (changedRegion.empty() && _undoSnapshotCaptured) {
         _module.discardLastUndoSnapshot();
     }
@@ -196,7 +195,7 @@ void SurfaceMaskBrushTool::finishStroke()
     if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
         _module._editManager->applyExternalSurfaceUpdate(changedRegion);
     }
-    persistSurface();
+    if (!changedRegion.empty()) persistSurface();
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -216,11 +215,6 @@ void SurfaceMaskBrushTool::cancelStroke()
     _pendingCells.clear();
     _strokeGridPoints.clear();
     _overlaySurfacePoints.clear();
-    if (_surface) {
-        _mask = _surface->validMask();
-    } else {
-        _mask.release();
-    }
     invalidateViewers(false);
 }
 
@@ -234,12 +228,6 @@ void SurfaceMaskBrushTool::refreshFromSurface()
     _pendingCells.clear();
     _strokeGridPoints.clear();
     _overlaySurfacePoints.clear();
-    if (_surface) {
-        _surface->invalidateCache();
-        _mask = _surface->validMask();
-    } else {
-        _mask.release();
-    }
     invalidateViewers(true);
 }
 
@@ -269,29 +257,9 @@ std::optional<std::pair<float, float>> SurfaceMaskBrushTool::surfaceToGridPositi
     return std::make_pair(row, col);
 }
 
-void SurfaceMaskBrushTool::ensureMask()
-{
-    if (!_surface) {
-        _mask.release();
-        return;
-    }
-
-    const auto* points = _surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        _mask.release();
-        return;
-    }
-
-    if (_mask.rows == points->rows && _mask.cols == points->cols) {
-        return;
-    }
-
-    _mask = _surface->validMask();
-}
-
 void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
 {
-    if (!_surface || _mask.empty()) {
+    if (!_surface) {
         return;
     }
 
@@ -315,9 +283,9 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
     }
 
     const int rowStart = std::max(0, centerRow - radius);
-    const int rowEnd = std::min(_mask.rows - 1, centerRow + radius);
+    const int rowEnd = std::min(points->rows - 1, centerRow + radius);
     const int colStart = std::max(0, centerCol - radius);
-    const int colEnd = std::min(_mask.cols - 1, centerCol + radius);
+    const int colEnd = std::min(points->cols - 1, centerCol + radius);
 
     for (int row = rowStart; row <= rowEnd; ++row) {
         const int dr = row - centerRow;
@@ -345,21 +313,18 @@ void SurfaceMaskBrushTool::appendOverlayPoint(const QPointF& surfacePos)
 
 void SurfaceMaskBrushTool::queueVertex(int row, int col)
 {
-    if (row < 0 || row >= _mask.rows || col < 0 || col >= _mask.cols) {
-        return;
-    }
-
     const uint64_t key = cellKey(row, col);
     if (!_paintedCells.insert(key).second) {
         return;
     }
 
-    _pendingCells.emplace_back(row, col);
+    _pendingCells.emplace_back(col, row);
 }
 
 void SurfaceMaskBrushTool::fillEnclosedStrokeArea()
 {
-    if (_strokeGridPoints.size() < 3 || _mask.rows < 2 || _mask.cols < 2) {
+    const auto* points = _surface ? std::as_const(*_surface).rawPointsPtr() : nullptr;
+    if (_strokeGridPoints.size() < 3 || !points || points->rows < 2 || points->cols < 2) {
         return;
     }
 
@@ -387,9 +352,9 @@ void SurfaceMaskBrushTool::fillEnclosedStrokeArea()
     }
 
     const int rowStart = std::max(0, minRow);
-    const int rowEnd = std::min(_mask.rows - 1, maxRow);
+    const int rowEnd = std::min(points->rows - 1, maxRow);
     const int colStart = std::max(0, minCol);
-    const int colEnd = std::min(_mask.cols - 1, maxCol);
+    const int colEnd = std::min(points->cols - 1, maxCol);
 
     for (int row = rowStart; row <= rowEnd; ++row) {
         for (int col = colStart; col <= colEnd; ++col) {
@@ -403,76 +368,22 @@ void SurfaceMaskBrushTool::fillEnclosedStrokeArea()
 
 void SurfaceMaskBrushTool::persistSurface()
 {
-    if (!_surface || _mask.empty()) {
+    if (!_surface) {
         return;
     }
 
-    _surface->invalidateCache();
-    // The brushed validity is the surface's mask (validity) channel.
-    _surface->setChannel("mask", _mask.clone());
-
-    if (_module.hasActiveSession()) {
+    if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface) {
+        _module._autosaveFullSurfaceNeeded = true;
         _module.emitPendingChanges();
         _module.markAutosaveNeeded(true);
         return;
     }
 
-    // The mask is the surface's validity: masked vertices keep their stored coordinates.
-    if (_module.saveSurface(_surface, false, {"mask"})) {
+    if (_module.saveSurface(_surface, true, {"mask", "growth_exclusions"})) {
         Q_EMIT _module.statusMessageRequested(
             QCoreApplication::translate("SurfaceMaskBrushTool", "Saved surface."),
             kStatusShort);
     }
-}
-
-cv::Rect SurfaceMaskBrushTool::applyPendingCells()
-{
-    if (!_surface || _mask.empty()) {
-        return {};
-    }
-
-    auto* points = _surface->rawPointsPtr();
-    if (!points || points->empty()) {
-        return {};
-    }
-
-    int minRow = points->rows;
-    int maxRow = -1;
-    int minCol = points->cols;
-    int maxCol = -1;
-
-    const cv::Vec3f invalid(-1.0f, -1.0f, -1.0f);
-    for (const auto& [row, col] : _pendingCells) {
-        if (row < 0 || row >= _mask.rows || col < 0 || col >= _mask.cols) {
-            continue;
-        }
-        const cv::Vec3f previousWorld = (*points)(row, col);
-        if (previousWorld == invalid) {
-            continue;
-        }
-        _mask(row, col) = 0;
-        (*points)(row, col) = invalid;
-        minRow = std::min(minRow, row);
-        maxRow = std::max(maxRow, row);
-        minCol = std::min(minCol, col);
-        maxCol = std::max(maxCol, col);
-    }
-
-    if (maxRow < minRow || maxCol < minCol || points->rows < 2 || points->cols < 2) {
-        return {};
-    }
-
-    const int cellRowCount = points->rows - 1;
-    const int cellColCount = points->cols - 1;
-    const int rowStart = std::max(0, minRow - 1);
-    const int rowEnd = std::min(cellRowCount, maxRow + 1);
-    const int colStart = std::max(0, minCol - 1);
-    const int colEnd = std::min(cellColCount, maxCol + 1);
-    if (rowStart >= rowEnd || colStart >= colEnd) {
-        return {};
-    }
-
-    return cv::Rect(colStart, rowStart, colEnd - colStart, rowEnd - rowStart);
 }
 
 void SurfaceMaskBrushTool::invalidateOverlay()

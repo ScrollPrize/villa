@@ -48,7 +48,11 @@ struct Surface {
     std::vector<uint8_t> validity;
     // Other aligned channels, each a whole multiple of the grid per axis.
     std::vector<objects::GeometryArray> channels;
-    void validate() const;
+    // Display-frame drafts can place a real coordinate anywhere, including at the
+    // stored-frame sentinel. Nonzero = present, independent of the validity mask.
+    std::vector<uint8_t> coordinatePresence;
+    void validate() const;       // canonical geometry, suitable for encode()
+    void validateDraft() const;  // also accepts explicit display-frame presence
     const SurfacePoint& vertex(int64_t row, int64_t column) const;
     // Has coordinates and is not marked invalid by `validity`.
     bool valid(int64_t row, int64_t column) const;
@@ -72,6 +76,9 @@ Geometry decode(const objects::GeometryData&);
 // every mask value it covers is at least 255.
 std::vector<uint8_t> validityFromMask(std::span<const double> mask, int64_t maskRows, int64_t maskColumns,
                                       int64_t rows, int64_t columns);
+// Empty presence uses stored-coordinate rules. Otherwise, a present vertex must
+// be finite, and an absent vertex must carry the missing sentinel.
+void validateSurfacePoints(std::span<const SurfacePoint>, std::span<const uint8_t> coordinatePresence = {});
 double polylineLength(std::span<const Point>);
 double polylineLength(std::span<const TrackPoint>);
 // The store's one rule for surface vertices: a vertex has coordinates unless a

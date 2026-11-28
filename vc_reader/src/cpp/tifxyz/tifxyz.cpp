@@ -5,6 +5,7 @@
 
 #include "vc_reader/image_write.hpp"
 #include "vc_reader/sources.hpp"
+#include "vc_reader/native/utf8_path.hpp"
 #include "vc_reader/zarr.hpp"
 #include "vc_reader/zarr_write.hpp"
 #include "../element_type.hpp"
@@ -360,7 +361,7 @@ Metadata parseMetadata(const json& document, const std::string& location)
 
 Metadata readMetadata(const std::string& location, const sources::OptionsFor& options)
 {
-    if (!zarr::isRemote(location)) files::recoverDirectory(location);
+    if (!zarr::isRemote(location)) files::recoverDirectory(utf8Path(location));
     return parseMetadata(json::parse(readText(child(location, "meta.json"), options)), location);
 }
 
@@ -382,7 +383,7 @@ std::vector<Entry> list(const std::string& folder, bool recursive, const std::op
     while (!pending.empty()) {
         const auto location = std::move(pending.back());
         pending.pop_back();
-        const zarr::Store store(location, optionsFor(location).access);
+        const zarr::Store store(utf8Path(location), optionsFor(location).access);
         if (!top && store.exists("meta.json") && store.exists("x.tif") && store.exists("y.tif") && store.exists("z.tif")) {
             Entry entry;
             entry.location = location;
@@ -420,7 +421,7 @@ void write(const std::filesystem::path& path, Surface& surface, const WriteOptio
     fs::create_directories(parent);
     static std::atomic<unsigned long long> sequence{0};
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto temporary = parent / (".tifxyz_tmp_" + path.filename().string() + "." +
+    const auto temporary = parent / utf8Path(".tifxyz_tmp_" + utf8String(path.filename()) + "." +
         std::to_string(
 #ifdef _WIN32
         ::_getpid()
@@ -460,7 +461,7 @@ void write(const std::filesystem::path& path, Surface& surface, const WriteOptio
                 throw std::invalid_argument("invalid tifxyz channel name or buffer");
             auto settings = tiff;
             if (channel.components == 2 || channel.components > 4) settings.compression = "lzw";
-            sources::writeTiff(temporary / (channel.name + ".tif"), channel.data, channel.dtype,
+            sources::writeTiff(temporary / utf8Path(channel.name + ".tif"), channel.data, channel.dtype,
                 channel.rows, channel.cols, channel.components, settings);
         }
         files::publishDirectory(temporary,path,options.overwrite);

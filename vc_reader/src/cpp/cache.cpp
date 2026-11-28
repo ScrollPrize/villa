@@ -157,8 +157,15 @@ DownloadResult downloadPrefix(const std::string& location, const zarr::OpenOptio
         }
     };
     {
-        std::vector<std::jthread> threads;
-        for (int i = 0; i < std::min(workers, state.totalFiles); ++i) threads.emplace_back(worker);
+        std::vector<std::thread> threads;
+        const auto join = [&] { for (auto& thread : threads) thread.join(); };
+        try {
+            for (int i = 0; i < std::min(workers, state.totalFiles); ++i) threads.emplace_back(worker);
+        } catch (...) {
+            join();
+            throw;
+        }
+        join();
     }
     if (callbackError) std::rethrow_exception(callbackError);
     result.cancelled = cancelled();

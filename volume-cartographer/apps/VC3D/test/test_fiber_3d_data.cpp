@@ -3,7 +3,7 @@
 #include <vc_object_store/objects/StoreReader.hpp>
 #include <vc_object_store/objects/FiberJson.hpp>
 #include <vc_object_store/Uuid.hpp>
-#include <QtTest/QtTest>
+#include "support/QtTestCompat.hpp"
 #include <QTemporaryDir>
 using namespace vc3d::fibers3d;
 using Json = nlohmann::json;

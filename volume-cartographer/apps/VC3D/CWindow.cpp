@@ -2427,6 +2427,9 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId)
     if (_projectWorkspace) {
         _projectWorkspace->refresh();
     }
+    if (_lineAnnotationController) {
+        _lineAnnotationController->syncAnnotationInputsWithProject();
+    }
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -2957,8 +2960,27 @@ void CWindow::CreateWidgets(void)
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
     _segmentationOverlay->setViewerManager(_viewerManager.get());
     _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
-    _surfaceRotationOverlay->setSaver([this](QuadSurface* surface) {
-        return _segmentationModule && _segmentationModule->saveSurface(surface);
+    _surfaceRotationOverlay->setSaver([this](QuadSurface* surface, const std::optional<std::string>& geometryRevision) {
+        return _segmentationModule && _segmentationModule->saveSurface(surface, true, {}, geometryRevision);
+    });
+    // Apply saves only over the geometry revision Rotate transformed: the one the segment's
+    // edits continue from when Rotate opens, and still the stored one.
+    _surfaceRotationOverlay->setSourceRevisionReader([this](QuadSurface* surface) -> std::optional<std::string> {
+        const auto pin = _segmentationModule ? _segmentationModule->storePin(surface) : std::nullopt;
+        return pin ? pin->geometryRevision : std::nullopt;
+    });
+    _surfaceRotationOverlay->setRevisionReader([this](const std::string& id) -> std::optional<std::string> {
+        const auto* row = _surfaceCatalog ? _surfaceCatalog->row(id) : nullptr;
+        if (!row) return std::nullopt;
+        try {
+            const auto head = _surfaceCatalog->session()->currentObject(row->source, id);
+            return head ? head->geometryRevision : std::nullopt;
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    });
+    _surfaceRotationOverlay->setReopener([this](const std::string& id) {
+        return _surfacePanel && _surfacePanel->activateSurfaceById(id);
     });
     _surfaceRotationOverlay->setViewerManager(_viewerManager.get());
 
@@ -5405,9 +5427,14 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
 
     if (enabled) {
         auto activeSurfaceShared = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+        // While Rotate is open the viewer can show its unsaved preview: edits and their autosave
+        // would publish the preview's geometry outside Apply.
+        const bool rotating = _surfaceRotationOverlay && _surfaceRotationOverlay->isOpen();
 
-        if (!_segmentationModule->beginEditingSession(activeSurfaceShared)) {
-            showStatusBarMessage(tr("Unable to start segmentation editing"), 3000);
+        if (rotating || !_segmentationModule->beginEditingSession(activeSurfaceShared)) {
+            showStatusBarMessage(rotating ? tr("Apply Rotate or select the segment again before editing it")
+                                          : tr("Unable to start segmentation editing"),
+                                 3000);
             if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
                 QSignalBlocker blocker(_segmentationWidget);
                 _segmentationWidget->setEditingEnabled(false);
