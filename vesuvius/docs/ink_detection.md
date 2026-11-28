@@ -467,8 +467,9 @@ the second output.
 | `--tta-batch-size` | Maximum mirror variants evaluated together. |
 | `--gpus` | Unique comma-separated CUDA IDs, for example `0,1`; omit for automatic CUDA/CPU selection. |
 | `--device` | `auto` (default), `cpu`, `mps` or `cuda`. `auto` picks CUDA, then MPS, then CPU; `--gpus` selects CUDA devices and cannot be combined with `cpu` or `mps`. |
-| `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
-| `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
+| `--compile` | Compile the model with `torch.compile`. Off by default: for a typical single segment the compile takes longer than it saves. Multiple selected GPUs disable compilation. |
+| `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. Giving a mode also enables compilation unless `--no-compile` is given. |
+| `--no-compile` | Use eager inference (the default). |
 
 Flat inference requires a checkpoint with `mode: "flat"` and a square Y/X
 crop. It prefers `ema_model`, then common flat state-dict aliases, then
