@@ -17,6 +17,7 @@ import atexit
 import hashlib
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -68,6 +69,180 @@ def _resolve_zarr_array(obj) -> ZarrReader:
             if hasattr(candidate, "shape"):
                 return candidate
     raise ValueError("Could not resolve a zarr Array inside the given store")
+
+
+# The coarse scan dedupes patch starts on the image's stride grid, one byte per
+# grid cell. Grids with more cells than this (32 MiB) sort cell indices instead.
+_DEDUPE_TABLE_MAX_CELLS = 1 << 25
+# Voxels / patches handled per step of the coarse scan, so its temporaries stay
+# at a few MiB however many foreground voxels the scan level has.
+_DEDUPE_CHUNK_ROWS = 1 << 16
+# Compact accumulated 1-D fallback keys once they reach ~32 MiB.
+_DEDUPE_COMPACT_KEYS = 1 << 22
+# Target voxels per Z-slab read (aligned up to chunks[0] so no chunk is read
+# twice) and per argwhere sub-slab inside each read.
+_SCAN_SLAB_TARGET_VOXELS = 1 << 24
+_SCAN_SUBSLAB_TARGET_VOXELS = 1 << 22
+
+
+def _unique_starts_by_row_sort(
+    image_centers: np.ndarray,
+    st: np.ndarray,
+    ps: np.ndarray,
+    image_shape: np.ndarray,
+) -> np.ndarray:
+    """Sorted unique patch starts for ``(N, 3)`` int64 image voxels.
+
+    Snaps each voxel to the stride cell that contains it, drops the starts
+    whose patch ``[start, start + ps)`` leaves the image, and dedupes the
+    remaining rows with a lexicographic sort. Returns ``(K, 3)`` int64.
+    """
+    image_starts = (image_centers // st) * st
+    keep = np.all(
+        (image_starts >= 0) & (image_starts + ps <= image_shape), axis=1
+    )
+    image_starts = image_starts[keep]
+    if image_starts.shape[0] == 0:
+        return image_starts
+    return np.unique(image_starts, axis=0)
+
+
+class _StrideGridDeduper:
+    """Streaming stride-grid deduplicator for ``(N, 3)`` int64 image voxels.
+
+    A start is ``cell * st`` with ``cell = center // st``, and its patch fits
+    the image exactly when ``0 <= cell <= (image_shape - ps) // st``. The
+    distinct starts are therefore the occupied cells of a grid with that many
+    cells per axis, and the grid's C-order index sorts cells the way a
+    lexicographic sort orders their rows. Occupied cells are marked in a
+    boolean table, or their indices are sorted when the grid has more than
+    ``_DEDUPE_TABLE_MAX_CELLS`` cells.
+
+    That argument needs a positive stride and int64 arithmetic that cannot
+    wrap. Chunks outside it, such as voxels cast from non-finite coordinates,
+    fall back to :func:`_unique_starts_by_row_sort` per chunk and are merged
+    on :meth:`finalize`.
+    """
+
+    def __init__(
+        self,
+        st: np.ndarray,
+        ps: np.ndarray,
+        image_shape: np.ndarray,
+    ) -> None:
+        self._st = np.asarray(st, dtype=np.int64)
+        self._ps = np.asarray(ps, dtype=np.int64)
+        self._image_shape = np.asarray(image_shape, dtype=np.int64)
+        stride = [int(v) for v in self._st]
+        patch = [int(v) for v in self._ps]
+        max_cell = [
+            (int(size) - p) // s
+            for size, p, s in zip(self._image_shape, patch, stride)
+        ] if min(stride) > 0 else [-1, -1, -1]
+        grid = tuple(m + 1 for m in max_cell)
+        n_cells = math.prod(grid) if min(max_cell) >= 0 else 0
+        # No start or ``start + ps`` computed from a voxel in [-exact, exact] wraps.
+        exact = (
+            np.iinfo(np.int64).max
+            - max(abs(s) for s in stride)
+            - max(abs(p) for p in patch)
+        )
+        self._fast_valid = (
+            min(stride) > 0
+            and min(max_cell) >= 0
+            and n_cells <= np.iinfo(np.intp).max
+            and exact >= 0
+        )
+        self._grid = grid
+        self._exact = exact
+        self._last_cell = np.asarray(max_cell, dtype=np.int64)
+        self._use_table = self._fast_valid and (n_cells <= _DEDUPE_TABLE_MAX_CELLS)
+        self._occupied: Optional[np.ndarray] = (
+            np.zeros(n_cells, dtype=bool) if self._use_table else None
+        )
+        self._key_chunks: List[np.ndarray] = []
+        self._key_count: int = 0
+        self._compact_at: int = _DEDUPE_COMPACT_KEYS
+        self._fallback_rows: List[np.ndarray] = []
+
+    def add(self, image_centers: np.ndarray) -> None:
+        n = image_centers.shape[0]
+        if n == 0:
+            return
+        for lo in range(0, n, _DEDUPE_CHUNK_ROWS):
+            block = image_centers[lo:lo + _DEDUPE_CHUNK_ROWS]
+            if (
+                not self._fast_valid
+                or block.min() < -self._exact
+                or block.max() > self._exact
+            ):
+                rows = _unique_starts_by_row_sort(
+                    block, self._st, self._ps, self._image_shape
+                )
+                if rows.shape[0] > 0:
+                    self._fallback_rows.append(rows)
+                continue
+            cells = block // self._st
+            cells = cells[
+                np.all((cells >= 0) & (cells <= self._last_cell), axis=1)
+            ]
+            if cells.shape[0] == 0:
+                continue
+            flat = np.ravel_multi_index(
+                (cells[:, 0], cells[:, 1], cells[:, 2]), self._grid
+            )
+            if self._use_table:
+                assert self._occupied is not None
+                self._occupied[flat] = True
+            else:
+                self._key_chunks.append(flat)
+                self._key_count += flat.size
+                if self._key_count >= self._compact_at:
+                    compacted = np.unique(np.concatenate(self._key_chunks))
+                    self._key_chunks = [compacted]
+                    self._key_count = compacted.size
+                    # Wait for the keys to double so the re-sorts stay amortised.
+                    self._compact_at = max(
+                        _DEDUPE_COMPACT_KEYS, 2 * compacted.size
+                    )
+
+    def finalize(self) -> np.ndarray:
+        parts: List[np.ndarray] = []
+        if self._fast_valid:
+            if self._use_table:
+                assert self._occupied is not None
+                flat = np.flatnonzero(self._occupied)
+            elif self._key_chunks:
+                flat = np.unique(np.concatenate(self._key_chunks))
+            else:
+                flat = np.empty(0, dtype=np.intp)
+            if flat.size > 0:
+                fast_unique = np.stack(
+                    np.unravel_index(flat, self._grid), axis=1
+                ).astype(np.int64, copy=False)
+                fast_unique *= self._st
+                parts.append(fast_unique)
+        if self._fallback_rows:
+            parts.extend(self._fallback_rows)
+        if not parts:
+            return np.empty((0, 3), dtype=np.int64)
+        if len(parts) == 1 and not self._fallback_rows:
+            return parts[0]
+        return np.unique(np.vstack(parts), axis=0)
+
+
+def _unique_starts(
+    image_centers: np.ndarray,
+    st: np.ndarray,
+    ps: np.ndarray,
+    image_shape: np.ndarray,
+) -> np.ndarray:
+    """The rows of :func:`_unique_starts_by_row_sort`, in the same order and
+    dtype, without materialising or sorting ``(N, 3)`` rows.
+    """
+    deduper = _StrideGridDeduper(st, ps, image_shape)
+    deduper.add(image_centers)
+    return deduper.finalize()
 
 
 class CrossFrameZarrDataset(Dataset):
@@ -450,96 +625,148 @@ class CrossFrameZarrDataset(Dataset):
         """Enumerate image-space patch positions whose corresponding label
         region (after applying the forward transform) contains foreground.
 
-        Strategy: read the coarse label level in one go, find label voxels
-        with FG, map each to an image-space position via
+        Strategy: stream the coarse label level in chunk-aligned Z-slabs,
+        find label voxels with FG, map each to an image-space position via
         ``label_to_image_zyx``, snap the candidate image position to a
         patch-stride grid so the mapped image patch contains the FG label
         voxel, dedupe, and filter by image bounds.
         """
         assert self._scan_array is not None
-        fz, fy, fx = self._scan_factor
         ps = np.asarray(self.patch_size, dtype=np.int64)
         st = np.asarray(self.stride, dtype=np.int64)
-
-        _stage(f"coarse scan: reading {self._scan_array.shape} into memory")
-        coarse = np.asarray(self._scan_array[...])
-        if self.valid_patch_value is not None:
-            coarse_mask = coarse == self.valid_patch_value
-        elif self.valid_label_values is not None:
-            coarse_mask = np.isin(coarse, self.valid_label_values)
-        else:
-            coarse_mask = coarse > 0
-        _stage(
-            f"coarse scan: {int(coarse_mask.sum())} FG voxels "
-            f"/ {coarse_mask.size} total ({100.0 * coarse_mask.mean():.2f}%)"
-        )
-
-        fg_coarse = np.argwhere(coarse_mask)
-        if fg_coarse.size == 0:
-            return []
-
-        # Upscale the coarse FG voxel centers into label-scale-0 voxel centers.
         factor = np.asarray(self._scan_factor, dtype=np.float64)
-        fg_label = fg_coarse.astype(np.float64) * factor + 0.5 * factor
-        # Map each label center to its image-space voxel.
-        fg_image = affine.apply_affine_zyx(
-            self._matrix_zyx_label_to_image, fg_label
-        )
-
-        # Snap each image center to the stride cell that CONTAINS it, so the
-        # resulting patch [start, start + ps) actually covers the image voxel
-        # that the label FG mapped to. (The old ``floor(c - ps/2) // st * st``
-        # snap could push the start so far that the patch no longer contained
-        # the FG voxel, producing empty label AABBs in __getitem__.)
-        image_centers = np.floor(fg_image).astype(np.int64)
-        image_starts = (image_centers // st) * st
-
+        half_factor = 0.5 * factor
         image_shape = np.asarray(self._image_shape, dtype=np.int64)
-        keep = np.all(
-            (image_starts >= 0) & (image_starts + ps <= image_shape), axis=1
-        )
-        image_starts = image_starts[keep]
-        if image_starts.size == 0:
+        deduper = _StrideGridDeduper(st, ps, image_shape)
+
+        def _fg_mask(arr: np.ndarray) -> np.ndarray:
+            if self.valid_patch_value is not None:
+                return arr == self.valid_patch_value
+            if self.valid_label_values is not None:
+                return np.isin(arr, self.valid_label_values)
+            return arr > 0
+
+        def _add_fg_coords(fg_coords: np.ndarray, batched: bool = True) -> None:
+            for lo in range(0, fg_coords.shape[0], _DEDUPE_CHUNK_ROWS):
+                fg_label = fg_coords[lo:lo + _DEDUPE_CHUNK_ROWS].astype(np.float64)
+                fg_label *= factor
+                fg_label += half_factor
+                if batched and fg_label.shape[0] == 1:
+                    # matmul can round one point differently from a batch, and
+                    # the cache must match a scan that mapped all FG at once.
+                    fg_label = np.repeat(fg_label, 2, axis=0)
+                # Map each label center to its image-space voxel and snap to
+                # the stride cell that CONTAINS it (the old floor(c - ps/2)
+                # snap could push the start past the mapped FG voxel).
+                fg_image = affine.apply_affine_zyx(
+                    self._matrix_zyx_label_to_image, fg_label
+                )
+                np.floor(fg_image, out=fg_image)
+                deduper.add(fg_image.astype(np.int64))
+
+        # A scan with a single FG voxel maps it unbatched, so hold the first
+        # voxel until the count is known.
+        lone_fg: List[np.ndarray] = []
+
+        def _ingest_fg_coords(fg_coords: np.ndarray) -> None:
+            if n_fg == 1:
+                lone_fg.append(fg_coords)
+                return
+            if lone_fg:
+                _add_fg_coords(lone_fg.pop())
+            _add_fg_coords(fg_coords)
+
+        scan_shape = tuple(int(v) for v in self._scan_array.shape)
+        _stage(f"coarse scan: scanning {scan_shape}")
+        n_fg = 0
+        n_total = math.prod(scan_shape) if scan_shape else 0
+        if len(scan_shape) == 3 and n_total > 0:
+            nz, ny, nx = scan_shape
+            plane_voxels = max(1, ny * nx)
+            raw_chunks = getattr(self._scan_array, "chunks", None)
+            chunk_z = (
+                int(raw_chunks[0])
+                if raw_chunks is not None and len(raw_chunks) == 3 and int(raw_chunks[0]) > 0
+                else 64
+            )
+            raw_slab_z = max(1, _SCAN_SLAB_TARGET_VOXELS // plane_voxels)
+            slab_z = ((raw_slab_z + chunk_z - 1) // chunk_z) * chunk_z
+            sub_z = max(1, _SCAN_SUBSLAB_TARGET_VOXELS // plane_voxels)
+
+            for z0 in range(0, nz, slab_z):
+                z1 = min(z0 + slab_z, nz)
+                slab = np.asarray(self._scan_array[z0:z1, 0:ny, 0:nx])
+                for sz0 in range(0, slab.shape[0], sub_z):
+                    sz1 = min(sz0 + sub_z, slab.shape[0])
+                    sub_mask = _fg_mask(slab[sz0:sz1])
+                    sub_fg = int(sub_mask.sum())
+                    if sub_fg == 0:
+                        continue
+                    n_fg += sub_fg
+                    fg_sub = np.argwhere(sub_mask)
+                    fg_sub[:, 0] += z0 + sz0
+                    _ingest_fg_coords(fg_sub)
+        elif n_total > 0:
+            coarse = np.asarray(self._scan_array[...])
+            coarse_mask = _fg_mask(coarse)
+            del coarse
+            n_fg = int(coarse_mask.sum())
+            if n_fg > 0:
+                fg_coarse = np.argwhere(coarse_mask)
+                del coarse_mask
+                _ingest_fg_coords(fg_coarse)
+        if lone_fg:
+            _add_fg_coords(lone_fg.pop(), batched=False)
+
+        pct = (100.0 * n_fg / n_total) if n_total else 0.0
+        _stage(f"coarse scan: {n_fg} FG voxels / {n_total} total ({pct:.2f}%)")
+        if n_fg == 0:
             return []
 
-        # Dedupe.
-        unique = np.unique(image_starts, axis=0)
+        unique = deduper.finalize()
+        if unique.shape[0] == 0:
+            return []
         _stage(
-            f"coarse scan: {fg_coarse.shape[0]} coarse FG -> "
+            f"coarse scan: {n_fg} coarse FG -> "
             f"{unique.shape[0]} unique image-space patch starts"
         )
 
         # Verify each candidate by forward-mapping the patch corners back to
         # label space and checking that the AABB is non-degenerate and inside
-        # the label volume. Vectorised across all N candidates at once:
-        # build an (N*8, 3) point array, apply the affine once, reshape to
-        # (N, 8, 3), take min/max per patch, and mask.
+        # the label volume. Vectorised in bounded chunks so corner arrays stay
+        # at a few MiB even when N is in the millions.
         n = unique.shape[0]
         ps_c = np.asarray(self.patch_size, dtype=np.float64)
         label_shape = np.asarray(self._labels_shape, dtype=np.float64)
         corners_offsets = np.array([
             [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
             [1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1],
-        ], dtype=np.float64)  # (8, 3)
-        corners = (
-            corners_offsets[None, :, :] * ps_c[None, None, :]
-            + unique.astype(np.float64)[:, None, :]
-        ).reshape(n * 8, 3)
-        mapped = affine.apply_affine_zyx(
-            self._matrix_zyx_image_to_label, corners
-        ).reshape(n, 8, 3)
-        lo = np.floor(mapped.min(axis=1))
-        hi = np.ceil(mapped.max(axis=1))
-        lo_clipped = np.clip(lo, 0.0, label_shape)
-        hi_clipped = np.clip(hi, 0.0, label_shape)
-        keep_verified = np.all(hi_clipped > lo_clipped, axis=1)
+        ], dtype=np.float64) * ps_c[None, :]  # (8, 3)
+        keep_verified = np.empty(n, dtype=bool)
+        for lo in range(0, n, _DEDUPE_CHUNK_ROWS):
+            hi = min(lo + _DEDUPE_CHUNK_ROWS, n)
+            m = hi - lo
+            corners = (
+                corners_offsets[None, :, :]
+                + unique[lo:hi].astype(np.float64)[:, None, :]
+            ).reshape(m * 8, 3)
+            mapped = affine.apply_affine_zyx(
+                self._matrix_zyx_image_to_label, corners
+            ).reshape(m, 8, 3)
+            lo_c = np.clip(np.floor(mapped.min(axis=1)), 0.0, label_shape)
+            hi_c = np.clip(np.ceil(mapped.max(axis=1)), 0.0, label_shape)
+            keep_verified[lo:hi] = np.all(hi_c > lo_c, axis=1)
         unique = unique[keep_verified]
         _stage(
             f"coarse scan: {int(keep_verified.sum())} / {n} patches survive "
             f"label-AABB verification"
         )
 
-        candidates = [tuple(int(v) for v in row) for row in unique]
+        candidates: List[Tuple[int, int, int]] = []
+        for lo in range(0, unique.shape[0], _DEDUPE_CHUNK_ROWS):
+            candidates.extend(
+                map(tuple, unique[lo:lo + _DEDUPE_CHUNK_ROWS].tolist())
+            )
         _stage(f"coarse scan kept {len(candidates)} candidate patches")
         return candidates
 
