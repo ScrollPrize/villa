@@ -748,6 +748,8 @@ class InteractiveFitSession:
                 "checkpoint_state": copy.deepcopy(
                     getattr(self, "_checkpoint_state", None)),
                 "supports_input_incorporation": self._context is not None,
+                "umbilicus_end_rule": getattr(
+                    self._context, "umbilicus_end_rule", None),
                 "input_manifest": copy.deepcopy(self.input_manifest),
                 "input_digest": getattr(self, "_input_digest", None),
                 "input_generation": getattr(self, "_input_generation", 0),

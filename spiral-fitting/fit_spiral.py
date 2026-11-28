@@ -93,7 +93,8 @@ from tracks import (
     validate_track_sampling_config,
 )
 from track_graph import TrackGraph
-from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
+from umbilicus import (EXTRAPOLATE_ENDS, HOLD_ENDS, checkpoint_end_rule,
+                       thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx)
 from sample_spiral import (
     get_radial_normal_stretch,
     get_spiral_points,
@@ -1086,8 +1087,10 @@ class FitContext:
         self.z_direction_is_top_to_bottom = scroll.z_direction_is_top_to_bottom
         umbilicus_path = paths.umbilicus
         umbilicus_scale = float(scroll.umbilicus_coordinate_scale)
-        self.umbilicus_z_to_yx = lambda: json_umbilicus_z_to_yx(
-            umbilicus_path, coordinate_scale=umbilicus_scale)
+        self.umbilicus_end_rule = HOLD_ENDS
+        self.umbilicus_z_to_yx = lambda end_rule=None: json_umbilicus_z_to_yx(
+            umbilicus_path, coordinate_scale=umbilicus_scale,
+            end_rule=end_rule or self.umbilicus_end_rule)
 
         # Resolved input paths ('' means absent).
         self.scroll_zarr_path = paths.scroll_zarr or None
@@ -1355,6 +1358,12 @@ class FitContext:
                         pass
             raise RuntimeError(message) from exc
 
+    def _adopt_resume_end_rule(self):
+        if getattr(self, 'resume_path', None):
+            checkpoint = load_checkpoint_cpu(self.resume_path)
+            if isinstance(checkpoint, Mapping):
+                self.umbilicus_end_rule = checkpoint_end_rule(checkpoint)
+
     def load_host_inputs(self):
         """Load and prepare every host-side input for a fit.
 
@@ -1396,7 +1405,11 @@ class FitContext:
         np.random.seed(self.config['optimizer_random_seed'])
         torch.random.manual_seed(self.config['optimizer_random_seed'])
         progress.begin('loading', 'Loading umbilicus')
+        # A resumed fit keeps its checkpoint's axis. The inputs below are
+        # filtered and weighted around it, so this precedes every use of it.
+        self._adopt_resume_end_rule()
         umbilicus = self.umbilicus_z_to_yx()
+        self.umbilicus_end_rule_moves_axis = self._end_rule_moves_model_axis()
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
@@ -2660,19 +2673,31 @@ class FitContext:
     # Checkpoint save/load
     # ==========================================================================
 
+    def _end_rule_moves_model_axis(self):
+        """Whether the two end rules differ anywhere in the optimisation
+        window, which is where the model samples its axis."""
+        zs = np.arange(self.z_begin, self.z_end)
+        return not np.array_equal(self.umbilicus_z_to_yx(HOLD_ENDS)(zs),
+                                  self.umbilicus_z_to_yx(EXTRAPOLATE_ENDS)(zs))
+
     def model_state_digest(self):
         """Content identity of the surface the resident model places.
 
         Stamped into every checkpoint and every raw preview manifest. Two
         artifacts carrying the same digest were produced from byte-identical
-        live parameters, frozen-epoch stack and run window, so the host may
-        re-show the flattened preview it already holds for a checkpoint it is
-        asked to load instead of flattening the same surface again.
+        live parameters, frozen-epoch stack, axis end rule and run window, so
+        the host may re-show the flattened preview it already holds for a
+        checkpoint it is asked to load instead of flattening the same surface
+        again.
         """
+        end_rule = getattr(self, 'umbilicus_end_rule', None)
+        if end_rule != HOLD_ENDS or not self.umbilicus_end_rule_moves_axis:
+            end_rule = None
         return model_state_sha256(
             self.spiral_and_transform.state_dict(),
             getattr(self, 'frozen_epochs', None) or (),
-            getattr(self, 'z_begin', None), getattr(self, 'z_end', None))
+            getattr(self, 'z_begin', None), getattr(self, 'z_end', None),
+            umbilicus_end_rule=end_rule)
 
     def _checkpoint_payload(self, completed_iterations):
         return {
@@ -2699,6 +2724,7 @@ class FitContext:
             # resume rebuilds parameter shapes from these values.
             'z_begin': self.model_z_begin,
             'z_end': self.model_z_end,
+            'umbilicus_end_rule': self.umbilicus_end_rule,
             'spiral_outward_sense': self.spiral_outward_sense,
             'z_direction_is_top_to_bottom': self.z_direction_is_top_to_bottom,
             'numpy_rng_state': np.random.get_state(),
@@ -2934,6 +2960,23 @@ class FitContext:
             reasons.append(
                 'checkpoint does not record a model z-domain, so it cannot be '
                 'shown to match the live model')
+
+        # --- model axis ----------------------------------------------------
+        # The axis is built with the fit, so a load cannot change its rule.
+        live_end_rule = getattr(self, 'umbilicus_end_rule', None)
+        if live_end_rule is not None:
+            try:
+                saved_end_rule = checkpoint_end_rule(checkpoint)
+            except ValueError as exc:
+                reasons.append(f'checkpoint has an {exc}')
+            else:
+                if (saved_end_rule != live_end_rule
+                        and self.umbilicus_end_rule_moves_axis):
+                    reasons.append(
+                        f'checkpoint umbilicus end rule {saved_end_rule!r} gives '
+                        f'a different model axis from this fit\'s '
+                        f'{live_end_rule!r}; start the fit by resuming from this '
+                        'checkpoint to keep its geometry')
 
         # --- model keys and tensor geometry --------------------------------
         model_state = checkpoint.get('spiral_and_transform')

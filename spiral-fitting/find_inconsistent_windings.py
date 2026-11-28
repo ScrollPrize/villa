@@ -1082,6 +1082,8 @@ def main(checkpoint, object_store, volume_uuid, umbilicus, fibers, patch_id, z_r
 
     print('loading + z-filtering patches and point-collections')
     context = fs.FitContext(fit_config, scroll=scroll, paths=input_paths)
+    from umbilicus import checkpoint_end_rule
+    context.umbilicus_end_rule = checkpoint_end_rule(ckpt)
     context.load_host_inputs()
     patches = context.verified_patches
     # fit_spiral holds the cross-patch pcls as a list; this tool's

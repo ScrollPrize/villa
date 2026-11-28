@@ -44,7 +44,7 @@ def _feed_state_dict(digest, prefix, state_dict):
 
 
 def model_state_sha256(state_dict, frozen_epochs=(), z_begin=None,
-                       z_end=None):
+                       z_end=None, umbilicus_end_rule=None):
     """Content digest of everything that places the fitted surface.
 
     The live parameters alone do not determine the surface a fit publishes:
@@ -53,12 +53,17 @@ def model_state_sha256(state_dict, frozen_epochs=(), z_begin=None,
     preview export that agree on this digest were produced from the same
     surface, which is what lets a service re-show the preview it already
     flattened for a checkpoint instead of flattening it again.
+
+    ``umbilicus_end_rule`` is passed only where the rule moves the model's
+    axis away from straight-line extension, so other digests are unchanged.
     """
     import hashlib
     import json
 
     digest = hashlib.sha256()
     digest.update(f"z_window|{z_begin!r}|{z_end!r}\n".encode("utf-8"))
+    if umbilicus_end_rule is not None:
+        digest.update(f"umbilicus_end_rule|{umbilicus_end_rule}\n".encode("utf-8"))
     _feed_state_dict(digest, "live/", state_dict)
     for index, snapshot in enumerate(frozen_epochs or ()):
         prefix = f"frozen/{index}/"
