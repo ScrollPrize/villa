@@ -152,7 +152,9 @@ and managed Lasagna inference write portable provenance.
 
 New Fiber and Lasagna outputs default to the [compact schema v3](docs/volume_schema_v3.md):
 one Zarr store, an embedded manifest, and resolution-based full-channel chunks.
-Existing sidecar outputs remain resumable. Fiber output declares
+Existing sidecar outputs remain resumable; Fiber outputs written before stores
+recorded their tiling resume only with `--adopt-unrecorded-tiling`, to be passed
+only when they were predicted with the same tiling. Fiber output declares
 `validity_channel: chunks` (every stored chunk is a complete prediction; the
 input region is widened to the output chunk grid) and rounds/clamps width to
 uint8 base-volume voxels; `--blank-invalid` additionally zeroes the other
@@ -344,11 +346,15 @@ runner:
 lasagna-preprocess predict3d ... --devices all
 ```
 
-New Fiber and Lasagna `predict3d` OME-Zarr arrays use the same Zarr-v2
-Blosc/Zstd compressor (`clevel=3`, byte shuffle) at every pyramid level.
-Existing arrays keep their compressor when inference resumes; a mismatch is
-reported. Use `--ome-compressor none` only when uncompressed compatibility
-output is required.
+New packed Fiber and Lasagna `predict3d` uint8 arrays use lossless Delta3D
+(`vc-delta3d`, its `fast` preset) at every pyramid level. It is smaller but
+slower to write and read than Blosc/Zstd (`clevel=3`, byte shuffle), which
+float32 arrays (Fiber `--no-width-uint8-base`) and `--output-format legacy`
+use unless `--ome-compressor` says otherwise. Existing arrays keep their
+compressor when inference resumes; for unpacked arrays a mismatch with
+`--ome-compressor` is reported, and a packed output rejects it. Use
+`--ome-compressor none` only when uncompressed compatibility output is
+required.
 
 Use a subset with `--devices cuda:0,cuda:2`. Input tiles are read in the
 background through `vc_reader` outside GPU workers. The tile Cartesian product

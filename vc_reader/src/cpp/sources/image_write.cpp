@@ -1,6 +1,7 @@
 #include "vc_reader/publication.hpp"
 #include "vc_reader/image_write.hpp"
 #include "../chunk_io.hpp"
+#include "../utf8_path.hpp"
 
 #include <tiffio.h>
 #include <unistd.h>
@@ -141,7 +142,7 @@ TiffWriter::TiffWriter(std::filesystem::path path, const std::string& dtype, std
     s.options = std::move(options);
     s.path = std::move(path);
     if (s.path.has_parent_path()) std::filesystem::create_directories(s.path.parent_path());
-    s.temporary = temporary_path(s.path.string());
+    s.temporary = utf8Path(temporary_path(utf8String(s.path)));
     const auto bytes = std::size_t(s.options.pages) * std::size_t(rows) * std::size_t(cols) * s.pixel;
     // Large output, or compressed output that may not shrink, needs 64-bit offsets.
 #ifdef _WIN32
@@ -149,7 +150,7 @@ TiffWriter::TiffWriter(std::filesystem::path path, const std::string& dtype, std
 #else
     s.tif.reset(TIFFOpen(s.temporary.c_str(), bytes >= (1ULL << 31) ? "w8" : "w"));
 #endif
-    if (!s.tif) throw std::runtime_error("cannot create " + s.temporary.string());
+    if (!s.tif) throw std::runtime_error("cannot create " + utf8String(s.temporary));
     s.tags();
 }
 

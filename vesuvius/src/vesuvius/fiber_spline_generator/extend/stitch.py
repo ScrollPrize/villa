@@ -248,7 +248,5 @@ def _gap_ranges(curve, points):
     ranges = []
     for gap in curve.get('gaps', []):
         if gap.get('kind') == 'gap' and len(gap.get('points', [])) >= 2:
-            a, b = sorted(map(int, tree.query(np.asarray(gap['points'])[[0, -1]])[1]))
-            if a != b:
-                ranges.append([a, b])
+            ranges.append(sorted(map(int, tree.query(np.asarray(gap['points'])[[0, -1]])[1])))
     return ranges

@@ -1,5 +1,6 @@
 import numpy as np
 
+from vesuvius.fiber_spline_generator.cleanup import clean
 from vesuvius.fiber_spline_generator.cli import GAP_MODEL
 from vesuvius.fiber_spline_generator.extend.ct_support import CTSupport
 from vesuvius.fiber_spline_generator.extend.gap_model import Predictor, geometry_features
@@ -54,6 +55,38 @@ def test_overlapping_splines_of_neighbouring_blocks_become_one_fiber(tmp_path):
     points = fibers[0]["points"]
     assert np.isclose(points[:, 0].min(), 20) and np.isclose(points[:, 0].max(), 298)
     assert np.abs(points[:, 1:] - 48).max() < 1e-3
+
+
+def test_splines_meeting_at_a_shared_end_point_become_one_fiber(tmp_path):
+    stitcher = Stitcher(tmp_path)
+    try:
+        stitcher.add_block("block-0", [0, 0, 0], list(SHAPE_XYZ), [("V", line(10, 60)), ("V", line(60, 130))],
+                           (np.zeros(3), np.asarray(SHAPE_XYZ)))
+        fibers = list(stitcher.chains())
+    finally:
+        stitcher.close()
+    assert len(fibers) == 1
+    assert np.isclose(fibers[0]["points"][:, 0].min(), 10) and np.isclose(fibers[0]["points"][:, 0].max(), 130)
+
+
+def chains(tmp_path, traces):
+    stitcher = Stitcher(tmp_path)
+    try:
+        stitcher.add_block("block-0", [0, 0, 0], list(SHAPE_XYZ), traces, (np.zeros(3), np.asarray(SHAPE_XYZ)))
+        return list(stitcher.chains())
+    finally:
+        stitcher.close()
+
+
+def test_a_join_at_a_shared_end_point_is_cut_when_it_turns_too_sharply(tmp_path):
+    bent = line(60, 130)
+    bent[:, 1] += (bent[:, 2] - 60) * np.tan(np.deg2rad(10))
+    fibers = chains(tmp_path, [("V", line(10, 60)), ("V", bent)])
+    assert len(fibers) == 1 and len(clean(fibers, 5, 0)) == 2
+
+
+def test_overlapping_tips_are_not_joined_backwards(tmp_path):
+    assert len(chains(tmp_path, [("V", line(10, 130)), ("V", line(129.875, 250))])) == 2
 
 
 def hooked(points, x, offset=1.6, over=4.):

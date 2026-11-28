@@ -341,6 +341,7 @@ vc_add_test(NAME test_post_process SOURCES test_post_process.cpp
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 vc_add_test(NAME test_surface_meshing)
+vc_add_test(NAME test_inpaint_surface LIBS doctest::doctest vc_inpaint)
 
 # These spawn the built command-line tools, so they only exist in
 # configurations that build the apps -- the test shards configure with
@@ -553,6 +554,10 @@ vc_add_test(NAME test_quadsurface_save_paths)
 
 vc_add_test(NAME test_growth_config
     LIBS doctest::doctest vc_tracer
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+vc_add_test(NAME test_growpatch_straight_loss
+    LIBS doctest::doctest opencv_core OpenMP::OpenMP_CXX
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 vc_add_test(NAME test_growth_helpers

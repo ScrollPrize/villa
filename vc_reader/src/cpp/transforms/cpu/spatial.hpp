@@ -180,7 +180,7 @@ inline bool resample_exact(const Array& src, Array& out, const Parameters& p, do
 // General deformations normally fail the check within their first voxel.
 inline std::size_t displacement_axis(const Parameters& p) {
     const auto d = p.shape.size();
-    if (p.field.empty() || !p.border || p.matrix != identity(d) ||
+    if (p.field.empty() || p.matrix != identity(d) ||
         std::any_of(p.offset.begin(), p.offset.end(), [](double v) { return v != 0; })) return d;
     std::size_t chosen = d;
     for (std::size_t i = 0; i < p.field.size(); i += d)
@@ -204,17 +204,19 @@ template<class Real> inline void resample_axis_displacement(const Array& src, Ar
                     std::array<Real,3> q{Real(x) + p.field[i * d + axis], 0, 0};
                     if (nearest) {
                         require(std::isfinite(q[0]), "nonfinite sampling coordinate");
-                        auto at = base + std::size_t(nearest_index(std::clamp(q[0], Real(0), Real(extent - 1)), p.nearest_mode)) * step;
+                        if (p.border) q[0] = std::clamp(q[0], Real(0), Real(extent - 1));
+                        auto at = q[0] < -1 || q[0] > Real(extent) ? -1 : nearest_index(q[0], p.nearest_mode);
                         for (std::size_t c = 0; c < src.shape[0]; ++c)
-                            destination[c * grid.size + i] = source[c * grid.size + at];
+                            if (at >= 0 && at < std::int64_t(extent)) destination[c * grid.size + i] = source[c * grid.size + base + std::size_t(at) * step];
+                            else out.set(c * grid.size + i, fill);
                     } else {
                         for (std::size_t c = 0; c < src.shape[0]; ++c) {
                             // The omitted axes have fraction zero, so their
                             // weights are exactly one. Keep low/high corner
                             // accumulation (including the initial +0) unchanged.
-                            Real value = linear_value<1>(line, q, true, fill, [&](auto at) {
-                                return Real(source[c * grid.size + base + at * step]);
-                            });
+                            // A literal border flag keeps this inlined; a runtime one is ~3x slower.
+                            const auto get = [&](auto at) { return Real(source[c * grid.size + base + at * step]); };
+                            Real value = p.border ? linear_value<1>(line, q, true, fill, get) : linear_value<1>(line, q, false, fill, get);
                             if constexpr (std::is_floating_point_v<T>) destination[c * grid.size + i] = static_cast<T>(value);
                             else out.set(c * grid.size + i, value);
                         }
@@ -450,8 +452,7 @@ inline Parameters sample(const SheetCompression& t, const Sample& s, Random& r) 
             }
     if (smooth > .5) { std::vector<double> sigmas(d, smooth); sigmas[chosen] = 0; gaussian_blur(values, g, sigmas, 6, Boundary::Mirror, true); }
     p.field = std::vector<float>(g.size * d);
-    for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = -values[i] * double(g.shape[chosen] - 1) / g.shape[chosen];
-    p.border = true;
+    for (std::size_t i = 0; i < g.size; ++i) p.field[i * d + chosen] = values[i];
     };
     if (image.bytes==4) build.template operator()<float>(); else build.template operator()<double>();
     return p;

@@ -201,7 +201,7 @@ def test_compact_options_and_resume_encoding(tmp_path):
     width = product("width", ["width"], dtype=np.float32)
     output = CompactOutputAdapter(root=tmp_path / "p.zarr", products=(p,width),
                                   n_levels=1, validity_channel="presence", blank_invalid=False)
-    kwargs = dict(base_shape_zyx=(4,4,4), ome_chunk=4,
+    kwargs = dict(base_shape_zyx=(4,4,4), ome_chunk=4, ome_compressor=None,
                   extra_fields={"width_encoding": "float32-input-voxels"})
     output.prepare(**kwargs)
     data = np.full((4,4,4), 128, np.uint8)
@@ -220,6 +220,46 @@ def test_compact_options_and_resume_encoding(tmp_path):
     path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="encoding"):
         output.prepare(**kwargs)
+
+
+@pytest.mark.parametrize("n_levels", [1, 3])
+def test_delta3d_output_matches_blosc_and_resumes(tmp_path, n_levels):
+    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_nx", "sheet_ny"])
+    rng = np.random.default_rng(3)
+    data = {name: rng.integers(0, 40, (64, 64, 40), dtype=np.uint8) for name in p.channel_names}
+    for values in data.values():
+        values[:32, :32, :32] = 0  # a stored all-zero chunk
+    stores = {}
+    for compressor in ("blosc-zstd", "vc-delta3d"):
+        root = tmp_path / f"{compressor}.zarr"
+        output = CompactOutputAdapter(root=root, products=(p,), n_levels=n_levels, validity_channel="chunks")
+        output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32, ome_compressor=compressor)
+        for origin in np.ndindex(2, 2, 2):
+            origin = tuple(32 * i for i in origin)
+            box = tuple(slice(o, o + 32) for o in origin)
+            output.write_products_chunk([(p, {n: a[box] for n, a in data.items()})], chunk_origin_zyx=origin)
+            assert output.validate_chunk(origin)
+        output.build_pyramids(workers=1)
+        output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32, ome_compressor=None)
+        stores[compressor] = root / "sd0"
+    for level in range(n_levels):
+        blosc, delta3d = (open_zarr(stores[c] / str(level)) for c in ("blosc-zstd", "vc-delta3d"))
+        assert delta3d.compressor == {"id": "vc-delta3d", "quant": 1, "channel_axis": "first"}
+        np.testing.assert_array_equal(delta3d[:], blosc[:])
+    with pytest.raises(ValueError, match="incompatible encoding"):
+        output.prepare(base_shape_zyx=(64, 64, 40), ome_chunk=32)
+
+
+@pytest.mark.parametrize("compressor", ["blosc-zstd", "none"])
+def test_resume_adds_levels_with_stored_codec(tmp_path, compressor):
+    p = product("fiber", ["presence"])
+    kwargs = dict(root=tmp_path / "p.zarr", products=(p,), validity_channel="chunks")
+    CompactOutputAdapter(**kwargs, n_levels=2).prepare(base_shape_zyx=(16,16,16), ome_chunk=4,
+                                                       ome_compressor=compressor)
+    output = CompactOutputAdapter(**kwargs, n_levels=3)
+    output.prepare(base_shape_zyx=(16,16,16), ome_chunk=4, ome_compressor=None)
+    output.prepare(base_shape_zyx=(16,16,16), ome_chunk=4, ome_compressor=compressor)
+    assert open_zarr(tmp_path / "p.zarr/sd0/2").compressor == open_zarr(tmp_path / "p.zarr/sd0/0").compressor
 
 
 def test_packed_provenance(tmp_path):
@@ -279,9 +319,12 @@ def test_compact_demand_complete_and_warm_resume(tmp_path):
         assert store.stats["warm_chunks"] == 1
 
 
-@pytest.mark.parametrize("with_distance", [False, True])
-@pytest.mark.parametrize("source_to_base", [1., 2.])
-def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_distance, source_to_base):
+@pytest.mark.parametrize("with_distance,source_to_base,shape", [
+    (False, 1., (8,8,8)), (True, 1., (8,8,8)), (False, 2., (8,8,8)), (True, 2., (8,8,8)),
+    # Not divisible by the output scale: the stored levels round up.
+    (False, 1., (13,11,9)), (True, 1., (13,11,9)),
+])
+def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_distance, source_to_base, shape):
     import torch
     from lasagna import preprocess_cos_omezarr as module
     events = []
@@ -295,7 +338,7 @@ def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_
         kwargs["output_level_arr"][:] = 91
     monkeypatch.setattr(module, "_compute_pred_dt_slab", distance)
     source = tmp_path / "input.zarr"
-    ZarrWriter.create(source, shape=(8,8,8), chunks=(4,4,4), dtype="uint8")[:] = 50
+    ZarrWriter.create(source, shape=shape, chunks=(4,4,4), dtype="uint8")[:] = 50
     for fmt in ("legacy", "compact"):
         events.clear()
         dest = tmp_path / fmt / "output.lasagna.json"
@@ -318,6 +361,10 @@ def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_
             for i, channel in enumerate(group.channels):
                 legacy = open_zarr(tmp_path / f"legacy/output_{channel}.ome.zarr/{level}")
                 assert np.array_equal(packed[i], legacy[:])
+    # Every finest voxel is predicted, the last partial one included.
+    normals = open_zarr(packed_root / "sd1/1")
+    assert normals.shape == (3, *((n + 1) // 2 for n in shape))
+    assert (normals[manifest.groups["sd1"].channels.index("grad_mag")] != 0).all()
 
 
 def test_compact_publication_benchmark(tmp_path):

@@ -18,6 +18,11 @@
 // from the hardware, as it is everywhere else in the library, and the run does not repeat; the
 // tool then refuses --threads above 1, because that generator is shared mutable state.
 //
+// Each slice is estimated on its own, but the axis is one continuous curve. --zfit fits that
+// curve through the estimates of every slice (fit_umbilicus_along_z), so each slice is smoothed
+// with its neighbours. With one slice each side in the window (--zfit 500 at one slice every
+// 256), a slice far off the axis keeps its own estimate, and so do the first and last slice.
+//
 // It does not build normal grids, and does not need to: vc_gen_normalgrids already builds them
 // from a prediction volume, reading every non zero voxel of a uint8 zarr with fill_value 0 as
 // predicted surface. From predictions to an umbilicus is therefore two commands:
@@ -62,6 +67,8 @@ using Json = nlohmann::json;
 using vc::core::util::GridStore;
 using vc::core::util::NormalGridVolume;
 using vc::core::util::align_and_extract_umbilicus;
+using vc::core::util::fit_umbilicus_along_z;
+using vc::core::util::median;
 
 namespace {
 
@@ -151,16 +158,6 @@ std::vector<int> parseSlices(const std::string& spec)
     return slices;
 }
 
-double median(std::vector<double> values)
-{
-    if (values.empty()) {
-        return std::numeric_limits<double>::quiet_NaN();
-    }
-    std::sort(values.begin(), values.end());
-    const size_t mid = values.size() / 2;
-    return values.size() % 2 == 1 ? values[mid] : 0.5 * (values[mid - 1] + values[mid]);
-}
-
 void writeCsv(const fs::path& path, const std::vector<Estimate>& estimates, double scale)
 {
     std::ofstream out(path);
@@ -214,6 +211,14 @@ int main(int argc, char** argv)
             "segment normals crowd towards before the search, each part of the slice counting once "
             "however densely it was sampled. Slices spanning under half a turn are left as they "
             "are. 0 is the estimator unchanged; 1.5 is the measured setting")
+        ("zfit", po::value<double>()->default_value(0.0),
+            "Fit one smooth axis through all the estimates before writing: each control point "
+            "becomes a robust local-linear fit (LOWESS) of the estimates within this many voxels "
+            "of its z, in the frame the points are written in, so each point is smoothed with "
+            "its neighbours along z. 0 writes every slice's own median, as before. Measured "
+            "setting: about 4.7 mm, i.e. 500 at 9.4 um or 2000 at 2.4 um, with --uncrush 1.5 "
+            "and one slice every 256. A window with one slice each side smooths but cannot drop "
+            "a slice that is far off the axis. The raw estimates stay in --csv")
         ("repeats", po::value<int>()->default_value(1),
             "Estimates per slice. The control point written is their coordinatewise median")
         ("threads", po::value<int>()->default_value(1),
@@ -260,6 +265,7 @@ int main(int argc, char** argv)
     const int repeats = vm["repeats"].as<int>();
     const int threads = vm["threads"].as<int>();
     const double uncrush = vm["uncrush"].as<double>();
+    const double zfit = vm["zfit"].as<double>();
     const std::optional<std::uint32_t> baseSeed =
         vm.count("seed") ? std::optional<std::uint32_t>(vm["seed"].as<std::uint32_t>())
                          : std::nullopt;
@@ -270,6 +276,10 @@ int main(int argc, char** argv)
     }
     if (!(uncrush >= 0.0 && uncrush <= 4.0)) {
         std::cerr << "Error: --uncrush must be between 0 and 4." << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (!(zfit >= 0.0) || !std::isfinite(zfit)) {
+        std::cerr << "Error: --zfit must be 0 or a positive number of voxels." << std::endl;
         return EXIT_FAILURE;
     }
     if (threads < 1) {
@@ -468,9 +478,36 @@ int main(int argc, char** argv)
         }
     }
 
-    // One control point per slice, the coordinatewise median of that slice's repeats, carried
-    // from grid units into the frame the grids were built from.
+    // With --zfit, every estimate of every slice goes into one robust fit along z, and each slice's
+    // control point is read off that fit; slices whose window holds too few estimates keep their
+    // median. Both are in the frame the points are written in.
+    std::vector<cv::Vec2d> fitted;
+    if (zfit > 0.0) {
+        std::vector<cv::Vec3d> all;
+        std::vector<double> queryZ;
+        all.reserve(estimates.size());
+        for (const auto& e : estimates) {
+            all.emplace_back(e.slice / coordinateScale, e.point[0] / coordinateScale,
+                             e.point[1] / coordinateScale);
+            if (queryZ.empty() || queryZ.back() != e.slice / coordinateScale) {
+                queryZ.push_back(e.slice / coordinateScale);
+            }
+        }
+        fitted = fit_umbilicus_along_z(all, queryZ, zfit);
+        bool reaches = false;
+        for (size_t q = 1; q < queryZ.size(); ++q) {
+            reaches = reaches || queryZ[q] - queryZ[q - 1] < zfit;
+        }
+        if (!reaches) {
+            std::cerr << "Warning: --zfit " << zfit << " does not reach a neighbouring slice, so "
+                      << "nothing is fitted along z." << std::endl;
+        }
+    }
+
+    // One control point per slice, the coordinatewise median of that slice's repeats (or the fit
+    // above), carried from grid units into the frame the grids were built from.
     Json points = Json::array();
+    size_t pointIndex = 0;
     size_t outside = 0;
     for (size_t i = 0; i < estimates.size();) {
         size_t j = i;
@@ -484,13 +521,24 @@ int main(int argc, char** argv)
             ++j;
         }
         Json point = Json::object();
-        point["x"] = median(xs) / coordinateScale;
-        point["y"] = median(ys) / coordinateScale;
+        bool inside = insideCount == j - i;
+        if (zfit > 0.0) {
+            point["x"] = fitted[pointIndex][0];
+            point["y"] = fitted[pointIndex][1];
+            const double gx = fitted[pointIndex][0] * coordinateScale;
+            const double gy = fitted[pointIndex][1] * coordinateScale;
+            const cv::Size size = estimates[i].gridSize;
+            inside = gx >= 0.0 && gx <= size.width && gy >= 0.0 && gy <= size.height;
+        } else {
+            point["x"] = median(xs) / coordinateScale;
+            point["y"] = median(ys) / coordinateScale;
+        }
+        ++pointIndex;
         point["z"] = estimates[i].slice / coordinateScale;
         point["estimates"] = static_cast<int>(j - i);
-        point["inside"] = insideCount == j - i;
+        point["inside"] = inside;
         points.push_back(point);
-        if (insideCount != j - i) {
+        if (!inside) {
             ++outside;
         }
         i = j;
@@ -504,6 +552,9 @@ int main(int argc, char** argv)
     metadata["coordinate_scale"] = coordinateScale;
     metadata["repeats"] = repeats;
     metadata["uncrush"] = uncrush;
+    if (zfit > 0.0) {
+        metadata["zfit"] = zfit;
+    }
     if (baseSeed) {
         metadata["seed"] = static_cast<int64_t>(*baseSeed);
     }

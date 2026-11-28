@@ -1180,7 +1180,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["base_scale"], 1)
 		self.assertEqual(kwargs["n_levels"], 3)
 		self.assertEqual(kwargs["ome_chunk"], 32)
-		self.assertEqual(kwargs["ome_compressor"], "blosc-zstd")
+		self.assertIsNone(kwargs["ome_compressor"])
 
 	def test_predict3d_cli_forwards_shared_multi_gpu_pipeline_options(self):
 		args = [
@@ -2258,6 +2258,35 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			self.assertEqual(provenance["product"]["groups"]["cos"]["scaledown"], 2)
 			self.assertEqual(provenance["atlas_model_identity"]["model_id"], "20260806123000")
 			self.assertEqual(provenance["artifacts"][1]["path"], "result_cos.ome.zarr")
+
+
+	def test_base_shape_of_a_remote_level(self):
+		"""A URL must not pass through pathlib, which turns s3:// into s3:/."""
+		import functools
+		from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+		import preprocess_cos_omezarr as preprocess_wrapper
+
+		class Quiet(SimpleHTTPRequestHandler):
+			def log_message(self, *args):
+				pass
+
+		with tempfile.TemporaryDirectory() as td:
+			group = Path(td) / "volume.zarr"
+			for level, shape in ((0, (17, 33, 31)), (2, (5, 9, 8))):
+				ZarrWriter.create(group / str(level), shape=shape, chunks=(8, 8, 8), dtype="uint8")
+			server = ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=td))
+			thread = threading.Thread(target=server.serve_forever, daemon=True)
+			thread.start()
+			try:
+				url = f"http://127.0.0.1:{server.server_port}/volume.zarr/2"
+				for location in (url, url + "/", str(group / "2")):
+					self.assertEqual(
+						preprocess_wrapper._resolve_base_shape(location, None, None), (17, 33, 31),
+					)
+			finally:
+				server.shutdown()
+				thread.join()
+				server.server_close()
 
 
 if __name__ == "__main__":

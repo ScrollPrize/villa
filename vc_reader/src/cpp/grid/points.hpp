@@ -39,6 +39,10 @@ struct PointMap {
 // `normals`, normals are those vertex normals interpolated; otherwise they are the
 // patch's. With the Hermite derivatives (du, dv, duv per vertex), patches are bicubic
 // Hermite; otherwise bilinear.
+struct VertexDerivatives {
+    geometry::V du, dv, duv;
+};
+
 struct GridView {
     const float* xyz = nullptr;
     const bool* valid = nullptr;
@@ -47,8 +51,22 @@ struct GridView {
     const float* du = nullptr;
     const float* dv = nullptr;
     const float* duv = nullptr;
+    // Crop-only derivatives on the core perimeter, in top, bottom, then left/right row order.
+    const VertexDerivatives* coreDerivatives = nullptr;
+    int core[4]{0, 0, 0, 0};  // half-open row and column ranges
     bool triangles = false;
 };
+
+// The two horizontal edges include the corners. The vertical edges omit them.
+VCR_POINTS_HD inline int perimeterIndex(const int* core, int row, int col)
+{
+    const int width = core[3] - core[2];
+    if (row == core[0]) return col - core[2];
+    if (row == core[1] - 1) return width + col - core[2];
+    if (col == core[2] || col == core[3] - 1)
+        return 2 * (width + row - core[0] - 1) + int(col != core[2]);
+    return -1;
+}
 
 namespace detail {
 struct Hermite {
@@ -59,6 +77,25 @@ VCR_POINTS_HD inline Hermite hermite(float t)
     const float t2 = t * t, t3 = t2 * t;
     return {2.f * t3 - 3.f * t2 + 1.f, t3 - 2.f * t2 + t, -2.f * t3 + 3.f * t2, t3 - t2,
             6.f * t2 - 6.f * t,       3.f * t2 - 4.f * t + 1.f, -6.f * t2 + 6.f * t, 3.f * t2 - 2.f * t};
+}
+
+VCR_POINTS_HD VCR_POINTS_FLATTEN inline void evaluateHermite(const geometry::V* p, const VertexDerivatives* d,
+                                                            float u, float w, geometry::V& du, geometry::V& dv,
+                                                            geometry::V* position = nullptr)
+{
+    using geometry::V;
+    const Hermite bx = hermite(u), by = hermite(w);
+    const V q0 = p[0] * bx.p0 + d[0].du * bx.m0 + p[1] * bx.p1 + d[1].du * bx.m1;
+    const V q1 = p[2] * bx.p0 + d[2].du * bx.m0 + p[3] * bx.p1 + d[3].du * bx.m1;
+    const V r0 = d[0].dv * bx.p0 + d[0].duv * bx.m0 + d[1].dv * bx.p1 + d[1].duv * bx.m1;
+    const V r1 = d[2].dv * bx.p0 + d[2].duv * bx.m0 + d[3].dv * bx.p1 + d[3].duv * bx.m1;
+    const V q0u = p[0] * bx.dp0 + d[0].du * bx.dm0 + p[1] * bx.dp1 + d[1].du * bx.dm1;
+    const V q1u = p[2] * bx.dp0 + d[2].du * bx.dm0 + p[3] * bx.dp1 + d[3].du * bx.dm1;
+    const V r0u = d[0].dv * bx.dp0 + d[0].duv * bx.dm0 + d[1].dv * bx.dp1 + d[1].duv * bx.dm1;
+    const V r1u = d[2].dv * bx.dp0 + d[2].duv * bx.dm0 + d[3].dv * bx.dp1 + d[3].duv * bx.dm1;
+    if (position) *position = q0 * by.p0 + r0 * by.m0 + q1 * by.p1 + r1 * by.m1;
+    du = q0u * by.p0 + r0u * by.m0 + q1u * by.p1 + r1u * by.m1;
+    dv = q0 * by.dp0 + r0 * by.dm0 + q1 * by.dp1 + r1 * by.dm1;
 }
 }  // namespace detail
 
@@ -88,23 +125,14 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
     for (int k = 0; k < 4; ++k)
         p[k] = vector(v.xyz + 3 * at[k]);
     V position, du, dv;
+    VertexDerivatives derivatives[4];
     if (v.triangles) {
         if(u+w<=1.f){position=p[0]+(p[1]-p[0])*u+(p[2]-p[0])*w;du=p[1]-p[0];dv=p[2]-p[0];}
         else {position=p[1]*(1-w)+p[3]*(u+w-1)+p[2]*(1-u);du=p[3]-p[2];dv=p[3]-p[1];}
     } else if (v.du) {
-        const detail::Hermite bx = detail::hermite(u), by = detail::hermite(w);
-        const auto D = [&](const float* d, int k) { return vector(d + 3 * at[k]); };
-        const V q0 = p[0] * bx.p0 + D(v.du, 0) * bx.m0 + p[1] * bx.p1 + D(v.du, 1) * bx.m1;
-        const V q1 = p[2] * bx.p0 + D(v.du, 2) * bx.m0 + p[3] * bx.p1 + D(v.du, 3) * bx.m1;
-        const V r0 = D(v.dv, 0) * bx.p0 + D(v.duv, 0) * bx.m0 + D(v.dv, 1) * bx.p1 + D(v.duv, 1) * bx.m1;
-        const V r1 = D(v.dv, 2) * bx.p0 + D(v.duv, 2) * bx.m0 + D(v.dv, 3) * bx.p1 + D(v.duv, 3) * bx.m1;
-        const V q0u = p[0] * bx.dp0 + D(v.du, 0) * bx.dm0 + p[1] * bx.dp1 + D(v.du, 1) * bx.dm1;
-        const V q1u = p[2] * bx.dp0 + D(v.du, 2) * bx.dm0 + p[3] * bx.dp1 + D(v.du, 3) * bx.dm1;
-        const V r0u = D(v.dv, 0) * bx.dp0 + D(v.duv, 0) * bx.dm0 + D(v.dv, 1) * bx.dp1 + D(v.duv, 1) * bx.dm1;
-        const V r1u = D(v.dv, 2) * bx.dp0 + D(v.duv, 2) * bx.dm0 + D(v.dv, 3) * bx.dp1 + D(v.duv, 3) * bx.dm1;
-        position = q0 * by.p0 + r0 * by.m0 + q1 * by.p1 + r1 * by.m1;
-        du = q0u * by.p0 + r0u * by.m0 + q1u * by.p1 + r1u * by.m1;
-        dv = q0 * by.dp0 + r0 * by.dm0 + q1 * by.dp1 + r1 * by.dm1;
+        for (int k = 0; k < 4; ++k)
+            derivatives[k] = {vector(v.du + 3 * at[k]), vector(v.dv + 3 * at[k]), vector(v.duv + 3 * at[k])};
+        detail::evaluateHermite(p, derivatives, u, w, du, dv, &position);
     } else {
         position = sampling::bilinear(p[0], p[1], p[2], p[3], u, w);
         du = (p[1] - p[0]) * (1 - w) + (p[3] - p[2]) * w;
@@ -116,6 +144,28 @@ VCR_POINTS_HD VCR_POINTS_FLATTEN inline bool point(const PointMap& g, const Grid
     if (rowTangent) geometry::store(rowTangent, dv);
     if (!step) return true;
     V n = geometry::cross(geometry::linear(g.physical, du), geometry::linear(g.physical, dv)) * g.orientation;
+    if (v.coreDerivatives && !v.triangles) {
+        // A cell of the core with a vertex on the core's border has other derivatives there when the core is a
+        // surface of its own (one sided, not centred). The sign of the normal follows those, so it is the same
+        // with or without the vertices around the core; every other cell has the same derivatives either way.
+        const bool inside = row >= v.core[0] && row + 1 < v.core[1] && col >= v.core[2] && col + 1 < v.core[3];
+        const bool border = row == v.core[0] || row + 2 == v.core[1] || col == v.core[2] || col + 2 == v.core[3];
+        if (inside && border) {
+            for (int k = 0; k < 4; ++k) {
+                const int index = perimeterIndex(v.core, row + k / 2, col + k % 2);
+                if (index >= 0) derivatives[k] = v.coreDerivatives[index];
+            }
+            V du0, dv0;
+            detail::evaluateHermite(p, derivatives, u, w, du0, dv0);
+            const V n0 = geometry::cross(geometry::linear(g.physical, du0), geometry::linear(g.physical, dv0)) * g.orientation;
+            if (geometry::finite(n0)) {
+                if (!geometry::finite(n) || (n.x == 0 && n.y == 0 && n.z == 0))
+                    n = n0;  // at a fold the context can leave no normal where the core alone has one
+                else if (geometry::dot(n, n0) < 0)
+                    n = n * -1.f;
+            }
+        }
+    }
     if (v.normals) {
         V m[4];
         for (int k = 0; k < 4; ++k)
