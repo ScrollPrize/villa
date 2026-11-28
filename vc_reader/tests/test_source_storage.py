@@ -7,6 +7,7 @@ import http.server
 import json
 import math
 import multiprocessing
+import os
 from pathlib import Path
 import pickle
 import sqlite3
@@ -605,6 +606,42 @@ class RemoteTests(RemoteFixtureCase):
             for read in reads:
                 read.result(timeout=30)
         self.assertEqual(list(self.cache.rglob('*.tmp.*')), [])
+
+    def test_budget_named_through_a_symlink_is_the_readers_budget(self):
+        # macOS temp dirs are reached through /var -> /private/var; readers resolve
+        # the cache root, so a budget opened by another spelling must be the same one.
+        from vc_reader import LowDiskSpaceError
+        self.cache.mkdir()
+        link = self.root/'cache_link'
+        link.symlink_to(self.cache, target_is_directory=True)
+        disk_budget(str(link), None).set_min_free_bytes(2**62)
+        with self.assertRaises(LowDiskSpaceError):
+            read_remote_source(Source('linked', Storage(self.url+'/image.png', 'png')), dict(cache_dir=self.cache))
+        self.assertTrue(disk_budget(str(self.cache), None).low_space)
+
+    def test_floor_set_through_a_trailing_slash_reaches_a_new_cache(self):
+        # The directory does not exist yet: the reader creates it, and both spellings
+        # must still be one budget afterwards.
+        from vc_reader import LowDiskSpaceError
+        spelled = str(self.cache) + '/'
+        disk_budget(spelled, None).set_min_free_bytes(2**62)
+        for name in ('first', 'second'):
+            with self.assertRaises(LowDiskSpaceError):
+                read_remote_source(Source(name, Storage(self.url+'/image.png', 'png')), dict(cache_dir=spelled))
+        self.assertIs(disk_budget(spelled, None), disk_budget(str(self.cache), None))
+        self.assertTrue(disk_budget(spelled, None).low_space)
+
+    def test_relative_cache_takes_a_limit_after_its_absolute_spelling_was_used(self):
+        image = lambda name: Source(name, Storage(self.url+'/image.png', 'png'))
+        old = os.getcwd()
+        os.chdir(self.root)
+        try:
+            np.testing.assert_array_equal(read_remote_source(image('first'), dict(cache_dir='cache')), self.data)
+            self.assertIs(disk_budget(str(self.cache), None), disk_budget('cache', None))
+            self.assertEqual(disk_budget('cache', 1 << 20).max_bytes, 1 << 20)
+            np.testing.assert_array_equal(read_remote_source(image('second'), dict(cache_dir='cache')), self.data)
+        finally:
+            os.chdir(old)
 
     def test_low_free_space_refuses_a_download_and_keeps_cached_files(self):
         from vc_reader import LowDiskSpaceError

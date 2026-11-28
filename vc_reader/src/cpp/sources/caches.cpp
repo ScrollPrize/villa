@@ -276,7 +276,7 @@ EncodedFiles::Opened EncodedFiles::open(const std::string& location)
             std::string path = dir;
             if (path.starts_with("~/"))
                 if (const char* home = std::getenv("HOME")) path = std::string(home) + path.substr(1);
-            roots.push_back(fs::weakly_canonical(utf8Path(path)));
+            roots.push_back(cacheRootPath(utf8Path(path)));
         }
         lookIn = roots;
         if (!temporary_.empty()) lookIn.push_back(utf8Path(temporary_));
