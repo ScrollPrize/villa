@@ -10,6 +10,7 @@ import pyro.distributions
 from einops import rearrange
 
 import flow_grad_smoothing
+import gap_metal
 import gap_triton
 import sample_spiral
 from flow_fields import (
@@ -147,7 +148,7 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         return self._pinned_scaled_logits
 
     def _triton_consts(self):
-        # Constants for the fused gap_triton kernels, cached on the (long
+        # Constants for the fused gap kernels, cached on the (long
         # lived) params module so float() conversions of tensor scalars do not
         # sync the GPU once per training iteration.
         consts = getattr(self.params, '_triton_consts', None)
@@ -167,9 +168,17 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
             self.params._triton_consts = consts
         return consts
 
-    def _use_triton(self, input_zyx, dr):
-        return isinstance(dr, torch.Tensor) and gap_triton.gap_triton_available(
-            input_zyx, self.params.logits, dr)
+    def _fused_gap(self, input_zyx, dr):
+        # The fused-kernel module for these tensors: gap_triton on CUDA,
+        # gap_metal on MPS, or None for the eager path.
+        if not isinstance(dr, torch.Tensor):
+            return None
+        tensors = (input_zyx, self.params.logits, dr)
+        if gap_triton.gap_triton_available(*tensors):
+            return gap_triton
+        if gap_metal.gap_metal_available(*tensors):
+            return gap_metal
+        return None
 
     def get_transformed_winding_radii(self, theta, z):
         # This returns the sequence of winding radii (true, not shifted) for the radials given by theta and z
@@ -233,9 +242,10 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         theta, original_radius, inner_winding, _ = get_bounding_windings(input_zyx[..., 1:], self.dr_per_winding)
         num_windings = len(self.params.num_by_winding)
         inner_winding_clipped = inner_winding.to(torch.int64).clip(min=0, max=num_windings - 2)
-        if self._use_triton(input_zyx, self.dr_per_winding):
+        fused = self._fused_gap(input_zyx, self.dr_per_winding)
+        if fused is not None:
             consts = self._triton_consts()
-            transformed_inner_radius, transformed_outer_radius = gap_triton.gap_bracketing_radii(
+            transformed_inner_radius, transformed_outer_radius = fused.gap_bracketing_radii(
                 theta, input_zyx[..., 0], self._get_pinned_scaled_logits(),
                 consts['idx'], consts['idx_total'], self.dr_per_winding,
                 inner_winding_clipped, self.truncate_frac,
@@ -257,9 +267,10 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
 
     def _inverse(self, input_zyx):
         theta, transformed_radius, _ = get_theta_and_radii(input_zyx[..., 1:], self.dr_per_winding)
-        if self._use_triton(input_zyx, self.dr_per_winding):
+        fused = self._fused_gap(input_zyx, self.dr_per_winding)
+        if fused is not None:
             consts = self._triton_consts()
-            transformed_inner_radius, transformed_outer_radius, inner_winding_clipped = gap_triton.gap_search_radii(
+            transformed_inner_radius, transformed_outer_radius, inner_winding_clipped = fused.gap_search_radii(
                 theta, input_zyx[..., 0], self._get_pinned_scaled_logits(),
                 consts['idx'], consts['idx_total'], self.dr_per_winding,
                 transformed_radius, self.truncate_frac,
@@ -466,6 +477,25 @@ class SpiralAndTransform(nn.Module):
             # To make spiral go anticlockwise in slice space (going outwards from the centre), flip it horizontally
             maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=_acw_flip_scale(self.device))]
         return gap_expander, maybe_flip, diffeomorphism, truncate_frac
+
+    def flow_interpolant(self):
+        """The interpolant the flow field integrates ('direct_lr' or
+        'upsampled'; see CartesianFlowField.effective_interpolant), or None
+        for the field types that have only one."""
+        effective = getattr(self.flow_field, 'effective_interpolant', None)
+        return None if effective is None else effective()
+
+    def pin_flow_interpolant(self, interpolant):
+        """Integrate the interpolant a checkpoint was fitted with
+        (checkpoint_io.checkpoint_flow_interpolant); None leaves the choice to
+        the configuration."""
+        pin = getattr(self.flow_field, 'pin_interpolant', None)
+        if pin is not None:
+            pin(interpolant)
+        elif interpolant is not None:
+            raise ValueError(
+                f'{type(self.flow_field).__name__} has a single interpolant; '
+                f'a checkpoint cannot ask for {interpolant!r}')
 
     def get_slice_to_spiral_transform(self, truncate_at_step=None, shared=None):
         # `shared` optionally supplies the (dr_per_winding, scaled_linear_logits,

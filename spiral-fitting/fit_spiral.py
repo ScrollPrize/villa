@@ -68,7 +68,8 @@ def _startup_resource_suffix(started_at=None):
 
 from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
 from lasagna_source import load_lasagna_source
-from checkpoint_io import load_checkpoint_cpu, model_state_sha256
+from checkpoint_io import (FLOW_INTERPOLANT_KEY, checkpoint_flow_interpolant,
+                           load_checkpoint_cpu, model_state_sha256)
 from fiber_direction_samples import load_fiber_direction_samples
 from spiral_sampling import load_spiral_sampling
 from geom_utils import bilinear_atlas_lookup, grid_sample_border, interp1d
@@ -2398,6 +2399,12 @@ class FitContext:
             spiral_outward_sense=self.spiral_outward_sense,
         )
         self.spiral_and_transform.to(self.device)
+        if resume_checkpoint is not None:
+            # A resumed fit integrates the interpolant it was fitted with,
+            # whatever this device's kernels, from its first transform on;
+            # apply_checkpoint below logs it.
+            self._keep_checkpoint_interpolant(
+                resume_checkpoint, config_decides=True, quiet=True)
 
         # ==========================================================================
         # Outer-shell setup
@@ -2479,7 +2486,7 @@ class FitContext:
                 detail=os.path.basename(resume_path))
             # Phase 2: apply. The LR realignment for a resident session is the
             # unconditional one below, so it is not requested twice here.
-            self.apply_checkpoint(resume_checkpoint)
+            self.apply_checkpoint(resume_checkpoint, config_decides=True)
             # load_state_dict has moved the model and optimiser state to their
             # destination tensors.  Release the CPU-side archive mappings before
             # entering the resident training loop.
@@ -2672,12 +2679,62 @@ class FitContext:
         return model_state_sha256(
             self.spiral_and_transform.state_dict(),
             getattr(self, 'frozen_epochs', None) or (),
-            getattr(self, 'z_begin', None), getattr(self, 'z_end', None))
+            getattr(self, 'z_begin', None), getattr(self, 'z_end', None),
+            flow_interpolant=self._flow_interpolant())
+
+    def _flow_interpolant(self):
+        # The interpolant the resident flow field integrates (None for field
+        # types with only one).
+        interpolant = getattr(self.spiral_and_transform, 'flow_interpolant', None)
+        return None if interpolant is None else interpolant()
+
+    def _keep_checkpoint_interpolant(self, checkpoint, config_decides=False,
+                                     quiet=False):
+        """Integrate the flow interpolant ``checkpoint`` was fitted with
+        (checkpoint_io.checkpoint_flow_interpolant) from now on, and say so
+        when an older checkpoint's interpolant had to be inferred.
+
+        ``config_decides``: the caller's model_flow_field_direct_lr is the
+        checkpoint's unless explicitly overridden, so a different value
+        decides the interpolant, and the change is logged.
+        """
+        pin = getattr(self.spiral_and_transform, 'pin_flow_interpolant', None)
+        if pin is None or not isinstance(checkpoint, dict):
+            return
+        try:
+            interpolant, note = checkpoint_flow_interpolant(checkpoint)
+        except ValueError:
+            return   # an unknown recorded interpolant: the preflight refuses it
+        saved = (checkpoint.get('cfg') or {}).get('model_flow_field_direct_lr')
+        live = self.config.get('model_flow_field_direct_lr')
+        changed = (config_decides and interpolant is not None and saved is not None
+                   and live is not None and bool(saved) != bool(live))
+        try:
+            pin(None if changed else interpolant)
+        except ValueError:
+            # Another field type than the checkpoint's: the preflight refuses
+            # it and says why.
+            return
+        message = None
+        if changed:
+            now = self._flow_interpolant()
+            message = (f'WARNING: checkpoint flow field: model_flow_field_direct_lr is '
+                       f'{bool(live)} here and was {bool(saved)} in the checkpoint '
+                       f'({interpolant}); integrating {now}'
+                       + ('; the fitted surface moves' if now != interpolant else ''))
+        elif note:
+            message = f'checkpoint flow field: {interpolant} ({note})'
+        if message is not None and not quiet:
+            print(message, flush=True)
 
     def _checkpoint_payload(self, completed_iterations):
         return {
             'schema_version': 2,
             'model_state_sha256': self.model_state_digest(),
+            # The interpolant the fit integrated, not the one its
+            # configuration asked for (they differ where no fused kernel
+            # runs): reconstructions keep it.
+            FLOW_INTERPOLANT_KEY: self._flow_interpolant(),
             'completed_iterations': int(completed_iterations),
             'spiral_and_transform': self.spiral_and_transform.state_dict(),
             'optimiser': self.optimiser.state_dict(),
@@ -2807,6 +2864,10 @@ class FitContext:
         for key in ('spiral_and_transform', 'optimiser', 'cfg'):
             if checkpoint.get(key) is None:
                 reasons.append(f'checkpoint has no {key!r} entry')
+        try:
+            checkpoint_flow_interpolant(checkpoint)
+        except ValueError as exc:
+            reasons.append(str(exc))
 
         # --- scroll / input identity --------------------------------------
         # A fit that reads no Lasagna dataset has no downsampling to compare.
@@ -3011,7 +3072,7 @@ class FitContext:
             completed_iterations=(None if completed is None else int(completed)),
             source=source)
 
-    def apply_checkpoint(self, checkpoint, *, realign_lr=False):
+    def apply_checkpoint(self, checkpoint, *, realign_lr=False, config_decides=False):
         """Phase 2: move a preflighted checkpoint into the live fit.
 
         Only ever called after :meth:`inspect_checkpoint` accepted this exact
@@ -3027,7 +3088,7 @@ class FitContext:
         """
         completed = int(checkpoint['completed_iterations'])
         self.start_iteration = completed
-        self.load_checkpoint(checkpoint)
+        self.load_checkpoint(checkpoint, config_decides=config_decides)
         self._restore_rng_state(checkpoint)
         if realign_lr:
             self._realign_lr_schedule(completed)
@@ -3053,7 +3114,10 @@ class FitContext:
                 and self.device.type == 'mps'):
             torch.mps.set_rng_state(checkpoint['torch_mps_rng_state'])
 
-    def load_checkpoint(self, checkpoint):
+    def load_checkpoint(self, checkpoint, config_decides=False):
+        # The model state places the checkpoint's surface only under the
+        # interpolant it was fitted with.
+        self._keep_checkpoint_interpolant(checkpoint, config_decides)
         checkpoint, _ = tolerate_checkpoint_config(checkpoint)
         checkpoint = expand_gap_checkpoint_capacity(
             checkpoint, self.config['model_gap_expander_capacity_windings'])
@@ -4447,6 +4511,15 @@ if __name__ == '__main__':
         # default; FIT_SPIRAL_CONFIG_OVERRIDES still wins over it.
         config.update(scroll_spec_config_defaults(scroll_spec, config))
         config.update(overrides)
+        resume_path = os.environ.get('FIT_SPIRAL_RESUME_PATH')
+        if resume_path and 'model_flow_field_direct_lr' not in overrides:
+            # Only an override changes the interpolant a resume was fitted with.
+            checkpoint = load_checkpoint_cpu(resume_path)
+            saved_config = checkpoint.get('cfg') if isinstance(checkpoint, dict) else None
+            saved = (saved_config or {}).get('model_flow_field_direct_lr')
+            del checkpoint
+            if saved is not None:
+                config['model_flow_field_direct_lr'] = saved
         config['object_store_location'] = cli_args.object_store
         config['object_store_author'] = cli_args.object_store_author
         config['object_store_link_timeout_s'] = cli_args.object_store_link_timeout
@@ -4520,7 +4593,7 @@ if __name__ == '__main__':
             scroll=scroll_spec,
             paths=input_paths,
             progress=cli_progress,
-            resume_path=os.environ.get('FIT_SPIRAL_RESUME_PATH'),
+            resume_path=resume_path,
             out_base_dir=os.environ.get('FIT_SPIRAL_OUT_DIR'),
             run_dir=os.environ.get('FIT_SPIRAL_RUN_DIR'),
             run_tag=os.environ.get('FIT_SPIRAL_RUN_TAG'),
