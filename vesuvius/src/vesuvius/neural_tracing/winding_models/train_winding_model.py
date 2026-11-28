@@ -833,16 +833,19 @@ def train(config_path):
                             first_val = (val_batch, val_output)
                     local_validation_batch_count = val_batches_per_log
 
-                sum_keys = tuple(val_sums)
-                reduced = accelerator.reduce(
-                    torch.tensor(
-                        [val_sums[key] for key in sum_keys],
-                        dtype=torch.float64,
-                        device=accelerator.device,
-                    ),
-                    reduction="sum",
-                )
-                val_sums = dict(zip(sum_keys, reduced.cpu().tolist()))
+                # One process (always the case on MPS, which has no float64)
+                # needs no reduction; the sums stay Python floats.
+                if accelerator.num_processes > 1:
+                    sum_keys = tuple(val_sums)
+                    reduced = accelerator.reduce(
+                        torch.tensor(
+                            [val_sums[key] for key in sum_keys],
+                            dtype=torch.float64,
+                            device=accelerator.device,
+                        ),
+                        reduction="sum",
+                    )
+                    val_sums = dict(zip(sum_keys, reduced.cpu().tolist()))
                 validation_batch_count = (
                     local_validation_batch_count * accelerator.num_processes
                 )
