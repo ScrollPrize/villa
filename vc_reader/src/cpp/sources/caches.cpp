@@ -340,7 +340,9 @@ EncodedFiles::Ranges EncodedFiles::readRanges(const std::string& location,
         std::lock_guard guard(mutex_);
         if (!temporary_.empty()) roots.push_back(utf8Path(temporary_));
     }
-    for (const auto& root : roots) {
+    // A reader that asks for one version reads only that version's bytes: a
+    // cached copy has none known, so it is not read in place then.
+    for (const auto& root : version.empty() ? roots : std::vector<fs::path>{}) {
         const auto path = zarr::decodedCachePath(root, location);
         const int fd = platform::open_file(path, O_RDONLY);
         if (fd < 0) {
@@ -380,9 +382,9 @@ EncodedFiles::Ranges EncodedFiles::readRanges(const std::string& location,
                     missing = true;
                     return;
                 }
-                if (seen && !response.etag.empty() && response.etag != *seen)
+                if (seen && response.etag != *seen)  // no ETag: not known to be that version
                     throw Changed(location + ": the object changed between range reads (ETag " + *seen + " then " +
-                                  response.etag + ")");
+                                  (response.etag.empty() ? std::string("none") : response.etag) + ")");
                 if (!seen && !response.etag.empty()) seen = response.etag;
                 if (!out.size) out.size = rangeTotal(response.content_range);
                 out.parts[i].assign(reinterpret_cast<const char*>(body.data()), body.size());

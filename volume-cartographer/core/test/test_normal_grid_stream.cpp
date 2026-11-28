@@ -80,6 +80,7 @@ struct Streamed {
         std::ofstream(store / "metadata.json") << R"({"sparse-volume": 1, "spiral-step": 20.0})";
         for (int slice = 0; slice < 8; ++slice) grid(store / "xy" / gridName(slice), slice);
         grid(store / "xz" / gridName(0), 0);
+        server.sendETags();
         server.serveDirectory(store, "/ng");
         fs::create_directories(dir);
         REQUIRE(vc::core::util::writeNormalGridsRemoteMarker(dir, url));
@@ -223,6 +224,12 @@ TEST_CASE("Streaming store: a marker directory outside the cache layout is refus
 
 namespace {
 // VC_NORMAL_GRID_RANGE_READS=1 for one scope.
+std::string readFile(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+}
+
 struct RangeReads {
     RangeReads() { setenv("VC_NORMAL_GRID_RANGE_READS", "1", 1); }
     ~RangeReads() { unsetenv("VC_NORMAL_GRID_RANGE_READS"); }
@@ -269,12 +276,12 @@ TEST_CASE("Range reads: grids are read in parts, never downloaded whole, and ans
     CHECK_FALSE(fs::exists(s.dir / "xy" / "000003.grid"));
     CHECK(s.temporaries().empty());
 
-    // A later volume replays the pack: nothing fetched again.
+    // A later volume replays the pack: only its version is checked again.
     const auto before = s.fetches("xy/000000.grid");
     NormalGridVolume again(s.dir.string());
     REQUIRE(again.get_grid(0, 0) != nullptr);
     (void)again.get_grid(0, 0)->get(cv::Rect(0, 0, 100, 100));
-    CHECK(s.fetches("xy/000000.grid") == before);
+    CHECK(s.fetches("xy/000000.grid") == before + 1);
 }
 
 TEST_CASE("Range reads: under a tiny memory cap read-ahead files are dropped and replayed, answers unchanged")
@@ -294,7 +301,7 @@ TEST_CASE("Range reads: under a tiny memory cap read-ahead files are dropped and
         CHECK(volume.cacheStats().fetchFailures == 0);
     }
     unsetenv("VC_NORMAL_GRID_RANGE_MEMORY_BYTES");
-    // What was dropped from memory is still in the packs: nothing is fetched again.
+    // What was dropped from memory is still in the packs: only versions are checked again.
     std::vector<std::size_t> before;
     for (int slice = 0; slice < 8; ++slice) before.push_back(s.fetches("xy/" + gridName(slice)));
     NormalGridVolume again(s.dir.string());
@@ -302,7 +309,7 @@ TEST_CASE("Range reads: under a tiny memory cap read-ahead files are dropped and
         const auto grid = again.get_grid(0, slice);
         REQUIRE(grid != nullptr);
         (void)grid->get(cv::Rect(0, 0, 100, 100));
-        CHECK(s.fetches("xy/" + gridName(slice)) == before[slice]);
+        CHECK(s.fetches("xy/" + gridName(slice)) == before[slice] + 1);
     }
 }
 
@@ -343,7 +350,7 @@ TEST_CASE("Range reads: under the free-space floor grids are read into memory, n
     CHECK_FALSE(fs::exists(s.dir / "xz" / "000000.grid.ranges"));
 }
 
-TEST_CASE("Range reads: when a grid's regions stop arriving, the grid is read whole, never as empty")
+TEST_CASE("Range reads: when a grid's regions stop arriving, it is reported, never read whole at another version")
 {
     Streamed s;
     RangeReads on;
@@ -365,39 +372,49 @@ TEST_CASE("Range reads: when a grid's regions stop arriving, the grid is read wh
         }
         return std::nullopt;
     });
-    vc::core::util::GridStore whole((s.store / "xy" / gridName(5)).string());
     NormalGridVolume volume(s.dir.string());
     const auto grid = volume.get_grid(0, 5);  // opened by range reads
     REQUIRE(grid != nullptr);
-    CHECK(wholeGets == 0);
     failRanges = true;
-    for (const auto& rect : {cv::Rect(3000, 2000, 300, 300), cv::Rect(100, 2500, 200, 200), cv::Rect(0, 0, 4000, 3000)}) {
-        const auto got = points(grid->get(rect));
-        CHECK_FALSE(got.empty());
-        CHECK(got == points(whole.get(rect)));
-    }
+    CHECK(grid->get(cv::Rect(3000, 2000, 300, 300)).empty());
+    CHECK(volume.readFailures() == 1);  // GrowPatch does not save
     CHECK(failed > 0);
-    CHECK(wholeGets == 1);  // read whole once, then every query answered from it
-    CHECK(fs::is_regular_file(s.dir / "xy" / gridName(5)));
+    CHECK(wholeGets == 0);              // not read whole: that copy could be another version
+    failRanges = false;
+    vc::core::util::GridStore whole((s.store / "xy" / gridName(5)).string());
+    CHECK(points(grid->get(cv::Rect(3000, 2000, 300, 300))) == points(whole.get(cv::Rect(3000, 2000, 300, 300))));
 }
 
 namespace {
-// Slice 5 is read by range, evicted, then (when `replace`) replaced on the
-// server and cached whole by a second reader, and read again by the first:
-// returns that reader's readFailures().
-uint64_t rereadAfterEviction(bool replace)
+struct Reread {
+    uint64_t failures = 0;
+    std::vector<std::vector<cv::Point>> first, again;
+};
+
+// Slice 5 is read by range, then its mirror and pack are evicted (memory cap,
+// and the pack removed as the disk cache would), and, when `replace`, the slice
+// is replaced on the server and cached whole by a second reader; the first
+// reader reads it again.
+Reread rereadAfterEviction(bool replace)
 {
     Streamed s;
-    setenv("VC_GRID_CACHE_BYTES", "1", 1);  // every lookup evicts down to one slice
+    setenv("VC_GRID_CACHE_BYTES", "1", 1);                // every lookup evicts down to one slice
+    setenv("VC_NORMAL_GRID_RANGE_MEMORY_BYTES", "1", 1);  // and mirrors not in use are dropped
     std::unique_ptr<NormalGridVolume> reader;
     {
         RangeReads on;
         reader = std::make_unique<NormalGridVolume>(s.dir.string());
     }
-    const auto first = reader->get_grid(0, 5);
-    REQUIRE(first != nullptr);
-    CHECK_FALSE(first->get(cv::Rect(0, 0, 100, 100)).empty());
-    CHECK(reader->get_grid(0, 2) != nullptr);  // slice 5 evicted
+    Reread out;
+    const cv::Rect rect(0, 0, 100, 100);
+    {
+        const auto first = reader->get_grid(0, 5);
+        REQUIRE(first != nullptr);
+        out.first = points(first->get(rect));
+        CHECK_FALSE(out.first.empty());
+    }
+    for (int slice = 0; slice < 5; ++slice) (void)reader->get_grid(0, slice);  // slice 5 evicted
+    fs::remove(s.dir / "xy" / (gridName(5) + ".ranges"));
     if (replace) {
         // The same size and layout: only a point moves.
         vc::core::util::GridStore gs(cv::Rect(0, 0, 100, 100), 10);
@@ -408,59 +425,99 @@ uint64_t rereadAfterEviction(bool replace)
         NormalGridVolume wholeReader(s.dir.string());  // reads it whole, into the shared cache
         REQUIRE(wholeReader.get_grid(0, 5) != nullptr);
     }
-    const auto again = reader->get_grid(0, 5);
-    REQUIRE(again != nullptr);
-    (void)again->get(cv::Rect(0, 0, 100, 100));
+    if (const auto again = reader->get_grid(0, 5)) out.again = points(again->get(rect));
     unsetenv("VC_GRID_CACHE_BYTES");
-    return reader->readFailures();
+    unsetenv("VC_NORMAL_GRID_RANGE_MEMORY_BYTES");
+    out.failures = reader->readFailures();
+    return out;
 }
 }  // namespace
 
-TEST_CASE("Range reads: a slice that changed on the server is counted when it is read again after eviction")
+TEST_CASE("Range reads: a slice that changed on the server is refused when it is read again after eviction")
 {
-    CHECK(rereadAfterEviction(true) == 1);  // GrowPatch does not save a trace that saw both
+    const auto r = rereadAfterEviction(true);
+    CHECK(r.failures == 1);  // GrowPatch does not save
+    CHECK(r.again.empty());  // never the replacement's paths
 }
 
-TEST_CASE("Range reads: a slice read again after eviction, unchanged, is not counted")
+TEST_CASE("Range reads: a slice read again after eviction, unchanged, reads the same")
 {
-    CHECK(rereadAfterEviction(false) == 0);
+    const auto r = rereadAfterEviction(false);
+    CHECK(r.failures == 0);
+    CHECK(r.again == r.first);
 }
 
-TEST_CASE("Range reads: a slice read whole after its regions stop arriving is charged to the grid cache")
+TEST_CASE("Range reads: queries in flight while a slice changes never answer from two versions")
 {
-    // The whole copy a slice keeps after the fallback counts against
-    // VC_GRID_CACHE_BYTES like any slice read whole: here it alone exceeds
-    // the budget, so the next lookup evicts down to one entry.
+    // One query waits for a range response of the old version while the slice
+    // is replaced, cached whole by another reader, evicted and opened again.
+    // Every answer is the old version's, or none (a failed read, so GrowPatch
+    // does not save): never the new one's.
     Streamed s;
-    RangeReads on;
-    {
+    const auto bigGrid = [&](int dx) {
         vc::core::util::GridStore big(cv::Rect(0, 0, 4000, 3000), 32);
         for (int y = 5; y < 3000; y += 37)
-            for (int x = 5; x < 4000; x += 41) big.add({cv::Point(x, y), cv::Point(x + 6, y + 3), cv::Point(x + 12, y + 1)});
+            for (int x = 5; x < 4000; x += 41) big.add({cv::Point(x, y), cv::Point(x + 6 + dx, y + 3), cv::Point(x + 12, y + 1)});
         big.save((s.store / "xy" / gridName(5)).string());
-    }
-    const auto budget = fs::file_size(s.store / "xy" / gridName(5)) / 2;
-    setenv("VC_GRID_CACHE_BYTES", std::to_string(budget).c_str(), 1);
-    std::atomic<bool> failRanges{false};
-    s.server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
-        if (request.path == "/ng/xy/" + gridName(5) && failRanges && !request.header("range").empty())
-            return LoopbackHttpServer::Response{500, "range reads are down", {}, false};
-        return std::nullopt;
-    });
+        return std::make_unique<vc::core::util::GridStore>((s.store / "xy" / gridName(5)).string());
+    };
+    const auto v1 = bigGrid(0);
+    const auto v1bytes = readFile(s.store / "xy" / gridName(5));
+    setenv("VC_GRID_CACHE_BYTES", "1", 1);
+    std::unique_ptr<NormalGridVolume> reader;
     {
-        NormalGridVolume volume(s.dir.string());
-        const auto grid = volume.get_grid(0, 5);
-        REQUIRE(grid != nullptr);
-        (void)grid->get(cv::Rect(100, 100, 200, 200));
-        const auto partial = grid->residentBytes();
-        CHECK(partial < budget);
-        failRanges = true;
-        CHECK(grid->get_all().size() == vc::core::util::GridStore((s.store / "xy" / gridName(5)).string()).get_all().size());
-        CHECK(grid->residentBytes() > budget);  // the whole copy is counted
-        REQUIRE(volume.get_grid(0, 4) != nullptr);   // the next lookup charges it
-        CHECK(volume.cacheStats().liveGridEntries == 1);
+        RangeReads on;
+        reader = std::make_unique<NormalGridVolume>(s.dir.string());
     }
+    const cv::Rect early(100, 100, 200, 200), held(3000, 2000, 300, 300), later(1000, 2600, 300, 300);
+    const auto a = reader->get_grid(0, 5);
+    REQUIRE(a != nullptr);
+    CHECK(points(a->get(early)) == points(v1->get(early)));
+
+    // The next range request for slice 5 is answered with the old bytes, late.
+    std::atomic<bool> hold{true}, holding{false};
+    const auto etag = [](const std::string& data) {
+        std::uint64_t h = 1469598103934665603ull;
+        for (const unsigned char c : data) h = (h ^ c) * 1099511628211ull;
+        return "\"" + std::to_string(h) + "\"";
+    };
+    s.server.setHandler([&](const LoopbackHttpServer::Request& request) -> std::optional<LoopbackHttpServer::Response> {
+        if (request.path != "/ng/xy/" + gridName(5) || request.header("range").empty() || !hold.exchange(false))
+            return std::nullopt;
+        const auto range = request.header("range");
+        const auto dash = range.find('-');
+        const std::size_t first = std::stoull(range.substr(6, dash - 6)), last = std::stoull(range.substr(dash + 1));
+        holding = true;
+        while (holding) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        LoopbackHttpServer::Response response{206, v1bytes.substr(first, last - first + 1), {}, false};
+        response.headers = {{"ETag", etag(v1bytes)},
+                            {"Content-Range", "bytes " + std::to_string(first) + "-" + std::to_string(last) + "/" +
+                                                  std::to_string(v1bytes.size())}};
+        return response;
+    });
+    std::vector<std::vector<cv::Point>> heldAnswer;
+    std::thread inFlight([&] { heldAnswer = points(a->get(held)); });
+    while (!holding) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+    const auto v2 = bigGrid(3);  // replaced on the server
+    {
+        NormalGridVolume wholeReader(s.dir.string());  // and cached whole by another reader
+        REQUIRE(wholeReader.get_grid(0, 5) != nullptr);
+    }
+    for (int slice = 0; slice < 5; ++slice) (void)reader->get_grid(0, slice);  // slice 5 evicted
+    std::vector<std::vector<cv::Point>> laterAnswer;
+    if (const auto b = reader->get_grid(0, 5)) laterAnswer = points(b->get(later));  // another store for it
+    holding = false;  // the old response arrives
+    inFlight.join();
     unsetenv("VC_GRID_CACHE_BYTES");
+
+    REQUIRE(points(v1->get(held)) != points(v2->get(held)));
+    REQUIRE(points(v1->get(later)) != points(v2->get(later)));
+    // The old version's paths, or none (the rest of its reads met the new
+    // version): never the new one's.
+    CHECK((heldAnswer.empty() || heldAnswer == points(v1->get(held))));
+    CHECK((laterAnswer.empty() || laterAnswer == points(v1->get(later))));
+    if (heldAnswer.empty() || laterAnswer.empty()) CHECK(reader->readFailures() >= 1);  // GrowPatch does not save
 }
 
 TEST_CASE("Range reads: in an outage a region that cannot be read is counted, not taken as empty, and reads after it")

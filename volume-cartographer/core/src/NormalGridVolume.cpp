@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 #include "vc/core/util/RemoteCacheSettings.hpp"
+#include "vc_reader/file_ownership.hpp"
 #include "vc/core/util/RemoteGridFile.hpp"
 
 #include <future>
@@ -216,19 +217,17 @@
          mutable std::shared_ptr<vcr::sources::EncodedFiles> files;
          // Shared with the range-read stores, which can outlive this volume.
          std::shared_ptr<std::atomic<uint64_t>> read_failures = std::make_shared<std::atomic<uint64_t>>(0);
-         // Set when a cached store's memory grew outside the cache's view (a
-         // range-read slice switched to its whole copy): resync at next lookup.
-         std::shared_ptr<std::atomic<bool>> resync_pending = std::make_shared<std::atomic<bool>>(false);
-         // The file each streamed slice was first read from. A slice evicted and
-         // opened again must be the same file: if it changed on the server in
-         // between, a trace would mix two versions of it, so that counts as a
-         // failed read (GrowPatch then does not save).
-         mutable std::mutex identity_mutex;
-         // Per slice first read a part at a time: what its stores were given.
-         mutable std::map<std::string, std::shared_ptr<SliceLedger>> ledgers;  // by slice path
-         // Per slice first read whole: the content it was read with. It is
-         // read whole thereafter, so it is always compared with that.
-         mutable std::map<std::string, std::string> whole_tokens;  // by slice path
+         // What each streamed slice was first read as, for this volume's life:
+         // by range at a version (the store's ETag), or whole with a content
+         // (vc_reader's token). It is read that way, at that version, from then
+         // on: a slice evicted and opened again, by any reader, is the file the
+         // trace already used, or the read fails (GrowPatch then does not save).
+         struct SlicePin {
+             bool by_range = false;
+             std::string id;
+         };
+         mutable std::mutex pin_mutex;
+         mutable std::map<std::string, SlicePin> pins;  // by slice path
          mutable std::atomic<uint64_t> fetch_failures{0};
          mutable std::mutex fetch_error_mutex;
          mutable std::string last_fetch_error;
@@ -758,7 +757,8 @@
             }
             const std::string location = remote_url + "/" + rel;
             RemoteGridFile::Options options;
-            options.ledger = ledger_for(rel);
+            if (const auto pin = pin_of(rel); pin && pin->by_range) options.version = pin->id;
+            options.own = [](const std::string& pack) { return vcr::ownFile(pack); };
             options.min_free_bytes = range_min_free_bytes;
             options.budgeted = [files = files, location](const std::string& path,
                                                          const RemoteGridFile::Options::Write& write) {
@@ -797,7 +797,9 @@
                 return std::shared_ptr<RemoteGridFile>();
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lock(fetch_error_mutex);
-                const std::string message = "normal-grid range read of " + rel + " unavailable, downloading it whole: " + e.what();
+                const std::string message = options.version.empty()
+                    ? "normal-grid range read of " + rel + " unavailable, downloading it whole: " + e.what()
+                    : "normal-grid range read of " + rel + " unavailable: " + e.what();
                 if (message != last_range_fallback) {
                     last_range_fallback = message;
                     std::cerr << message << std::endl;
@@ -902,9 +904,8 @@
                 }
                 if (found) {
                     if (byte_budget &&
-                        (resync_pending->exchange(false, std::memory_order_acq_rel) ||
-                         hits_since_resync.fetch_add(1, std::memory_order_relaxed)
-                             % kResyncEveryHits == kResyncEveryHits - 1)) {
+                        hits_since_resync.fetch_add(1, std::memory_order_relaxed)
+                            % kResyncEveryHits == kResyncEveryHits - 1) {
                         std::unique_lock<std::shared_mutex> lock(mutex);
                         resync_bytes_locked();
                         evict_to_budget_locked();
@@ -919,31 +920,36 @@
 
             std::shared_ptr<GridStore> grid_store;
             std::optional<vcr::sources::EncodedFiles::Opened> pinned;
+            const auto pin = remote_url.empty() ? std::nullopt : pin_of(rel);
             std::error_code exists_ec;
-            if (range_reads && !fs::exists(fs::path(base_path) / rel, exists_ec) && !first_read_whole(rel)) {
-                if (auto opened = range_file(plane_idx, slice_idx, first_px)) {
-                    if (!*opened) {  // the store does not have it
-                        std::unique_lock<std::shared_mutex> lock(mutex);
-                        insert_locked(key, nullptr);
-                        return nullptr;
-                    }
-                    // Should a region fail to arrive, the store reads this
-                    // slice whole the usual way (by value: the store can
-                    // outlive this volume).
-                    auto whole_file = [files = files, url = remote_url + "/" + rel,
-                                       grid_path]() -> std::shared_ptr<const GridStore> {
-                        try {
-                            auto pinned = files->open(url);
-                            return std::make_shared<GridStore>(grid_path);
-                        } catch (const vcr::zarr::NotFound&) {
-                            return nullptr;
-                        }
-                    };
+            const bool by_range = range_reads && (pin ? pin->by_range : !fs::exists(fs::path(base_path) / rel, exists_ec));
+            const auto unavailable = [&](const std::string& why) {
+                slice_failed(rel, why);
+                std::unique_lock<std::shared_mutex> lock(mutex);
+                insert_locked(key, nullptr);
+                return nullptr;
+            };
+            if (by_range) {
+                auto opened = range_file(plane_idx, slice_idx, first_px);
+                if (opened && !*opened) {  // the store does not have it
+                    if (pin) return unavailable("no longer on the server");
+                    std::unique_lock<std::shared_mutex> lock(mutex);
+                    insert_locked(key, nullptr);
+                    return nullptr;
+                }
+                if (opened && (*opened)->version().empty()) {
+                    // No version to pin it to: read whole, as without range reads.
+                    if (pin) return unavailable("the store no longer gives its version");
+                    opened.reset();
+                }
+                if (opened) {
+                    if (!pin_slice(rel, {true, (*opened)->version()}))
+                        return unavailable("changed on the server since it was first read");
                     GridStore::RemoteEvents events;
                     events.failed = [failures = read_failures] { failures->fetch_add(1, std::memory_order_relaxed); };
-                    // Its memory now includes the whole copy: charged at the next lookup.
-                    events.readWhole = [pending = resync_pending] { pending->store(true, std::memory_order_release); };
-                    grid_store = std::make_shared<GridStore>(std::move(*opened), std::move(whole_file), std::move(events));
+                    grid_store = std::make_shared<GridStore>(std::move(*opened), std::move(events));
+                } else if (pin) {
+                    return unavailable("cannot be read at the version first read");
                 }
             }
             if (!grid_store) {
@@ -952,12 +958,14 @@
                     if (!fs::exists(fs::path(base_path) / rel, ec)) read_ahead(plane_idx, slice_idx);
                 }
                 if (!ensure_local_file(rel, &pinned)) {
+                    if (pin) return unavailable("could not be read");
                     std::unique_lock<std::shared_mutex> lock(mutex);
                     insert_locked(key, nullptr);
                     return nullptr;
                 }
+                if (pinned && !pinned->token.empty() && !pin_slice(rel, {false, pinned->token}))
+                    return unavailable("changed on the server since it was first read");
                 grid_store = std::make_shared<GridStore>(grid_path);
-                if (!remote_url.empty()) check_whole_slice(rel, *grid_store, pinned);
             }
 
             // if (plane_idx == 0) { // XY plane
@@ -982,8 +990,7 @@
  
                 insert_locked(key, grid_store);
 
-                if (byte_budget && (resync_pending->exchange(false, std::memory_order_acq_rel) ||
-                                    ++inserts_since_resync >= kResyncEveryInserts)) {
+                if (byte_budget && ++inserts_since_resync >= kResyncEveryInserts) {
                     resync_bytes_locked();
                 }
                 evict_to_budget_locked();
@@ -993,47 +1000,29 @@
             return grid_store;
         }
 
-        std::shared_ptr<SliceLedger> ledger_for(const std::string& rel) const
+        std::optional<SlicePin> pin_of(const std::string& rel) const
         {
-            std::lock_guard<std::mutex> lock(identity_mutex);
-            auto& ledger = ledgers[rel];
-            if (!ledger)
-                ledger = std::make_shared<SliceLedger>(remote_url + "/" + rel,
-                                                       [failures = read_failures] { failures->fetch_add(1, std::memory_order_relaxed); });
-            return ledger;
+            std::lock_guard<std::mutex> lock(pin_mutex);
+            const auto found = pins.find(rel);
+            if (found == pins.end()) return std::nullopt;
+            return found->second;
         }
 
-        bool first_read_whole(const std::string& rel) const
+        // Pins a slice the first time it is read; false when it was read
+        // before as something else (another version, or the other way).
+        bool pin_slice(const std::string& rel, SlicePin read_as) const
         {
-            std::lock_guard<std::mutex> lock(identity_mutex);
-            return whole_tokens.count(rel) != 0;
+            std::lock_guard<std::mutex> lock(pin_mutex);
+            const auto [it, first] = pins.emplace(rel, read_as);
+            return first || (it->second.by_range == read_as.by_range && it->second.id == read_as.id);
         }
 
-        // A slice opened whole: the file a trace already used parts of (read a
-        // part at a time), or read whole before, must be this one. Otherwise
-        // the trace would mix two versions: a failed read (GrowPatch then does
-        // not save).
-        void check_whole_slice(const std::string& rel, const GridStore& store,
-                               const std::optional<vcr::sources::EncodedFiles::Opened>& pinned) const
+        // A slice the trace used cannot be read as it was: a failed read.
+        void slice_failed(const std::string& rel, const std::string& why) const
         {
-            std::shared_ptr<SliceLedger> ledger;
-            {
-                std::lock_guard<std::mutex> lock(identity_mutex);
-                const auto found = ledgers.find(rel);
-                if (found != ledgers.end()) ledger = found->second;
-                else if (pinned && !pinned->token.empty()) {
-                    const auto [it, first] = whole_tokens.emplace(rel, pinned->token);
-                    if (first || it->second == pinned->token) return;
-                    read_failures->fetch_add(1, std::memory_order_relaxed);
-                    RemoteGridFile::reportFailure(remote_url + "/" + rel +
-                                                  ": changed on the server since it was first read; a trace using it "
-                                                  "would mix two versions");
-                    return;
-                }
-            }
-            if (!ledger) return;
-            const auto [bytes, size] = store.fileBytes();
-            if (bytes) (void)ledger->checkAll(bytes, size);
+            read_failures->fetch_add(1, std::memory_order_relaxed);
+            RemoteGridFile::reportFailure(remote_url + "/" + rel + ": " + why +
+                                          "; a trace using it would mix two versions");
         }
 
         // Caller must hold the exclusive lock.

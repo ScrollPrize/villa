@@ -37,31 +37,6 @@ namespace vc::core::util {
 // File layout (GridStore v3, big-endian u32): a 13-word header; the bucket
 // index, num_buckets+1 cumulative counts; the flat path-offset list; the path
 // records (start x, start y, n, then n int8 offsets); the JSON metadata.
-// What the readers of one slice have been given so far: the offset, length and
-// hash of every piece of the file placed in a mirror. Shared by every store a
-// volume opens for that slice, so a store opened again after another was
-// evicted, or a whole copy opened in its place, is checked against what the
-// trace already used: a piece that differs means two versions would mix, and
-// is reported once through `diverged`.
-class SliceLedger {
-public:
-    SliceLedger(std::string url, std::function<void()> diverged);
-    // Records the piece, or checks it against the one given before at that
-    // offset with that length. False when it differs.
-    bool check(uint64_t offset, const char* data, uint64_t n);
-    // Checks every recorded piece against `data`, a whole copy of `size` bytes.
-    bool checkAll(const char* data, uint64_t size);
-    bool diverged() const;
-
-private:
-    void report(const std::string& why);
-    std::string url_;
-    std::function<void()> diverged_;
-    mutable std::mutex mutex_;
-    std::map<uint64_t, std::pair<uint64_t, uint64_t>> pieces_;  // offset -> (length, hash)
-    bool reported_ = false;
-};
-
 class RemoteGridFile {
 public:
     // The bytes of each (offset, length) range of the remote file, read
@@ -116,9 +91,16 @@ public:
         // interrupted write is reclaimed (see EncodedFiles::publishFile).
         // False: not published. Without it, a temporary and a rename here.
         std::function<bool(const std::string& path, uint64_t size, const std::function<bool(int fd)>& fill)> publish;
-        // Every piece placed in the mirror is checked against (or recorded in)
-        // this slice's ledger.
-        std::shared_ptr<SliceLedger> ledger;
+        // The version (ETag) the trace pinned this slice to when it first read
+        // it, empty for a first read. Given, only that version is read: a pack of
+        // another is not reused, a cached copy is not read in place, and
+        // another version (or a response without one) raises Changed.
+        std::string version;
+        // Takes ownership of the pack (vcr::ownFile): a token held while this
+        // file lives, or nullptr when another reader owns it (this one then
+        // keeps its pieces in memory). Without it, ownership is only among the
+        // readers of this process.
+        std::function<std::shared_ptr<void>(const std::string& pack_path)> own;
     };
 
     // Replays the pack at local_path + ".ranges", or creates it when there is
@@ -134,13 +116,8 @@ public:
 
     const char* data() const { return static_cast<const char*>(map_); }
     size_t size() const { return size_; }
-    // Whether every byte the mirror holds is the same in `data` (`size` bytes,
-    // the file read whole, say): answers read from the mirror are then what
-    // that copy answers. False when sizes differ and the mirror holds any byte.
-    bool sameBytesAs(const void* data, size_t size);
-    // Checks a whole copy against the slice's ledger (what earlier stores of
-    // the slice were given); a difference is reported there. True without one.
-    bool checkLedger(const void* data, size_t size);
+    // The version (ETag) the file is read at; empty when the store gave none.
+    std::string version() const;
     bool inMemory() const { return in_memory_; }  // no pack on disk
     // Bytes of the file held in memory (fetched or replayed, each byte once).
     uint64_t residentBytes() const { return resident_.load(); }
@@ -191,7 +168,10 @@ private:
     bool in_memory_ = false;
     std::function<void(const std::string&, const Options::Write&)> budgeted_;
     std::function<bool(const std::string&, uint64_t, const std::function<bool(int)>&)> publish_;
-    std::shared_ptr<SliceLedger> ledger_;
+    // Held for this file's life: one reader at a time owns a pack and is the
+    // only one to read or write it (others keep theirs in memory), and the
+    // cache does not evict a pack while it is owned.
+    std::shared_ptr<void> owner_;
     void* map_ = nullptr;
     size_t size_ = 0;
 
@@ -216,7 +196,7 @@ private:
     uint64_t flat_offset_ = 0;  // the path-offset list
     int grid_w_ = 0, grid_h_ = 0;
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable loaded_cv_;
     std::set<std::pair<int, int>> tiles_done_, tiles_loading_, tiles_used_;
     bool all_done_ = false;

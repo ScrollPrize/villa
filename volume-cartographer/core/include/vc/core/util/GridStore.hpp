@@ -38,22 +38,15 @@ public:
     explicit GridStore(const std::string& path);
     // A read-only store over a remote file read a part at a time: each query
     // first fetches what its region needs (see RemoteGridFile). Its `meta` is
-    // not read. When a region cannot be fetched (after a retry), or the
-    // remote file changed version, `whole_file` loads the file whole
-    // the usual way, and this store answers every later query, and size(),
-    // from that copy, so a slice is read from one version (and its memory
-    // counts that copy's). Without it, or when it fails too, the failure is
-    // reported (`events.failed` is called) and the region reads as empty; a
-    // later query tries both again. generation() changes whenever answers
-    // may have changed: on the switch to the whole copy (`events.readWhole`
-    // is called) and on each failed read.
+    // not read. The store reads one version of the file only (the one the
+    // RemoteGridFile is pinned to). When a region cannot be fetched (after a
+    // retry), or the file is no longer that version, the failure is reported
+    // (`events.failed` is called) and the region reads as empty; a later
+    // query tries again. generation() changes on each failed read.
     struct RemoteEvents {
         std::function<void()> failed;
-        std::function<void()> readWhole;
     };
-    explicit GridStore(std::shared_ptr<RemoteGridFile> remote,
-                       std::function<std::shared_ptr<const GridStore>()> whole_file = {},
-                       RemoteEvents events = {});
+    explicit GridStore(std::shared_ptr<RemoteGridFile> remote, RemoteEvents events = {});
     ~GridStore();
 
     void add(const std::vector<cv::Point>& points);
@@ -80,8 +73,6 @@ public:
     // constructor); constant for other stores. A caller that keeps results
     // reads it before its query and keeps them only while it is unchanged.
     uint64_t generation() const;
-    // The bytes of the file a store read whole maps (nullptr for other stores).
-    std::pair<const char*, size_t> fileBytes() const;
     CacheStats cacheStats() const;
     void resetCacheStats() const;
 

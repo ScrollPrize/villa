@@ -1,6 +1,7 @@
 // vcr::sources::EncodedFiles::readRanges: parts of local, cached and remote files, served
 // remotely without caching the whole file; missing files, changed objects, servers that
 // ignore Range, and many concurrent ranges.
+#include "vc_reader/file_ownership.hpp"
 #include "vc_reader/source_reader.hpp"
 
 #include <arpa/inet.h>
@@ -9,6 +10,8 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <sys/file.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <chrono>
 #include <optional>
@@ -580,6 +583,89 @@ int main()
         CHECK(onDisk <= 300);
         CHECK(fs::file_size(pack) == 290);
         for (int fd : {admitted[0], admitted[1], reconciled[0], reconciled[1]}) ::close(fd);
+    }
+
+    // A pack its reader owns (vcr::ownFile) is not evicted (its owner may be
+    // writing it, and unlinking it would leave its bytes on disk uncounted): a
+    // write that would need its room is refused instead. Released, it goes. An
+    // owner in this process or in another; and owning costs no descriptor per file.
+    {
+        const auto ownRoot = root / "owned";
+        fs::create_directories(ownRoot);
+        const auto make = [ownRoot](const std::string& location) {
+            zarr::OpenOptions options;
+            options.access = zarr::resolveAccess(location, zarr::AuthMode::Anonymous);
+            options.cacheDirs = {ownRoot.string()};
+            options.cacheMaxBytes = 200;
+            return options;
+        };
+        const auto base = zarr::decodedCachePath(ownRoot, server.url()).string();
+        const std::string held = base + ".held.ranges", next = base + ".next.ranges";
+        fs::create_directories(fs::path(held).parent_path());
+        const auto fill = [](std::size_t n) {
+            return [n](int fd) {
+                const std::string bytes(n, 'x');
+                return ::write(fd, bytes.data(), bytes.size()) == static_cast<ssize_t>(n);
+            };
+        };
+        sources::EncodedFiles files(make);
+        CHECK(files.publishFile(server.url(), held, 150, fill(150)));
+        {
+            // Spelled through a symlink, as a reader may (macOS's /var is /private/var).
+            const auto link = root / "owned-link";
+            fs::create_directory_symlink(fs::path(held).parent_path(), link);
+            CHECK(vcr::fileOwned(held) == false);
+            auto token = vcr::ownFile((link / fs::path(held).filename()).string());  // its reader, here
+            CHECK(vcr::fileOwned(held));
+            CHECK(vcr::ownFile(held) == nullptr);
+            CHECK(token != nullptr);
+            CHECK(vcr::ownFile(held) == nullptr);  // one owner at a time
+            CHECK(!files.publishFile(server.url(), next, 100, fill(100)));
+            CHECK(fs::exists(held));
+        }
+        // Its reader in another process.
+        int owned[2], release[2];
+        CHECK(::pipe(owned) == 0);
+        CHECK(::pipe(release) == 0);
+        const pid_t owner = ::fork();
+        if (owner == 0) {
+            auto token = vcr::ownFile(held);
+            char c = token ? 1 : 0;
+            (void)!::write(owned[1], &c, 1);
+            (void)!::read(release[0], &c, 1);
+            ::_exit(0);
+        }
+        char c = 0;
+        CHECK(::read(owned[0], &c, 1) == 1);
+        CHECK(c == 1);
+        const bool admitted = files.publishFile(server.url(), next, 100, fill(100));
+        const bool ownedThere = vcr::fileOwned(held);
+        c = 1;
+        (void)!::write(release[1], &c, 1);
+        int status = 0;
+        ::waitpid(owner, &status, 0);
+        CHECK(!admitted);
+        CHECK(ownedThere);
+        CHECK(fs::exists(held));
+        CHECK(!vcr::fileOwned(held));  // released with its process
+        CHECK(files.publishFile(server.url(), next, 100, fill(100)));
+        CHECK(!fs::exists(held));  // evicted now, for the newer file
+        for (int fd : {owned[0], owned[1], release[0], release[1]}) ::close(fd);
+
+        // Owning many files holds one descriptor for their directory, not one each.
+        const auto descriptors = [] {
+            std::size_t n = 0;
+            for (int fd = 0; fd < 65536; ++fd)
+                if (::fcntl(fd, F_GETFD) != -1) ++n;
+            return n;
+        };
+        const auto before = descriptors();
+        std::vector<std::shared_ptr<void>> tokens;
+        for (int i = 0; i < 2000; ++i) tokens.push_back(vcr::ownFile(base + ".many." + std::to_string(i) + ".ranges"));
+        std::size_t got = 0;
+        for (const auto& token : tokens) got += token != nullptr;
+        CHECK(got >= 1990);  // a few may share a byte
+        CHECK(descriptors() <= before + 1);
     }
 
     fs::remove_all(root);

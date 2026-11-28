@@ -175,7 +175,9 @@ public:
         std::vector<std::string> parts;
         // The remote object's ETag, or empty for a file read in place. Pass it back as
         // `version` on later reads of the same file: an object replaced in between then
-        // raises Changed instead of mixing two versions' bytes.
+        // raises Changed instead of mixing two versions' bytes. With a version given, a
+        // cached copy is not read in place (its version is not known), and a response
+        // without an ETag is not taken for that version (Changed).
         std::string version;
         std::optional<std::uint64_t> size;  // the whole file's, when storage says
     };

@@ -13,64 +13,9 @@
 #include <mutex>
 #include <map>
 #include <random>
+#include <set>
 
 namespace fs = std::filesystem;
-
-namespace vc::core::util {
-
-namespace {
-uint64_t pieceHash(const char* data, uint64_t n)
-{
-    uint64_t h = 1469598103934665603ull;  // FNV-1a
-    for (uint64_t i = 0; i < n; ++i) h = (h ^ static_cast<unsigned char>(data[i])) * 1099511628211ull;
-    return h;
-}
-}  // namespace
-
-SliceLedger::SliceLedger(std::string url, std::function<void()> diverged)
-    : url_(std::move(url)), diverged_(std::move(diverged))
-{
-}
-
-void SliceLedger::report(const std::string& why)
-{
-    // Caller holds mutex_.
-    if (reported_) return;
-    reported_ = true;
-    RemoteGridFile::reportFailure(url_ + ": " + why + "; a trace using it would mix two versions");
-    if (diverged_) diverged_();
-}
-
-bool SliceLedger::check(uint64_t offset, const char* data, uint64_t n)
-{
-    const uint64_t hash = pieceHash(data, n);
-    std::lock_guard lock(mutex_);
-    const auto [it, added] = pieces_.emplace(offset, std::make_pair(n, hash));
-    if (added || it->second.first != n) return true;  // new, or not the same piece
-    if (it->second.second == hash) return true;
-    report("changed on the server since it was first read");
-    return false;
-}
-
-bool SliceLedger::checkAll(const char* data, uint64_t size)
-{
-    std::lock_guard lock(mutex_);
-    for (const auto& [offset, piece] : pieces_) {
-        if (offset + piece.first > size || pieceHash(data + offset, piece.first) != piece.second) {
-            report("read whole, it is not the file read before");
-            return false;
-        }
-    }
-    return true;
-}
-
-bool SliceLedger::diverged() const
-{
-    std::lock_guard lock(mutex_);
-    return reported_;
-}
-
-}  // namespace vc::core::util
 
 #ifndef _WIN32
 
@@ -287,20 +232,43 @@ void RemoteGridFile::reportFailure(const std::string& what)
     std::cerr << "normal-grid range read failed (those normals are not used): " << what << std::endl;
 }
 
+namespace {
+// Ownership among this process's readers, when no other is given.
+std::shared_ptr<void> ownHere(const std::string& path)
+{
+    static std::mutex mutex;
+    static std::set<std::string> owned;
+    std::lock_guard lock(mutex);
+    if (!owned.insert(path).second) return nullptr;
+    return std::shared_ptr<void>(new int(0), [path](void* p) {
+        delete static_cast<int*>(p);
+        std::lock_guard lock(mutex);
+        owned.erase(path);
+    });
+}
+
+}  // namespace
+
 RemoteGridFile::RemoteGridFile(std::string url, const std::string& local_path, RangeFetcher fetcher, const Options& options)
     : url_(std::move(url)), pack_path_(local_path + ".ranges"), fetch_(std::move(fetcher)), budgeted_(options.budgeted),
       publish_(options.publish),
-      ledger_(options.ledger),
       min_free_bytes_(options.min_free_bytes)
 {
     ++g_opens;
     const fs::path dir = fs::path(local_path).parent_path();
     in_memory_ = options.in_memory;
+    version_ = options.version;  // pinned by the trace, or empty for a first read
     bool below_floor = false;
     if (!in_memory_) {
         std::error_code ec;
         fs::create_directories(dir, ec);
         in_memory_ = bool(ec);
+    }
+    if (!in_memory_) {
+        // One owner per pack: another reader (here or in another process) has
+        // it, so this one keeps its pieces in memory.
+        owner_ = options.own ? options.own(pack_path_) : ownHere(pack_path_);
+        if (!owner_) in_memory_ = true;
         below_floor = !in_memory_ && belowFloor(dir, options.min_free_bytes, 0);
     }
     // A pack already on disk is read even under the free-space floor (it is
@@ -333,6 +301,13 @@ RemoteGridFile::~RemoteGridFile()
 {
     if (map_) ::munmap(map_, size_);
     g_resident -= resident_.load();
+    owner_.reset();  // releases the pack
+}
+
+std::string RemoteGridFile::version() const
+{
+    std::lock_guard lock(mutex_);
+    return version_;
 }
 
 namespace {
@@ -449,6 +424,22 @@ bool RemoteGridFile::reuse()
     if (crc32(header.data(), header.size() - 4) != get(header.data() + header.size() - 4, 4)) return false;
     const uint64_t recorded_size = get(fixed + 8, 8);
     if (recorded_size < kHeaderBytes || recorded_size > kMaxFileBytes) return false;
+    const std::string pack_version = header.substr(sizeof(fixed), vlen);
+    if (!version_.empty()) {
+        if (pack_version != version_) return false;  // not the version the trace is pinned to
+    } else if (!pack_version.empty()) {
+        // A first read: the pack is used only while the store still has its
+        // version, so a fresh trace starts anew after the slice changed (one
+        // header read). Unreachable (offline, say), the pack is used as it is.
+        try {
+            (void)fetch_({{0, kHeaderBytes}}, pack_version);
+        } catch (const Changed&) {
+            return false;
+        } catch (const NotFound&) {
+            throw;
+        } catch (const std::exception&) {
+        }
+    }
 
     size_ = recorded_size;
     try {
@@ -508,7 +499,7 @@ bool RemoteGridFile::reuse()
         g_resident -= resident_.exchange(0);  // what place() charged while replaying
         return false;
     }
-    version_ = header.substr(sizeof(fixed), vlen);
+    version_ = pack_version;
     pack_identity_ = get(fixed + 16, 8);
     packed_ = std::move(packed);
     tiles_done_ = std::move(done);
@@ -657,24 +648,8 @@ void RemoteGridFile::writeAt(uint64_t offset, std::string bytes, Pieces* log)
 // Copies in the bytes memory does not hold yet. Bytes already held are never
 // written again, so queries reading them race with nothing; and the copy is
 // made under the lock, so once any writer of a range returns, it is in place.
-bool RemoteGridFile::sameBytesAs(const void* data, size_t size)
-{
-    std::lock_guard lock(held_mutex_);
-    if (held_.empty()) return true;
-    if (size != size_) return false;
-    for (const auto& [a, b] : held_)
-        if (std::memcmp(static_cast<const char*>(map_) + a, static_cast<const char*>(data) + a, b - a) != 0) return false;
-    return true;
-}
-
-bool RemoteGridFile::checkLedger(const void* data, size_t size)
-{
-    return !ledger_ || ledger_->checkAll(static_cast<const char*>(data), size);
-}
-
 void RemoteGridFile::place(uint64_t offset, const char* bytes, uint64_t n)
 {
-    if (ledger_) (void)ledger_->check(offset, bytes, n);
     std::lock_guard lock(held_mutex_);
     for (const auto& [a, b] : addRange(held_, offset, offset + n)) {
         std::memcpy(static_cast<char*>(map_) + a, bytes + (a - offset), b - a);
@@ -1022,19 +997,14 @@ RemoteGridFile::RemoteGridFile(std::string url, const std::string&, RangeFetcher
 
 RemoteGridFile::~RemoteGridFile() = default;
 
+std::string RemoteGridFile::version() const
+{
+    return {};
+}
+
 void RemoteGridFile::ensureBuckets(int, int, int, int, bool)
 {
     throw std::logic_error("normal-grid range reads are not available on Windows");
-}
-
-bool RemoteGridFile::checkLedger(const void*, size_t)
-{
-    return true;
-}
-
-bool RemoteGridFile::sameBytesAs(const void*, size_t)
-{
-    return false;
 }
 
 void RemoteGridFile::ensureAll()

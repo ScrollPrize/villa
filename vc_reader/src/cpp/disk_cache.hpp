@@ -3,6 +3,7 @@
 // reads never wait on this index.
 #pragma once
 
+#include "vc_reader/file_ownership.hpp"
 #include "chunk_io.hpp"
 #include "http.hpp"
 #include "vc_reader/zarr.hpp"
@@ -146,7 +147,9 @@ public:
             const auto available = number("SELECT max_bytes FROM budget WHERE id=1") - reserved_bytes();
             if (size > static_cast<std::uint64_t>(available))
                 return;  // A chunk larger than the budget is served without caching.
-            evict_to(available - static_cast<std::int64_t>(size));
+            if (!evict_to(available - static_cast<std::int64_t>(size)))
+                return;  // nor one with no room left beside files in use
+
             file.publish();
             record(path, static_cast<std::int64_t>(size));
             if (owned_file) {
@@ -363,10 +366,10 @@ public:
                 f.text(1, path);
                 f.step();
                 if (growth > 0) {
+                    if (!evict_to(available - growth)) return;  // what is left is owned by live writers
                     reservation = std::make_unique<AtomicFile>(path);
                     lock_file(reservation->fd());
                     record_download(reservation->temporary_path(), static_cast<std::size_t>(growth));
-                    evict_to(available - growth);
                 }
                 accepted = true;
             });
@@ -380,7 +383,7 @@ public:
             std::error_code ec;
             const auto there = utf8Path(path);
             if (std::filesystem::is_regular_file(std::filesystem::symlink_status(there, ec)))
-                after = occupied_bytes(there);
+                after = static_cast<std::int64_t>(std::filesystem::file_size(there, ec));
         }
         transaction([&] {
             if (after) {
@@ -431,7 +434,7 @@ public:
                     reserved = reserved_bytes();
                     if (size > static_cast<std::uint64_t>(limit - reserved)) return;
                 }
-                evict_to(limit - reserved - static_cast<std::int64_t>(size));
+                if (!evict_to(limit - reserved - static_cast<std::int64_t>(size))) return;
                 output = std::make_unique<AtomicFile>(path);
                 temporary = output->temporary_path();
                 lock_file(output->fd());
@@ -455,7 +458,9 @@ public:
             transaction([&] {
                 if (filled) {
                     output->publish();
-                    record(path, occupied_bytes(utf8Path(path)));
+                    // Its length, not its allocation: a file just written may
+                    // have none yet (APFS allocates later), and this one is dense.
+                    record(path, static_cast<std::int64_t>(std::filesystem::file_size(utf8Path(path))));
                     Statement f(db_, "INSERT OR IGNORE INTO files(path) VALUES(?)");
                     f.text(1, path);
                     f.step();
@@ -603,7 +608,7 @@ private:
             const auto published = path.substr(0, tmp);
             std::error_code ec;
             if (std::filesystem::is_regular_file(std::filesystem::symlink_status(utf8Path(published), ec)))
-                record(published, occupied_bytes(utf8Path(published)));
+                record(published, static_cast<std::int64_t>(std::filesystem::file_size(utf8Path(published), ec)));
         }
     }
 
@@ -623,7 +628,9 @@ private:
                         reserved = reserved_bytes();
                     }
                     if (needed <= static_cast<std::uint64_t>(limit - reserved)) {
-                        evict_to(limit - reserved - static_cast<std::int64_t>(needed));
+                        if (!evict_to(limit - reserved - static_cast<std::int64_t>(needed)))
+                            throw std::runtime_error("disk cache is full of files in use (range-read packs); "
+                                                     "increase cache_max_bytes");
                         record_download(path, needed);
                         admitted = true;
                     }
@@ -664,8 +671,13 @@ private:
                         if (wanted > limit - others) return;  // sized downloads hold it; they finish
                     }
                     const auto spare = limit - others - number("SELECT total FROM budget WHERE id=1") - wanted;
-                    const auto target = wanted + std::clamp<std::int64_t>(spare, 0, step);
-                    evict_to(limit - others - target);
+                    auto target = wanted + std::clamp<std::int64_t>(spare, 0, step);
+                    if (!evict_to(limit - others - target)) {
+                        target = wanted;  // no spare beside files in use
+                        if (!evict_to(limit - others - target))
+                            throw std::runtime_error("disk cache is full of files in use (range-read packs); "
+                                                     "increase cache_max_bytes");
+                    }
                     record_download(path, static_cast<std::size_t>(target));
                     granted = static_cast<std::size_t>(target);
                 });
@@ -675,17 +687,32 @@ private:
         }
     }
 
-    void evict_to(std::int64_t limit)
+    // A file a live reader owns (vcr::ownFile: a range-read pack while it is
+    // used). Eviction leaves it, since its owner may be writing it, and
+    // unlinking it would leave the bytes on disk uncounted.
+    static bool owned(const std::string& path) { return vcr::fileOwned(path); }
+
+    // Evicts the oldest files not owned by a live process until the files
+    // charged come to `limit`; false when the owned ones leave it short.
+    bool evict_to(std::int64_t limit)
     {
+        std::int64_t skipped = 0;
         while (number("SELECT total FROM budget WHERE id=1") > limit) {
             std::string path;
             {
-                Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1");
-                if (!s.step())
+                Statement s(db_, "SELECT path FROM chunks ORDER BY age,path LIMIT 1 OFFSET ?");
+                s.integer(1, skipped);
+                if (!s.step()) {
+                    if (skipped) return false;
                     throw std::runtime_error("disk cache accounting is inconsistent");
+                }
                 path = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
             }
             check_path(path);
+            if (owned(path)) {
+                ++skipped;
+                continue;
+            }
             std::filesystem::remove(utf8Path(path));  // unlink, never truncate a mapped file
             Statement s(db_, "DELETE FROM chunks WHERE path=?");
             s.text(1, path);
@@ -693,6 +720,7 @@ private:
             Statement f(db_, "DELETE FROM files WHERE path=?");
             f.text(1, path); f.step();
         }
+        return true;
     }
 
     // One pooled client per set of credentials, so files downloaded one after another
@@ -771,8 +799,11 @@ private:
                 check_path(utf8String(path));
                 std::error_code ec;
                 if (std::filesystem::is_regular_file(std::filesystem::symlink_status(path, ec)))
+                    // Whole files their owners write (downloads, packs) are dense:
+                    // charged their length, which a file just written may not
+                    // have allocated yet (APFS allocates later).
                     files.emplace_back(std::filesystem::last_write_time(path), utf8String(path),
-                                       occupied_bytes(path));
+                                       static_cast<std::int64_t>(std::filesystem::file_size(path)));
             }
         }
         std::sort(files.begin(), files.end());
