@@ -188,6 +188,8 @@ CHECKPOINT_MODEL_SHAPE_KEYS = (
     "model_gap_expander_min_gap", "model_gap_expander_softplus_bias",
     "model_initial_dr_per_winding", "model_linear_z_resolution",
     "fit_volume_level",
+    # The axis the model was fitted around: weights fitted around another one place the surface elsewhere.
+    "umbilicus_smoothing_sigma",
 )
 
 
@@ -316,7 +318,8 @@ NEW_FIT_KEYS = frozenset(
     | _PREPARED_INPUT_FIELDS
     | {"optimizer_random_seed", "track_inner_exclusion_radius",
        "pcl_vertical_fiber_min_auto_certainty",
-       "pcl_vertical_fiber_min_z_fraction", "spiral_outward_sense"}
+       "pcl_vertical_fiber_min_z_fraction", "spiral_outward_sense",
+       "umbilicus_smoothing_sigma"}
 )
 
 _AUDITED_PREFIXES = ("model_", "input_", "pcl_", "object_store_")
@@ -430,6 +433,50 @@ def _field_spec(key, default):
         # not as independent advanced-JSON settings.
         spec["ui_owner"] = "run"
     return spec
+
+
+def check_field_value(key, value, spec):
+    """Raise ValueError unless ``value`` is a valid setting for the field ``spec`` describes (type, range, shape)."""
+    if value is None and spec["nullable"]:
+        return
+    valid = {
+        "boolean": lambda: type(value) is bool,
+        "integer": lambda: type(value) is int,
+        "number": lambda: type(value) in (int, float),
+        "string": lambda: isinstance(value, str),
+        "enum": lambda: value in spec["values"],
+        "vector": lambda: isinstance(value, list),
+        "strings": lambda: isinstance(value, list) and all(
+            isinstance(item, str) for item in value),
+        "dictionary": lambda: isinstance(value, dict),
+        # Any JSON object (a store position).
+        "mapping": lambda: isinstance(value, dict),
+    }
+    if not valid[spec["type"]]():
+        raise ValueError(f"Invalid value for {key}")
+    if spec["type"] in ("integer", "number") and not (
+            spec["minimum"] <= value <= spec["maximum"]):
+        raise ValueError(f"Out-of-range value for {key}")
+    if spec["type"] == "vector" and len(value) != spec["length"]:
+        raise ValueError(f"Invalid vector length for {key}")
+    if spec["type"] == "vector" and any(
+            type(item) not in (int, float) for item in value):
+        raise ValueError(f"Invalid vector value for {key}")
+    if spec["type"] == "dictionary" and any(
+            not isinstance(item_key, str)
+            or type(item) not in (int, float)
+            for item_key, item in value.items()):
+        raise ValueError(f"Invalid dictionary value for {key}")
+
+
+def check_overrides(overrides):
+    """Raise ValueError unless every override is a valid value of its key, by the checks ``Config`` makes of a
+    configuration, so a fit started with overrides and a checkpoint resumed with the same ones agree."""
+    defaults = vars(Config())
+    for key, value in overrides.items():
+        if key not in defaults:
+            raise ValueError(f"Unknown Spiral config keys: {[key]}")
+        check_field_value(key, value, _field_spec(key, defaults[key]))
 
 
 class Config:
@@ -643,6 +690,7 @@ class Config:
         self.loss_weight_fiber_directions = 0.0
         self.loss_weight_dense_spacing = 12.0
         self.loss_weight_umbilicus = 1.25
+        self.umbilicus_smoothing_sigma = 75.0
         self.loss_weight_shell_outer = 1.0
         self.dense_min_spacing_d_min_wv = 6.0
         self.dense_normals_finite_difference_epsilon = 8.0
@@ -751,37 +799,7 @@ class Config:
             raise ValueError(f"Unknown Spiral config keys: {sorted(unknown)}")
         values = defaults | overrides
         for key, value in values.items():
-            spec = fields[key]
-            if value is None and spec["nullable"]:
-                continue
-            valid = {
-                "boolean": lambda: type(value) is bool,
-                "integer": lambda: type(value) is int,
-                "number": lambda: type(value) in (int, float),
-                "string": lambda: isinstance(value, str),
-                "enum": lambda: value in spec["values"],
-                "vector": lambda: isinstance(value, list),
-                "strings": lambda: isinstance(value, list) and all(
-                    isinstance(item, str) for item in value),
-                "dictionary": lambda: isinstance(value, dict),
-                # Any JSON object (a store position).
-                "mapping": lambda: isinstance(value, dict),
-            }
-            if not valid[spec["type"]]():
-                raise ValueError(f"Invalid value for {key}")
-            if spec["type"] in ("integer", "number") and not (
-                    spec["minimum"] <= value <= spec["maximum"]):
-                raise ValueError(f"Out-of-range value for {key}")
-            if spec["type"] == "vector" and len(value) != spec["length"]:
-                raise ValueError(f"Invalid vector length for {key}")
-            if spec["type"] == "vector" and any(
-                    type(item) not in (int, float) for item in value):
-                raise ValueError(f"Invalid vector value for {key}")
-            if spec["type"] == "dictionary" and any(
-                    not isinstance(item_key, str)
-                    or type(item) not in (int, float)
-                    for item_key, item in value.items()):
-                raise ValueError(f"Invalid dictionary value for {key}")
+            check_field_value(key, value, fields[key])
         for key in ("object_store_normal_ct_downsampling",):
             if values[key] is not None and not (
                     math.isfinite(values[key]) and values[key] > 0):

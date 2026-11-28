@@ -40,7 +40,7 @@ from ddp_helpers import (
     maybe_init_distributed,
     process_context,
 )
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, OBJECT_STORE_PCL_KEYS,
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, OBJECT_STORE_PCL_KEYS, check_overrides,
                     Config, FitConfig, SHELL_ATLAS_KEYS)
 from checkpoint_migrations import (expand_gap_checkpoint_capacity,
                                    tolerate_checkpoint_config)
@@ -93,7 +93,8 @@ from tracks import (
     validate_track_sampling_config,
 )
 from track_graph import TrackGraph
-from umbilicus import thaumato_umbilicus_z_to_yx, json_umbilicus_z_to_yx
+from umbilicus import (LEGACY_UMBILICUS_SMOOTHING_SIGMA, thaumato_umbilicus_z_to_yx,
+                       json_umbilicus_z_to_yx, smooth_umbilicus_z_to_yx)
 from sample_spiral import (
     get_radial_normal_stretch,
     get_spiral_points,
@@ -203,6 +204,8 @@ def get_env_config_overrides():
     unknown_keys = sorted(set(overrides) - set(Config().as_dict()))
     if unknown_keys:
         raise KeyError(f'unknown FIT_SPIRAL_CONFIG_OVERRIDES keys: {unknown_keys}')
+    # The checks a configuration gets everywhere else (a checkpoint, the service): a value one refuses all refuse.
+    check_overrides(overrides)
     return overrides
 
 
@@ -1396,7 +1399,9 @@ class FitContext:
         np.random.seed(self.config['optimizer_random_seed'])
         torch.random.manual_seed(self.config['optimizer_random_seed'])
         progress.begin('loading', 'Loading umbilicus')
-        umbilicus = self.umbilicus_z_to_yx()
+        umbilicus = smooth_umbilicus_z_to_yx(
+            self.umbilicus_z_to_yx(), self.z_begin, self.z_end,
+            self.config['umbilicus_smoothing_sigma'])
         if self.scroll_zarr_path:
             progress.begin('loading', 'Opening scroll volume')
             print('loading volume zarr')
@@ -2672,7 +2677,8 @@ class FitContext:
         return model_state_sha256(
             self.spiral_and_transform.state_dict(),
             getattr(self, 'frozen_epochs', None) or (),
-            getattr(self, 'z_begin', None), getattr(self, 'z_end', None))
+            getattr(self, 'z_begin', None), getattr(self, 'z_end', None),
+            umbilicus_smoothing_sigma=self.config.get('umbilicus_smoothing_sigma'))
 
     def _checkpoint_payload(self, completed_iterations):
         return {
@@ -2930,6 +2936,16 @@ class FitContext:
                     f'not the live model domain [{self.model_z_begin}, '
                     f'{self.model_z_end}); rebuild the fit to change the model '
                     'domain')
+            elif (domain != (int(self.z_begin), int(self.z_end))
+                  and self.config['umbilicus_smoothing_sigma'] != LEGACY_UMBILICUS_SMOOTHING_SIGMA):
+                # The readers smooth over the model domain, this run over its window.
+                reasons.append(
+                    f'umbilicus_smoothing_sigma='
+                    f'{self.config["umbilicus_smoothing_sigma"]!r} smooths the '
+                    f'umbilicus over the run window [{self.z_begin}, '
+                    f'{self.z_end}), not the checkpoint model z-domain '
+                    f'[{domain[0]}, {domain[1]}) it was fitted around; resume '
+                    'with the checkpoint window')
         else:
             reasons.append(
                 'checkpoint does not record a model z-domain, so it cannot be '

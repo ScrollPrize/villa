@@ -111,6 +111,7 @@ from scipy.optimize import milp, LinearConstraint, Bounds
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 import fit_spiral as fs
+from umbilicus import LEGACY_UMBILICUS_SMOOTHING_SIGMA, umbilicus_zyx_table
 from sample_spiral import (
     get_theta_and_radii,
     get_theta_crossing_step_adjustments,
@@ -288,10 +289,9 @@ def build_transform(checkpoint, cfg, context, model_z_begin, model_z_end):
     device = torch.device('cuda')
 
     all_zs = np.arange(model_z_begin, model_z_end)
-    umbilicus_fn = context.umbilicus_z_to_yx()
-    umbilicus_zyx = torch.from_numpy(
-        np.concatenate([all_zs[:, None], umbilicus_fn(all_zs)], axis=-1).astype(np.float32)
-    ).to(device)
+    umbilicus_zyx = torch.from_numpy(umbilicus_zyx_table(
+        context.umbilicus_z_to_yx(), model_z_begin, model_z_end,
+        cfg.get('umbilicus_smoothing_sigma', LEGACY_UMBILICUS_SMOOTHING_SIGMA))).to(device)
 
     r = cfg['model_flow_bounds_radius']
     flow_min_corner = torch.tensor([model_z_begin - cfg['model_flow_bounds_z_margin'], -r, -r], dtype=torch.int64, device=device)
