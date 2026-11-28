@@ -27,7 +27,14 @@ REQUIRED_ARGS = [
 ]
 
 
-def _run_production_parser(extra_argv, required_args=REQUIRED_ARGS):
+def _fake_torch(cuda=False, mps=False):
+    return SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: cuda),
+        backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: mps)),
+    )
+
+
+def _run_production_parser(extra_argv, required_args=REQUIRED_ARGS, torch=None):
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
     functions = [
         node for node in tree.body
@@ -42,7 +49,7 @@ def _run_production_parser(extra_argv, required_args=REQUIRED_ARGS):
         "argparse": argparse,
         "json": json,
         "os": os,
-        "torch": SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
+        "torch": torch if torch is not None else _fake_torch(),
         "np": SimpleNamespace(isfinite=math.isfinite),
         "Path": Path,
         "_DEFAULT_VOLUME_CHUNK_CACHE_GB": 20.0,
@@ -54,6 +61,18 @@ def _run_production_parser(extra_argv, required_args=REQUIRED_ARGS):
     }
     exec(compile(module, str(SOURCE), "exec"), namespace)
     return namespace["parse_args"](required_args + list(extra_argv))
+
+
+@pytest.mark.parametrize(
+    "cuda, mps, expected",
+    [(True, True, "cuda"), (True, False, "cuda"), (False, True, "mps"), (False, False, "cpu")],
+)
+def test_copy_device_default_prefers_cuda_then_mps(cuda, mps, expected):
+    assert _run_production_parser([], torch=_fake_torch(cuda=cuda, mps=mps)).device == expected
+
+
+def test_copy_explicit_device_wins_over_default():
+    assert _run_production_parser(["--device", "cpu"], torch=_fake_torch(mps=True)).device == "cpu"
 
 
 def test_copy_bbox_overlap_default_is_half():
