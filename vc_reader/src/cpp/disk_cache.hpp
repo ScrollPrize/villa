@@ -19,12 +19,25 @@
 
 namespace vcr {
 
+// The one spelling of a cache directory: absolute, symlinks in its existing part resolved,
+// no trailing separator. A relative or slash-terminated path names the same directory before
+// and after it is created, so it keeps one budget and one index.
+inline std::filesystem::path cacheRootPath(const std::filesystem::path& root)
+{
+    std::error_code ec;
+    auto path = std::filesystem::absolute(root, ec);
+    if (ec) path = root;
+    path = std::filesystem::weakly_canonical(path);
+    if (!path.has_filename() && path.has_relative_path()) path = path.parent_path();
+    return path;
+}
+
 class DiskCache {
 public:
     // max_bytes -1 keeps the limit stored in the root, unlimited for a new root;
     // anything else replaces it. Only a limit ever evicts.
     DiskCache(const std::string& root, std::int64_t max_bytes)
-        : root_(std::filesystem::weakly_canonical(utf8Path(root)))
+        : root_(cacheRootPath(utf8Path(root)))
     {
         if (max_bytes < -1)
             throw std::invalid_argument("invalid cache_max_bytes");
@@ -534,7 +547,13 @@ private:
 
     void check_path(const std::string& path)
     {
-        const auto rel = utf8Path(path).lexically_relative(root_);
+        // An index written through a relative cache directory holds relative entries.
+        auto entry = utf8Path(path);
+        if (entry.is_relative()) {
+            std::error_code ec;
+            if (auto absolute = std::filesystem::absolute(entry, ec); !ec) entry = absolute;
+        }
+        const auto rel = entry.lexically_normal().lexically_relative(root_);
         if (rel.empty() || rel.is_absolute() || *rel.begin() == "..")
             throw std::runtime_error("disk cache entry outside its root: " + path);
     }

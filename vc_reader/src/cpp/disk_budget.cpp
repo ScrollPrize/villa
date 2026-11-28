@@ -15,8 +15,9 @@ std::shared_ptr<DiskCache> diskBudget(const std::string& root, std::optional<std
         owner = getpid();
     }
     // One budget per directory, whichever spelling names it: readers pass resolved
-    // roots, other callers may pass a symlinked one (macOS /var -> /private/var).
-    const auto key = utf8String(std::filesystem::weakly_canonical(utf8Path(root)));
+    // roots, other callers may pass a symlinked one (macOS /var -> /private/var), a
+    // relative one or one ending in a separator, before or after the directory exists.
+    const auto key = utf8String(cacheRootPath(utf8Path(root)));
     auto& budget = budgets[key];
     if (!budget)
         budget = std::make_shared<DiskCache>(key, maxBytes.value_or(-1));
