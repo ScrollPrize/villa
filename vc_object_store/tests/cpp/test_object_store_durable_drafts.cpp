@@ -11,7 +11,11 @@
 #include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/server/Server.hpp"
 
+#include <algorithm>
 #include <iostream>
+#include <limits>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 using namespace vc::objects;
 using vc::geometry::Surface;
@@ -20,11 +24,11 @@ using vc::geometry::SurfacePoint;
 namespace {
 const std::string volume = "20260411134726";
 
-Surface flat(float z)
+Surface flat(float z, int side = 20)
 {
-    Surface surface{20, 20, {1, 1}, {}};
-    for (int r = 0; r < 20; ++r)
-        for (int c = 0; c < 20; ++c) surface.points.push_back(SurfacePoint{float(c), float(r), z});
+    Surface surface{side, side, {1, 1}, {}};
+    for (int r = 0; r < side; ++r)
+        for (int c = 0; c < side; ++c) surface.points.push_back(SurfacePoint{float(c), float(r), z});
     return surface;
 }
 
@@ -68,11 +72,89 @@ std::size_t filesIn(const std::filesystem::path& directory, const std::string& p
         n += entry.path().filename().string().rfind(prefix, 0) == 0;
     return n;
 }
+
+// Main's format-1 writer records the same grid binary without channel sidecars
+// or a channels field in the manifest.
+void useLegacyManifest(const std::filesystem::path& directory)
+{
+    const auto path = directory / "checkpoint.json";
+    auto manifest = nlohmann::json::parse(std::ifstream(path));
+    require(manifest.at("format") == 1, "legacy checkpoint format");
+    require(!manifest.at("drafts").empty(), "legacy checkpoint contains a draft");
+    for (auto& draft : manifest.at("drafts")) {
+        require(draft.at("channels").empty(), "legacy fixture has no sidecars");
+        draft.erase("channels");
+    }
+    std::ofstream(path) << manifest;
+}
+
+void checkDisplayFrameCheckpoint(const std::filesystem::path& directory)
+{
+    const auto canonicalId = util::newUuid(), displayedId = util::newUuid();
+    const auto coordinates = volumeCoordinates(volume, 1);
+    const SurfacePoint missing{-1, -1, -1};
+    // Cross both a shared tile row and a shared tile column.
+    constexpr int side = 70, row = 32, column = 31, first = row * side + column;
+    auto displayed = flat(-10, side);
+    displayed.coordinatePresence.assign(displayed.points.size(), 1);
+    displayed.validity.assign(displayed.points.size(), 1);
+    displayed.points[0] = displayed.points[1] = missing;
+    displayed.coordinatePresence[1] = 0;
+    displayed.validity[0] = displayed.validity[1] = 0;
+    const std::vector<SurfacePoint> patch{{3, -1, -2}, missing, missing};
+    const std::vector<uint8_t> presence{1, 1, 0};
+    {
+        ObjectStoreSession session;
+        session.useDraftDirectory(directory);
+        session.setDraft(canonicalId, flat(5, side), coordinates);
+        session.setDraft(displayedId, displayed, coordinates);
+        mustFail([&] { (void)vc::geometry::encode(displayed); });
+        auto bad = displayed;
+        bad.coordinatePresence[5] = 0; // absent but still carries display XYZ
+        mustFail([&] { session.setDraft(displayedId, bad, coordinates); });
+        bad = displayed;
+        bad.points[3][1] = std::numeric_limits<float>::quiet_NaN();
+        mustFail([&] { session.setDraft(displayedId, bad, coordinates); });
+        mustFail([&] { session.updateDraft(displayedId, row, column, 1, 3, patch, {}, std::vector<uint8_t>{1}); });
+        session.updateDraft(displayedId, row, column, 1, 3, patch, {}, presence);
+        session.checkpointDrafts();
+    }
+    {
+        ObjectStoreSession session;
+        require(session.useDraftDirectory(directory).drafts.size() == 2, "both draft formats recovered");
+        const auto legacy = session.draftContents(canonicalId);
+        require(legacy && legacy->surface.coordinatePresence.empty() && legacy->surface.valid(0, 0),
+                "canonical draft retains its original coordinate rules");
+        const auto current = session.draftContents(displayedId);
+        std::copy(patch.begin(), patch.end(), displayed.points.begin() + first);
+        std::copy(presence.begin(), presence.end(), displayed.coordinatePresence.begin() + first);
+        require(current && current->surface.points == displayed.points &&
+                    current->surface.coordinatePresence == displayed.coordinatePresence &&
+                    current->surface.validity == displayed.validity,
+                "display XYZ, distinct present and absent sentinels, and masks survive tiled edits and restart");
+        require(!current->surface.valid(0, 0) && current->surface.valid(row, column + 1) && !current->surface.valid(row, column + 2),
+                "displayed validity combines coordinate presence with the mask");
+        SurfaceProximityQuery near;
+        near.volume = volume;
+        near.point = {10, 10, -10};
+        near.tolerance = 0.001;
+        near.uuids = std::vector{displayedId};
+        const auto hits = session.nearestSurfaces({}, near);
+        require(hits.size() == 1 && hits.front().hit.point == near.point,
+                "draft spatial bounds include visible negative display coordinates");
+        session.updateDraft(canonicalId, row, column, 1, 3, patch, {}, presence);
+        const auto upgraded = session.draftContents(canonicalId);
+        require(upgraded->surface.coordinatePresence[first + 2] == 0 && upgraded->surface.valid(row, column + 1) &&
+                    upgraded->surface.valid(side - 1, side - 1),
+                "a local display edit to a canonical draft keeps its unrelated vertices");
+    }
+}
 } // namespace
 
 int main()
 try {
     TemporaryDirectory directory;
+    checkDisplayFrameCheckpoint(directory.path / "mixed-format-checkpoint");
     OpenOptions options; options.author = "draft-test";
     const auto storePath = directory.path / "local.vcobj", drafts = directory.path / "drafts";
     const auto surface = createSurface(storePath, options);
@@ -118,6 +200,7 @@ try {
         ObjectStoreSession other;
         mustFail([&] { (void)other.useDraftDirectory(drafts); }); // one session per directory
     }
+    useLegacyManifest(drafts);
     {
         ObjectStoreSession session;
         const auto attachment = session.attach(storePath, options);
@@ -217,6 +300,7 @@ try {
         require(session.pendingSubmissions().size() == 1 && session.draftState(hostedSurface)->pendingRequest == pending,
                 "unknown outcome stays pending");
     }
+    useLegacyManifest(hostedDrafts);
     service = std::make_unique<server::Server>(hostedPath, serverOptions);
     service->start();
     {

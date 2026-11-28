@@ -640,7 +640,7 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
 
-    synchronizeTransformPersistenceCompatibility();
+    const bool persistenceAvailable = synchronizeTransformPersistenceCompatibility();
     const vc3d::surface_rotation::Transform transform{static_cast<float>(_angleDeg), _horizontalFlip};
     if (transform.isNoOp()) {
         _previewSurface.reset();
@@ -653,16 +653,17 @@ void SurfaceRotationOverlayController::updatePreview()
         return;
     }
     transform.applyInMemory(*_previewSurface);
-    showActive(_previewSurface);
+    showActive(_previewSurface, persistenceAvailable);
 }
 
-void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface)
+void SurfaceRotationOverlayController::showActive(const std::shared_ptr<QuadSurface>& surface, bool publishDraft)
 {
     // Showing a preview replaces the selected surface, so CWindow drops it as the active one
     // (onSurfaceWillBeDeleted): the segment stays selected while the tool shows it.
     const bool selected = sourceSelected();
-    // CState drafts the shown surface, so store queries see the preview's grid.
-    _state->setSurface("segmentation", surface, false, true);
+    // A transformation that Apply rejects remains a display-only preview.
+    const auto draftMode = publishDraft ? CState::SurfaceDraftMode::Full : CState::SurfaceDraftMode::KeepExisting;
+    _state->setSurface("segmentation", surface, false, true, draftMode);
     _shownSurface = surface;
     if (selected) {
         _state->setActiveSurface(_sourceSurfaceId, _sourceSurface);
@@ -673,7 +674,9 @@ void SurfaceRotationOverlayController::endPreview(const std::shared_ptr<QuadSurf
 {
     // `surface` is the selected segment now; made active before it replaces the preview.
     _state->setActiveSurface(_sourceSurfaceId, surface);
-    _state->setSurface("segmentation", surface, false, true);
+    // A saved result is already shown. Avoid republishing it as an unsaved draft.
+    if (_state->surface("segmentation") != surface)
+        _state->setSurface("segmentation", surface, false, true, CState::SurfaceDraftMode::Full);
     _shownSurface = surface;
 }
 
@@ -782,6 +785,9 @@ void SurfaceRotationOverlayController::applyRotation()
                     return;
                 }
 
+                // The durable save must capture the complete transformed draft.
+                self->showActive(result.surface);
+
                 // The store edit refuses the save unless it still holds the geometry revision the
                 // transform started from (a save that finished or was resolved meanwhile wins).
                 if (!self->_saver || !self->_saver(result.surface.get(), self->_sourceRevision)) {
@@ -831,5 +837,7 @@ std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::cloneSurface(cons
     }
     clone->id = surface->id;
     clone->meta = surface->meta;
+    clone->maskedVertices = surface->maskedVertices;
+    clone->hasTransformedCoordinates = surface->hasTransformedCoordinates;
     return clone;
 }

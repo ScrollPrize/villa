@@ -8,6 +8,8 @@
 #include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
+#include <utility>
+#include <cstring>
 
 using namespace vc::objects;
 
@@ -62,22 +64,147 @@ void SessionDrafts::forgetRecovered(const std::string& objectUuid)
     _recovered.erase(objectUuid);
 }
 
+bool SessionDrafts::canRestoreSurface(QuadSurface& surface, const vc::geometry::Surface& draft)
+{
+    const auto* grid = surface.rawPointsPtr();
+    if (!grid) return false;
+    if (grid->rows == draft.rows && grid->cols == draft.columns) return true;
+    // Like Apply, refuse resized grids while component column ranges cannot follow them.
+    const auto components = surface.meta.find("components");
+    if (components != surface.meta.end() && components->is_array() && !components->empty()) return false;
+    const auto recorded = [&](const std::string& name) {
+        return std::any_of(draft.channels.begin(), draft.channels.end(),
+                           [&](const auto& channel) { return channel.name == name; });
+    };
+    if (!recorded("growth_exclusions")) return false;
+    for (const auto& name : surface.channelNames())
+        if (name != "mask" && !recorded(name)) return false;
+    return true;
+}
+
+namespace {
+using vc::geometry::SurfacePoint;
+constexpr SurfacePoint missing{-1, -1, -1};
+
+// A registered view can place a real vertex at negative Z or at exactly the
+// missing-value sentinel. Keep its presence separate from its display XYZ.
+std::vector<SurfacePoint> draftPoints(QuadSurface& surface, const cv::Rect& area,
+                                      std::vector<uint8_t>& coordinatePresence)
+{
+    const auto points = surface.pointsForStorage(area);
+    const bool displayed = surface.hasTransformedCoordinates;
+    const auto mask = displayed ? surface.vertexMask(area) : cv::Mat_<uint8_t>{};
+    const auto hiddenSentinels = displayed ? surface.retainedDisplaySentinels(area) : std::vector<uint8_t>{};
+    if (displayed) coordinatePresence.reserve(points.total());
+    std::vector<SurfacePoint> result;
+    result.reserve(points.total());
+    for (int row = 0; row < points.rows; ++row)
+        for (int col = 0; col < points.cols; ++col) {
+            const auto p = points(row, col);
+            const SurfacePoint point{p[0], p[1], p[2]};
+            bool present = vc::geometry::validSurfacePoint(point);
+            if (displayed) {
+                present = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
+                    (point != missing || (!mask.empty() && mask(row, col)) ||
+                     (!hiddenSentinels.empty() && hiddenSentinels[result.size()]));
+                coordinatePresence.push_back(present);
+            }
+            result.push_back(present ? point : missing);
+        }
+    return result;
+}
+}
+
 void SessionDrafts::restoreSurface(QuadSurface& surface, const vc::geometry::Surface& draft)
 {
-    draft.validate();
-    auto* grid = surface.rawPointsPtr();
-    if (!grid || grid->rows != draft.rows || grid->cols != draft.columns)
+    draft.validateDraft();
+    if (!canRestoreSurface(surface, draft))
         throw std::invalid_argument("Recovered draft grid differs from the open surface");
-    cv::Mat_<uint8_t> mask(grid->rows, grid->cols);
+    auto* grid = surface.rawPointsPtr();
+    const cv::Size size(int(draft.columns), int(draft.rows));
+    const bool resized = grid->size() != size;
+    const auto retainedPoints = surface.pointsForStorage();
+    const auto retainedMask = surface.vertexMask();
+    cv::Mat_<uint8_t> exclusions = resized ? cv::Mat{} : surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (exclusions.empty()) exclusions = cv::Mat_<uint8_t>(size, uint8_t{0});
+    else exclusions = exclusions.clone();
+    std::vector<std::pair<std::string, cv::Mat>> channels;
+    bool recordedExclusions = false;
+    const std::vector<int64_t> shape{draft.rows, draft.columns};
+    for (const auto& channel : draft.channels) {
+        const auto pixels = quad_channel_mat(channel);
+        if (channel.name == "growth_exclusions") {
+            if (channel.dtype != "|u1" || channel.shape != shape)
+                throw std::invalid_argument("Recovered growth exclusions differ from the surface grid");
+            exclusions = pixels;
+            recordedExclusions = true;
+        } else if (channel.name == "generations") {
+            // Surface validation already checks whole-multiple alignment.
+            if (channel.dtype != "<u2" || channel.shape.size() != 2)
+                throw std::invalid_argument("Recovered generations must be a two-dimensional uint16 channel");
+        }
+        if (channel.name != "growth_exclusions") channels.emplace_back(channel.name, pixels);
+    }
+    grid->create(size);
+    cv::Mat_<uint8_t> mask(size);
+    auto oldHidden = std::move(surface.maskedVertices);
+    surface.maskedVertices.clear();
     for (int r = 0; r < grid->rows; ++r)
         for (int c = 0; c < grid->cols; ++c) {
             const auto i = std::size_t(r) * grid->cols + c;
             const auto& p = draft.points[i];
-            (*grid)(r, c) = cv::Vec3f(p[0], p[1], p[2]);
             mask(r, c) = draft.validity.empty() || draft.validity[i] ? 255 : 0;
+            const bool hasPoint = draft.coordinatePresence.empty() ? vc::geometry::validSurfacePoint(p)
+                                                                   : draft.coordinatePresence[i] != 0;
+            const cv::Vec3f displayed{p[0], p[1], p[2]};
+            if (!mask(r, c)) {
+                if (hasPoint) {
+                    surface.maskedVertices.set({c, r}, displayed);
+                } else if (!recordedExclusions && !retainedMask.empty() && !retainedMask(r, c)) {
+                    if (const auto previous = oldHidden.get({c, r}))
+                        surface.maskedVertices.set({c, r}, *previous);
+                    else if (vc::geometry::validSurfacePoint(retainedPoints(r, c)))
+                        surface.maskedVertices.set({c, r}, retainedPoints(r, c));
+                }
+            }
+            (*grid)(r, c) = mask(r, c) ? displayed : cv::Vec3f(-1, -1, -1);
         }
     surface.setChannel("mask", mask);
+    surface.setChannel("growth_exclusions", exclusions);
+    for (const auto& [name, pixels] : channels) surface.setChannel(name, pixels);
     surface.invalidateCache();
+}
+
+vc::geometry::Surface SessionDrafts::surfaceForDraft(QuadSurface& surface, bool fullChannels)
+{
+    const cv::Rect bounds(cv::Point{}, surface.rawPointsPtr()->size());
+    vc::geometry::Surface draft{bounds.height, bounds.width, {surface.scale()[0], surface.scale()[1]}, {}};
+    draft.points = draftPoints(surface, bounds, draft.coordinatePresence);
+    if (!surface.channel("mask", SURF_CHANNEL_NORESIZE).empty())
+        draft.validity = quad_channels_operation(surface.id, surface, {"mask"}, {}, bounds.height, bounds.width)
+                             .channels.front().bytes;
+    if (fullChannels) {
+        auto names = surface.channelNames();
+        std::erase(names, "mask");
+        draft.channels = quad_channels_operation(surface.id, surface, names, {}, int(draft.rows), int(draft.columns)).channels;
+        if (std::find(names.begin(), names.end(), "growth_exclusions") == names.end())
+            draft.channels.push_back({"growth_exclusions", "|u1", {draft.rows, draft.columns},
+                                      std::vector<uint8_t>(draft.points.size(), uint8_t{0})});
+    } else if (!surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE).empty()) {
+        std::vector<std::string> channels{"growth_exclusions"};
+        if (!surface.channel("generations", SURF_CHANNEL_NORESIZE).empty()) channels.push_back("generations");
+        draft.channels = quad_channels_operation(surface.id, surface, channels, {}, int(draft.rows), int(draft.columns)).channels;
+    }
+    return draft;
+}
+
+void SessionDrafts::updateSurfaceDraft(ObjectStoreSession& session, QuadSurface& surface, const cv::Rect& rectangle)
+{
+    const auto area = rectangle & cv::Rect(cv::Point{}, surface.rawPointsPtr()->size());
+    if (area.empty()) return;
+    std::vector<uint8_t> presence;
+    const auto points = draftPoints(surface, area, presence);
+    session.updateDraft(surface.id, area.y, area.x, area.height, area.width, points, {}, presence);
 }
 
 bool SessionDrafts::checkpointNow()

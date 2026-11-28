@@ -68,7 +68,7 @@ private:
     void updatePreview();
     void applyRotation();
     // Make `surface` the active ("segmentation") surface.
-    void showActive(const std::shared_ptr<QuadSurface>& surface);
+    void showActive(const std::shared_ptr<QuadSurface>& surface, bool publishDraft = true);
     // End the preview: `surface` is the selected segment again.
     void endPreview(const std::shared_ptr<QuadSurface>& surface);
     // The segment the tool was opened on is still selected and shown as the tool left it.

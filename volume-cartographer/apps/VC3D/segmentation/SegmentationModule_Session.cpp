@@ -1,4 +1,5 @@
 #include "SegmentationModule.hpp"
+#include "SurfaceGridEdit.hpp"
 #include "SurfaceCorrections.hpp"
 #include "SurfaceStoreEdit.hpp"
 
@@ -177,26 +178,19 @@ void SegmentationModule::onSurfaceCollectionChanged(std::string name, std::share
     setEditingEnabled(false);
 }
 
-bool SegmentationModule::captureUndoSnapshot()
+bool SegmentationModule::captureSurfaceUndoSnapshot()
 {
-    if (_suppressUndoCapture) {
-        return false;
-    }
-    if (!_editManager || !_editManager->hasSession()) {
-        return false;
-    }
-
-    const auto& previewPoints = _editManager->previewPoints();
-    if (previewPoints.empty()) {
-        return false;
-    }
-
-    return _undoHistory.capture(previewPoints);
+    if (_suppressUndoCapture || !_editManager || !_editManager->hasSession()) return false;
+    auto surface = _editManager->baseSurface();
+    if (!surface) return false;
+    for (const auto* name : {"mask", "growth_exclusions", "generations"})
+        (void)surface->channel(name, SURF_CHANNEL_NORESIZE);
+    return _undoHistory.captureRepair(SurfaceStoreEdit::snapshotForSave(*surface));
 }
 
-bool SegmentationModule::captureUndoDelta()
+bool SegmentationModule::captureUndoDelta(bool activateRepairedCells)
 {
-    if (_suppressUndoCapture) {
+    if (_suppressUndoCapture && !activateRepairedCells) {
         return false;
     }
     if (!_editManager || !_editManager->hasSession()) {
@@ -215,7 +209,11 @@ bool SegmentationModule::captureUndoDelta()
         deltas.push_back({edit.row, edit.col, edit.originalWorld});
     }
 
-    return _undoHistory.captureDelta(deltas);
+    if (activateRepairedCells && segmentation::activateRepairedVertices(*_editManager->baseSurface(), deltas)) {
+        _autosaveFullSurfaceNeeded = true;
+        publishEditDraft();
+    }
+    return !_suppressUndoCapture && _undoHistory.captureDelta(deltas);
 }
 
 void SegmentationModule::discardLastUndoSnapshot()
@@ -270,19 +268,26 @@ bool SegmentationModule::restoreUndoSnapshot()
 
             _editManager->applyPreview();
             if (auto surface = _editManager->previewSurface()) {
+                if (segmentation::restoreRepairedVertices(*surface, *deltas))
+                    _autosaveFullSurfaceNeeded = true;
                 surface->invalidateCache();
             }
             applied = true;
         }
     } else {
-        // Legacy full snapshot restore
+        // Repair snapshots carry validity and hidden coordinates as well as XYZ.
+        const auto repair = _undoHistory.lastRepairSnapshot();
         auto state = _undoHistory.takeLast();
         if (state && !state->empty()) {
             applied = _editManager->setPreviewPoints(*state, false, &undoBounds);
             if (applied) {
+                if (repair) {
+                    segmentation::applyGrowthChannels(*_editManager->baseSurface(), *repair);
+                    _autosaveFullSurfaceNeeded = true;
+                }
                 _editManager->applyPreview();
             } else {
-                _undoHistory.pushBack(std::move(*state));
+                _undoHistory.pushBack(std::move(*state), repair);
             }
         }
     }
@@ -473,7 +478,7 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
     const auto pin = storeEdit->pin();
     // The recovered grid must address this surface's grid in the frame it is open in.
     QString mismatch;
-    if (!points || contents->surface.rows != points->rows || contents->surface.columns != points->cols)
+    if (!points || !SessionDrafts::canRestoreSurface(*surface, contents->surface))
         mismatch = tr("its grid size differs from the surface as opened");
     else if (vc::objects::geometryCoordinates(contents->coordinates) != vc::objects::geometryCoordinates(editCoordinates(*storeEdit)))
         mismatch = tr("it was made in another volume or scale; open the surface in that volume to restore it");
@@ -514,7 +519,14 @@ void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
 
     // The recovered grid becomes the surface's, reapplied on the version on
     // screen, and the next autosave publishes all of it.
-    SessionDrafts::restoreSurface(*surface, contents->surface);
+    try {
+        SessionDrafts::restoreSurface(*surface, contents->surface);
+    } catch (const std::exception& error) {
+        QMessageBox::warning(_widget, tr("Recovered edits"),
+            tr("These recovered edits could not be restored. They remain available for another attempt.\n\n%1")
+                .arg(QString::fromUtf8(error.what())));
+        return;
+    }
     session->setDraft(uuid, contents->surface, contents->coordinates, pin.attachment, pin.reference());
     _state->recoveredDraftResolved(uuid, true);
     _saveSnapshot.reset();

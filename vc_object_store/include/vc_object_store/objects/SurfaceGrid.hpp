@@ -23,6 +23,9 @@ struct SurfaceGrid {
     // Payload identity of its geometry (its channels read through it).
     std::string geometryRevision;
     std::vector<std::string> channels;  // per-vertex arrays other than points and valid
+    // Present in editable transformed grids: a canonical XYZ exists even when
+    // its target-frame value is indistinguishable from the display sentinel.
+    std::vector<uint8_t> coordinatePresence;
 };
 
 // The surface's current version, or numbered `version` in `generation` (default
@@ -36,8 +39,7 @@ SurfaceGrid readSurfaceGrid(const StoreReader&, const std::string& surfaceUuid, 
 SurfaceGrid readSurfaceGrid(const StoreReader&, const ObjectVersion&, const std::string& volume,
                             double targetScale = 1.0);
 // Materialize an already selected state, without re-resolving current metadata.
-// Without a transformed view, return stored coordinates; masked coordinates can
-// be retained for editing with applyValidity=false.
+// With applyValidity=false, retain masked coordinates while keeping validity separate.
 SurfaceGrid readSurfaceGrid(const StoreReader&, const ObjectRevision&,
                             const TransformedGeometryView* transformed = nullptr, bool applyValidity = true);
 }

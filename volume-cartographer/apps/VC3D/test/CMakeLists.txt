@@ -707,12 +707,13 @@ if(TARGET VC3D)
 endif()
 
 add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp
+    ../segmentation/SurfaceGridEdit.cpp ../segmentation/SurfaceGridEdit.hpp
     ../segmentation/SurfaceStoreEdit.cpp ../segmentation/SurfaceStoreEdit.hpp
     ../segmentation/SurfaceCorrections.cpp ../segmentation/SurfaceCorrections.hpp
     ../OpenDataResourceSelection.cpp ../VolumeRegistrations.cpp ../SessionDrafts.cpp ../SessionDrafts.hpp)
 set_target_properties(test_surface_catalog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_surface_catalog PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D ${PROJECT_SOURCE_DIR}/core/test)
-target_link_libraries(test_surface_catalog PRIVATE vc_core Qt6::Core Qt6::Concurrent)
+target_link_libraries(test_surface_catalog PRIVATE vc_core vc_object_store::vc_object_geometry Qt6::Core Qt6::Concurrent)
 if(TARGET vc_object_server)
     target_link_libraries(test_surface_catalog PRIVATE vc_object_server)
     target_compile_definitions(test_surface_catalog PRIVATE VC3D_TEST_HOSTED=1)

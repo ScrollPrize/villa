@@ -99,6 +99,19 @@ void SurfaceStoreEdit::settlePending()
     repin(receipt);
 }
 
+std::shared_ptr<QuadSurface> SurfaceStoreEdit::snapshotForSave(QuadSurface& surface)
+{
+    auto snapshot = std::make_shared<QuadSurface>(surface.rawPoints().clone(), surface.scale());
+    for (const auto& name : surface.channelNames())
+        if (surface.channelLoaded(name))
+            snapshot->setChannel(name, surface.channel(name, SURF_CHANNEL_NORESIZE).clone());
+    snapshot->maskedVertices = surface.maskedVertices;
+    snapshot->hasTransformedCoordinates = surface.hasTransformedCoordinates;
+    snapshot->id = surface.id;
+    snapshot->meta = surface.meta;
+    return snapshot;
+}
+
 void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const std::vector<std::string>& channels,
                             std::optional<uint64_t> draftRevision, const std::optional<std::string>& geometryRevision)
 {
@@ -129,9 +142,10 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
             if(transformed) {
                 vc::geometry::Surface desired;
                 desired.rows=points.rows;desired.columns=points.cols;
-                for(const auto& p:points)desired.points.push_back({p[0],p[1],p[2]});
+                for(const auto& p:surface.pointsForStorage())desired.points.push_back({p[0],p[1],p[2]});
                 for(const auto& array:data.arrays)if(array.name=="valid")desired.validity=array.bytes;
-                const auto canonical=vc::geometry::encode(transformed->canonicalSurface(desired));
+                const auto retained = surface.retainedDisplaySentinels({0, 0, points.cols, points.rows});
+                const auto canonical=vc::geometry::encode(transformed->canonicalSurface(desired, retained));
                 data.arrays.front()=canonical.arrays.front();
                 data.attributes=canonical.attributes;
                 for(const auto& array:canonical.arrays)if(array.name=="valid") {
@@ -143,15 +157,27 @@ void SurfaceStoreEdit::save(QuadSurface& surface, const cv::Rect& rect, const st
         } else {
             // Channels first; the vertex edit then applies to the validity they set.
             std::vector<uint8_t> validity;
+            std::vector<uint8_t> clearMaskedCoordinates;
+            bool completeCoordinateState = false;
             const std::vector<uint8_t>* replaced = nullptr;
             if (!channels.empty()) {
                 auto op = quad_channels_operation(_uuid, surface, channels, {}, points.rows, points.cols);
-                for (const auto& array : op.channels)
+                for (const auto& array : op.channels) {
                     if (array.name == "valid") { validity = array.bytes; replaced = &validity; }
+                    if (array.name == "growth_exclusions") completeCoordinateState = true;
+                }
                 request.operations.push_back(std::move(op));
             }
+            // A complete exclusion snapshot also records that an empty cell
+            // has no hidden XYZ. Undo of a repair can restore ordinary padding
+            // (zero marker), not just an explicit exclusion (nonzero marker).
+            // pointsForStorage still supplies real retained XYZ where present.
+            if (replaced && completeCoordinateState)
+                clearMaskedCoordinates.assign(validity.size(), uint8_t{255});
             const auto view = transformed ? *transformed : snapshot.viewStored(_uuid, *_pin.geometryRevision);
-            if (auto edit = quad_rect_edit(view, surface, rect, replaced)) request.operations.push_back(std::move(*edit));
+            if (auto edit = quad_rect_edit(view, surface, rect, replaced,
+                    clearMaskedCoordinates.empty() ? nullptr : &clearMaskedCoordinates))
+                request.operations.push_back(std::move(*edit));
         }
         // Revalidate under the writer lock, including newly added registrations
         // and route choices that a list of existing record versions cannot guard.

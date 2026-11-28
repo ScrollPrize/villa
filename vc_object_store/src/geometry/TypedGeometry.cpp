@@ -89,17 +89,34 @@ void Umbilicus::validate() const
     finite(points);
 }
 double Track::length() const { return polylineLength(points); }
+void validateSurfacePoints(std::span<const SurfacePoint> points, std::span<const uint8_t> presence)
+{
+    if (!presence.empty() && presence.size() != points.size())
+        throw std::invalid_argument("surface coordinate presence must have one byte per vertex");
+    for (size_t i = 0; i < points.size(); ++i) {
+        const auto& p = points[i];
+        if (!presence.empty() && presence[i]) {
+            for (const auto v : p)
+                if (!std::isfinite(v)) throw std::invalid_argument("surface vertices must be finite");
+        } else if (p != SurfacePoint{-1, -1, -1} && (!presence.empty() || !validSurfacePoint(p))) {
+            throw std::invalid_argument("missing surface vertices must use (-1,-1,-1)");
+        }
+    }
+}
 void Surface::validate() const
+{
+    if (!coordinatePresence.empty())
+        throw std::invalid_argument("convert display-frame drafts to canonical geometry before storing them");
+    validateDraft();
+}
+void Surface::validateDraft() const
 {
     if (rows < 0 || columns < 0 || (columns && rows > INT64_MAX / columns) ||
         uint64_t(rows) * uint64_t(columns) != points.size())
         throw std::invalid_argument("surface dimensions do not match vertices");
     for (auto v : scale)
         if (!(v > 0) || !std::isfinite(v)) throw std::invalid_argument("surface scale must be positive and finite");
-    finite(points);
-    for (const auto& p : points)
-        if (!validSurfacePoint(p) && p != SurfacePoint{-1, -1, -1})
-            throw std::invalid_argument("invalid surface vertices must use (-1,-1,-1)");
+    validateSurfacePoints(points, coordinatePresence);
     if (!validity.empty() && validity.size() != points.size())
         throw std::invalid_argument("surface validity must have one byte per vertex");
     std::set<std::string> names;
@@ -118,7 +135,10 @@ const SurfacePoint& Surface::vertex(int64_t row, int64_t column) const
 }
 bool Surface::valid(int64_t row, int64_t column) const
 {
-    return validSurfacePoint(vertex(row, column)) && (validity.empty() || validity[size_t(row * columns + column)]);
+    const auto& point = vertex(row, column);
+    const auto i = size_t(row * columns + column);
+    const bool present = coordinatePresence.empty() ? validSurfacePoint(point) : coordinatePresence.at(i) != 0;
+    return present && (validity.empty() || validity.at(i));
 }
 
 objects::GeometryData encode(const Geometry& geometry)

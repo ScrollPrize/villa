@@ -1,10 +1,16 @@
 #pragma once
 
+#include <cstdint>
 #include <deque>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 #include <opencv2/core.hpp>
+
+#include "SurfaceGridEdit.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 namespace segmentation
 {
@@ -15,6 +21,10 @@ struct VertexDelta
     int row{0};
     int col{0};
     cv::Vec3f previousWorld{0.0f, 0.0f, 0.0f};  // Position before the edit
+    // Manual Add can also replace an exclusion and its retained coordinates.
+    cv::Mat previousMask;
+    uint8_t previousExclusion{0};
+    std::optional<cv::Vec3f> previousHiddenWorld;
 };
 
 class UndoHistory
@@ -35,8 +45,23 @@ public:
         if (_states.size() >= kMaxEntries) {
             _states.pop_front();
         }
-        _states.push_back({std::move(clone), {}});
+        _states.push_back({std::move(clone), {}, {}});
         return true;
+    }
+
+    // An owned repair snapshot also restores validity and retained hidden XYZ.
+    bool captureRepair(std::shared_ptr<QuadSurface> surface)
+    {
+        if (!surface || surface->rawPoints().empty()) return false;
+        if (_states.size() >= kMaxEntries) _states.pop_front();
+        const auto points = surface->rawPoints();
+        _states.push_back({points, {}, std::move(surface)});
+        return true;
+    }
+
+    [[nodiscard]] std::shared_ptr<QuadSurface> lastRepairSnapshot() const
+    {
+        return _states.empty() ? nullptr : _states.back().repair;
     }
 
     // Capture only changed vertices (delta-based - memory efficient)
@@ -49,7 +74,7 @@ public:
         if (_states.size() >= kMaxEntries) {
             _states.pop_front();
         }
-        _states.push_back({cv::Mat_<cv::Vec3f>(), deltas});
+        _states.push_back({cv::Mat_<cv::Vec3f>(), deltas, {}});
         return true;
     }
 
@@ -103,7 +128,7 @@ public:
         return !_states.back().deltas.empty();
     }
 
-    void pushBack(cv::Mat_<cv::Vec3f> points)
+    void pushBack(cv::Mat_<cv::Vec3f> points, std::shared_ptr<QuadSurface> repair = {})
     {
         if (points.empty()) {
             return;
@@ -111,7 +136,7 @@ public:
         if (_states.size() >= kMaxEntries) {
             _states.pop_front();
         }
-        _states.push_back({std::move(points), {}});
+        _states.push_back({std::move(points), {}, std::move(repair)});
     }
 
     // Keeps the history valid after the grid grows by the given counts:
@@ -123,7 +148,11 @@ public:
                 delta.row += top;
                 delta.col += left;
             }
-            if (!entry.points.empty()) {
+            if (entry.repair) {
+                if (!resizeSurfaceGrid(*entry.repair, top, bottom, left, right))
+                    throw std::runtime_error("Cannot pad the repair undo snapshot's channels");
+                entry.points = entry.repair->rawPoints();
+            } else if (!entry.points.empty()) {
                 cv::Mat padded;
                 cv::copyMakeBorder(entry.points, padded, top, bottom, left, right,
                                    cv::BORDER_CONSTANT, cv::Scalar(-1.0, -1.0, -1.0));
@@ -152,6 +181,7 @@ private:
     {
         cv::Mat_<cv::Vec3f> points;        // Full snapshot (memory intensive)
         std::vector<VertexDelta> deltas;   // Delta-based (memory efficient)
+        std::shared_ptr<QuadSurface> repair; // Optional channels and hidden coordinates
     };
 
     static constexpr std::size_t kMaxEntries = 10;

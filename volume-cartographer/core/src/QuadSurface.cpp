@@ -31,6 +31,7 @@
 #include <chrono>
 #include <exception>
 #include <set>
+#include <map>
 #include <unordered_map>
 
 #include <stdio.h>
@@ -285,6 +286,7 @@ void QuadSurface::ensureLoaded()
     _scale = loaded->_scale;
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
+    maskedVertices = std::move(loaded->maskedVertices);
 
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
@@ -524,40 +526,37 @@ void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
     dropPointSurface();
 }
 
-cv::Mat QuadSurface::channel(const std::string& name, int flags)
+cv::Mat* QuadSurface::loadChannel(const std::string& name)
 {
     ensureLoaded();
-    if (_channels.count(name)) {
-        cv::Mat& channel = _channels[name];
-        if (channel.empty() && _channelLoader) {
-            channel = _channelLoader(name);
-        } else if (channel.empty()) {
-            // On-demand loading
-            std::filesystem::path channel_path = path / (name + ".tif");
-            if (std::filesystem::exists(channel_path)) {
-                try {
-                    channel = vc::core::util::imageMat(vcr::sources::readImagePage(std::filesystem::path(channel_path).string(), 0));
-                } catch (const std::exception& error) {
-                    Logger()->warn("cannot read channel {}: {}", channel_path.string(), error.what());
-                }
+    const auto found = _channels.find(name);
+    if (found == _channels.end()) return nullptr;
+    auto& channel = found->second;
+    if (channel.empty() && _channelLoader) {
+        channel = _channelLoader(name);
+    } else if (channel.empty()) {
+        const auto source = path / (name + ".tif");
+        if (std::filesystem::exists(source)) {
+            try {
+                channel = vc::core::util::imageMat(vcr::sources::readImagePage(source.string(), 0));
+            } catch (const std::exception& error) {
+                Logger()->warn("cannot read channel {}: {}", source.string(), error.what());
             }
         }
-
-        if (name == "mask") {
-            normalizeMaskChannel(channel);
-        }
-
-        if (!channel.empty() && !(flags & SURF_CHANNEL_NORESIZE)) {
-            cv::Mat scaled_channel;
-            cv::resize(channel, scaled_channel, _points->size(), 0, 0, cv::INTER_NEAREST);
-            if (name == "mask") {
-                normalizeMaskChannel(scaled_channel);
-            }
-            return scaled_channel;
-        }
-        return channel;
     }
-    return cv::Mat();
+    return &channel;
+}
+
+cv::Mat QuadSurface::channel(const std::string& name, int flags)
+{
+    auto* source = loadChannel(name);
+    if (!source || source->empty()) return {};
+    if (name == "mask") normalizeMaskChannel(*source);
+    if (flags & SURF_CHANNEL_NORESIZE) return *source;
+
+    cv::Mat scaled;
+    cv::resize(*source, scaled, _points->size(), 0, 0, cv::INTER_NEAREST);
+    return scaled;
 }
 
 std::vector<std::string> QuadSurface::channelNames() const
@@ -567,6 +566,141 @@ std::vector<std::string> QuadSurface::channelNames() const
         names.push_back(pair.first);
     }
     return names;
+}
+
+namespace {
+auto firstAtColumn(auto& row, int column)
+{
+    return std::ranges::lower_bound(row, column, {}, [](const auto& vertex) { return vertex.cell.x; });
+}
+}
+
+void QuadSurface::MaskedVertices::set(cv::Point cell, cv::Vec3f coords)
+{
+    auto& row = _rows[cell.y];
+    if (row.empty() || row.back().cell.x < cell.x) {
+        row.push_back({cell, coords}); // Common case when loading a grid in row order.
+        return;
+    }
+    const auto pos = firstAtColumn(row, cell.x);
+    if (pos->cell.x == cell.x) pos->coords = coords;
+    else row.insert(pos, {cell, coords});
+}
+
+std::optional<cv::Vec3f> QuadSurface::MaskedVertices::get(cv::Point cell) const
+{
+    const auto row = _rows.find(cell.y);
+    if (row == _rows.end()) return {};
+    const auto pos = firstAtColumn(row->second, cell.x);
+    if (pos == row->second.end() || pos->cell.x != cell.x) return {};
+    return pos->coords;
+}
+
+std::optional<cv::Vec3f> QuadSurface::MaskedVertices::erase(cv::Point cell)
+{
+    const auto row = _rows.find(cell.y);
+    if (row == _rows.end()) return {};
+    const auto pos = firstAtColumn(row->second, cell.x);
+    if (pos == row->second.end() || pos->cell.x != cell.x) return {};
+    const auto coords = pos->coords;
+    row->second.erase(pos);
+    if (row->second.empty()) _rows.erase(row);
+    return coords;
+}
+
+std::span<const QuadSurface::MaskedVertex> QuadSurface::MaskedVertices::row(int y, int firstColumn, int endColumn) const
+{
+    const auto row = _rows.find(y);
+    if (row == _rows.end() || endColumn <= firstColumn) return {};
+    return {firstAtColumn(row->second, firstColumn), firstAtColumn(row->second, endColumn)};
+}
+
+std::size_t QuadSurface::MaskedVertices::size() const
+{
+    std::size_t count = 0;
+    for (const auto& [_, vertices] : _rows) count += vertices.size();
+    return count;
+}
+
+void QuadSurface::MaskedVertices::flipRows(int height)
+{
+    decltype(_rows) flipped;
+    for (auto& [row, vertices] : _rows) {
+        const int y = height - 1 - row;
+        for (auto& vertex : vertices) vertex.cell.y = y;
+        flipped.emplace_hint(flipped.begin(), y, std::move(vertices));
+    }
+    _rows = std::move(flipped);
+}
+
+void QuadSurface::MaskedVertices::flipColumns(int width)
+{
+    for (auto& [_, vertices] : _rows) {
+        for (auto& vertex : vertices) vertex.cell.x = width - 1 - vertex.cell.x;
+        std::reverse(vertices.begin(), vertices.end());
+    }
+}
+
+cv::Mat_<uint8_t> QuadSurface::vertexMask()
+{
+    ensureLoaded();
+    return vertexMask(cv::Rect(cv::Point{}, _points->size()));
+}
+
+cv::Mat_<uint8_t> QuadSurface::vertexMask(const cv::Rect& rectangle)
+{
+    ensureLoaded();
+    const auto area = rectangle & cv::Rect(cv::Point{}, _points->size());
+    if (area.empty()) return {};
+    auto* mask = loadChannel("mask");
+    if (!mask || mask->empty()) return {};
+    if (mask->rows % _points->rows || mask->cols % _points->cols)
+        throw std::invalid_argument("a mask must be a whole multiple of the points grid");
+
+    const int sy = mask->rows / _points->rows, sx = mask->cols / _points->cols;
+    auto pixels = (*mask)(cv::Rect(area.x * sx, area.y * sy, area.width * sx, area.height * sy));
+    normalizeMaskChannel(pixels);
+    if (area.size() == _points->size()) *mask = pixels;
+    if (sx == 1 && sy == 1) return pixels;
+
+    cv::Mat_<double> values;
+    pixels.convertTo(values, CV_64F);
+    const auto validity = vc::geometry::validityFromMask({values.ptr<double>(), values.total()},
+                                                        values.rows, values.cols, area.height, area.width);
+    cv::Mat_<uint8_t> result(area.size());
+    std::copy(validity.begin(), validity.end(), result.begin());
+    return result;
+}
+
+cv::Mat_<cv::Vec3f> QuadSurface::pointsForStorage()
+{
+    ensureLoaded();
+    return pointsForStorage(cv::Rect(cv::Point{}, _points->size()));
+}
+
+cv::Mat_<cv::Vec3f> QuadSurface::pointsForStorage(const cv::Rect& rectangle)
+{
+    ensureLoaded();
+    const auto area = rectangle & cv::Rect(cv::Point{}, _points->size());
+    auto points = (*_points)(area);
+    if (maskedVertices.empty()) return points;
+
+    cv::Mat_<uint8_t> mask;
+    for (int y = area.y; y < area.br().y; ++y) {
+        const auto vertices = maskedVertices.row(y, area.x, area.br().x);
+        if (vertices.empty()) continue;
+        if (mask.empty()) {
+            mask = vertexMask(area);
+            if (mask.empty()) return points;
+            points = points.clone();
+        }
+        for (const auto& vertex : vertices) {
+            const auto cell = vertex.cell - area.tl();
+            if (!mask(cell) && !vc::geometry::validSurfacePoint(points(cell)))
+                points(cell) = vertex.coords;
+        }
+    }
+    return points;
 }
 
 bool QuadSurface::channelLoaded(const std::string& name) const
@@ -1040,9 +1174,10 @@ void QuadSurface::saveWithUuid(const std::filesystem::path& destination, const s
     std::lock_guard<std::recursive_mutex> lock(vcr::files::directoryMutex(destination));
     std::vector<std::uint8_t> valid;
     (void)gridVertices(valid);
+    const auto points = pointsForStorage();
     std::vector<float> xyz(_points->total() * 3);
     for (int row = 0; row < _points->rows; ++row)
-        std::copy_n(reinterpret_cast<const float*>(_points->ptr(row)), _points->cols * 3,
+        std::copy_n(reinterpret_cast<const float*>(points.ptr(row)), _points->cols * 3,
                     xyz.data() + std::size_t(row) * _points->cols * 3);
     vcr::tifxyz::Metadata metadata;
     metadata.uuid = uuid;
@@ -1119,13 +1254,22 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz_impl(
     const auto stored = requestedRegion ? reader.window({requestedRegion->y, requestedRegion->x, requestedRegion->height, requestedRegion->width}) : reader.whole();
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>(int(stored.rows), int(stored.cols));
     std::memcpy(points->data, stored.xyz.data(), stored.xyz.size() * sizeof(float));
-    // Invalid vertices: vc_reader's rule and the mask, and the store's (z > 0).
-    for (int j = 0; j < points->rows; ++j)
-        for (int i = 0; i < points->cols; ++i)
-            if (!stored.valid[std::size_t(j) * std::size_t(stored.cols) + std::size_t(i)] || !vc::geometry::validSurfacePoint((*points)(j, i)))
-                (*points)(j, i) = cv::Vec3f(-1.f, -1.f, -1.f);
+    QuadSurface::MaskedVertices maskedVertices;
+    for (int j = 0; j < points->rows; ++j) {
+        for (int i = 0; i < points->cols; ++i) {
+            auto& point = (*points)(j, i);
+            if (!vc::geometry::validSurfacePoint(point)) {
+                point = {-1, -1, -1};
+            } else if (!stored.valid[std::size_t(j) * stored.cols + i]) {
+                if (!requestedRegion)
+                    maskedVertices.set({i, j}, point);
+                point = {-1, -1, -1};
+            }
+        }
+    }
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
+    surf->maskedVertices = std::move(maskedVertices);
     if (!requestedRegion) surf->path = path;
     surf->id   = path.filename().string();
     surf->meta = metadata;
@@ -1223,61 +1367,168 @@ bool intersect(const Rect3D &a, const Rect3D &b)
 void QuadSurface::rotate(float angleDeg)
 {
     ensureLoaded();
-    if (!_points || _points->empty() || std::abs(angleDeg) < 0.01f) {
-        return;
+    if (!_points || _points->empty() || std::abs(angleDeg) < 0.01f) return;
+    if (!std::isfinite(angleDeg)) throw std::invalid_argument("surface rotation must be finite");
+
+    // Materialize channels before their grid changes, including lazy store channels.
+    for (const auto& name : channelNames()) (void)channel(name, SURF_CHANNEL_NORESIZE);
+    const cv::Size sourceSize = _points->size();
+    const auto sourceMask = vertexMask();
+    const cv::Mat_<uint8_t> sourceMarker = channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (!sourceMarker.empty() && sourceMarker.size() != sourceSize)
+        throw std::runtime_error("growth exclusions differ from the surface grid");
+    const auto storedPoints = pointsForStorage();
+    const cv::Mat_<uint16_t> sourceGenerations = channel("generations").clone();
+    std::map<std::pair<int, int>, std::optional<cv::Vec3f>> exclusions;
+    for (int r = 0; r < sourceSize.height; ++r)
+        for (int c = 0; c < sourceSize.width; ++c)
+            if ((sourceMask.empty() || !sourceMask(r, c)) &&
+                ((!sourceMarker.empty() && sourceMarker(r, c)) ||
+                 (!sourceMask.empty() && vc::geometry::validSurfacePoint(storedPoints(r, c)))))
+                exclusions[{r, c}] = vc::geometry::validSurfacePoint(storedPoints(r, c))
+                    ? std::optional(storedPoints(r, c)) : std::nullopt;
+    for (const auto& vertex : maskedVertices.all())
+        if (cv::Rect(cv::Point{}, sourceSize).contains(vertex.cell) &&
+            (sourceMask.empty() || !sourceMask(vertex.cell))) {
+            auto& coords = exclusions[{vertex.cell.y, vertex.cell.x}];
+            if (!coords) coords = vertex.coords;
+        }
+    auto visiblePoints = _points->clone();
+    for (const auto& [cell, coords] : exclusions) visiblePoints(cell.first, cell.second) = {-1, -1, -1};
+
+    const double angle = std::remainder(double(angleDeg), 360.0);
+    const int turns = int(std::lround(angle / 90.0));
+    const bool rightAngle = std::abs(angle - turns * 90.0) < 1e-5;
+    const int quarterTurns = (turns % 4 + 4) % 4;
+    if (!rightAngle)
+        for (const auto& [name, values] : _channels)
+            if (!values.empty() && (values.cols % sourceSize.width || values.rows % sourceSize.height))
+                throw std::runtime_error("surface channel differs from the rotation grid");
+    cv::Mat rotation;
+    cv::Size dstSize;
+    if (rightAngle) {
+        // Exact permutations avoid half-pixel translations and edge interpolation.
+        const int code = quarterTurns == 1 ? cv::ROTATE_90_COUNTERCLOCKWISE :
+                         quarterTurns == 2 ? cv::ROTATE_180 : cv::ROTATE_90_CLOCKWISE;
+        if (quarterTurns) cv::rotate(visiblePoints, *_points, code);
+        else *_points = visiblePoints;
+        for (auto& [name, values] : _channels)
+            if (!values.empty() && quarterTurns) cv::rotate(values, values, code);
+        dstSize = _points->size();
+    } else {
+        const cv::Point2f center((sourceSize.width - 1) / 2.f, (sourceSize.height - 1) / 2.f);
+        rotation = cv::getRotationMatrix2D(center, angle, 1.0);
+        const double cosine = std::abs(rotation.at<double>(0, 0));
+        const double sine = std::abs(rotation.at<double>(0, 1));
+        dstSize = {int(std::ceil(cosine * (sourceSize.width - 1) + sine * (sourceSize.height - 1))) + 1,
+                   int(std::ceil(sine * (sourceSize.width - 1) + cosine * (sourceSize.height - 1))) + 1};
+        rotation.at<double>(0, 2) += (dstSize.width - 1) / 2.0 - center.x;
+        rotation.at<double>(1, 2) += (dstSize.height - 1) / 2.0 - center.y;
+        cv::Mat inverse;
+        cv::invertAffineTransform(rotation, inverse);
+        const vcr::grid::Raster raster{inverse.at<double>(0, 2), inverse.at<double>(1, 2),
+            inverse.at<double>(0, 0), inverse.at<double>(1, 1), dstSize.width, dstSize.height,
+            inverse.at<double>(0, 1), inverse.at<double>(1, 0)};
+        std::vector<uint8_t> valid;
+        const vcr::grid::Surface sampled(gridVertices(valid, &visiblePoints), gridOptions());
+        cv::Mat_<cv::Vec3f> rotated(dstSize);
+        sampled.resample(raster, rotated.ptr<float>(), nullptr);
+        for (auto& point : rotated)
+            if (!std::isfinite(cv::norm(point))) point = {-1, -1, -1};
+        *_points = rotated;
+        for (auto& [name, values] : _channels) {
+            if (values.empty() || name == "mask" || name == "growth_exclusions") continue;
+            const double sx = double(values.cols) / sourceSize.width, sy = double(values.rows) / sourceSize.height;
+            const cv::Matx33d toGrid(1/sx, 0, .5/sx-.5, 0, 1/sy, .5/sy-.5, 0, 0, 1);
+            const cv::Matx33d toChannel(sx, 0, .5*sx-.5, 0, sy, .5*sy-.5, 0, 0, 1);
+            const cv::Matx33d gridRotation(rotation.at<double>(0,0), rotation.at<double>(0,1), rotation.at<double>(0,2),
+                rotation.at<double>(1,0), rotation.at<double>(1,1), rotation.at<double>(1,2), 0, 0, 1);
+            const auto mapping = toChannel * gridRotation * toGrid;
+            cv::Mat affine(2, 3, CV_64F);
+            for (int r=0;r<2;++r) for(int c=0;c<3;++c) affine.at<double>(r,c)=mapping(r,c);
+            cv::Mat transformed;
+            cv::warpAffine(values, transformed, affine, {int(dstSize.width*sx), int(dstSize.height*sy)},
+                name == "generations" ? cv::INTER_NEAREST : cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar::all(0));
+            values = transformed;
+        }
     }
 
-    // Compute rotation center (center of the image)
-    cv::Point2f center(
-        static_cast<float>(_points->cols - 1) / 2.0f,
-        static_cast<float>(_points->rows - 1) / 2.0f
-    );
-
-    // Get rotation matrix
-    cv::Mat rotMat = cv::getRotationMatrix2D(center, angleDeg, 1.0);
-
-    // Calculate bounding box of rotated image
-    cv::Rect2f bbox = cv::RotatedRect(center, _points->size(), angleDeg).boundingRect2f();
-
-    // Adjust rotation matrix to translate image to center of new canvas
-    rotMat.at<double>(0, 2) += bbox.width / 2.0 - center.x;
-    rotMat.at<double>(1, 2) += bbox.height / 2.0 - center.y;
-
-    // Rotate points without blending invalid sentinels into finite coordinates.
-    const cv::Size dstSize = bbox.size();
-    cv::Mat dstToSrc;
-    cv::invertAffineTransform(rotMat, dstToSrc);
-    cv::Mat_<cv::Vec3f> rotatedMat(dstSize);
-    const vcr::grid::Raster raster{dstToSrc.at<double>(0,2),dstToSrc.at<double>(1,2),
-        dstToSrc.at<double>(0,0),dstToSrc.at<double>(1,1),dstSize.width,dstSize.height,
-        dstToSrc.at<double>(0,1),dstToSrc.at<double>(1,0)};
-    pointSurface()->resample(raster,rotatedMat.ptr<float>(),nullptr);
-    for(auto& point : rotatedMat)
-        if(!std::isfinite(cv::norm(point)))point={-1,-1,-1};
-
-    // Update points
-    *_points = rotatedMat;
-
-    // Rotate all channels
-    for (auto& [name, channel] : _channels) {
-        if (channel.empty()) continue;
-
-        cv::Mat rotatedChannel;
-        cv::Scalar borderValue = (name == "normals") ? cv::Scalar(0, 0, 0) : cv::Scalar(0, 0, 0);
-        cv::warpAffine(
-            channel,
-            rotatedChannel,
-            rotMat,
-            dstSize,
-            cv::INTER_LINEAR,
-            cv::BORDER_CONSTANT,
-            borderValue
-        );
-        channel = rotatedChannel;
+    cv::Mat_<uint8_t> marker(dstSize, uint8_t{0});
+    auto outputMask = rightAngle ? channel("mask", SURF_CHANNEL_NORESIZE) : cv::Mat{};
+    auto outputGenerations = channel("generations", SURF_CHANNEL_NORESIZE);
+    maskedVertices.clear();
+    // Forward-map categorical exclusions exactly once. At oblique angles two
+    // source cells may round to one destination, so choose the nearest free cell.
+    for (const auto& [source, coords] : exclusions) {
+        cv::Point2d projected;
+        const int r = source.first, c = source.second;
+        if (rightAngle) {
+            if (quarterTurns == 1) projected = {double(r), double(sourceSize.width - 1 - c)};
+            else if (quarterTurns == 2) projected = {double(sourceSize.width - 1 - c), double(sourceSize.height - 1 - r)};
+            else if (quarterTurns == 3) projected = {double(sourceSize.height - 1 - r), double(c)};
+            else projected = {double(c), double(r)};
+        } else projected = {rotation.at<double>(0,0)*c+rotation.at<double>(0,1)*r+rotation.at<double>(0,2),
+                            rotation.at<double>(1,0)*c+rotation.at<double>(1,1)*r+rotation.at<double>(1,2)};
+        const cv::Point rounded(cvRound(projected.x), cvRound(projected.y));
+        cv::Point target(-1, -1);
+        double best = std::numeric_limits<double>::infinity();
+        for (int radius = 0; radius <= std::max(dstSize.width, dstSize.height); ++radius) {
+            for (int y = rounded.y-radius; y <= rounded.y+radius; ++y)
+                for (int x = rounded.x-radius; x <= rounded.x+radius; ++x) {
+                    if (radius && std::abs(x-rounded.x)!=radius && std::abs(y-rounded.y)!=radius) continue;
+                    if (x<0 || y<0 || x>=dstSize.width || y>=dstSize.height || marker(y,x)) continue;
+                    const double distance = (x-projected.x)*(x-projected.x)+(y-projected.y)*(y-projected.y);
+                    if (distance < best || (distance == best && (y<target.y || (y==target.y && x<target.x)))) {
+                        best = distance; target = {x,y};
+                    }
+                }
+            if (target.x >= 0 && (radius+.5)*(radius+.5) > best) break;
+        }
+        if (target.x < 0) throw std::runtime_error("rotated grid cannot retain every exclusion");
+        marker(target) = 255;
+        (*_points)(target) = {-1, -1, -1};
+        if (!outputMask.empty()) {
+            const int sx = outputMask.cols / dstSize.width, sy = outputMask.rows / dstSize.height;
+            outputMask(cv::Rect(target.x*sx, target.y*sy, sx, sy)).setTo(0);
+        }
+        if (!sourceGenerations.empty() && !outputGenerations.empty()) {
+            const int sx = outputGenerations.cols / dstSize.width, sy = outputGenerations.rows / dstSize.height;
+            outputGenerations(cv::Rect(target.x*sx, target.y*sy, sx, sy)).setTo(sourceGenerations(r,c));
+        }
+        if (coords) maskedVertices.set(target, *coords);
     }
-
-    // Invalidate cached bbox
     invalidateCache();
+    if (!outputMask.empty()) setChannel("mask", outputMask);
+    else if (!sourceMask.empty() || !exclusions.empty()) setChannel("mask", validMask());
+    if (!sourceMarker.empty() || !exclusions.empty()) setChannel("growth_exclusions", marker);
+}
+
+namespace {
+// A transformed mask-only surface becomes a complete coordinate snapshot.
+// The explicit marker distinguishes a vacated hidden cell from a legacy
+// mask-only edit, whose sentinel intentionally preserves stored hidden XYZ.
+void recordFlipExclusions(QuadSurface& surface)
+{
+    const auto* points = surface.rawPointsPtr();
+    const auto mask = surface.vertexMask();
+    cv::Mat_<uint8_t> marker = surface.channel("growth_exclusions", SURF_CHANNEL_NORESIZE);
+    if (mask.empty() && marker.empty()) return;
+    if (marker.empty()) marker = cv::Mat_<uint8_t>(points->size(), uint8_t{0});
+    else {
+        if (marker.size() != points->size())
+            throw std::runtime_error("growth exclusions differ from the surface grid");
+        marker = marker.clone();
+    }
+    if (!mask.empty()) {
+        for (int r = 0; r < points->rows; ++r) {
+            for (int c = 0; c < points->cols; ++c)
+                if (!mask(r, c) && vc::geometry::validSurfacePoint((*points)(r, c))) marker(r, c) = 255;
+            for (const auto& vertex : surface.maskedVertices.row(r, 0, points->cols))
+                if (!mask(vertex.cell)) marker(vertex.cell) = 255;
+        }
+    }
+    surface.setChannel("growth_exclusions", marker);
+}
 }
 
 void QuadSurface::flipU()
@@ -1289,6 +1540,9 @@ void QuadSurface::flipU()
 
     // Flip over the U axis means reversing the rows (V direction)
     constexpr int flipCode = 0;  // 0 = flip around x-axis (vertical flip)
+    for (const auto& name : channelNames()) (void)channel(name, SURF_CHANNEL_NORESIZE);
+    recordFlipExclusions(*this);
+    maskedVertices.flipRows(_points->rows);
     cv::flip(*_points, *_points, flipCode);
 
     // Flip all channels the same way
@@ -1311,6 +1565,9 @@ void QuadSurface::flipV()
 
     // Flip over the V axis means reversing the columns (U direction)
     constexpr int flipCode = 1;  // 1 = flip around y-axis (horizontal flip)
+    for (const auto& name : channelNames()) (void)channel(name, SURF_CHANNEL_NORESIZE);
+    recordFlipExclusions(*this);
+    maskedVertices.flipColumns(_points->cols);
     cv::flip(*_points, *_points, flipCode);
 
     // Flip all channels the same way

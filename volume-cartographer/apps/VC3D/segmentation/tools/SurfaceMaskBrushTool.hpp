@@ -1,7 +1,7 @@
 #pragma once
 
 #include <QPointF>
-#include <opencv2/core/mat.hpp>
+#include <opencv2/core/types.hpp>
 
 #include <optional>
 #include <unordered_set>
@@ -30,25 +30,22 @@ public:
 
 private:
     [[nodiscard]] std::optional<std::pair<float, float>> surfaceToGridPosition(const QPointF& surfacePos) const;
-    void ensureMask();
     void paintAt(int row, int col);
     void appendOverlayPoint(const QPointF& surfacePos);
     void queueVertex(int row, int col);
     void fillEnclosedStrokeArea();
     void persistSurface();
-    [[nodiscard]] cv::Rect applyPendingCells();
     void invalidateOverlay();
     void invalidateViewers(bool surfaceChanged);
 
     SegmentationModule& _module;
     QuadSurface* _surface{nullptr};
-    cv::Mat_<uint8_t> _mask;
     bool _active{false};
     bool _strokeActive{false};
     bool _undoSnapshotCaptured{false};
     std::optional<std::pair<float, float>> _lastGridPosition;
     std::unordered_set<uint64_t> _paintedCells;
-    std::vector<std::pair<int, int>> _pendingCells;
+    std::vector<cv::Point> _pendingCells;
     std::vector<std::pair<int, int>> _strokeGridPoints;
     std::vector<QPointF> _overlaySurfacePoints;
 };

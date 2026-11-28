@@ -324,7 +324,8 @@ std::vector<geometry::Point> TransformedGeometryView::points(const std::string& 
     for(auto& p:result)p=mapping_.apply(p);
     return result;
 }
-TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const {
+TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row, int64_t column, int64_t rows, int64_t columns,
+                                                          bool applyValidity) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
     if(!surface)throw std::invalid_argument("not a surface");
     const auto source=surface->readTile(row,column,rows,columns);
@@ -335,11 +336,15 @@ TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row,int64_t col
     if(const auto similarity=mapping_.similarityScale())
         for(auto& step:result.scale)step/=*similarity;
     result.points.reserve(source.points.size());result.validity.reserve(source.points.size());
+    if (!applyValidity) result.coordinatePresence.reserve(source.points.size());
     for(size_t i=0;i<source.points.size();++i) {
-        const bool valid=source.valid(i/columns,i%columns);
         const auto& p=source.points[i];
+        const bool present = geometry::validSurfacePoint(p);
+        const bool valid = present && (source.validity.empty() || source.validity[i]);
+        if (!applyValidity) result.coordinatePresence.push_back(present);
         result.validity.push_back(valid?255:0);
-        result.points.push_back(valid?mapping_.apply({p[0],p[1],p[2]}):geometry::Point{-1,-1,-1});
+        const bool showPoint = valid || (!applyValidity && present);
+        result.points.push_back(showPoint ? mapping_.apply({p[0], p[1], p[2]}) : geometry::Point{-1, -1, -1});
     }
     return result;
 }
@@ -391,15 +396,18 @@ std::string TransformedGeometryView::writeSurface(ObjectStore& db,WriteTxn& txn,
 namespace {
 geometry::SurfacePoint inverseSurfacePoint(const geometry::SurfacePoint& desired,
     const std::optional<geometry::SurfacePoint>& original,bool valid,const VolumeAffine& forward,const VolumeAffine& inverse,
-    bool explicitValid = false) {
+    bool explicitCoordinate = false,bool preserveHidden = true) {
     const geometry::SurfacePoint missing{-1,-1,-1};
-    auto shown=missing;
-    if(original&&valid) {
+    if(desired==missing&&!explicitCoordinate&&!preserveHidden)return missing;
+    // Compare retained hidden points in the same frame as the desired XYZ,
+    // preserving their exact canonical bytes across float32 display rounding.
+    if(original && geometry::validSurfacePoint(*original) && (valid || explicitCoordinate || desired!=missing)) {
         const auto p=forward.apply({(*original)[0],(*original)[1],(*original)[2]});
-        shown={float(p[0]),float(p[1]),float(p[2])};
+        const geometry::SurfacePoint shown{float(p[0]),float(p[1]),float(p[2])};
+        if(desired==shown)return *original;
     }
-    if(original&&desired==shown&&(valid||!explicitValid))return *original;
-    if(desired==missing&&!explicitValid)return missing;
+    if(desired==missing&&!explicitCoordinate)
+        return original && !valid && preserveHidden ? *original : missing;
     const auto p=inverse.apply({desired[0],desired[1],desired[2]});
     geometry::SurfacePoint result{float(p[0]),float(p[1]),float(p[2])};
     // A position the validity rule rejects in the canonical frame is missing there.
@@ -453,34 +461,40 @@ geometry::PointCollection TransformedGeometryView::canonicalPointCollection(cons
     }
     return result;
 }
-geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surface& desired) const {
+geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surface& desired,
+    std::span<const uint8_t> retainedCoordinates) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
     if(!surface)throw std::invalid_argument("not a surface");
     if(desired.rows<0||desired.columns<0||size_t(desired.rows)*size_t(desired.columns)!=desired.points.size()||
-       (!desired.validity.empty()&&desired.validity.size()!=desired.points.size()))
+       (!desired.validity.empty()&&desired.validity.size()!=desired.points.size()) ||
+       (!retainedCoordinates.empty() && retainedCoordinates.size()!=desired.points.size()))
         throw std::invalid_argument("surface shape mismatch");
     const auto stored=surface->readTile(0,0,surface->rows(),surface->columns());
+    if (!desired.coordinatePresence.empty()) desired.validateDraft();
     auto result=desired;result.scale=stored.scale;
-    if(result.validity.empty()&&!stored.validity.empty()) {
-        result.validity.assign(desired.points.size(),255);
-        for(int64_t r=0;r<std::min(stored.rows,desired.rows);++r)
-            for(int64_t c=0;c<std::min(stored.columns,desired.columns);++c)
-                result.validity[r*desired.columns+c]=stored.validity[r*stored.columns+c];
-    }
+    result.coordinatePresence.clear();
     const auto inverse=mapping_.inverse();
     for(int64_t r=0;r<desired.rows;++r)for(int64_t c=0;c<desired.columns;++c) {
         const auto i=r*desired.columns+c;
         const bool exists=r<stored.rows&&c<stored.columns;
+        const bool explicitCoordinate = desired.coordinatePresence.empty()
+            ? ((!desired.validity.empty() && desired.validity[i]) || (!retainedCoordinates.empty() && retainedCoordinates[i]))
+            : desired.coordinatePresence[i] != 0;
         result.points[i]=inverseSurfacePoint(desired.points[i],exists?std::optional(stored.points[r*stored.columns+c]):std::nullopt,
-            exists&&stored.valid(r,c),mapping_,inverse,!desired.validity.empty()&&desired.validity[i]!=0);
+            exists&&stored.valid(r,c),mapping_,inverse,explicitCoordinate,false);
     }
     result.validate();return result;
 }
 std::vector<GeometryArrayEdit> TransformedGeometryView::surfaceEdits(int64_t row,int64_t column,int64_t rows,int64_t columns,
-    const std::vector<geometry::SurfacePoint>& desired,const std::vector<uint8_t>* validity) const {
+    const std::vector<geometry::SurfacePoint>& desired,const std::vector<uint8_t>* validity,
+    const std::vector<uint8_t>* clearMaskedCoordinates, std::span<const uint8_t> retainedCoordinates) const {
     const auto* surface=std::get_if<SurfaceView>(&source_);
     if(!surface)throw std::invalid_argument("not a surface");
     auto stored=surface->readTile(row,column,rows,columns);
+    if(clearMaskedCoordinates&&int64_t(clearMaskedCoordinates->size())!=surface->rows()*surface->columns())
+        throw std::invalid_argument("surface coordinate-clear mask shape mismatch");
+    if(!retainedCoordinates.empty() && int64_t(retainedCoordinates.size())!=rows*columns)
+        throw std::invalid_argument("surface retained coordinate tile shape mismatch");
     if(validity) {
         const auto gridColumns=surface->columns();
         if(int64_t(validity->size())!=surface->rows()*gridColumns)throw std::invalid_argument("surface validity shape mismatch");
@@ -493,11 +507,16 @@ std::vector<GeometryArrayEdit> TransformedGeometryView::surfaceEdits(int64_t row
     std::vector<GeometryArrayEdit> edits;
     for(int64_t r=0;r<rows;++r)for(int64_t c=0;c<columns;++c) {
         const auto i=r*columns+c;
-        const auto point=inverseSurfacePoint(desired[i],stored.points[i],stored.valid(r,c),mapping_,inverse);
-        if(point==stored.points[i])continue;
         const auto offset=(row+r)*surface->columns()+column+c;
+        const bool clearHidden=validity&&clearMaskedCoordinates&&(*clearMaskedCoordinates)[offset]!=0&&
+            stored.validity[i]==0&&desired[i]==geometry::SurfacePoint{-1,-1,-1};
+        const bool retained = !retainedCoordinates.empty() && retainedCoordinates[i];
+        const bool explicitCoordinate = retained || (validity && stored.validity[i]);
+        const auto point=inverseSurfacePoint(desired[i],stored.points[i],stored.valid(r,c),mapping_,inverse,
+            explicitCoordinate,!clearHidden);
+        if(point==stored.points[i])continue;
         edits.push_back({"points",offset*3,detail::scalarBytes<float>(point)});
-        if(!stored.validity.empty()&&!stored.validity[i]&&geometry::validSurfacePoint(point))
+        if(!validity&&!retained&&!stored.validity.empty()&&!stored.validity[i]&&geometry::validSurfacePoint(point))
             edits.push_back({"valid",offset,{255}});
     }
     return edits;

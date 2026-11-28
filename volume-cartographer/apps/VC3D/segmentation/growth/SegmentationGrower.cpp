@@ -7,6 +7,7 @@
 #include "../SegmentationModule.hpp"
 #include "../SurfaceCorrections.hpp"
 #include "../SegmentationWidget.hpp"
+#include "../SurfaceGridEdit.hpp"
 
 #include "../../CState.hpp"
 #include "../../ViewerManager.hpp"
@@ -989,8 +990,6 @@ void SegmentationGrower::onFutureFinished()
         return;
     }
 
-    cv::Mat generations = result.surface->channel("generations");
-
     std::vector<std::shared_ptr<QuadSurface>> surfacesToUpdate;
     surfacesToUpdate.reserve(3);
     auto appendUniqueSurface = [&](const std::shared_ptr<QuadSurface>& surface) {
@@ -1019,6 +1018,11 @@ void SegmentationGrower::onFutureFinished()
     }
 
     if (primarySurface && primaryPoints && resultPoints) {
+        if (request.inpaintOnly && _context.module && _context.module->hasActiveSession()) {
+            auto* base = _context.module->activeBaseSurface();
+            if (base && base->rawPointsPtr()->size() == resultPoints->size())
+                (void)_context.module->captureSurfaceUndoSnapshot();
+        }
         std::swap(*primaryPoints, *resultPoints);
         primarySurface->invalidateCache();
     } else if (primarySurface && primaryPoints) {
@@ -1045,9 +1049,7 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->invalidateCache();
         }
 
-        if (!generations.empty()) {
-            targetSurface->setChannel("generations", generations);
-        }
+        segmentation::applyGrowthChannels(*targetSurface, *result.surface);
     }
 
     QuadSurface* surfaceToPersist = nullptr;
@@ -1059,10 +1061,6 @@ void SegmentationGrower::onFutureFinished()
         surfaceToPersist = request.segmentationSurface.get();
     }
 
-    // Mask is no longer valid after growth/inpainting
-    if (surfaceToPersist) {
-        surfaceToPersist->invalidateMask();
-    }
     // The grid (and its validity) changed: an edit's draft follows it; without
     // an edit the grown surface is saved below.
     if (sessionActive) {
