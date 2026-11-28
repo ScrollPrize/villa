@@ -175,6 +175,12 @@ folder max/composite TIFF is also converted, using rounded mean downsampling.
 Existing outputs are skipped unless `--overwrite` is present. Per-file errors
 are reported and make the command exit nonzero.
 
+New label stores use one-plane `(1, 128, 128)` chunks. Only the annotated Z
+plane is stored and downsampled; the other planes read as zero. The logical
+65-plane shape and label values are unchanged. Existing stores with 65-plane
+chunks remain readable; regenerate them with `--overwrite` to use the new
+chunk layout.
+
 | Argument | Meaning |
 |---|---|
 | `root` | Directory scanned recursively; `.zarr`, `.git`, and `__pycache__` trees are skipped. |

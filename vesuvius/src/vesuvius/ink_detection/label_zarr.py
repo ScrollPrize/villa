@@ -9,7 +9,7 @@ ARRAY_DIMENSIONS = ["z", "y", "x"]
 DEFAULT_LEVELS = 6
 VOLUME_DEPTH = 65
 LABEL_SLICE = 32
-CHUNK_SHAPE = (VOLUME_DEPTH, 128, 128)
+CHUNK_SHAPE = (1, 128, 128)
 LABEL_CODEC = {"cname": "zstd", "level": 3, "shuffle": 2}
 
 
