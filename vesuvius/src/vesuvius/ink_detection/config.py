@@ -868,6 +868,7 @@ class InkModelConfig:
     spacing: tuple[float, float, float]
     stem_channels: int
     input_pad_depth_to: int | None
+    stem_conv_backend: str
 
     def model_settings_mapping(self) -> dict[str, Any]:
         """Return independent model settings for NetworkFromConfig."""
@@ -970,6 +971,12 @@ class InkModelConfig:
             raise ValueError(
                 f"model_config.stem_channels must be positive, got {stem_channels!r}"
             )
+        stem_conv_backend = str(raw_model_config.get("stem_conv_backend", "torch"))
+        if stem_conv_backend not in {"torch", "triton"}:
+            raise ValueError(
+                "model_config.stem_conv_backend must be 'torch' or 'triton', "
+                f"got {stem_conv_backend!r}"
+            )
         return cls(
             model_type=model_type,
             crop_size=crop_size,
@@ -990,6 +997,7 @@ class InkModelConfig:
             spacing=spacing,
             stem_channels=stem_channels,
             input_pad_depth_to=input_pad_depth_to,
+            stem_conv_backend=stem_conv_backend,
         )
 
 

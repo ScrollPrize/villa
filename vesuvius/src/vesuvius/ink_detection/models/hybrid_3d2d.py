@@ -5,21 +5,32 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from vesuvius.ink_detection.models.triton_conv3d import TritonConv3d
+
+STEM_CONV_BACKENDS = {"torch": nn.Conv3d, "triton": TritonConv3d}
+
 
 class LocalDepthFusionStem(nn.Module):
     """Map one BCZYX image channel to attention-weighted sum and max features."""
 
-    def __init__(self, *, channels: int = 16) -> None:
+    def __init__(self, *, channels: int = 16, conv_backend: str = "torch") -> None:
         super().__init__()
         channels = int(channels)
         if channels <= 0:
             raise ValueError(f"channels must be positive, got {channels!r}")
+        if conv_backend not in STEM_CONV_BACKENDS:
+            raise ValueError(
+                f"conv_backend must be one of {sorted(STEM_CONV_BACKENDS)}, "
+                f"got {conv_backend!r}"
+            )
         self.channels = channels
         self.features = nn.Sequential(
             nn.Conv3d(1, channels, kernel_size=3, padding=1, bias=False),
             nn.InstanceNorm3d(channels, affine=True),
             nn.LeakyReLU(negative_slope=1e-2, inplace=True),
-            nn.Conv3d(channels, channels, kernel_size=3, padding=1, bias=False),
+            STEM_CONV_BACKENDS[conv_backend](
+                channels, channels, kernel_size=3, padding=1, bias=False
+            ),
             nn.InstanceNorm3d(channels, affine=True),
             nn.LeakyReLU(negative_slope=1e-2, inplace=True),
         )
@@ -50,13 +61,16 @@ class Local3DStem2DUNet(nn.Module):
         *,
         input_depth: int,
         stem_channels: int = 16,
+        stem_conv_backend: str = "torch",
     ) -> None:
         super().__init__()
         self.network = network
         self.input_depth = int(input_depth)
         if self.input_depth <= 0:
             raise ValueError(f"input_depth must be positive, got {input_depth!r}")
-        self.depth_fusion = LocalDepthFusionStem(channels=stem_channels)
+        self.depth_fusion = LocalDepthFusionStem(
+            channels=stem_channels, conv_backend=stem_conv_backend
+        )
 
     @property
     def shared_encoder(self):
