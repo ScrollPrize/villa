@@ -10,6 +10,7 @@ import time
 import math
 import shutil
 import logging
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -63,6 +64,7 @@ class Inputs:
     num_parts: int = 1
     part_id: int = 0
     zarr_output_dir: str = "/tmp/partitions"
+    work_dir: str = "/workspace"  # Downloaded layers and model weights (WORK_DIR)
     surface_volume_zarr: str = ""  # Path to pre-created surface volume zarr
     chunk_size: int = 1024  # Chunk size for zarr array creation (SURFACE_VOLUME_CHUNK_SIZE)
     use_zarr_compression: bool = False  # Enable/disable zarr compression
@@ -98,6 +100,7 @@ def parse_env() -> Inputs:
         num_parts = int(os.getenv("NUM_PARTS", "1"))
         part_id = int(os.getenv("PART_ID", "0"))
         zarr_output_dir = os.getenv("ZARR_OUTPUT_DIR", "/tmp/partitions").strip()
+        work_dir = os.getenv("WORK_DIR", "/workspace").strip() or "/workspace"
         surface_volume_zarr = os.getenv("SURFACE_VOLUME_ZARR", "").strip()
         chunk_size = int(os.getenv("SURFACE_VOLUME_CHUNK_SIZE", "1024"))
         use_zarr_compression = os.getenv("USE_ZARR_COMPRESSION", "false").lower() == "true"
@@ -187,6 +190,7 @@ def parse_env() -> Inputs:
             num_parts=num_parts,
             part_id=part_id,
             zarr_output_dir=zarr_output_dir,
+            work_dir=work_dir,
             surface_volume_zarr=surface_volume_zarr,
             chunk_size=chunk_size,
             use_zarr_compression=use_zarr_compression,
@@ -220,12 +224,6 @@ def parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
     if len(parts) == 1:
         return parts[0], ""
     return parts[0], parts[1]
-
-
-def ensure_clean_dir(path: str) -> None:
-    if os.path.isdir(path):
-        shutil.rmtree(path)
-    os.makedirs(path, exist_ok=True)
 
 
 def build_profiler(inputs: Inputs, template_name: str) -> WorkflowProfiler:
@@ -453,7 +451,9 @@ def download_model_weights(model_name: str, dest_dir: str, profiler: Optional[Wo
     # 2) Fall back to Hugging Face
     logger.info(f"Downloading model from Hugging Face: {model_name}")
     with scoped_timer(profiler, "download_seconds", flag=FLAG_ESTIMATED):
-        local_dir = snapshot_download(repo_id=model_name, local_dir=dest_dir, local_dir_use_symlinks=False)
+        local_dir = snapshot_download(
+            repo_id=model_name, local_dir=os.path.join(dest_dir, model_name), local_dir_use_symlinks=False
+        )
     candidates = []
     for root, _, files in os.walk(local_dir):
         for f in files:
@@ -627,29 +627,29 @@ def run_prepare_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None
     from processing import contiguous_layer_window
     layer_start, layer_end = contiguous_layer_window([base for _, base in layer_objects])
 
-    # Download layers to temporary directory
-    work_dir = "/workspace"
-    input_dir = os.path.join(work_dir, "input", "layers")
-    logger.info(f"Ensuring clean input directory at {os.path.join(work_dir, 'input')}")
-    ensure_clean_dir(os.path.join(work_dir, "input"))
-
-    logger.info(f"Downloading layer files to {input_dir} ...")
-    layer_paths = download_layers(bucket, layer_objects, input_dir, profiler=profiler)
-    logger.info(f"Downloaded {len(layer_paths)} layer files")
-
     if inputs.surface_volume_zarr:
         output_path = inputs.surface_volume_zarr
     else:
         output_path = f"/tmp/surface_volume_{inputs.start_layer:02d}_{inputs.end_layer:02d}.zarr"
 
-    logger.info(f"Creating surface volume zarr at {output_path} with chunk_size={inputs.chunk_size}, compression={inputs.use_zarr_compression}")
-    created_zarr_path = create_surface_volume_zarr(
-        layer_paths,
-        output_path,
-        chunk_size=inputs.chunk_size,
-        use_compression=inputs.use_zarr_compression,
-        profiler=profiler,
-    )
+    # Stage layers in a directory private to this run; WORK_DIR may be shared or hold other files
+    os.makedirs(inputs.work_dir, exist_ok=True)
+    input_dir = tempfile.mkdtemp(prefix="layers-", dir=inputs.work_dir)
+    try:
+        logger.info(f"Downloading layer files to {input_dir} ...")
+        layer_paths = download_layers(bucket, layer_objects, input_dir, profiler=profiler)
+        logger.info(f"Downloaded {len(layer_paths)} layer files")
+
+        logger.info(f"Creating surface volume zarr at {output_path} with chunk_size={inputs.chunk_size}, compression={inputs.use_zarr_compression}")
+        created_zarr_path = create_surface_volume_zarr(
+            layer_paths,
+            output_path,
+            chunk_size=inputs.chunk_size,
+            use_compression=inputs.use_zarr_compression,
+            profiler=profiler,
+        )
+    finally:
+        shutil.rmtree(input_dir, ignore_errors=True)
 
     # Record the layer window so the inference step does not re-apply it to the cropped stack
     from processing import record_layer_window
@@ -725,7 +725,7 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     )
 
     # Prepare models directory
-    work_dir = "/workspace"
+    work_dir = inputs.work_dir
     models_dir = os.path.join(work_dir, "models")
     logger.info(f"Ensuring models directory exists at {models_dir}")
     os.makedirs(models_dir, exist_ok=True)
@@ -913,7 +913,7 @@ def run_reduce_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = None)
         result_uri = final_output_path
     else:
         # Local file path
-        os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(final_output_path)), exist_ok=True)
         logger.info(f"Copying tiled TIFF to local path: {final_output_path}")
         with scoped_timer(profiler, "local_write_seconds", flag=FLAG_APPROXIMATE):
             shutil.copy2(local_tiff_path, final_output_path)
