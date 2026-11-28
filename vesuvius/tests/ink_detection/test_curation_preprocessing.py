@@ -5,7 +5,11 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import multiprocessing as mp
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 from unittest.mock import patch
 
 import numpy as np
@@ -20,7 +24,7 @@ from vesuvius.ink_detection.preprocessing import download_required_zarr_chunks
 from vesuvius.ink_detection.preprocessing import merge_predictions
 from vesuvius.ink_detection.preprocessing import validate_segments
 from vesuvius.ink_detection.types import Segment
-from vc_reader import tifxyz
+from vc_reader import images, tifxyz
 
 
 def _write_group(path: Path, arrays: dict[str, np.ndarray], *, chunks: tuple[int, ...]) -> None:
@@ -230,6 +234,73 @@ def test_merge_predictions_exports_expected_values_reruns_and_rejects_invalid_in
         merge_predictions.main(
             [str(nonfinite), "--workers", "1", "--direction", "forward"]
         )
+
+
+@pytest.mark.parametrize("fail_write", [False, True])
+def test_prediction_merge_releases_mapped_scratch(tmp_path, monkeypatch, fail_write):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    data = np.arange(48, dtype=np.uint8).reshape(6, 8)
+    compressed = tmp_path / "compressed.tif"
+    fallback = tmp_path / "uint16.tif"
+    images.write_tiff(compressed, data, compression="lzw")
+    images.write_tiff(fallback, data.astype(np.uint16), compression="lzw")
+    output = tmp_path / "output.tif"
+
+    if fail_write:
+        def fail(path, raster):
+            assert raster.shape == data.shape
+            raise OSError("injected writer failure")
+
+        monkeypatch.setattr(merge_predictions, "write_prediction_image", fail)
+        with pytest.raises(OSError, match="injected writer failure"):
+            merge_predictions.merge_prediction_files([compressed, fallback], output, merge_method="soft_mean")
+        assert not output.exists()
+    else:
+        merge_predictions.merge_prediction_files([compressed, fallback], output, merge_method="soft_mean")
+        np.testing.assert_array_equal(tifffile.imread(output), data)
+
+    assert sorted(scratch.iterdir()) == []
+
+
+def test_prediction_scratch_view_remains_valid_until_released(tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    with merge_predictions.ExitStack() as resources:
+        with pytest.raises(ValueError, match="nonzero dimensions"):
+            merge_predictions.scratch_array(resources, (0, 2), np.dtype("uint8"))
+        raster = merge_predictions.scratch_array(resources, (2, 2), np.dtype("uint8"))
+        raster[:] = 17
+        view = raster[:, 0]
+
+    np.testing.assert_array_equal(view, [17, 17])
+    del view, raster
+    assert sorted(tmp_path.iterdir()) == []
+
+
+def test_merge_predictions_png_cli_with_spawn_workers(tmp_path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    folders = [tmp_path / segment / "preds" for segment in ("one", "two")]
+    values = np.array([[0, 80, 180], [20, 120, 240]], dtype=np.uint8)
+    for folder in folders:
+        folder.mkdir(parents=True)
+        Image.fromarray(values).save(folder / "first_forward.png")
+        Image.fromarray(255 - values).save(folder / "second_forward.png")
+
+    completed = subprocess.run(
+        [sys.executable, "-m", merge_predictions.__name__, str(tmp_path),
+         "--workers", "2", "--direction", "forward", "--method", "soft_mean"],
+        capture_output=True, encoding="utf-8", timeout=90,
+        env={**os.environ, "TMPDIR": str(scratch), "TEMP": str(scratch), "TMP": str(scratch),
+             "PYTHONIOENCODING": "utf-8"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "merged_outputs=2" in completed.stdout
+    for folder in folders:
+        with Image.open(folder / "merged_soft_mean_forward.png") as merged:
+            np.testing.assert_array_equal(merged, np.full(values.shape, 128, dtype=np.uint8))
+    assert sorted(scratch.iterdir()) == []
 
 
 @pytest.mark.parametrize(

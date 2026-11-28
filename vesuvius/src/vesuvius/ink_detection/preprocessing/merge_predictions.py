@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import multiprocessing as mp
 import os
 import tempfile
@@ -14,6 +15,7 @@ from typing import Sequence
 import numpy as np
 from PIL import Image
 from vc_reader import images
+from vc_reader.reader import SourceReader
 from tqdm.auto import tqdm
 
 from vesuvius.ink_detection.preprocessing.staged_write import (
@@ -36,8 +38,7 @@ FOREGROUND_THRESHOLD_U8 = 128
 @dataclass(frozen=True)
 class PreparedPrediction:
     path: Path
-    array: np.ndarray
-    cleanup_path: Path | None
+    array: np.ndarray | SourceReader
 
 
 @dataclass(frozen=True)
@@ -165,42 +166,35 @@ def normalize_prediction_array(array: np.ndarray, *, path: Path) -> np.ndarray:
     return normalized
 
 
-def write_array_to_temp_memmap(array: np.ndarray) -> tuple[np.memmap, Path]:
-    handle = tempfile.NamedTemporaryFile(prefix="merge_predictions_", suffix=".memmap", delete=False)
-    handle.close()
-    temp_path = Path(handle.name)
-    memmap_array = np.memmap(temp_path, mode="w+", dtype=array.dtype, shape=array.shape)
-    memmap_array[...] = array
-    memmap_array.flush()
-    return memmap_array, temp_path
+def scratch_array(resources: ExitStack, shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+    """Tie scratch deletion to the file handle and keep exported views valid."""
+    if 0 in shape:
+        raise ValueError("Prediction rasters must have nonzero dimensions")
+    backing = resources.enter_context(tempfile.TemporaryFile(prefix="merge_predictions_"))
+    # NumPy retains the mapping while an array view is alive, including in a traceback.
+    return np.memmap(backing, dtype=dtype, mode="w+", shape=shape)
 
 
-def prepare_prediction(path: Path) -> PreparedPrediction:
+def prepare_prediction(path: Path, resources: ExitStack) -> PreparedPrediction:
     if path.suffix.lower() in {".tif", ".tiff"}:
         try:
             mapped = images.memmap(path)
         except ValueError:
-            pass
+            with ExitStack() as probe:
+                try:
+                    reader = probe.enter_context(images.open(path, decoded_cache_bytes=0))
+                    if reader.axes == ("y", "x") and min(reader.shape) > 1 and reader.dtype == np.uint8:
+                        resources.enter_context(probe.pop_all())
+                        return PreparedPrediction(path, reader)
+                except (ValueError, RuntimeError):
+                    # The per-page path also handles TIFFs without a uniform stack.
+                    pass
         else:
-            return PreparedPrediction(path=path, array=normalize_prediction_array(mapped, path=path), cleanup_path=None)
+            return PreparedPrediction(path, normalize_prediction_array(mapped, path=path))
     loaded = normalize_prediction_array(images.read(path, page=0), path=path)
-    memmap_array, cleanup_path = write_array_to_temp_memmap(loaded)
-    return PreparedPrediction(path=path, array=memmap_array, cleanup_path=cleanup_path)
-
-
-def cleanup_prepared_predictions(predictions: Sequence[PreparedPrediction]) -> None:
-    for prepared in predictions:
-        try:
-            if isinstance(prepared.array, np.memmap):
-                prepared.array.flush()
-        except Exception:
-            pass
-        if prepared.cleanup_path is None:
-            continue
-        try:
-            prepared.cleanup_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    array = scratch_array(resources, loaded.shape, loaded.dtype)
+    array[...] = loaded
+    return PreparedPrediction(path, array)
 
 
 def normalize_chunk_to_u8(chunk: np.ndarray) -> np.ndarray:
@@ -339,44 +333,32 @@ def write_prediction_image(output_path: Path, output_array: np.ndarray) -> None:
 
 
 def merge_prediction_files(files: Sequence[Path], output_path: Path, *, merge_method: str) -> None:
-    prepared_predictions: list[PreparedPrediction] = []
-    output_memmap_path: Path | None = None
-    output_array: np.memmap | None = None
-    staged_output_path: Path | None = None
-    try:
-        for path in files:
-            prepared_predictions.append(prepare_prediction(path))
-        height, width = validate_prediction_shapes(prepared_predictions)
-        row_chunk_size = choose_row_chunk_size(width, len(prepared_predictions))
-        output_handle = tempfile.NamedTemporaryFile(prefix="merge_predictions_out_", suffix=".memmap", delete=False)
-        output_handle.close()
-        output_memmap_path = Path(output_handle.name)
-        output_array = np.memmap(output_memmap_path, mode="w+", dtype=np.uint8, shape=(height, width))
+    with ExitStack() as resources:
+        prepared_predictions = []
+        chunks = []
+        output_array = None
+        try:
+            prepared_predictions.extend(prepare_prediction(path, resources) for path in files)
+            height, width = validate_prediction_shapes(prepared_predictions)
+            row_chunk_size = choose_row_chunk_size(width, len(prepared_predictions))
+            output_array = scratch_array(resources, (height, width), np.dtype("uint8"))
 
-        for row_start in range(0, height, row_chunk_size):
-            row_end = min(height, row_start + row_chunk_size)
-            chunks = [prepared.array[row_start:row_end, :] for prepared in prepared_predictions]
-            output_array[row_start:row_end, :] = merge_chunk(chunks, merge_method=merge_method)
+            for row_start in range(0, height, row_chunk_size):
+                row_end = min(height, row_start + row_chunk_size)
+                chunks = [prepared.array[row_start:row_end, :] for prepared in prepared_predictions]
+                output_array[row_start:row_end, :] = merge_chunk(chunks, merge_method=merge_method)
 
-        output_array.flush()
-        staged_output_path = create_staged_output(output_path)
-        write_prediction_image(staged_output_path, output_array)
-        publish_staged_output(staged_output_path, output_path)
-        staged_output_path = None
-    finally:
-        if output_array is not None:
+            staged_output_path = create_staged_output(output_path)
             try:
-                output_array.flush()
-            except Exception:
-                pass
-        cleanup_prepared_predictions(prepared_predictions)
-        if output_memmap_path is not None:
-            try:
-                output_memmap_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-        if staged_output_path is not None:
-            discard_staged_output(staged_output_path)
+                write_prediction_image(staged_output_path, output_array)
+                publish_staged_output(staged_output_path, output_path)
+            finally:
+                discard_staged_output(staged_output_path)
+        finally:
+            # Drop this frame's views before closing the backing files on Windows.
+            chunks.clear()
+            prepared_predictions.clear()
+            del output_array
 
 
 def directions_to_process(direction: str) -> tuple[str, ...]:
