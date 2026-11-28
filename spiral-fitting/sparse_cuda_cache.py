@@ -182,6 +182,19 @@ class ResidentBrickPool:
         self.table = None
 
 
+
+def resident_brick_pool_class():
+    """ResidentBrickPool, or its host-RAM subclass (brick_pool_offload.OffloadBrickPool) when FIT_SPIRAL_POOL_OFFLOAD=1.
+
+    The offload keeps the brick table and the index arithmetic on the card but holds the uint8 pool in page-locked host RAM mapped into the
+    card's address space, so a whole-height fit of a tall or many-winding scroll fits a 24-32 GB card; values are bit-identical to the
+    resident gather (see POOL_OFFLOAD.md). Default off."""
+    if os.environ.get("FIT_SPIRAL_POOL_OFFLOAD") == "1":
+        import sys
+        import brick_pool_offload
+        return brick_pool_offload.offload_class(sys.modules[__name__])
+    return ResidentBrickPool
+
 class SparseLasagnaStore:
     def __init__(
         self,
@@ -224,7 +237,16 @@ class SparseLasagnaStore:
         return normals, gradient
 
     def close(self):
-        if self.normal_cache is not None:
-            self.normal_cache.close()
-        if self.grad_cache is not None:
-            self.grad_cache.close()
+        """Close both pools. A pool whose close() fails (an offloaded pool the driver would not unregister) does not stop the other from being closed; the first failure is raised
+        afterwards, and calling close() again retries only what is still open (closing a pool twice is a no-op)."""
+        first = None
+        for pool in (self.normal_cache, self.grad_cache):
+            if pool is None:
+                continue
+            try:
+                pool.close()
+            except BaseException as error:                  # noqa: BLE001 - re-raised below, after the other pool was tried
+                if first is None:
+                    first = error
+        if first is not None:
+            raise first

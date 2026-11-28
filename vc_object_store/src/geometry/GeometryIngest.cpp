@@ -5,10 +5,16 @@
 #include "vc_object_store/objects/StoreReader.hpp"
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "vc_object_store/PackedTrackStore.hpp"
+#include "vc_object_store/objects/InitialImport.hpp"
+#include "vc_object_store/objects/ObjectCollection.hpp"
+#include <cstdio>
+#include <fstream>
+#include <limits>
 #include "vc_object_store/Uuid.hpp"
 #include "formats/GeometryInput.hpp"
 #include "formats/TrackInput.hpp"
 #include "formats/RemoteSource.hpp"
+#include "internal/Publication.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <functional>
@@ -396,3 +402,243 @@ std::string importSurfaceChannel(ObjectStore& db, WriteTxn& txn, const std::stri
     return db.updateSurfaceChannels(txn, objectUuid, {formats::surfaceChannel(name, tiff)}, {}, current->uuid);
 }
 } // namespace vc::objects
+
+namespace vc::objects {
+namespace {
+GeometryIngestReport bulkIngest(const fs::path& source, const fs::path& destination, const std::string& author,
+    const std::string& coordinateContext, const std::vector<std::string>& tags, std::size_t shards, InitialImportResult& sealed)
+{
+    GeometryIngestReport report;
+    if (shards == 0) shards = 1;
+    if (fs::exists(destination)) throw std::runtime_error("bulk ingest: destination exists: " + destination.string());
+    geometryCoordinates(nlohmann::json::parse(coordinateContext));
+    const auto packed = resolvePackedTrackStore(source);
+    PackedTrackStore store(packed);
+    const size_t rows = store.sourceIds().size();
+    nlohmann::json sourceMeta = nlohmann::json::object();
+    if (fs::exists(packed / "metadata.json")) sourceMeta = readJson(packed / "metadata.json");
+    const std::string ref = packed.string();
+    // Fresh identities, routed to their shard (the initial-import API requires uuidShardIndex routing).
+    std::vector<std::string> uuids(rows);
+    std::vector<std::vector<uint32_t>> byShard(shards);
+    for (size_t i = 0; i < rows; ++i) { uuids[i] = util::newUuid(); byShard[uuidShardIndex(uuids[i], shards)].push_back(uint32_t(i)); }
+    InitialImportOptions options;
+    options.store.author = author;
+    options.shards.assign(shards, InitialShardSpec{});
+    const int64_t per = std::numeric_limits<int64_t>::max() / int64_t(shards);
+    for (size_t k = 0; k < shards; ++k) options.shards[k].objectIds = {int64_t(k) * per + 1, int64_t(k + 1) * per};
+    std::atomic<int64_t> done{0};
+    sealed = importInitialCollection(destination, options, [&](size_t shardIndex, InitialShardImport& shard) {
+        std::vector<InitialObjectRecord> batch;
+        auto flush = [&] { if (batch.empty()) return; shard.appendObjects(batch); done += int64_t(batch.size()); batch.clear(); };
+        for (const uint32_t row : byShard[shardIndex]) {
+            ObjectRecord object;
+            object.uuid = uuids[row]; object.kind = "track"; object.name = std::to_string(store.sourceIds()[row]);
+            object.storageKind = "dataset"; object.storageRef = ref;
+            object.track = TrackDetail{}; object.track->datasetRef = ref; object.track->externalKey = object.name;
+            auto p = track(store, row, object);
+            p.source = sourceMeta;
+            addTags(p, tags);
+            detail::normalizeIngestMetadata(p, coordinateContext);
+            InitialObjectRecord record; record.record = std::move(p.object); record.geometry = std::move(p.geometry);
+            batch.push_back(std::move(record));
+            if (batch.size() >= 2000) { flush(); shard.checkCancelled(); }
+        }
+        flush();
+    });
+    report.ingested = done.load();
+    report.uuids = std::move(uuids);        // the objects created, as the per-track path reports them
+    return report;
+}
+}
+
+GeometryIngestReport ingestTracksBulk(const fs::path& source, const fs::path& destination, const std::string& author,
+    const std::string& coordinateContext, const std::vector<std::string>& tags, std::size_t shards)
+{
+    InitialImportResult sealed;
+    return bulkIngest(source, destination, author, coordinateContext, tags, shards, sealed);
+}
+}
+
+namespace vc::objects {
+namespace {
+using Stage = BulkOverlayError::Stage;
+nlohmann::json bulkMarkerRead(const fs::path& marker)
+{
+    std::ifstream in(marker);
+    if (!in) return nullptr;
+    try { return nlohmann::json::parse(in); } catch (const std::exception&) { return nullptr; }
+}
+// Written only after the sealed tracks are published; it is what lets a retry tell "ours, finished" from "somebody else's".
+// Published WITHOUT replacing: a hard link fails if the marker path exists (a marker created meanwhile by another writer is preserved); on a
+// filesystem without hard links an exclusive create ("wx") is used instead, whose half-written result a retry reads as foreign and refuses.
+void bulkMarkerWrite(const fs::path& marker, const nlohmann::json& body)
+{
+    const auto temporary = fs::path(marker.string() + "." + util::newUuid() + ".tmp");
+    const std::string text = body.dump(2) + "\n";
+    {
+        std::ofstream out(temporary, std::ios::binary);
+        out << text;
+        out.flush();
+        if (!out) { std::error_code ignored; fs::remove(temporary, ignored); throw std::runtime_error("cannot write " + temporary.string()); }
+    }
+    std::error_code error;
+    fs::create_hard_link(temporary, marker, error);
+    if (error && error != std::errc::file_exists) {
+        if (std::FILE* file = std::fopen(marker.string().c_str(), "wx")) {
+            const bool ok = std::fwrite(text.data(), 1, text.size(), file) == text.size();
+            if (std::fclose(file) == 0 && ok) error.clear();
+            else { std::error_code ignored; fs::remove(marker, ignored); }
+        }
+    }
+    std::error_code ignored; fs::remove(temporary, ignored);
+    if (error) throw std::runtime_error("cannot publish " + marker.string() + " (an existing marker is never replaced): " + error.message());
+}
+// Cheap identity of the packed source: every file's relative path and size, its modification time, and the bytes of the small files (header and
+// metadata). A changed source at the same path therefore does not match a marker written for the old one (a copied source reads as changed:
+// the retry then asks for the marker to be removed rather than silently reusing tracks that may differ).
+std::string bulkSourceFingerprint(const fs::path& packed)
+{
+    std::uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void* data, std::size_t n) { const auto* b = static_cast<const unsigned char*>(data); for (std::size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; } };
+    std::vector<fs::path> files;
+    std::error_code error;
+    if (fs::is_directory(packed, error)) { for (fs::recursive_directory_iterator it(packed, error), end; !error && it != end; it.increment(error)) if (it->is_regular_file(error)) files.push_back(it->path()); }
+    else files.push_back(packed);
+    std::sort(files.begin(), files.end());
+    for (const auto& file : files) {
+        const auto name = fs::is_directory(packed, error) ? fs::relative(file, packed, error).generic_string() : file.filename().string();
+        const std::uint64_t size = fs::file_size(file, error), stamp = std::uint64_t(fs::last_write_time(file, error).time_since_epoch().count());
+        mix(name.data(), name.size()); mix(&size, sizeof size); mix(&stamp, sizeof stamp);
+        if (size <= (1u << 20)) { std::ifstream in(file, std::ios::binary); std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()); mix(bytes.data(), bytes.size()); }
+    }
+    char text[32]; std::snprintf(text, sizeof text, "%016llx", static_cast<unsigned long long>(h));
+    return text;
+}
+// The content-affecting options, normalised: coordinate frame as parsed JSON (key order irrelevant), tags sorted and deduplicated, author.
+nlohmann::json bulkOptions(const std::string& coordinateContext, const std::vector<std::string>& tags, const std::string& author)
+{
+    std::vector<std::string> sorted = tags; std::sort(sorted.begin(), sorted.end()); sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+    return {{"coordinate_context", nlohmann::json::parse(coordinateContext)}, {"tags", sorted}, {"author", author}};
+}
+// Identity of the COMPLETE sealed publication (every member of the base collection: store and lineage UUIDs, generation, exact commit sequence), sorted.
+// Recorded in the marker when the sealed tracks are published and compared on every retry, so a replacement store (a different valid base, one shard of a
+// four-shard collection, an emptier collection) is refused before an overlay is attached to it.
+nlohmann::json bulkMembersIdentity(const std::vector<CollectionMember>& members, std::size_t first = 0)
+{
+    std::vector<nlohmann::json> rows;
+    for (std::size_t i = first; i < members.size(); ++i)
+        rows.push_back({{"database_uuid", members[i].databaseUuid}, {"store_uuid", members[i].storeUuid}, {"generation", members[i].generation}, {"commit_sequence", members[i].commitSequence}});
+    std::sort(rows.begin(), rows.end(), [](const nlohmann::json& a, const nlohmann::json& b) { return a.dump() < b.dump(); });
+    return nlohmann::json(rows);
+}
+nlohmann::json bulkBaseIdentity(const fs::path& base)
+{
+    OpenOptions readOnly; readOnly.readOnly = true;
+    auto root = ObjectCollection::open(base, readOnly);
+    std::int64_t objects = 0;
+    { auto txn = root.read(); objects = root.objectCount(txn, "track"); }          // the number of tracks the publication really holds: a count, not a scan that decodes every record (review of PR 2588)
+    return {{"members", bulkMembersIdentity(root.members())}, {"objects", objects}};
+}
+bool bulkMarkerMatches(const nlohmann::json& marker, const std::string& packed, const std::string& fingerprint, const nlohmann::json& options, std::size_t shards, std::size_t rows)
+{
+    return marker.is_object() && marker.value("kind", std::string()) == "vc_object_ingest_bulk" && marker.value("source", std::string()) == packed
+        && marker.value("fingerprint", std::string()) == fingerprint && marker.contains("options") && marker.at("options") == options
+        && marker.value("shards", std::size_t(0)) == shards && marker.value("tracks", std::size_t(0)) == rows;
+}
+}
+
+BulkOverlayReport ingestTracksBulkOverlay(const fs::path& source, const fs::path& overlayPath, const std::string& author,
+    const std::string& coordinateContext, const std::vector<std::string>& tags, std::size_t shards)
+{
+    if (shards == 0) shards = 1;
+    BulkOverlayReport out;
+    out.tracksPath = fs::path(overlayPath.string() + ".tracks");
+    out.marker = fs::path(overlayPath.string() + ".tracks.bulk.json");
+    std::string packedText, fingerprint; nlohmann::json options; std::size_t rows = 0;
+    try {
+        const auto packed = resolvePackedTrackStore(source);
+        packedText = packed.string(); rows = PackedTrackStore(packed).sourceIds().size();
+        geometryCoordinates(nlohmann::json::parse(coordinateContext));
+        fingerprint = bulkSourceFingerprint(packed); options = bulkOptions(coordinateContext, tags, author);
+    } catch (const std::exception& error) {
+        throw BulkOverlayError(Stage::Preflight, std::string("bulk ingest: ") + error.what());
+    }
+    const auto recorded = bulkMarkerRead(out.marker);
+    const bool ours = bulkMarkerMatches(recorded, packedText, fingerprint, options, shards, rows);
+    std::error_code markerProbe;
+    if (!ours && (fs::exists(out.marker, markerProbe) || fs::is_symlink(out.marker, markerProbe)))
+        throw BulkOverlayError(Stage::Preflight, "bulk ingest: " + out.marker.string() + " exists and does not match this command (another writer's file, a different source, "
+            "source contents, coordinate frame, tags, author or shard count, or a damaged record); it is left untouched. Remove it (and the sealed tracks it describes) to start over.");
+    const auto base = shards > 1 ? out.tracksPath / "collection.vcobj" : out.tracksPath;
+    OpenOptions rootOptions; rootOptions.author = author;
+    auto overlayError = [&](const std::exception& error) {
+        return BulkOverlayError(Stage::Overlay, std::string("bulk ingest: the overlay ") + overlayPath.string() + " could not be created: " + error.what()
+            + ". The sealed tracks are kept at " + out.tracksPath.string() + " (recorded in " + out.marker.string() + "); no file of another writer was touched. "
+            "Remove whatever the message names, then run the same command again: it reuses the sealed tracks and only creates the overlay.");
+    };
+
+    if (fs::exists(overlayPath) || fs::is_symlink(overlayPath)) {
+        if (!ours) throw BulkOverlayError(Stage::Preflight, "bulk ingest: the overlay path exists and this command did not make it: " + overlayPath.string());
+        // Read-only: opening verifies every dependency pin; then the overlay must depend on EXACTLY the sealed publication recorded when this command made it
+        // (every shard, same UUIDs and commit sequences), and the base that sits there now must still be that publication.
+        try {
+            const auto& wanted = recorded.at("base_members");
+            OpenOptions readOnly; readOnly.readOnly = true;
+            if (bulkBaseIdentity(base) != wanted) throw std::runtime_error("the sealed tracks at " + out.tracksPath.string() + " are no longer the publication this command made (a different or partial store sits there)");
+            auto root = ObjectCollection::open(overlayPath, readOnly);
+            const auto members = root.members();
+            if (members.size() < 2 || bulkMembersIdentity(members, 1) != wanted.at("members")) throw std::runtime_error("it does not depend on the complete sealed tracks recorded for this command (" + out.tracksPath.string() + ")");
+            auto writableRoot = ObjectCollection::open(overlayPath, rootOptions);
+            (void)writableRoot;
+        } catch (const std::exception& error) { throw overlayError(error); }
+        out.overlayAlreadyComplete = true; out.reusedSealedTracks = true; out.ingest.ingested = int64_t(rows);
+        return out;
+    }
+    const bool tracksPresent = fs::exists(out.tracksPath) || fs::is_symlink(out.tracksPath);
+    nlohmann::json recordedBase;
+    if (ours && !tracksPresent)
+        throw BulkOverlayError(Stage::Preflight, "bulk ingest: " + out.marker.string() + " records sealed tracks that are missing now (" + out.tracksPath.string()
+            + "); nothing was re-ingested and no file was touched. Remove the marker to start over, or restore the tracks.");
+    if (tracksPresent) {
+        if (!ours) throw BulkOverlayError(Stage::Preflight, "bulk ingest: the tracks destination exists and this command did not make it (no matching "
+            + out.marker.string() + "); it is left untouched: " + out.tracksPath.string());
+        try {
+            if (!recorded.contains("base_members") || bulkBaseIdentity(base) != recorded.at("base_members"))
+                throw std::runtime_error("the sealed tracks at " + out.tracksPath.string() + " are not the complete publication this command made (a different, partial or replaced store); "
+                    "they and the marker are left untouched, no overlay was created");
+        } catch (const std::exception& error) { throw BulkOverlayError(Stage::Preflight, std::string("bulk ingest: ") + error.what()); }
+        recordedBase = recorded.at("base_members");
+        out.reusedSealedTracks = true; out.ingest.ingested = int64_t(rows);
+    } else {
+        InitialImportResult sealed;
+        try { out.ingest = bulkIngest(source, out.tracksPath, author, coordinateContext, tags, shards, sealed); }
+        catch (const std::exception& error) { throw BulkOverlayError(Stage::SealedTracks, std::string("bulk ingest: ") + error.what()); }
+        try {
+            recordedBase = bulkBaseIdentity(base);
+            const auto& members = recordedBase.at("members");
+            if (recordedBase.at("objects") != out.ingest.ingested
+                || std::any_of(members.begin(), members.end(), [&](const nlohmann::json& member) { return member.at("store_uuid") != sealed.storeUuid; }))
+                throw std::runtime_error("the store at " + out.tracksPath.string() + " is not the one this command sealed");
+            bulkMarkerWrite(out.marker, {{"base_members", recordedBase}, {"kind", "vc_object_ingest_bulk"}, {"source", packedText}, {"fingerprint", fingerprint}, {"options", options}, {"shards", shards}, {"tracks", rows}, {"author", author},
+                                         {"tracks_path", out.tracksPath.string()}});
+        } catch (const std::exception& error) {
+            throw BulkOverlayError(Stage::Marker, std::string("bulk ingest: the sealed tracks were published at ") + out.tracksPath.string() + " but could not be recorded ("
+                + error.what() + "); they are kept. Create " + overlayPath.string() + " over them with ObjectCollection::create, or remove them and run again.");
+        }
+    }
+    // The overlay is verified under a private name, so a failure never leaves one at overlayPath over different tracks.
+    try {
+        detail::StagedDatabase staged(overlayPath, false);
+        {
+            auto root = ObjectCollection::create(staged.path, {base}, rootOptions);
+            const auto members = root.members();
+            if (members.size() < 2 || bulkMembersIdentity(members, 1) != recordedBase.at("members"))
+                throw std::runtime_error("the sealed tracks at " + out.tracksPath.string() + " changed while the overlay was attached");
+        }
+        staged.publish();
+        auto root = ObjectCollection::open(overlayPath, rootOptions); (void)root;
+    } catch (const std::exception& error) { throw overlayError(error); }
+    return out;
+}
+}

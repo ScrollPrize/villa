@@ -108,6 +108,40 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
     const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {},
     const std::string& coordinateContext = "{}");
 
+// Bulk mode for packed tracks. The per-track path commits one transaction per track (about 2-3 ms of store work each: 11.4 M tracks
+// take hours). This builds a NEW sealed, history-off collection at `destination` (must not exist) through importInitialCollection,
+// with `shards` parallel writers (UUID-hash routed; 1 shard = one ordinary SQLite file, more = a directory with collection.vcobj).
+// Objects get the same records and metadata as the per-track path (identities are fresh random UUIDs, as there). The result is
+// insertion-only and cannot be opened writable: put an editable ObjectCollection root over it (vc_object_ingest --bulk does).
+// Throws on any failure and leaves no destination.
+GeometryIngestReport ingestTracksBulk(const std::filesystem::path& source, const std::filesystem::path& destination,
+    const std::string& author, const std::string& coordinateContext, const std::vector<std::string>& tags, std::size_t shards);
+
+// What ingestTracksBulkOverlay did on this call. `ingest` is the report of the sealed tracks (a reused collection reports the recorded
+// track count, no uuids); `tracksPath` is the sealed collection (overlayPath + ".tracks"), `marker` the file that records it.
+struct BulkOverlayReport {
+    GeometryIngestReport ingest;
+    std::filesystem::path tracksPath, marker;
+    bool reusedSealedTracks = false;      // an earlier run of this command sealed these tracks; only the overlay was created now
+    bool overlayAlreadyComplete = false;  // an earlier run created the overlay and it opens: nothing was done
+};
+// The failed stage of ingestTracksBulkOverlay, in the message and here. Every file of ANOTHER writer is left exactly as found; the
+// sealed tracks (and the marker) this command made are never removed after they were published, because rebuilding them takes hours.
+struct BulkOverlayError : std::runtime_error {
+    enum class Stage { Preflight, SealedTracks, Marker, Overlay };
+    BulkOverlayError(Stage stage, const std::string& message) : std::runtime_error(message), stage(stage) {}
+    Stage stage;
+};
+// ingestTracksBulk plus the editable overlay root at `overlayPath` over it (what a fit opens), as three distinct, retryable stages:
+//  1. preflight: refuses a foreign destination (an existing overlayPath or overlayPath + ".tracks" this command did not make) without touching it;
+//  2. sealed tracks (overlayPath + ".tracks"), published atomically, then recorded in overlayPath + ".tracks.bulk.json";
+//  3. the overlay. When this fails (e.g. a conflicting directory at <overlay>-owner or <overlay>-wal) the sealed tracks stay published and
+//     recorded; after the conflict is removed, running the same call again skips stage 2 and only creates the overlay (or, when the overlay
+//     already opens, does nothing).
+// A failure before the sealed tracks were published leaves nothing behind.
+BulkOverlayReport ingestTracksBulkOverlay(const std::filesystem::path& source, const std::filesystem::path& overlayPath,
+    const std::string& author, const std::string& coordinateContext, const std::vector<std::string>& tags, std::size_t shards);
+
 // Create new objects and ingest one source: a tifxyz surface directory or a
 // folder of them, vc3d_fiber JSON, collection or directory, vc_pointcollections
 // JSON (all collections), or packed tracks (.vctracks directory or DBM path with

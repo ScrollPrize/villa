@@ -184,7 +184,8 @@ add_library(vc_object_links_objects OBJECT
     linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LineSurface.cpp
     linking/TrackSurface.cpp linking/PointCollectionSurface.cpp linking/LinkObjects.cpp)
 target_include_directories(vc_object_links_objects PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_links_objects PRIVATE vc_objects vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+# geometry/GeometryInternal.hpp includes <openssl/evp.h>: declare the dependency directly (its include path does not propagate from vc_objects / vc_object_geometry).
+target_link_libraries(vc_object_links_objects PRIVATE vc_objects vc_object_formats vc_resident_geometry vc_reader::reader opencv_core OpenSSL::Crypto nlohmann_json::nlohmann_json)
 # vc_track_crossings<suffix> and vc_object_links<suffix>, with or without OpenMP.
 function(vc_object_store_detectors suffix use_openmp)
     add_library(vc_track_crossings${suffix} STATIC TrackCrossings.cpp)
@@ -194,7 +195,7 @@ function(vc_object_store_detectors suffix use_openmp)
     endif()
     target_compile_features(vc_track_crossings${suffix} PUBLIC cxx_std_20)
     add_library(vc_object_links${suffix} STATIC $<TARGET_OBJECTS:vc_object_links_objects>)
-    target_link_libraries(vc_object_links${suffix} PUBLIC vc_objects PRIVATE vc_track_crossings${suffix} vc_object_formats vc_resident_geometry vc_reader::reader opencv_core nlohmann_json::nlohmann_json)
+    target_link_libraries(vc_object_links${suffix} PUBLIC vc_objects PRIVATE vc_track_crossings${suffix} vc_object_formats vc_resident_geometry vc_reader::reader opencv_core OpenSSL::Crypto nlohmann_json::nlohmann_json)
 endfunction()
 # The copy the native tools, the server and the installed package use.
 vc_object_store_detectors("" ${VC_OBJECT_STORE_DETECTORS_OPENMP})

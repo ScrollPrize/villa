@@ -1,6 +1,10 @@
 #include "StorageBindings.hpp"
 #include "vc_object_store/SqliteRuntime.hpp"
 #include "internal/ObjectVersionJson.hpp"
+#include "geometry/GeometryInternal.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include "AfvBindings.hpp"
 #include "ExtensionBindings.hpp"
 #include "CollectionBindings.hpp"
@@ -78,8 +82,8 @@ nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
     d["version"] = revision.version; d["generation"] = revision.generation;
     d["a_version"] = revision.aReference.version; d["b_version"] = revision.bReference.version;
     d["store"] = revision.record.versionStoreUuid;
-    const auto refs = nb::cast<nb::list>(jsonLoads(vo::objectVersionsRequestToJson({revision.aReference, revision.bReference}))["versions"]);
-    d["a_reference"] = refs[0]; d["b_reference"] = refs[1];
+    d["a_reference"] = jsonToPy(vo::detail::objectVersionJson(revision.aReference));
+    d["b_reference"] = jsonToPy(vo::detail::objectVersionJson(revision.bReference));
     return d;
 }
 
@@ -1747,9 +1751,29 @@ NB_MODULE(_native, m)
                              nb::str(update.detail.data(), update.detail.size()));
                 };
             }
+            // VC_OBJECT_STORE_TIMING: the store's exclusive-time phase profiler
+            // (GeometryWorkScope) over this request, reported on stderr. Measurement only.
+            const bool timing = std::getenv("VC_OBJECT_STORE_TIMING") != nullptr;
             const auto receipt = self.withStore<true>([&](auto& db) {
+                vo::detail::GeometryWork work;
+                std::optional<vo::detail::GeometryWorkScope> scope;
+                if (timing) scope.emplace(work);
+                const auto t0 = std::chrono::steady_clock::now();
                 const auto prepared = db.prepare(parsed, options);
-                return db.submit(parsed, prepared);
+                const auto t1 = std::chrono::steady_clock::now();
+                auto result = db.submit(parsed, prepared);
+                const auto t2 = std::chrono::steady_clock::now();
+                if (timing) {
+                    std::vector<std::pair<uint64_t, std::string>> phases;
+                    for (const auto& [name, ns] : work.phaseNanoseconds) phases.emplace_back(ns, name);
+                    std::sort(phases.rbegin(), phases.rend());
+                    std::string line = "VC_OBJECT_STORE_TIMING submit: prepare " +
+                        std::to_string(std::chrono::duration<double>(t1 - t0).count()) + " s, submit " +
+                        std::to_string(std::chrono::duration<double>(t2 - t1).count()) + " s | exclusive phases (s):";
+                    for (const auto& [ns, name] : phases) line += " " + name + "=" + std::to_string(double(ns) / 1e9);
+                    std::fprintf(stderr, "%s\n", line.c_str()); std::fflush(stderr);
+                }
+                return result;
             });
             return jsonLoads(vo::transactionReceiptToJson(receipt));
         }, nb::arg("request"), nb::arg("payloads") = nb::dict(), nb::arg("progress") = nb::none(),

@@ -91,6 +91,8 @@ void validateEdgeProjection(const ObjectFields& fields)
 std::string projectedEdgeColumns(sqlite3* db,const ObjectFields& fields)
 {
     validateEdgeProjection(fields);
+    auto pool=activeStatementPools.find(db);
+    if(!fields&&pool!=activeStatementPools.end()&&pool->second->projectedEdgeColumnsSql)return *pool->second->projectedEdgeColumnsSql;
     std::string sql;
     std::istringstream names(kEdgeCols);std::string name;
     while(std::getline(names,name,',')){
@@ -102,6 +104,7 @@ std::string projectedEdgeColumns(sqlite3* db,const ObjectFields& fields)
         if(!identity&&fields&&!fields->contains(field))sql+="NULL";
         else sql+=edgeReadColumn(db,name);
     }
+    if(!fields&&pool!=activeStatementPools.end()&&pool->second->edgeColumnNames)pool->second->projectedEdgeColumnsSql=sql;
     return sql;
 }
 

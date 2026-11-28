@@ -10,6 +10,7 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import copy
 import gc
+import threading
 import json
 import math
 try:
@@ -146,6 +147,67 @@ configure_torch_threads_from_env()
 
 
 _HEADLESS_AUTOSAVE_INTERVAL = AUTOSAVE_INTERVAL_ITERATIONS
+# Every step builds fresh transform objects (slice-to-spiral transform, the
+# integrated-flow diffeomorphism and its cached-integrator closures) that sit in
+# reference cycles and each hold a full gap-logit lattice copy and a full-resolution
+# flow copy. Reference counting never frees them; only the cyclic collector does, and
+# it runs on Python container-allocation counts, never on device memory (a failed CUDA
+# allocation does not start it), so on a long z range the garbage fills the card.
+# FIT_SPIRAL_GC_POLICY chooses how the garbage is collected (measurements and trade-offs: GC_CYCLE_LEAK.md):
+#   freeze (default)  gc.freeze() once after the first step moves the large, permanent setup heap (tracks, pools, configuration) out of every later scan,
+#                     then a full collection after every FIT_SPIRAL_GC_EVERY_STEPS-th step (default 1): lowest memory, no measurable speed cost
+#   every-step        a full collection after every step without freezing: same memory, but each collection scans the whole heap (about 0.3 s) - 3x slower on a small window
+#   pressure          a full collection only when the device memory allocated since the last one grew by more than FIT_SPIRAL_GC_GARBAGE_FRACTION (default 0.2) of the card:
+#                     no cost for fits that fit, the peak is the live set plus that fraction of the card
+#   off               Python's own cyclic collector only (the previous behaviour)
+_GC_POLICY = os.environ.get('FIT_SPIRAL_GC_POLICY', 'freeze')
+if _GC_POLICY not in ('freeze', 'every-step', 'pressure', 'off'):
+    raise SystemExit(f"FIT_SPIRAL_GC_POLICY must be freeze, every-step, pressure or off, got {_GC_POLICY!r}")
+_GC_EVERY_STEPS = int(os.environ.get('FIT_SPIRAL_GC_EVERY_STEPS', '1'))
+_GC_GARBAGE_FRACTION = float(os.environ.get('FIT_SPIRAL_GC_GARBAGE_FRACTION', '0.2'))
+
+# gc.freeze() is process-wide, and a resident service process runs many sessions one after another and may run several at once. The freeze is therefore an
+# EPOCH: a context takes it (gc.collect(); gc.freeze(), which also freezes the setup heap of any session that started since the previous freeze) at its first
+# step of an epoch, and ANY context that lets go (model rebuild, close(), failed session) ends it for everybody: one gc.unfreeze() plus one collection frees
+# the cycles that context discarded (a frozen cycle keeps its model and optimiser tensors on the card), and the other contexts re-freeze at their next step.
+_GC_FREEZE_LOCK = threading.Lock()
+_GC_FREEZE_OWNERS = set()
+_GC_FREEZE_EPOCH = 0
+
+
+def _gc_freeze_epoch():
+    return _GC_FREEZE_EPOCH
+
+
+def _gc_freeze_acquire(owner):
+    """Freeze everything alive now; returns the epoch the owner froze in (compare with _gc_freeze_epoch())."""
+    with _GC_FREEZE_LOCK:
+        gc.collect()
+        gc.freeze()
+        _GC_FREEZE_OWNERS.add(id(owner))
+        return _GC_FREEZE_EPOCH
+
+
+def _gc_forget(ctx):
+    """Forget a context's share of the collector policy: the freeze epoch it took, and the pressure policy's watermark (both belong to the old model; a smaller rebuilt model needs a fresh baseline).
+
+    A module function, not only a method, so the rebuild and close paths work on the lightweight contexts the existing rebuild checks use (a SimpleNamespace borrowing FitContext's methods has no _reset_gc_state)."""
+    ctx._gc_epoch = None
+    ctx._gc_floor_bytes = 0
+
+
+def _gc_freeze_release(owner):
+    """End any fitter-owned freeze on a context's teardown or rebuild, for every context. `owner` need not be registered: its heap may have been
+    frozen by another session before its first step, or after a release cleared the registrations while it stayed alive. A no-op only when no freeze
+    is active."""
+    global _GC_FREEZE_EPOCH
+    with _GC_FREEZE_LOCK:
+        if not _GC_FREEZE_OWNERS:
+            return
+        _GC_FREEZE_OWNERS.clear()
+        _GC_FREEZE_EPOCH += 1
+        gc.unfreeze()
+        gc.collect()
 
 
 class InputReplacementRefused(RuntimeError):
@@ -2650,6 +2712,8 @@ class FitContext:
         # The optimiser state and the flow-field lattices are the session's
         # largest allocations; hand the arena back before asking for their
         # replacements rather than peaking at twice the model.
+        _gc_freeze_release(self)
+        _gc_forget(self)
         gc.collect()
         torch.cuda.empty_cache()
         if self.device.type == 'mps':
@@ -2744,6 +2808,25 @@ class FitContext:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+
+    def _free_fit_state_for_export(self):
+        """Export-OOM prevention. The final checkpoint is already on disk, so everything only the optimisation steps need is released before the
+        mesh export, whose transform and torch.cat allocate several GiB more (+4 to 10.5 GiB measured; PHerc0343 16-voxel died there with
+        1.42 GiB free): the AdamW moments, the parameter gradients and the allocator's cached blocks.  FIT_SPIRAL_EXPORT_FREE=0 disables it."""
+        if os.environ.get('FIT_SPIRAL_EXPORT_FREE', '1') != '1':
+            return
+        before = torch.cuda.memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        try:
+            self.optimiser.state.clear()
+            self.optimiser.zero_grad(set_to_none=True)
+        except Exception as e:
+            print(f'export free: optimiser state not released ({type(e).__name__}: {e})', flush=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f'export free: allocated {before:.2f} -> {torch.cuda.memory_allocated() / 2**30:.2f} GiB '
+                  f'(reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB) before the mesh export', flush=True)
 
     def _save_model(self, suffix, completed_iterations=None):
         if completed_iterations is None:
@@ -3935,6 +4018,7 @@ class FitContext:
         self.step_timer.start('opt')
         self.optimiser.step()
         self.step_timer.stop('opt')
+        self._collect_garbage_after_step(iteration)
         self.optimiser.zero_grad(set_to_none=True)
         self.lr_scheduler.step()
         self.step_timer.tick()
@@ -3943,6 +4027,25 @@ class FitContext:
             self.profiler.step()
 
         return loss, losses, log_metrics, shell_metrics
+
+    def _reset_gc_state(self):
+        """Forget this context's share of the collector policy (see _gc_forget)."""
+        _gc_forget(self)
+
+    def _collect_garbage_after_step(self, iteration):
+        """The FIT_SPIRAL_GC_POLICY collection that follows one optimiser step (see the policy block at the top of this module)."""
+        if _GC_POLICY in ('freeze', 'every-step') and _GC_EVERY_STEPS > 0:
+            if _GC_POLICY == 'freeze' and getattr(self, '_gc_epoch', None) != _gc_freeze_epoch():
+                self._gc_epoch = _gc_freeze_acquire(self)
+            if iteration % _GC_EVERY_STEPS == 0:
+                gc.collect()
+        elif _GC_POLICY == 'pressure' and self.device.type == 'cuda':
+            # The fit's own device (FIT_SPIRAL_DEVICE=cuda:1), not the thread's current one: explicit allocations on another card do not change it.
+            device = self.device
+            allocated = torch.cuda.memory_allocated(device)
+            if allocated - getattr(self, '_gc_floor_bytes', 0) > _GC_GARBAGE_FRACTION * torch.cuda.get_device_properties(device).total_memory:
+                gc.collect()
+                self._gc_floor_bytes = torch.cuda.memory_allocated(device)
 
     def resolve_output_path(self):
         """Derive and create this run's output directory.
@@ -4236,6 +4339,7 @@ class FitContext:
                 'saving_checkpoint', 'Saving final checkpoint',
                 detail=f'checkpoint_{suffix}.ckpt')
             self._save_model(suffix, self.num_training_steps)
+            self._free_fit_state_for_export()
             if self.config.get('output_save_png_visualizations', False):
                 progress.begin(
                     'finalizing', 'Preparing final visualizations')
@@ -4295,10 +4399,20 @@ class FitContext:
         this rank (the runtime calls it when its session ends; the CLI
         process simply exits).
         """
-        store, self._lasagna_store = self._lasagna_store, None
-        if store is not None:
-            store.close()
-        self.winding_inference = None
+        try:
+            # The interactive driver sets _lasagna_store; a headless fit never does, so its pools (page-locked host memory when FIT_SPIRAL_POOL_OFFLOAD=1) would be left to object
+            # lifetime. The context owns the store it prepared either way.
+            store = getattr(self, '_lasagna_store', None)
+            if store is None:
+                store = (getattr(self, 'lasagna_volume', None) or {}).get('store')
+            self._lasagna_store = None
+            if store is not None:
+                store.close()
+            self.winding_inference = None
+        finally:
+            # The freeze is process-wide: end this context's share of it even when releasing the store failed.
+            _gc_freeze_release(self)
+            _gc_forget(self)
 
 
 def main(config, *, scroll, paths, progress=None, resume_path=None,
@@ -4312,7 +4426,7 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
     resolved SpiralInputPaths; the remaining keywords mirror the FitContext
     constructor's explicit fit controls.
     """
-    return FitContext(
+    context = FitContext(
         config,
         scroll=scroll,
         paths=paths,
@@ -4326,7 +4440,12 @@ def main(config, *, scroll, paths, progress=None, resume_path=None,
         storage_backend=storage_backend,
         render_volume_scale=render_volume_scale,
         dist_context=dist_context,
-    ).run()
+    )
+    try:
+        return context.run()
+    finally:
+        # Release the context on success and on failure: its share of the process-wide gc.freeze() and its volume stores.
+        context.close()
 
 
 def _wandb_init_kwargs(config, mode, environment):

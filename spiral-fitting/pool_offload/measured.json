@@ -1,0 +1,10 @@
+{
+ "_note": "nvidia-smi per-process memory, MiB converted to GiB (/1024). steady = median of the optimiser phase; max = whole-run maximum including start-up and the final 'Writing final mesh windings' phase. Sources: nvidia-smi logs of whole-height fits (2 s samples, V100-SXM2-32GB, 32-voxel flow grid, GC hook every step) and 16-voxel probes.",
+ "points": [
+  {"scroll":"PHerc0343","grid":32,"setting":"gc","steady":20.10,"max":23.98,"src":"perf_0343_res.mem (676 samples x 2 s, 500 windings)"},
+  {"scroll":"PHerc0343","grid":32,"setting":"gc_offload","steady":9.30,"max":13.20,"src":"perf_0343_off.mem"},
+  {"scroll":"PHerc0268","grid":32,"setting":"gc_offload","steady":14.65,"max":25.12,"src":"perf_0268_off.mem (816 windings)"},
+  {"scroll":"PHerc0800","grid":32,"setting":"gc_offload","steady":13.25,"max":20.11,"src":"perf_0800_off.mem (550 windings)"},
+  {"scroll":"PHerc0343","grid":16,"setting":"gc","steady":30.1,"max":30.1,"src":"z 1200-17500 probe, torch peak 28.17 GiB, nvidia-smi 32.3 GB (=30.1 GiB), survived 300 its, no margin (H=16300, not 18000)"}
+ ]
+}

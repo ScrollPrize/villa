@@ -1,7 +1,9 @@
 #include "internal/Database.hpp"
 #include "internal/ReadRequest.hpp"
 #include "vc_object_store/objects/PackedStore.hpp"
+#include <cstdlib>
 #include <limits>
+#include <string>
 
 namespace vc::objects::detail {
 [[noreturn]] void fail(sqlite3* db, const std::string& what)
@@ -138,7 +140,12 @@ void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly)
     sqlite3_busy_timeout(db, options.busyTimeoutMs);
     exec(db, "PRAGMA foreign_keys=ON;");
     exec(db, "PRAGMA temp_store=MEMORY;");
-    const auto cacheKiB=options.sqliteCacheBytes/1024+(options.sqliteCacheBytes%1024!=0);
+    // VC_OBJECT_STORE_SQLITE_CACHE_MB overrides the per-connection page cache (default 8,000 KiB) for
+    // measurement: a link refresh inserts ~25 rows per crossing at random UUID keys into a multi-GB file.
+    std::size_t cacheBytes=options.sqliteCacheBytes;
+    if(const char* mb=std::getenv("VC_OBJECT_STORE_SQLITE_CACHE_MB"); mb && *mb)
+        cacheBytes=static_cast<std::size_t>(std::stoull(mb))*1024*1024;
+    const auto cacheKiB=cacheBytes/1024+(cacheBytes%1024!=0);
     if(cacheKiB>static_cast<size_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument("object store: SQLite cache budget exceeds supported range");
     const auto cachePragma="PRAGMA cache_size=-"+std::to_string(cacheKiB)+";";

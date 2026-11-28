@@ -206,14 +206,14 @@ def prepare_lasagna_volume(
         raise RuntimeError(f'lasagna z-ROI [{z_lo}, {z_hi}) is empty (store z size {z_size})')
 
     roi_shape = (z_hi - z_lo, reference_shape[1], reference_shape[2])
-    from sparse_cuda_cache import ResidentBrickPool, SparseLasagnaStore
+    from sparse_cuda_cache import SparseLasagnaStore, resident_brick_pool_class
     normal_cache = None
     if use_normals:
         if progress is not None:
             progress.begin(
                 'loading', 'Loading normal volumes onto GPU',
                 step=0, total_steps=0, unit='bricks')
-        normal_cache = ResidentBrickPool(
+        normal_cache = resident_brick_pool_class()(
             normal_sidecar,
             origin_zyx=(z_lo, 0, 0),
             z_roi=(z_lo, z_hi),
@@ -232,7 +232,7 @@ def prepare_lasagna_volume(
             progress.begin(
                 'loading', 'Loading gradient volume onto GPU',
                 step=0, total_steps=0, unit='bricks')
-        grad_cache = ResidentBrickPool(
+        grad_cache = resident_brick_pool_class()(
             grad_sidecar,
             origin_zyx=(z_lo, 0, 0),
             z_roi=(z_lo, z_hi),

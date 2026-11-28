@@ -4,6 +4,8 @@
 #include "vc_object_store/objects/TransactionJson.hpp"
 #include "internal/TransformedLength.hpp"
 #include "internal/ObjectVersionJson.hpp"
+#include "internal/ReadTiming.hpp"
+#include "internal/SelectedRead.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -22,7 +24,16 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
         (inherited && before.commitSequence != position.commitSequence))
         throw StoreBusy("selected inputs: requested graph position is no longer available");
     SelectedInputs result;
-    const auto records = store_->objectsAtVersions(*txn_, refs, result.trackDatasets);
+    auto& timing = detail::readTiming();
+    timing.reset();
+    // One memo for the whole read: the objects resolved here serve the
+    // relationship read below instead of being resolved again.
+    detail::SelectedReadScope memo;
+    std::vector<std::optional<ObjectRevision>> records;
+    {
+        detail::ScopedReadTimer timer(timing.objects);
+        records = store_->objectsAtVersions(*txn_, refs, result.trackDatasets);
+    }
     std::set<std::string> objects;
     for (size_t i = 0; i < refs.size(); ++i) {
         if (!records[i] || records[i]->deleted) throw std::invalid_argument("selected object is not retained: " + refs[i].objectUuid);
@@ -41,8 +52,12 @@ SelectedInputs LocalStoreReader::selectedInputs(const std::vector<ObjectVersion>
         for (const auto& ref : *relationshipVersions)
             if (!selected.contains(key(ref)))
                 throw std::invalid_argument("selected inputs: relationships requested of an unselected object: " + ref.objectUuid);
+        result.relationships = relationshipsAt(*relationshipVersions);
+    } else {
+        // All selected objects: the revisions resolved above are used as they are.
+        result.relationships = store_->relationshipsAt(*txn_, result.objects);
     }
-    result.relationships = relationshipsAt(relationshipVersions ? *relationshipVersions : refs);
+    timing.report("selectedInputs", result.objects.size(), result.relationships.size());
     return result;
 }
 

@@ -1,3 +1,4 @@
+#include "vc_object_store/objects/ObjectCollection.hpp"
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/TerminalProgress.hpp"
@@ -15,6 +16,7 @@ try {
     vc::objects::SourceIngestOptions sourceOptions;
     std::vector<std::string> tags;
     bool showProgress = true;
+    bool bulk = false; std::size_t bulkShards = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         auto next = [&]() -> std::string {
@@ -28,6 +30,8 @@ try {
         else if (arg == "--point-collections") sources.emplace_back("point_collection", next());
         else if (arg == "--umbilicus") sources.emplace_back("umbilicus", next());
         else if (arg == "--tracks") sources.emplace_back("track", next());
+        else if (arg == "--bulk") bulk = true;
+        else if (arg == "--bulk-shards") bulkShards = std::max<std::size_t>(1, std::stoul(next()));
         else if (arg == "--surface-channel") {
             Channel channel; channel.uuid = next(); channel.name = next(); channel.image = next();
             channels.push_back(std::move(channel));
@@ -46,6 +50,10 @@ try {
                 "  --point-collections FILE  import new collections from a JSON\n"
                 "  --umbilicus FILE          import a new umbilicus from a vc_umbilicus JSON\n"
                 "  --tracks PATH             import new packed tracks (or DBM with packed mirror)\n"
+                "  --bulk                    with ONE --tracks source: build the tracks as a NEW sealed collection (--db + \".tracks\") through the\n"
+                "                            parallel initial-import API and put an editable overlay store at --db (must not exist) over it,\n"
+                "                            instead of one transaction per track (hours for millions of tracks)\n"
+                "  --bulk-shards N           parallel writers for --bulk (default 1 = one ordinary SQLite file; N>1 = a directory)\n"
                 "  --surface-channel UUID NAME TIFF\n"
                 "                            add or replace a channel of a stored surface\n"
                 "  --volume-uuid ID          coordinate frame: catalog volume ID (metadata.json id)\n"
@@ -89,6 +97,27 @@ try {
         frame = vc::objects::geometryCoordinates({{"volume_uuid", *volumeUuid}, {"scale_factor", scale}});
     }
     const auto coordinateContext = frame.dump();
+    if (bulk) {
+        if (sources.size() != 1 || sources[0].first != "track" || !channels.empty())
+            throw std::runtime_error("--bulk takes exactly one --tracks source and nothing else");
+        // The sealed tracks collection goes next to --db; --db itself is an editable overlay root that references it, which is
+        // what a fit opens (it refreshes links into the store; a sealed collection cannot be opened writable). Three retryable
+        // stages (see ingestTracksBulkOverlay): a failure creating the overlay keeps the sealed tracks, and running the same command again
+        // creates only the overlay.
+        vc::objects::util::TerminalProgress progress("Bulk ingest tracks", showProgress);
+        try {
+            const auto report = vc::objects::ingestTracksBulkOverlay(sources[0].second, path, author, coordinateContext, tags, bulkShards);
+            progress.finish();
+            if (report.overlayAlreadyComplete) std::cout << "overlay " << path.string() << " already exists and opens over the sealed tracks " << report.tracksPath.string() << "; nothing to do\n";
+            else std::cout << report.ingest.ingested << (report.reusedSealedTracks ? " tracks reused from an earlier run" : " ingested") << " (bulk, " << bulkShards << " shard(s)), "
+                           << report.ingest.problems.size() << " problems\n";
+            return 0;
+        } catch (const vc::objects::BulkOverlayError& error) {
+            progress.finish();
+            std::cerr << error.what() << "\n";
+            return 2;
+        }
+    }
     vc::objects::OpenOptions options; options.author = author;
     auto db = std::filesystem::exists(path) ? vc::objects::ObjectStore::open(path, options) : vc::objects::ObjectStore::create(path, options);
     bool failed = false;
