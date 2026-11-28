@@ -822,15 +822,23 @@ def _pyrdown3d(t: torch.Tensor, *, factor: int) -> torch.Tensor:
 		return t
 	if (f & (f - 1)) != 0:
 		raise ValueError("downscale factor must be a power of 2 for pyramid scaling")
-	k = torch.tensor([1, 4, 6, 4, 1], dtype=t.dtype, device=t.device) / 16.0
 	while f > 1:
-		C = t.shape[0]
-		for dim, pad_arg in enumerate([(0,0,0,0,2,2), (0,0,2,2,0,0), (2,2,0,0,0,0)]):
-			shape = [1, 1, 1, 1, 1]
-			shape[dim + 2] = 5
-			kd = k.view(*shape).expand(C, 1, *shape[2:])
-			t = F.conv3d(F.pad(t.unsqueeze(0), pad_arg, mode='reflect'), kd, groups=C)[0]
-		t = t[:, ::2, ::2, ::2]
+		# Separable [1, 4, 6, 4, 1] / 16 blur with reflect padding, written as
+		# shifted adds that only compute the even outputs kept by the 2x step.
+		for dim in (1, 2, 3):
+			n = t.shape[dim]
+			m = (n + 1) // 2
+			p = torch.cat([
+				t.narrow(dim, 1, 2).flip(dim),
+				t,
+				t.narrow(dim, n - 3, 2).flip(dim),
+			], dim=dim)
+			idx = [slice(None)] * 4
+			s = []
+			for j in range(5):
+				idx[dim] = slice(j, j + 2 * m - 1, 2)
+				s.append(p[tuple(idx)])
+			t = (s[0] + s[4]) * (1.0 / 16.0) + (s[1] + s[3]) * (4.0 / 16.0) + s[2] * (6.0 / 16.0)
 		f //= 2
 	# The native accumulator needs contiguous rows; the strided view above is not.
 	return t.contiguous()
