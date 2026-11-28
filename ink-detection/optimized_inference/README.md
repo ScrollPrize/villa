@@ -28,6 +28,7 @@ GPU-accelerated, containerized inference for ink detection models. The GPU image
 | `STRIDE` | Stride for sliding window (pixels) | `16` |
 | `BATCH_SIZE` | Batch size for inference | `256` |
 | `MODEL_TYPE` | Model architecture: `timesformer`, `resnet3d-50`, or `resnet3d-152-3d-decoder` | `timesformer` |
+| `FORCE_REVERSE` | Layer order fed to the model: `false` (ascending, as stored), `true` (descending) or `auto`, which reverses when the first layers of the window look like air (much less texture than the last layers, the rule from #2627) and otherwise keeps the stored order. Exposed fragment surfaces are often stored air first: on PHerc0343P's `2um_front_surface` stack the `ink_canonical_2um` 3D-decoder checkpoint scores ROC-AUC 0.62 against the traced letters in the stored order and 0.93 reversed. `auto` is rejected for `NUM_PARTS` > 1 on an S3 zarr, since every partition would read most of the stack | `false` |
 | `STEP` | Execution step: `prepare`, `inference`, or `reduce` | `inference` |
 | `NUM_PARTS` | Number of partitions for distributed inference | `1` |
 | `PART_ID` | Partition ID (0-indexed) when NUM_PARTS > 1 | `0` |
