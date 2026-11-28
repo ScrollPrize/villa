@@ -75,8 +75,11 @@ target_sources(vc_reader_native PRIVATE
 # CPU and CUDA composites evaluate the same unfused float32 formulas (the kernels
 # build with --fmad=false). Every translation unit holding a copy of the shared inline
 # surface math (grid/points.hpp) is unfused too: the linker keeps any one copy, and a
-# fused one (an FMA-capable -march) moves nearest-voxel ties.
-set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/display.cpp"
+# fused one (an FMA-capable -march) moves nearest-voxel ties. The CPU sheet normals
+# (sheet_normal/normal.hpp, also in bindings.cpp) are unfused like their CUDA kernel:
+# on arm64 a fused gradient filter turns a near-isotropic tensor's normal by ~0.5 degrees.
+set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/../src/cpp/native_reader.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/display.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/display/slab.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/composite/reduce.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/cpp/projection/mask.cpp"
