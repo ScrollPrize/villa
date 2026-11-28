@@ -1088,6 +1088,54 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					)
 					load_model.assert_called_once_with(device=torch.device("cpu" if device == "cpu" else "mps"))
 
+	def test_predict3d_resume_keeps_the_conv3d_kernels_an_output_started_with(self):
+		with tempfile.TemporaryDirectory() as td:
+			root = Path(td)
+			input_path = _write_zarr_array(root / "input.zarr", (8, 8, 8))
+			native = root / "native.lasagna.json"
+			_write_predict3d_manifest(native, {})  # an output started before 2-D kernels existed
+
+			def kernels_used(output_path, *, keep_native=False):
+				seen = []
+
+				def stop(adapter, *, device):
+					seen.append(adapter.conv3d_2d_kernels)
+					raise _StopAfterManifest
+
+				env = {"VESUVIUS_MPS_NATIVE_CONV3D": "1"} if keep_native else {}
+				with mock.patch.object(torch.cuda, "is_available", return_value=False), \
+					 mock.patch.object(torch.cuda, "device_count", return_value=0), \
+					 mock.patch.object(torch.backends.mps, "is_available", return_value=True), \
+					 mock.patch.dict(os.environ, env), \
+					 mock.patch.object(LasagnaCosPredict3DAdapter, "load_model", autospec=True, side_effect=stop):
+					self._run_predict3d_until_model_build(input_path=input_path, output_path=output_path, device=None)
+				return seen[0]
+
+			fresh = root / "fresh.lasagna.json"
+			self.assertTrue(kernels_used(fresh))
+			self.assertTrue((root / ".fresh_conv3d_2d_kernels").is_file())
+			self.assertTrue(kernels_used(fresh), "a resume keeps the 2-D kernels its output started with")
+			self.assertFalse(kernels_used(native), "an output started with native kernels keeps them")
+			self.assertFalse((root / ".native_conv3d_2d_kernels").exists())
+			self.assertFalse(kernels_used(root / "opt_out.lasagna.json", keep_native=True))
+			self.assertFalse((root / ".opt_out_conv3d_2d_kernels").exists())
+			self.assertEqual(_cleanup_predict3d_temp_files(root), 0)
+			self.assertTrue((root / ".fresh_conv3d_2d_kernels").is_file())
+
+	def test_conv3d_2d_kernels_only_for_fresh_mps_outputs_or_marked_resumes(self):
+		decide = preprocess_wrapper._conv3d_2d_kernels_for_run
+		for device, exists, marked, keep_native, expected in (
+			("mps", False, False, False, True),
+			("mps", True, False, False, False),
+			("mps", True, True, False, True),
+			("mps", False, False, True, False),
+			("cpu", False, False, False, False),
+			("cuda", True, True, False, True),  # swapped layers run PyTorch's kernels off MPS
+		):
+			with self.subTest(device=device, exists=exists, marked=marked, keep_native=keep_native):
+				self.assertEqual(decide(device=device, output_exists=exists, marker_exists=marked,
+					keep_native=keep_native), expected)
+
 	def _dispatch_predict3d_fixture(self, args):
 		"""Exercise real CLI provenance I/O; mock only expensive inference/procfs."""
 		with tempfile.TemporaryDirectory() as td, chdir(td):

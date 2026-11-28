@@ -173,6 +173,24 @@ def _grad_mag_factor_from_input_sd(input_sd: int) -> float:
 	return 1.0 / float(max(1, int(input_sd)))
 
 
+CONV3D_2D_KERNELS_MARKER = "conv3d_2d_kernels"
+
+
+def _conv3d_2d_kernels_for_run(
+	*, device: str | torch.device, output_exists: bool, marker_exists: bool, keep_native: bool,
+) -> bool:
+	"""Whether predict3d runs the UNet's 3-D convolutions through vesuvius' 2-D kernels for Apple GPUs.
+
+	The two kernel paths agree only to rounding, so a resumed output keeps the path it was started
+	with and its chunks never mix them. The marker file records a start with 2-D kernels; an output
+	that exists without it was started with PyTorch's own kernels. A fresh output on MPS uses the 2-D
+	kernels unless ``VESUVIUS_MPS_NATIVE_CONV3D=1``.
+	"""
+	if marker_exists:
+		return True
+	return torch.device(device).type == "mps" and not keep_native and not output_exists
+
+
 class LasagnaCosPredict3DAdapter:
 	"""Lasagna cos/normal model adapter for shared tiled predict3d mechanics."""
 
@@ -209,6 +227,7 @@ class LasagnaCosPredict3DAdapter:
 		self.upsample_mode = None
 		self.output_sigmoid = True
 		self.calibrated_instance_norm = False
+		self.conv3d_2d_kernels = False
 
 	@property
 	def model_output_products(self) -> tuple[OutputProductSpec, ...]:
@@ -239,6 +258,9 @@ class LasagnaCosPredict3DAdapter:
 		)
 		self.output_sigmoid = bool(output_sigmoid)
 		model.eval()
+		if self.conv3d_2d_kernels:
+			from vesuvius.models.utilities.mps_conv3d import speed_up_3d_convs
+			speed_up_3d_convs(model)
 		return model
 
 	def prepare_model_for_state_load(self, model, state, *, device: torch.device) -> None:
@@ -1599,6 +1621,23 @@ def run_preprocess_3d(
 			else None
 		),
 	)
+	# Decide before the outputs are created: their existence is what marks a resume.
+	conv3d_marker = Path(out_dir) / f".{prefix}{CONV3D_2D_KERNELS_MARKER}"
+	predict_adapter.conv3d_2d_kernels = _conv3d_2d_kernels_for_run(
+		device=torch_device,
+		output_exists=any(os.path.exists(path) for path in (
+			output_path, cos_omezarr_path, gm_omezarr_path, nx_omezarr_path, ny_omezarr_path)),
+		marker_exists=conv3d_marker.exists(),
+		keep_native=os.environ.get("VESUVIUS_MPS_NATIVE_CONV3D") == "1",
+	)
+	if predict_adapter.conv3d_2d_kernels:
+		conv3d_marker.write_text("3-D convolutions run through 2-D kernels on MPS; a resume keeps them.\n")
+	if torch_device.type == "mps" and predict_adapter.conv3d_2d_kernels:
+		print("[predict3d] 3-D convolutions: 2-D kernels (Apple GPU)", flush=True)
+	elif torch_device.type == "mps":
+		reason = ("VESUVIUS_MPS_NATIVE_CONV3D=1" if os.environ.get("VESUVIUS_MPS_NATIVE_CONV3D") == "1"
+			else "resuming an output started with them")
+		print(f"[predict3d] 3-D convolutions: PyTorch's own kernels ({reason})", flush=True)
 	if output_format == "compact":
 		output_adapter = CompactOutputAdapter(root=output_path, products=predict_adapter.output_products,
 			n_levels=n_levels, validity_channel="grad_mag")
