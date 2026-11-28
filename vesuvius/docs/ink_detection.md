@@ -24,6 +24,31 @@ OpenCV and TIFF/Zarr codecs. Positive native-3D label dilation uses
 vc_reader's exact distance transform on the batch's device. The volume-only installation does not include the training
 stack.
 
+### Older NVIDIA GPUs
+
+The locked PyTorch is a CUDA 13 build, which has no kernels for GPUs below
+compute capability 7.5 (GTX 9xx/10xx, Titan Xp, Titan V, P100, V100). On those
+GPUs automatic device selection warns and uses the CPU, and `--gpus` or
+`--device cuda` stops with a recovery command for the installed release. On
+x86-64, the CUDA 12.6 build of PyTorch 2.14 or earlier still runs them. On
+Linux its CUDA libraries overwrite files of the locked CUDA 13 ones, so install
+it into a separate environment and leave `.venv` untouched. Replace only torch
+and torchvision, so the locked NumPy and Numba stay as they are. For the locked
+torch 2.12.1:
+
+```bash
+export UV_PROJECT_ENVIRONMENT=.venv-cu126
+uv sync --extra models --extra tests
+uv pip install --python .venv-cu126 torch==2.12.1+cu126 torchvision \
+  --index-url https://download.pytorch.org/whl/cu126 \
+  --reinstall-package torch --reinstall-package torchvision
+uv run --no-sync python -m vesuvius.ink_detection.inference.infer -h
+```
+
+While `UV_PROJECT_ENVIRONMENT` is set, start commands with `uv run --no-sync`:
+a plain `uv run` re-syncs `uv.lock` and reinstalls the CUDA 13 build. Unset it
+to return to the locked `.venv`.
+
 ## Data layout
 
 The published `ink_9um` label tree holds one folder per source family, with
