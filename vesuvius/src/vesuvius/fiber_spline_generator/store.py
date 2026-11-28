@@ -105,7 +105,8 @@ def write_store(
                     tx.put_geometry(tx.upsert_object(record), geometry)
             store_uuid = store.uuid
             store.checkpoint()
-        with open(temporary, "rb") as stream:
+        # Windows flushes only handles opened for writing (EBADF otherwise).
+        with open(temporary, "r+b") as stream:
             os.fsync(stream.fileno())
         _publish(temporary, destination)
     return {"uuid": store_uuid, "fiber_count": fiber_count, "point_count": point_count}
