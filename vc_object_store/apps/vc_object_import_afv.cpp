@@ -123,7 +123,7 @@ Json importNative(const Json& config,const std::filesystem::path& input,const st
         edgeSource->setMmapBytes(sourceMmapBytes);
         const auto estimated=edgeLimit?edgeLimit:edgeSource->constraintCount();
         const auto chunkRows=integerOption("source_chunk_edges",2048,sizeLimit);
-        edgeRanges=edgeSource->idRanges(std::max(size_t(readers),size_t(estimated)/chunkRows+1),edgeLimit);
+        edgeRanges=edgeSource->idRanges(std::max(size_t(readers),size_t(estimated)/size_t(chunkRows)+1),edgeLimit);
     }
     InitialImportOptions options;options.store.author=config.value("author",std::string("afv-import"));
     options.store.sqliteCacheBytes=integerOption("sqlite_cache_bytes",512*1024*1024,sizeLimit,true);

@@ -27,8 +27,10 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -824,58 +826,73 @@ static int run_main(int argc, char *argv[])
                                 : 0;
 
         // Traverse grid
+        // An exception cannot leave the OpenMP loop: keep the first and rethrow it after.
+        std::atomic<bool> ray_failed{false};
+        std::exception_ptr ray_error;
         #pragma omp parallel for schedule(static)
         for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                const cv::Vec3f start = src_points(r, c);
-                if (!vc::geometry::validSurfacePoint(start)) {
-                    continue;
-                }
-
-                const cv::Vec3f n = ray_dirs(r, c);
-                if (!has_ray_dir(r, c)) {
-                    continue; // leave invalid
-                }
-
-                // March along the ray until threshold is hit or max distance reached
-                bool clearance_met = (required_clearance_steps == 0);
-                bool left_surface = false;
-                int below_counter = 0;
-
-                for (int k = 1; k <= max_steps; ++k) {
-                    const double t = neighbor_step * static_cast<double>(k);
-                    if (!clearance_met && k >= required_clearance_steps) {
-                        clearance_met = true;
-                    }
-
-                    const cv::Vec3d pos = cv::Vec3d(start[0], start[1], start[2]) + cv::Vec3d(n[0], n[1], n[2]) * t;
-                    const float v = volume_value(tracing_volume, pos);
-                    if (!std::isfinite(v)) {
+            if (ray_failed.load(std::memory_order_relaxed)) continue;
+            try {
+                for (int c = 0; c < cols; ++c) {
+                    const cv::Vec3f start = src_points(r, c);
+                    if (!vc::geometry::validSurfacePoint(start)) {
                         continue;
                     }
 
-                    if (!clearance_met) {
-                        continue;
+                    const cv::Vec3f n = ray_dirs(r, c);
+                    if (!has_ray_dir(r, c)) {
+                        continue; // leave invalid
                     }
 
-                    if (!left_surface) {
-                        if (v <= neighbor_exit_threshold) {
-                            below_counter += 1;
-                            if (below_counter >= neighbor_exit_count) {
-                                left_surface = true;
-                            }
-                        } else {
-                            below_counter = 0;
+                    // March along the ray until threshold is hit or max distance reached
+                    bool clearance_met = (required_clearance_steps == 0);
+                    bool left_surface = false;
+                    int below_counter = 0;
+
+                    for (int k = 1; k <= max_steps; ++k) {
+                        const double t = neighbor_step * static_cast<double>(k);
+                        if (!clearance_met && k >= required_clearance_steps) {
+                            clearance_met = true;
                         }
-                        continue;
-                    }
 
-                    if (v >= neighbor_threshold) {
-                        hit_dist(r, c) = static_cast<float>(t);
-                        break;
+                        const cv::Vec3d pos = cv::Vec3d(start[0], start[1], start[2]) + cv::Vec3d(n[0], n[1], n[2]) * t;
+                        const float v = volume_value(tracing_volume, pos);
+                        if (!std::isfinite(v)) {
+                            continue;
+                        }
+
+                        if (!clearance_met) {
+                            continue;
+                        }
+
+                        if (!left_surface) {
+                            if (v <= neighbor_exit_threshold) {
+                                below_counter += 1;
+                                if (below_counter >= neighbor_exit_count) {
+                                    left_surface = true;
+                                }
+                            } else {
+                                below_counter = 0;
+                            }
+                            continue;
+                        }
+
+                        if (v >= neighbor_threshold) {
+                            hit_dist(r, c) = static_cast<float>(t);
+                            break;
+                        }
                     }
                 }
+            } catch (...) {
+                #pragma omp critical(neighbor_ray_error)
+                {
+                    if (!ray_error) ray_error = std::current_exception();
+                }
+                ray_failed = true;
             }
+        }
+        if (ray_error) {
+            std::rethrow_exception(ray_error);
         }
 
         auto endpoint_from_dist = [&](const cv::Mat_<float>& dist_map,

@@ -77,7 +77,15 @@ set_target_properties(vc_grid_raycast PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
     INSTALL_RPATH "${VC_PY_RPATH_SELF_AND_PARENT}"
 )
-target_link_libraries(vc_grid_raycast PRIVATE OpenMP::OpenMP_CXX)
+# torch's macOS wheels load their own libomp.dylib, and winding_model_dataset.py
+# imports torch before this module: linking Homebrew's libomp here would start a
+# second OpenMP runtime with the first raycaster and stop at OMP Error #15. Keep
+# the raycaster serial on macOS, as spiral-fitting's kernels are (#2490)
+if(APPLE)
+    target_link_libraries(vc_grid_raycast PRIVATE openmp_stub)
+else()
+    target_link_libraries(vc_grid_raycast PRIVATE OpenMP::OpenMP_CXX)
+endif()
 target_compile_features(vc_grid_raycast PRIVATE cxx_std_23)
 target_compile_options(vc_grid_raycast PRIVATE
     $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>
