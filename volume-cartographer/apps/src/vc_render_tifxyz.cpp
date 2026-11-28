@@ -862,6 +862,7 @@ int main(int argc, char *argv[])
         ("zarr-compression-level", po::value<int>()->default_value(-1), "Zarr compression level (<=0 = compressor default)")
         ("zarr-separator", po::value<std::string>()->default_value("/"), "Zarr chunk dimension separator: / or .")
         ("tif-output", po::value<std::string>(), "Output path for per-slice TIFFs (optional)")
+        ("dry-run", po::bool_switch()->default_value(false), "Count source chunks for a surface-volume render without reading CT chunks or writing output")
         ("quick-tif", po::bool_switch()->default_value(false), "Fast TIF: PACKBITS + zero low nibble")
         ("alpha-min", po::value<float>()->default_value(0.0f), "Alpha min (0-255)")
         ("alpha-max", po::value<float>()->default_value(255.0f), "Alpha max (0-255)")
@@ -942,9 +943,15 @@ int main(int argc, char *argv[])
     const bool wantPyramid = parsed["pyramid"].as<bool>();
     const bool resumeFlag = parsed["resume"].as<bool>();
 
-    const bool wantZarr = parsed.count("zarr-output") > 0;
-    const bool wantTif = parsed.count("tif-output") > 0;
-    if (!wantZarr && !wantTif) { logPrintf(stderr, "Error: at least one of --zarr-output or --tif-output required\n"); return EXIT_FAILURE; }
+    const bool dryRun = parsed["dry-run"].as<bool>();
+    const bool requestedZarr = parsed.count("zarr-output") > 0;
+    const bool wantZarr = requestedZarr && !dryRun;
+    const bool wantTif = parsed.count("tif-output") > 0 && !dryRun;
+    if (!dryRun && !wantZarr && !wantTif) { logPrintf(stderr, "Error: at least one of --zarr-output or --tif-output required\n"); return EXIT_FAILURE; }
+    if (dryRun && (pre_flag || resumeFlag || parsed["merge-tiff-parts"].as<bool>() || parsed["cuda"].as<bool>())) {
+        logPrintf(stderr, "Error: --dry-run cannot be combined with --pre, --resume, --merge-tiff-parts or --cuda\n");
+        return EXIT_FAILURE;
+    }
     const std::string zarrOutputArg = wantZarr ? parsed["zarr-output"].as<std::string>() : "";
     const std::string tifOutputArg = wantTif ? parsed["tif-output"].as<std::string>() : "";
 
@@ -1028,6 +1035,10 @@ int main(int argc, char *argv[])
     const bool requestComposite = parsed["composite-collapse"].as<bool>();
     const bool isCompositeMode = requestComposite
         || accumType == AccumType::Alpha || accumType == AccumType::BeerLambert;
+    if (dryRun && isCompositeMode) {
+        logPrintf(stderr, "Error: --dry-run supports surface-volume slices, not composite rendering\n");
+        return EXIT_FAILURE;
+    }
 
     // Without layers to reduce, the slices are the sampled layers and accumType is never
     // read, so an explicit max/mean/median here changes nothing. Say so rather than stay quiet.
@@ -1198,7 +1209,20 @@ int main(int argc, char *argv[])
         }
         (void)vc::cuda::toolReader(*source);
     }
-    vcr::Array& volume = *source->array;
+    std::unique_ptr<vcr::Array> planningVolume;
+    if (dryRun) {
+        vcr::ArraySpec spec;
+        spec.shape = source->array->spec().shape;
+        spec.chunks = source->array->spec().chunks;
+        spec.itemsize = sourceType.itemsize;
+        spec.fill.assign(spec.itemsize, 0);
+        spec.offline = true;
+        spec.offline_fill = true;
+        spec.threads = 0;
+        spec.caller_thread_only = true;
+        planningVolume = std::make_unique<vcr::Array>(std::move(spec), std::make_shared<vcr::MemoryCache>(cache_bytes));
+    }
+    vcr::Array& volume = dryRun ? *planningVolume : *source->array;
 
     {
         std::ostringstream oss;
@@ -1545,7 +1569,7 @@ int main(int argc, char *argv[])
         // Each part renders a contiguous range of tile rows. With a pyramid the
         // ranges are multiples of 32 rows, so a part builds levels 1-5 of its rows alone.
         uint32_t rowsPerPart = uint32_t((tilesY + size_t(numParts) - 1) / size_t(numParts));
-        if (numParts > 1 && wantZarr && wantPyramid)
+        if (numParts > 1 && requestedZarr && wantPyramid)
             rowsPerPart = (rowsPerPart + 31u) / 32u * 32u;
         const uint32_t rowStart = std::min(uint32_t(partId) * rowsPerPart, uint32_t(tilesY));
         const uint32_t rowEnd = std::min(rowStart + rowsPerPart, uint32_t(tilesY));
@@ -1620,5 +1644,14 @@ int main(int argc, char *argv[])
     }
     if (!ok)
         return EXIT_FAILURE;
+    if (dryRun) {
+        const auto chunks = volume.offline_misses().size();
+        logPrintf(stdout, "[dry-run] Referenced source chunks: %zu\n", chunks);
+        logPrintf(stdout, "[dry-run] Full decoded chunk bytes: %.0Lf (%.3Lf GiB)\n",
+                  static_cast<long double>(chunks) * volume.chunk_bytes(),
+                  static_cast<long double>(chunks) * volume.chunk_bytes() / (1ull << 30));
+        logPrintf(stdout, "[dry-run] No CT chunks read or render files written. Metadata may be cached.\n");
+        logPrintf(stdout, "[dry-run] Compressed download size and existing cached chunks are not estimated.\n");
+    }
     return EXIT_SUCCESS;
 }

@@ -1,0 +1,19 @@
+{
+  "shape": [
+    24298,
+    9867,
+    9867
+  ],
+  "chunks": [
+    128,
+    128,
+    128
+  ],
+  "fill_value": 0,
+  "order": "C",
+  "filters": null,
+  "dimension_separator": "/",
+  "compressor": null,
+  "zarr_format": 2,
+  "dtype": "|u1"
+}
