@@ -2,14 +2,17 @@
 
 The flat 9 um ink recipe (`configs/aligned21_hybrid_3d2d.json`) reads the scrolls it was trained on almost perfectly, but
 the scrolls that are still unread are scanned natively at 8.6-9.4 um, while most labelled training data are renders pooled
-from 2.4 um scans: PHerc 1667 and PHerc Paris 4 have no 9.362 um scan at all. This page adds three things that measurably
-improve reading an **unseen** scroll from its **native** scan, and the evaluation that shows it.
+from 2.4 um scans: PHerc 1667 and PHerc Paris 4 have no 9.362 um scan at all. This page evaluates mirror TTA, scan-type
+transfer augmentation and self-training on a scroll held out of training. Self-training is scored both on the regions it
+adapted on (transductive) and on regions kept out of its adaptation.
 
-## Evaluation: leave one scroll out
+## Evaluation on PHerc 0139
 
-Train on PHerc 1667 + Paris 4 + 0814 (recipe batch shares, 25k steps), score per-pixel ROC-AUC on PHerc 0139, which the
-model never saw: its 5 native 9.362 um segments (w035 w039 w040 w041 w044, open-data labels inside their supervision masks)
-and its 9 pooled renders. A model trained *with* 0139 scores 0.99+ on the same pixels, so the gap below is the scroll gap.
+The baseline, scan-transfer models and teacher ensemble train on PHerc 1667 + Paris 4 + 0814 (recipe batch shares, 25k
+steps except the teacher's 78k-step member). PHerc 0139 is held out from those runs. The self-training variants also use
+pseudo-labels from designated PHerc 0139 regions. Report per-pixel ROC-AUC on the 5 native 9.362 um segments (w035 w039
+w040 w041 w044, open-data labels inside their supervision masks) and 9 pooled renders. A model trained with PHerc 0139
+annotations scores 0.99+ on the same pixels.
 All numbers are forward direction (the reverse direction is ~0.5 throughout).
 
 | model (seed 42 unless noted) | native, plain | native, mirror TTA | native, mirror + 3 depth windows | pooled, 9 segments |
@@ -43,9 +46,13 @@ single-model seed mean 0.763 -> 0.790) at ~4x inference cost. Averaging three de
 A registered pooled/native pair of the same surface (PHerc 0814 segment 46527) shows the native render is, to first
 order, the pooled one blurred over ~3 depth planes and slightly in-plane, plus smooth low-frequency intensity differences
 (R^2 0.707 vs 0.580 for resampling alone on held-out 256 px spatial blocks with a guard band, a check outside
-`scan_transfer_fit.py`; 0.711 vs 0.590 on randomly held-out pixels, the split `scan_transfer_fit.py` uses, so
-neighbouring-pixel leakage is negligible; three PHerc 0846A pairs give the same picture). The augmentation applies
-that kernel plus a matching smooth random field to a share of the training samples:
+`scan_transfer_fit.py`; 0.711 vs 0.590 on randomly held-out pixels, the split `scan_transfer_fit.py` uses, where
+neighbouring rows can share input voxels; three PHerc 0846A pairs give a similar picture). The shipped 5x9x9 kernel is
+an unregularized least-squares fit, recorded in its metadata with the earlier random-pixel protocol, and its taps are not
+smooth: their absolute values sum to 10.19 against a net sum of 1.05, and its zero-padded 3D frequency response peaks at
+3.7x its DC gain at high frequencies on all three axes (1.2x for the depth-summed in-plane response). Its depth sums,
+-0.09 / 0.27 / 0.43 / 0.37 / 0.07, put the signed depth centroid at +0.40 planes. The augmentation applies that kernel
+plus a matching smooth random field to a share of the training samples:
 
 ```json
 "scan_transfer": {"enabled": true, "kernel": "builtin:pooled_to_native_pherc0814", "probability": 0.5,
@@ -53,7 +60,8 @@ that kernel plus a matching smooth random field to a share of the training sampl
 ```
 
 `skip_datasets` lists substrings of a dataset group's `segments_path`; samples from matching groups (scans that are
-already native, such as the ink_9um `native9-*` labels) are never converted. An earlier revision of this pull request
+already native, such as the ink_9um `native9-*` labels) are never converted. When combining scan transfer with
+self-training on a native scan, list the pseudo-label output directory as well. An earlier revision of this pull request
 converted every training sample, native ones included. The leave-one-scroll-out runs below are unaffected (all their
 training groups are pooled renders); the production models were retrained with the fix (see "Other unseen scrolls").
 
@@ -79,9 +87,10 @@ python -m vesuvius.ink_detection.pseudo_labels OUT_ROOT \
 ```
 
 **First Letters rule.** Ink outputs of a submitted region must not overlap any training data. Pseudo-label some regions of
-the target scroll and read others. In the table above all 5 native segments were adapted (transductive); on the 4 pooled
-segments that were never pseudo-labelled the round-1 student matches its teacher (0.850 vs 0.846) while the safer-background
-student is lower (0.830), so check transfer to unadapted regions before relying on it.
+the target scroll and reserve other regions for scoring. The round-1 and safer-background transductive rows in the first
+table adapted all 5 native segments. On the 4 pooled segments that neither student adapted on, the round-1 student scores
+0.850, the teacher 0.846, and the safer-background student 0.830. The complementary split below tests transfer to
+unadapted native regions.
 
 **Split test (the First Letters setting).** Self-train on some native segments, read the others. Split A adapts on
 w035, w040 and w044 and reads w039 and w041; split B adapts on w039 and w041 and reads w035, w040 and w044 (the same
@@ -128,6 +137,15 @@ the kernel was fitted on). With `skip_datasets` the 0343P loss is gone (0.749 / 
 keeps the small gain (0.769 / 0.782 against 0.757 / 0.769, within the benchmark's noise). Seed 44 of the fixed row was
 trained on a different GPU with the same code and config.
 
+[Independent three-seed check](https://github.com/ScrollPrize/villa/pull/2512#issuecomment-7194757500): on PHerc 1447
+w060 and the PHerc 0343P camera truth, jo-tud found the leave-0139-out scan-transfer checkpoints ahead of the same-seed
+baseline in all 12 matched comparisons (two pieces, three seeds, with and without mirror TTA), with mean AUC gains of
++0.023 to +0.037. None of the four means cleared all three of jo-tud's prespecified checks (over seeds, over spatial
+blocks and against shifted labels). Our w060 replays gave smaller gains: +0.001 over the whole winding with Villa
+per-tile mirror TTA, and in jo-tud's window on the distributed render +0.0124 plain, +0.0020 per-tile TTA and +0.0039
+whole-render TTA (+0.0073 / -0.0007 / +0.0035 on an integer-centred render of the same mesh). These runs support a
+possible external benefit; the difference between the two evaluation pipelines is unresolved.
+
 ## Reproduce
 
 - Configs: the recipe restricted to the training scrolls (`sampling_scroll` in 1667 / Paris4 / 0814), `seed` 42, 25k
@@ -136,8 +154,13 @@ trained on a different GPU with the same code and config.
 - Native 0139 labels: open-data S3 `PHerc0139/segments/*/` (identical to the ink_9um w035 labels pixel for pixel).
 - Scoring: ROC-AUC of the forward prediction inside the supervision mask, per segment, mean over segments.
 - Hardware: one RTX 4070 (12 GB), ~2.5 h per 25k-step run at batch 64.
-- Checkpoints, configs, the kernel and a PHerc 0846A 2.403 um -> 9.362 um transform:
-  https://huggingface.co/TequilaYuen/vesuvius-ink-9um-cross-scroll (CC BY-NC 4.0, as the training data).
+- [Pinned checkpoints, configs, the kernel and a PHerc 0846A 2.403 um -> 9.362 um transform](https://huggingface.co/TequilaYuen/vesuvius-ink-9um-cross-scroll/tree/39eab1b26c7484c2975698b03d881049f9520af6)
+  (CC BY-NC 4.0). The release includes all three scan-transfer checkpoints, all six complementary-split students,
+  the split configs, and `loso0139/SHA256SUMS`.
+- [Pinned benchmark evidence and replay scripts](https://huggingface.co/TequilaYuen/vesuvius-ink-9um-cross-scroll/blob/71bcda3f8e42a3fb5ab7341413ae0c820d841326/evidence/november_progress_prize_evidence.zip).
+  In the PHerc 0139 blank-papyrus check (two verified blank crops, three seeds), scan transfer lowered false ink from
+  43.54% to 39.21% of blank pixels at an interpolated 80% calibration recall. The fitted filter beat a matched Gaussian
+  control in two of three seeds, short of the preset three-win criterion.
 
 ## Data and credit
 

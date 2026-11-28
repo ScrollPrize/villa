@@ -11,9 +11,11 @@ and writes ``{"kernel": ..., "fit": ...}`` JSON for ``load_kernel``.
 The shipped ``builtin:pooled_to_native_pherc0814`` came from PHerc 0814 segment 46527, fitted with an earlier version
 of this script (random 80/20 split of sampled pixels, no spatial separation: held-out R^2 0.740 vs 0.623 for the centre
 pooled voxel alone). This script on the same pair gives 0.711 vs 0.590 on randomly held-out pixels; a separate check
-holding out 256 px blocks with a guard band gives 0.707 vs 0.580. Depth weights -0.09 / 0.27 / 0.43 / 0.37 / 0.07,
-mild in-plane blur, no sharpening; the residual is smooth (autocorrelation ~0.5 at 6 px), which the augmentation
-models as a smooth random field.
+holding out 256 px blocks with a guard band gives 0.707 vs 0.580. Depth sums -0.09 / 0.27 / 0.43 / 0.37 / 0.07
+(signed depth centroid +0.40 planes). The unregularized taps are not smooth: their absolute values sum to 10.19 against
+a net 1.05, and the zero-padded 3D frequency response peaks at 3.7x its DC gain at high frequencies on all three axes
+(1.2x for the depth-summed in-plane response). The residual is smooth (autocorrelation ~0.5 at 6 px), which the
+augmentation models as a smooth random field.
 
 CLI::
 

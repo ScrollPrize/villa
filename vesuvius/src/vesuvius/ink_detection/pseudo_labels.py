@@ -20,7 +20,7 @@ target scroll and read others; never read a pseudo-labelled region.
 Leave-one-scroll-out on PHerc 0139 native 9.362 um segments (25k steps, 16 of 64 slots, ``background="max"``, margin 8,
 mirror-TTA teachers), scored only on segments the student never received a label for (two complementary splits that
 together cover all five native segments; seeds 42, 43 and 44, each paired with the same-seed baseline): mean ROC-AUC
-0.790 -> 0.809 with mirror TTA (+0.018, SE 0.006; higher in 13 of 15 segment-seed pairs) and 0.763 -> 0.799 plain.
+0.790 -> 0.808 with mirror TTA (+0.018, SE 0.006; higher in 13 of 15 segment-seed pairs) and 0.763 -> 0.799 plain.
 Earlier single-seed numbers that also score the adapted segments (0.743 -> 0.804; 0.813 against the four-model
 teacher's 0.808) are transductive. See docs/ink_cross_scroll.md.
 
@@ -101,9 +101,12 @@ def build_segment(out_root: Path, name: str, surface_volume: str, predictions: l
     mean = np.zeros(papyrus.shape, np.float32)
     top = np.zeros(papyrus.shape, np.float32)
     for path in predictions:
-        p = tifffile.imread(path).astype(np.float32) / 255.0
+        p = tifffile.imread(path)
+        if p.dtype != np.uint8:
+            raise ValueError(f"{path}: expected a uint8 teacher TIFF (scores 0–255), got {p.dtype}")
         if p.shape != papyrus.shape:
             raise ValueError(f"{path}: prediction {p.shape} does not match the surface volume {papyrus.shape}")
+        p = p.astype(np.float32) / 255.0
         covered &= p > 0
         mean += p
         np.maximum(top, p, out=top)

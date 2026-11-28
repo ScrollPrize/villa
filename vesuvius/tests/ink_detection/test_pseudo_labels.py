@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -133,3 +136,35 @@ def test_failed_rerun_leaves_no_old_supervision_beside_new_ink(tmp_path, monkeyp
     # instead of training new ink against stale supervision
     assert (seg / "s1_inklabels.zarr").exists()
     assert not (seg / "s1_supervision_mask.zarr").exists()
+
+
+@pytest.mark.parametrize("dtype, score", [(np.float32, 0.60), (np.uint16, 39321)])
+def test_wrong_teacher_encoding_preserves_existing_outputs(tmp_path, monkeypatch, dtype, score):
+    tifffile = pytest.importorskip("tifffile")
+    from vesuvius.ink_detection import pseudo_labels as pl
+
+    shape = (8, 8)
+    volume = np.ones((3, *shape), dtype=np.uint8)
+    monkeypatch.setitem(sys.modules, "vc_reader.reader", SimpleNamespace(open_node=lambda _: volume))
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("Expected invalid teacher input to be rejected before writing labels")
+
+    monkeypatch.setattr(pl, "_write_label", unexpected_write)
+    valid_teacher = tmp_path / "valid.tif"
+    invalid_teacher = tmp_path / "invalid.tif"
+    tifffile.imwrite(valid_teacher, np.full(shape, 153, dtype=np.uint8))
+    tifffile.imwrite(invalid_teacher, np.full(shape, score, dtype=dtype))
+
+    out = tmp_path / "out"
+    segment = out / "s1"
+    for suffix in ("inklabels", "supervision_mask"):
+        store = segment / f"s1_{suffix}.zarr"
+        store.mkdir(parents=True)
+        (store / "existing").write_bytes(suffix.encode())
+
+    with pytest.raises(ValueError, match=r"invalid\.tif: expected a uint8 teacher TIFF"):
+        pl.build_segment(out, "s1", "surface.zarr", [str(valid_teacher), str(invalid_teacher)])
+
+    for suffix in ("inklabels", "supervision_mask"):
+        assert (segment / f"s1_{suffix}.zarr" / "existing").read_bytes() == suffix.encode()
