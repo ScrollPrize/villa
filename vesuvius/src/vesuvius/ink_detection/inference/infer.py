@@ -624,7 +624,7 @@ class FlatPatchReader:
 
 
 class FlatBlockDataset(Dataset):
-    """Turn scheduled flat blocks into C/Z/Y/X model tensors and metadata."""
+    """Turn scheduled flat blocks into C/Z/Y/X model tensors, metadata and pixel occupancy."""
 
     def __init__(
         self,
@@ -651,8 +651,10 @@ class FlatBlockDataset(Dataset):
             self.patch_size,
         )
         # Measure occupancy before normalization because robust normalization
-        # maps an all-zero patch to nonzero values.
-        nonempty = int(patch_HWZ.any())
+        # maps all-zero input to nonzero values. Pixels with no rendered
+        # surface (zero in every selected layer) get no blend weight.
+        occupied_HW = patch_HWZ.any(axis=-1)
+        nonempty = int(occupied_HW.any())
         patch_ZYX = np.moveaxis(patch_HWZ, -1, 0)
         patch_ZYX = normalize_flat_patch(patch_ZYX, self.preprocessing)
         image_CZYX = torch.from_numpy(patch_ZYX).unsqueeze(0)
@@ -660,7 +662,7 @@ class FlatBlockDataset(Dataset):
             [block.y0, block.x0, block.valid_h, block.valid_w, nonempty],
             dtype=torch.int64,
         )
-        return image_CZYX, metadata
+        return image_CZYX, metadata, torch.from_numpy(occupied_HW)
 
 
 def unflip_spatial_output_for_patch_axes(
@@ -904,11 +906,11 @@ class ThreadedBatchLoader:
             self.dataset[index]
             for index in range(start, min(len(self.dataset), start + self.batch_size))
         ]
-        images, metadata = zip(*items)
+        images, metadata, occupied = zip(*items)
         images_BCZYX = torch.stack(images)
         if torch.cuda.is_available():
             images_BCZYX = images_BCZYX.pin_memory()
-        return images_BCZYX, torch.stack(metadata)
+        return images_BCZYX, torch.stack(metadata), torch.stack(occupied)
 
     def __iter__(self):
         starts = iter(range(0, len(self.dataset), self.batch_size))
@@ -948,7 +950,7 @@ def run_block_inference(
         else nullcontext()
     )
     with torch.inference_mode(), autocast:
-        for images_BCZYX, metadata in loader:
+        for images_BCZYX, metadata, occupied_BHW in loader:
             # The dataset records occupancy on raw patches; normalized all-zero
             # input is not a valid signal for this skip.
             keep = metadata[:, 4] > 0
@@ -974,6 +976,7 @@ def run_block_inference(
                 device, non_blocking=device.type == "cuda"
             )
             metadata = metadata[keep]
+            occupied_BHW = occupied_BHW[keep].numpy()
             if tta_axes:
                 probabilities = predict_with_mirror_tta(
                     model,
@@ -987,10 +990,12 @@ def run_block_inference(
                     image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
                 )
             probabilities_np = probabilities.cpu().numpy()[:, 0]
-            for probability, values in zip(probabilities_np, metadata.numpy()):
+            for probability, values, occupied in zip(
+                probabilities_np, metadata.numpy(), occupied_BHW
+            ):
                 y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
                 tile = probability[:valid_h, :valid_w]
-                weights = weight_map[:valid_h, :valid_w]
+                weights = weight_map[:valid_h, :valid_w] * occupied[:valid_h, :valid_w]
                 if mask_f32 is not None:
                     weights = weights * mask_f32[
                         y0 : y0 + valid_h, x0 : x0 + valid_w
