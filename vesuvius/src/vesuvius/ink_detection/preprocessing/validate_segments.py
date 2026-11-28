@@ -16,6 +16,7 @@ from vc_reader import images
 from tqdm.auto import tqdm
 
 from vc_reader.reader import ZarrReader, open_node
+from vc_reader.reader.decoded_cache import DEFAULT_DECODE_BYTES
 
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -227,15 +228,19 @@ def _preview_invalid_values(values: set[int]) -> str:
     return preview
 
 
-def _iter_label_tiles(path: Path) -> Iterator[np.ndarray]:
-    """The first page in bands of rows, as one value per pixel: the largest colour channel."""
-    with images.open(path) as reader:
+def _iter_label_tiles(path: Path, *, workers: int = 1) -> Iterator[np.ndarray]:
+    """The first page in bands of rows, as one value per pixel: the largest colour channel.
+
+    ``workers`` concurrent scans share one scan's band rows and decode cache budget.
+    """
+    band_rows = max(1, LABEL_BAND_ROWS // workers)
+    with images.open(path, decoded_cache_bytes=DEFAULT_DECODE_BYTES // workers) as reader:
         axes = reader.axes
         page = (0,) if axes[0] == "z" else ()
         channels = axes.index("c") - len(page) if "c" in axes else None
         height = reader.shape[axes.index("y")]
-        for row in range(0, height, LABEL_BAND_ROWS):
-            band = reader[(*page, slice(row, row + LABEL_BAND_ROWS))] if channels != 0 else reader[(*page, slice(None), slice(row, row + LABEL_BAND_ROWS))]
+        for row in range(0, height, band_rows):
+            band = reader[(*page, slice(row, row + band_rows))] if channels != 0 else reader[(*page, slice(None), slice(row, row + band_rows))]
             if channels is not None:
                 count = band.shape[channels]
                 color = np.take(band, range(count - 1), axis=channels) if count in {2, 4} else band
@@ -243,8 +248,43 @@ def _iter_label_tiles(path: Path) -> Iterator[np.ndarray]:
             yield band
 
 
+_VALUE_SCAN_CHUNK_SIZE = 1 << 20
+
+
+def _find_invalid_binary_values(band: np.ndarray) -> set[int]:
+    if band.dtype == np.bool_:
+        return set()
+    if band.dtype == np.uint8:
+        flat = band.ravel()
+        invalid: set[int] = set()
+        for start in range(0, flat.size, _VALUE_SCAN_CHUNK_SIZE):
+            chunk = flat[start : start + _VALUE_SCAN_CHUNK_SIZE]
+            bad = chunk[(chunk > 1) & (chunk < 255)]
+            if bad.size:
+                invalid.update(int(value) for value in np.unique(bad).tolist())
+                if len(invalid) > 8:
+                    break
+        return invalid
+    if np.issubdtype(band.dtype, np.integer):
+        flat = band.ravel()
+        invalid = set()
+        for start in range(0, flat.size, _VALUE_SCAN_CHUNK_SIZE):
+            chunk = flat[start : start + _VALUE_SCAN_CHUNK_SIZE]
+            bad = chunk[(chunk != 0) & (chunk != 1) & (chunk != 255)]
+            if bad.size:
+                invalid.update(int(value) for value in np.unique(bad).tolist())
+                if len(invalid) > 8:
+                    break
+        return invalid
+    return {
+        int(value)
+        for value in np.unique(band).tolist()
+        if int(value) not in ALLOWED_BINARY_LABEL_VALUES
+    }
+
+
 def validate_label_tiff(
-    path: Path, *, raw_shape: Sequence[int]
+    path: Path, *, raw_shape: Sequence[int], workers: int = 1
 ) -> tuple[str, ...]:
     issues: list[str] = []
 
@@ -252,13 +292,8 @@ def validate_label_tiff(
         issues.append("label image has an alpha channel")
 
     invalid_values: set[int] = set()
-    for band in _iter_label_tiles(path):
-        tile_values = np.unique(band)
-        invalid_values.update(
-            int(value)
-            for value in tile_values.tolist()
-            if int(value) not in ALLOWED_BINARY_LABEL_VALUES
-        )
+    for band in _iter_label_tiles(path, workers=workers):
+        invalid_values.update(_find_invalid_binary_values(band))
         if len(invalid_values) > 8:
             break
 
@@ -271,24 +306,47 @@ def validate_label_tiff(
     return tuple(issues)
 
 
-def _resolve_zarr_array(zarr_path: Path) -> ZarrReader:
+def _close_opened_nodes(*nodes: object) -> None:
+    seen: set[int] = set()
+    for node in nodes:
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        close = getattr(node, "close", None)
+        if callable(close):
+            close()
+
+
+def _resolve_zarr_node(zarr_path: Path) -> tuple[object, ZarrReader]:
     root = open_node(str(zarr_path))
-    if isinstance(root, ZarrReader):
-        return root
-    if "0" in root and isinstance(root["0"], ZarrReader):
-        return root["0"]
-    array_keys = sorted(str(key) for key in root.array_keys())
-    if len(array_keys) == 1:
-        return root[array_keys[0]]
-    raise ValueError(
-        f"Could not determine which array to validate in {zarr_path}. "
-        f"Available array keys: {array_keys}"
-    )
+    try:
+        if isinstance(root, ZarrReader):
+            return root, root
+        if "0" in root and isinstance(root["0"], ZarrReader):
+            return root, root["0"]
+        array_keys = sorted(str(key) for key in root.array_keys())
+        if len(array_keys) == 1:
+            return root, root[array_keys[0]]
+        raise ValueError(
+            f"Could not determine which array to validate in {zarr_path}. "
+            f"Available array keys: {array_keys}"
+        )
+    except Exception:
+        _close_opened_nodes(root)
+        raise
+
+
+def _resolve_zarr_array(zarr_path: Path) -> ZarrReader:
+    _, array = _resolve_zarr_node(zarr_path)
+    return array
 
 
 def read_zarr_shape(path: Path) -> tuple[int, int]:
-    array = _resolve_zarr_array(path)
-    return _normalize_zarr_shape(array.shape, path)
+    root, array = _resolve_zarr_node(path)
+    try:
+        return _normalize_zarr_shape(array.shape, path)
+    finally:
+        _close_opened_nodes(array, root)
 
 
 def _run_parallel_map(
@@ -410,23 +468,37 @@ def validate_root(
         if _is_label_tiff(tiff_path):
             label_stage_items.append((state, tiff_path, metadata.raw_shape))
 
-    progress = tqdm(total=len(label_stage_items), desc="Label contents", unit="file", disable=not show_progress)
-    try:
-        for state, label_path, raw_shape in label_stage_items:
-            try:
-                messages = [
-                    message
-                    for message in validate_label_tiff(label_path, raw_shape=raw_shape)
-                    if message != "label image has an alpha channel"
-                ]
-                for message in messages:
-                    state.issues.append(ShapeIssue(label_path, message))
-            except Exception as exc:
-                state.issues.append(ShapeIssue(label_path, f"Failed to validate label contents: {exc}"))
-            finally:
-                progress.update(1)
-    finally:
-        progress.close()
+    label_workers = max(1, min(workers, len(label_stage_items)))
+
+    def _validate_label_contents(
+        indexed_item: tuple[int, tuple[SegmentState, Path, tuple[int, ...]]],
+    ) -> tuple[str, ...]:
+        _, (_, label_path, raw_shape) = indexed_item
+        # Kept exceptions would hold the failed file's band through their tracebacks.
+        try:
+            return tuple(
+                message
+                for message in validate_label_tiff(label_path, raw_shape=raw_shape, workers=label_workers)
+                if message != "label image has an alpha channel"
+            )
+        except Exception as exc:
+            return (f"Failed to validate label contents: {exc}",)
+
+    label_outcomes: dict[int, tuple[str, ...]] = {}
+    for item, result in _run_parallel_map(
+        list(enumerate(label_stage_items)),
+        workers=label_workers,
+        fn=_validate_label_contents,
+        desc="Label contents",
+        unit="file",
+        show_progress=show_progress,
+    ):
+        idx, _ = item
+        label_outcomes[idx] = result
+
+    for idx, (state, label_path, _raw_shape) in enumerate(label_stage_items):
+        for message in label_outcomes[idx]:
+            state.issues.append(ShapeIssue(label_path, message))
 
     results = [
         SegmentResult(
