@@ -5,6 +5,7 @@ import ctypes
 import ctypes.util
 import json
 import multiprocessing
+import os
 from pathlib import Path
 import pickle
 import unittest
@@ -17,7 +18,7 @@ from build_support import load_build
 load_build()
 
 from vc_reader import Affine, Encoding, Selection, Source, Storage, VolumeRegistration, CacheMissError
-from vc_reader.reader import ZarrReader, ZarrGroup
+from vc_reader.reader import ZarrReader, ZarrGroup, open_node
 from vc_reader.reader.zarr_meta import ArrayMeta
 from vc_reader.reader import S3Credentials
 
@@ -99,6 +100,27 @@ def write_v3(path, *, sharded=True, index_end=True, compressed=False, endian='li
 
 
 class V3Tests(FixtureCase):
+    @unittest.skipUnless('fork' in multiprocessing.get_all_start_methods(), 'fork is unavailable')
+    def test_array_released_in_forked_child(self):
+        # The child drops the last reference to an array (and its worker pool)
+        # opened in the parent, as when an atexit handler holding it is cleared.
+        path = self.root/'fork_release'
+        expected, _ = write_v3(path, compressed=True)
+        array = open_node(str(path), threads=2)
+        np.testing.assert_array_equal(np.asarray(array[0:3, 0:4]), expected[:3, :4])
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                del array
+                code = 0
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFEXITED(status), f'forked child died with signal {os.WTERMSIG(status) if os.WIFSIGNALED(status) else status}')
+        self.assertEqual(os.WEXITSTATUS(status), 0)
+        np.testing.assert_array_equal(np.asarray(array[0:3, 0:4]), expected[:3, :4])
+
     @unittest.skipUnless('fork' in multiprocessing.get_all_start_methods(), 'fork is unavailable')
     def test_inherited_chunk_reader_reopens_after_fork(self):
         path = self.root/'fork'
