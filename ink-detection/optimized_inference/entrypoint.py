@@ -668,7 +668,7 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     """Execute the inference step (either standard or partitioned mode)."""
     # Import torch and related dependencies only when doing inference
     import torch
-    from device_utils import select_device, amp_device_type
+    from device_utils import select_device, amp_device_type, autocast_enabled
     from torch.nn import DataParallel
     from inference import run_inference, CFG
     from processing import path_exists
@@ -789,7 +789,7 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
             try:
                 dummy = torch.zeros((CFG.batch_size, 1, CFG.in_chans, CFG.size, CFG.size), device=device)
                 with torch.inference_mode():
-                    with torch.autocast(device_type=amp_device_type(device), enabled=True):
+                    with torch.autocast(device_type=amp_device_type(device), enabled=autocast_enabled(device)):
                         _ = model.forward(dummy)
                 del dummy
             except Exception as e:

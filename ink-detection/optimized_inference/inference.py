@@ -20,7 +20,7 @@ from contextlib import suppress
 import cv2
 import numpy as np
 import torch
-from device_utils import amp_device_type, empty_cache
+from device_utils import amp_device_type, empty_cache, autocast_enabled
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -440,7 +440,7 @@ def predict_fn(
 
                 amp_device = amp_device_type(device)
                 with scoped_timer(profiler, "forward_seconds", cuda_sync=detailed_sync):
-                    with torch.autocast(device_type=amp_device, enabled=True):
+                    with torch.autocast(device_type=amp_device, enabled=autocast_enabled(device)):
                         y_preds = model.forward(images)[:raw_batch_size]  # Model-specific forward
                     y_preds = torch.sigmoid(y_preds)
                     y_preds_resized = F.interpolate(

@@ -847,12 +847,17 @@ def test_inference_auto_device_preserves_bf16_on_mps_host(monkeypatch: pytest.Mo
         ) == ("bf16", "cli")
 
 
-def test_inference_precision_auto_uses_checkpoint_policy(tmp_path: Path) -> None:
+def test_inference_precision_auto_uses_checkpoint_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vesuvius.utils.models import helpers
+
+    monkeypatch.setattr(helpers, "_cpu_has_amx_bf16", lambda: False)
     checkpoint = tmp_path / "snapshot.pt"
     torch.save({"config": {"training": {"mixed_precision": "bf16"}}}, checkpoint)
     assert _resolve_inference_precision(
         "auto", checkpoint=checkpoint, devices=(torch.device("cpu"),)
-    ) == ("bf16", "checkpoint")
+    ) == ("off", "checkpoint-cpu-fp32")
 
 
 def test_inference_precision_auto_legacy_and_unsupported_fall_back(tmp_path: Path) -> None:
