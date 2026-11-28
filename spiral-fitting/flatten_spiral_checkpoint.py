@@ -36,6 +36,7 @@ import torch
 from checkpoint_io import load_checkpoint_cpu
 from sample_spiral import get_spiral_yxs
 from tifxyz import save_combined_tifxyz
+from devices import fit_device
 from transforms import SpiralAndTransform
 from umbilicus import json_umbilicus_z_to_yx
 
@@ -346,6 +347,7 @@ def _flatten(
     flatten_config_path: Path,
     work: Path,
     *,
+    device: torch.device,
     voxel_size_um: float,
 ) -> None:
     object_store = work / "objects"
@@ -353,6 +355,10 @@ def _flatten(
     config = json.loads(flatten_config_path.read_text(encoding="utf-8"))
     config["external_surfaces"] = [surface_ref]
     config["voxel_size_um"] = float(voxel_size_um)
+    lasagna_args = config.setdefault("args", {})
+    # Lasagna defaults to CUDA; keep that wherever it can run.
+    if "device" not in lasagna_args and not torch.cuda.is_available():
+        lasagna_args["device"] = str(device)
     results = work / "results"
     results.mkdir()
     model_output = work / "flatten-model.pt"
@@ -459,8 +465,9 @@ def _parse_args(argv=None):
         "--lasagna-dir", type=Path,
         help="Lasagna repository containing fit_service.py (auto-detected)")
     parser.add_argument(
-        "--device", default="cuda",
-        help="Torch device used to reconstruct the Spiral surface (default: cuda)")
+        "--device", default=None,
+        help="Torch device used to reconstruct the Spiral surface "
+             "(default: cuda, else mps, else cpu)")
     parser.add_argument(
         "--voxel-size-um", type=float, default=9.6,
         help="source voxel size written to TIFXYZ metadata (default: 9.6)")
@@ -482,7 +489,7 @@ def main(argv=None) -> int:
         raise ValueError("--voxel-size-um must be positive")
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be positive")
-    device = torch.device(args.device)
+    device = fit_device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; pass --device cpu if intentional")
 
@@ -519,6 +526,7 @@ def main(argv=None) -> int:
             service,
             flatten_config,
             work,
+            device=device,
             voxel_size_um=float(args.voxel_size_um),
         )
     finally:
