@@ -50,10 +50,11 @@ def _sample_winding_volume(*, res: fit_model.FitResult3D) -> torch.Tensor:
 	grid[..., 1] = (grid[..., 1] - oy) / sy / max(1, Y - 1) * 2 - 1
 	grid[..., 2] = (grid[..., 2] - oz) / sz / max(1, Z - 1) * 2 - 1
 
+	# MPS has no 3D grid_sample backward, so fit.py keeps the volume on the CPU there.
 	sampled = F.grid_sample(
-		wv, grid.unsqueeze(0),  # (1, 1, Z, Y, X), (1, D, Hm, Wm, 3)
+		wv, grid.to(wv.device).unsqueeze(0),  # (1, 1, Z, Y, X), (1, D, Hm, Wm, 3)
 		mode='bilinear', padding_mode='zeros', align_corners=True,
-	)
+	).to(grid.device)
 	# sampled: (1, 1, D, Hm, Wm) → (D, 1, Hm, Wm)
 	return sampled[0].permute(1, 0, 2, 3)
 

@@ -40,6 +40,11 @@ def _debug_cuda_sync(label: str) -> None:
 			torch.cuda.synchronize()
 		except RuntimeError as exc:
 			raise RuntimeError(f"CUDA failure after {label}") from exc
+	elif torch.backends.mps.is_available():
+		try:
+			torch.mps.synchronize()
+		except RuntimeError as exc:
+			raise RuntimeError(f"MPS failure after {label}") from exc
 
 
 def _cuda_mem_debug_enabled() -> bool:
@@ -1496,6 +1501,8 @@ def optimize(
 	def _timing_cuda_sync() -> None:
 		if torch.cuda.is_available():
 			torch.cuda.synchronize()
+		elif torch.backends.mps.is_available():
+			torch.mps.synchronize()
 
 	def _truthy(value) -> bool:
 		if isinstance(value, bool):

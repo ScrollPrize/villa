@@ -344,15 +344,25 @@ def _parse_init_grow_config(args_cfg: dict | None, *, target_depth: int) -> Init
 
 
 def _require_torch_device_available(device: torch.device) -> None:
+	if device.type == "mps" and not torch.backends.mps.is_available():
+		raise RuntimeError(
+			"MPS device was requested, but PyTorch cannot use an Apple GPU here "
+			"(torch.backends.mps.is_available() is False: Apple silicon and macOS 12.3+ "
+			"with an MPS-enabled PyTorch build are required). Use --device cpu instead."
+		)
 	if device.type != "cuda":
 		return
 	if not torch.cuda.is_available():
+		mac_hint = (
+			" This machine has an Apple GPU: pass --device mps (or --device cpu)."
+			if torch.backends.mps.is_available() else ""
+		)
 		raise RuntimeError(
 			"CUDA device was requested, but PyTorch cannot access an NVIDIA GPU. "
 			"Expose the NVIDIA driver/device nodes to this process (for example "
 			"/dev/nvidia*, Docker --gpus all, or the equivalent sandbox GPU "
 			"passthrough). Refusing to continue because falling back to CPU would "
-			"make fit smoke/perf runs misleading."
+			"make fit smoke/perf runs misleading." + mac_hint
 		)
 	count = int(torch.cuda.device_count())
 	if device.index is not None and int(device.index) >= count:
@@ -452,6 +462,20 @@ def _projection_skip_reasons(skipped: list[dict]) -> dict[str, int]:
 		reason = str(item.get("reason", "unknown"))
 		reasons[reason] = reasons.get(reason, 0) + 1
 	return dict(sorted(reasons.items()))
+
+
+def _load_corr_point_roi_normal_data(*, input_path: str, device: torch.device) -> fit_data.FitData3D:
+	"""nx/ny for the corr-point ROI, streamed through the sparse chunk cache.
+
+	Every device streams: CUDA through its device-pointer cache, CPU and MPS
+	through the pooled cache. (Off CUDA this used to load the whole volume
+	densely, which does not fit in memory for a real scroll.)
+	"""
+	return fit_data.load_3d_streaming(
+		path=input_path,
+		device=device,
+		skip_channels={"cos", "pred_dt"},
+	)
 
 
 def _sample_corr_point_roi_normals(
@@ -1742,19 +1766,10 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		init_shell_dir = _require_init_shell_dir(
 			prep_params, override=data_cfg.init_shell_dir)
 		corr_point_roi_shell_index = InitShellIndex.from_directory(init_shell_dir)
-		if device.type == "cuda":
-			corr_point_roi_normal_data = fit_data.load_3d_streaming(
-				path=str(data_cfg.input),
-				device=device,
-				skip_channels={"cos", "pred_dt"},
-			)
-		else:
-			corr_point_roi_normal_data = fit_data.load_3d(
-				path=str(data_cfg.input),
-				device=device,
-				cuda_gridsample=(device.type == "cuda" and bool(data_cfg.cuda_gridsample)),
-				skip_channels={"cos", "pred_dt"},
-			)
+		corr_point_roi_normal_data = _load_corr_point_roi_normal_data(
+			input_path=str(data_cfg.input),
+			device=device,
+		)
 		corr_point_roi_normals = _sample_corr_point_roi_normals(
 			data=corr_point_roi_normal_data,
 			corr_points=corr_points_3d_for_roi,
@@ -2303,7 +2318,8 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 			d = dataclasses.replace(d, atlas_lines=atlas_lines_3d)
 		if data_cfg.winding_volume is not None:
 			wv_t, wv_min, wv_max = fit_data.load_winding_volume(
-				path=data_cfg.winding_volume, device=device,
+				path=data_cfg.winding_volume,
+				device=torch.device("cpu") if device.type == "mps" else device,
 				crop=None, downscale=scaledown)
 			d = dataclasses.replace(d, winding_volume=wv_t,
 						winding_min=wv_min, winding_max=wv_max)
