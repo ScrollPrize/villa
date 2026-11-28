@@ -92,9 +92,12 @@ VER_INFIX=""
 [ -d "$BUILD_DIR" ] || { echo "error: build dir '$BUILD_DIR' not found — configure & build first" >&2; exit 1; }
 [ -n "$QMAKE" ]     || { echo "error: qmake6 not found — install qt6-base-dev (or set QMAKE=...)" >&2; exit 1; }
 command -v patchelf >/dev/null || { echo "error: patchelf not found (apt install patchelf)" >&2; exit 1; }
-if [ "$BUNDLE_GLIBC" = 1 ] && [ "$ARCH" != x86_64 ]; then
-    echo "error: glibc bundling here only handles x86_64 (set BUNDLE_GLIBC=0)" >&2; exit 1
-fi
+case "$ARCH" in
+    x86_64|aarch64) ;;
+    *) if [ "$BUNDLE_GLIBC" = 1 ]; then
+           echo "error: glibc bundling here only handles x86_64 and aarch64 (set BUNDLE_GLIBC=0)" >&2; exit 1
+       fi ;;
+esac
 
 # linuxdeploy / appimagetool can't use FUSE in most containers; extract-and-run
 # makes every nested AppImage self-extract.
