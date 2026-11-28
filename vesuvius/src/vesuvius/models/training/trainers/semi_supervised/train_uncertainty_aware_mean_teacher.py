@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, SubsetRandomSampler
 
+from vesuvius.utils.dataloader_workers import keep_worker_descriptors_private
 from vesuvius.models.training.train import BaseTrainer
 from vesuvius.models.training.trainers.semi_supervised import ramps
 from vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler import (
@@ -344,7 +345,8 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             train_dataset,
             batch_sampler=batch_sampler,
             pin_memory=(True if self.device == 'cuda' else False),
-            num_workers=self.mgr.train_num_dataloader_workers
+            num_workers=self.mgr.train_num_dataloader_workers,
+            worker_init_fn=keep_worker_descriptors_private,
         )
 
         val_dataloader = DataLoader(
@@ -352,7 +354,8 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
             batch_size=1,
             sampler=SubsetRandomSampler(val_indices),
             pin_memory=(True if self.device == 'cuda' else False),
-            num_workers=self.mgr.train_num_dataloader_workers
+            num_workers=self.mgr.train_num_dataloader_workers,
+            worker_init_fn=keep_worker_descriptors_private,
         )
         
         self.train_indices = list(self.labeled_indices)

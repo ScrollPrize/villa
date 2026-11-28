@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from contextlib import nullcontext
 from torch.utils.data import DataLoader, SubsetRandomSampler
 
+from vesuvius.utils.dataloader_workers import keep_worker_descriptors_private
 from vesuvius.models.training.train import BaseTrainer
 from vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler import (
     TwoStreamBatchSampler,
@@ -182,6 +183,7 @@ class TrainMeanTeacher(BaseTrainer):
             batch_sampler=batch_sampler,
             pin_memory=(True if getattr(self.device, 'type', str(self.device)) == 'cuda' else False),
             num_workers=self.mgr.train_num_dataloader_workers,
+            worker_init_fn=keep_worker_descriptors_private,
         )
 
         val_dataloader = DataLoader(
@@ -190,6 +192,7 @@ class TrainMeanTeacher(BaseTrainer):
             sampler=SubsetRandomSampler(val_indices),
             pin_memory=(True if getattr(self.device, 'type', str(self.device)) == 'cuda' else False),
             num_workers=self.mgr.train_num_dataloader_workers,
+            worker_init_fn=keep_worker_descriptors_private,
         )
 
         self.train_indices = list(self.labeled_indices)
@@ -477,6 +480,7 @@ class TrainMeanTeacher(BaseTrainer):
                 shuffle=False,
                 pin_memory=pin_mem,
                 num_workers=self.mgr.train_num_dataloader_workers,
+                worker_init_fn=keep_worker_descriptors_private,
                 **dl_kwargs
             )
             return new_train_dl, val_dataloader
