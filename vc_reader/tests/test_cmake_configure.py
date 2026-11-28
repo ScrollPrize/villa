@@ -6,6 +6,7 @@ CUDA checks are skipped when no compiler is available.
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,27 @@ class CMakeConfigureTests(unittest.TestCase):
     def test_required_without_compiler(self):
         self.configure(True, "-DVC_READER_ENABLE_CUDA=ON",
                        "-DCMAKE_CUDA_COMPILER=NOTFOUND", success=False)
+
+    @unittest.skipIf(sys.platform == "win32", "Windows has no RPATH")
+    def test_reader_module_rpath_follows_install_libdir(self):
+        # GNUInstallDirs picks lib64 on Fedora, RHEL and openSUSE; the module must
+        # look for the reader's shared library where it is installed.
+        delta3d = Path(os.environ.get("VC_READER_BUILD_DIR", "")) / "_deps/vc_delta3d-src"
+        if not (delta3d / "CMakeLists.txt").is_file():
+            self.skipTest("set VC_READER_BUILD_DIR to a reader build (for its vc-delta3d sources)")
+        for libdir in ("lib", "lib64"):
+            with self.subTest(libdir=libdir), tempfile.TemporaryDirectory(prefix="vc-reader-cmake-") as build_dir:
+                result = subprocess.run(
+                    ["cmake", "-S", str(Path(__file__).resolve().parents[1]), "-B", build_dir,
+                     f"-DPython_EXECUTABLE={sys.executable}", "-DVC_READER_ENABLE_CUDA=OFF",
+                     f"-DCMAKE_INSTALL_LIBDIR={libdir}",
+                     f"-DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D={delta3d.resolve()}"],
+                    capture_output=True, text=True, timeout=300,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                install = (Path(build_dir) / "cmake_install.cmake").read_text()
+                rpaths = set(re.findall(r'(?:RPATH|-add_rpath) "([^"]+)"', install))
+                self.assertTrue(any(rpath.endswith(f"/../{libdir}") for rpath in rpaths), rpaths)
 
     def cuda_compiler(self):
         compiler = os.environ.get("CUDACXX") or shutil.which("nvcc")
