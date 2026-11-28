@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
-from vesuvius.neural_tracing.tracers.sheets.tracing.inference import _reach_row, resample, trace
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import _reach_row, default_device, resample, trace
 from vesuvius.neural_tracing.tracers.sheets.config import path_mapper
 from vesuvius.neural_tracing.tracers.sheets.evaluation.benchmark import draw_seeds, score, seed_polyline
 
@@ -48,8 +48,10 @@ def main(argv=None):
     ap.add_argument('--before', type=int, default=6, help='steps before the failure where the episode starts')
     ap.add_argument('--out', required=True)
     ap.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW')
-    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--device', default=None, help='torch device (default: cuda, else mps, else cpu)')
     args = ap.parse_args(argv)
+    if args.device is None:
+        args.device = default_device()
     model, cfg = load_checkpoint(args.checkpoint, args.device)[:2]
     path_mapper(args.path_map)(cfg)
     cfg.trace.confidence_threshold = args.threshold

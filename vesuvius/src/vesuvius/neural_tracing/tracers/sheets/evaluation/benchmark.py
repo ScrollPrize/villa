@@ -47,7 +47,7 @@ from vesuvius.neural_tracing.tracers.sheets.data.episodes import EpisodeSampler,
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.geometry import grid_eval, surface_frame
-from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, read_block, resample, trace, write_surface
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, default_device, read_block, resample, trace, write_surface
 from vesuvius.neural_tracing.tracers.sheets.losses import landing
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import sample_plane
 
@@ -361,12 +361,14 @@ def main(argv=None):
                     'seed (scripts/build_fiber_pool.py)')
     ap.add_argument('--min-valid', type=float, default=.95)
     ap.add_argument('--tag', default='bench')
-    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--device', default=None, help='torch device (default: cuda, else mps, else cpu)')
     ap.add_argument('--threshold', type=float, help='confidence threshold for every model (default: each model\'s own)')
     ap.add_argument('--volume', help='volume pyramid for every model (default: the first checkpoint\'s), e.g. when '
                                      'a checkpoint trained elsewhere records a path that does not exist here; '
                                      'each model still reads its own pyramid level')
     args = ap.parse_args(argv)
+    if args.device is None:
+        args.device = default_device()
     if args.rescore:
         for folder in args.rescore:
             rescore(Path(folder))

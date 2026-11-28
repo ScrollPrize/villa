@@ -37,7 +37,7 @@ from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import episode_fibers, fiber_pool
 from vesuvius.neural_tracing.tracers.shared.hub import checkpoint_source
 from vesuvius.neural_tracing.tracers.sheets.tracing.inference import (
-    DEFAULT_CHECKPOINT, connected_keep, resample, resolve_checkpoint, trace, write_trace, write_two_way_trace)
+    DEFAULT_CHECKPOINT, connected_keep, default_device, resample, resolve_checkpoint, trace, write_trace, write_two_way_trace)
 
 
 def seed_from_fiber(fiber: dict, scale: float, length: float, rng) -> tuple[np.ndarray, int] | None:
@@ -170,8 +170,10 @@ def main(argv=None):
     ap.add_argument('--shard', default='0/1', metavar='I/N', help='this process takes every N-th fiber of the order, '
                     'from the I-th (run N processes with I = 0..N-1 and --count split between them)')
     ap.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW')
-    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--device', default=None, help='torch device (default: cuda, else mps, else cpu)')
     args = ap.parse_args(argv)
+    if args.device is None:
+        args.device = default_device()
     path = resolve_checkpoint(args.checkpoint)
     model, cfg, _ = load_checkpoint(path, args.device)
     C.path_mapper(args.path_map)(cfg)

@@ -23,6 +23,7 @@ from vesuvius.neural_tracing.tracers.sheets import config as C
 from vesuvius.neural_tracing.tracers.sheets.data.episodes import EpisodeSampler, EpisodeStream, collate, episode_pad
 from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 from vesuvius.neural_tracing.tracers.sheets.model import build_model, compile_model, init_model_state
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import default_device
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.sheets.train.train import EMA, _pinned, device_batches, optimize_step
 
@@ -38,8 +39,10 @@ def main(argv=None):
     ap.add_argument('--profile', action='store_true')
     ap.add_argument('--stream', action='store_true', help='draw every batch from the loader, as training does '
                     '(end-to-end throughput, with the loader and pinning times), instead of cycling fixed batches')
-    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--device', default=None, help='torch device (default: cuda, else mps, else cpu)')
     args = ap.parse_args(argv)
+    if args.device is None:
+        args.device = default_device()
     cfg = C.load(args.config, args.set)
     tc, d = cfg.train, cfg.data
     device = torch.device(args.device)

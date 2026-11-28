@@ -34,7 +34,7 @@ from vesuvius.neural_tracing.tracers.sheets.data.patches import build_index
 from vesuvius.neural_tracing.tracers.sheets.geometry import grid_eval, project, surface_frame
 from vesuvius.neural_tracing.tracers.sheets.losses import front_metrics, gap_mask, landing
 from vesuvius.neural_tracing.tracers.sheets.checkpoint import load_checkpoint
-from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, write_surface
+from vesuvius.neural_tracing.tracers.sheets.tracing.inference import connected_keep, default_device, write_surface
 from vesuvius.neural_tracing.tracers.sheets.tracing.rollout import Tracer
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.gpu import sample_plane
 from vesuvius.neural_tracing.tracers.sheets.tracing.seeding import seed_rows
@@ -229,8 +229,10 @@ def main(argv=None):
     ap.add_argument('--episodes', type=int)
     ap.add_argument('--records', type=int, default=6)
     ap.add_argument('--tag')
-    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--device', default=None, help='torch device (default: cuda, else mps, else cpu)')
     args = ap.parse_args(argv)
+    if args.device is None:
+        args.device = default_device()
     model, cfg, _ = load_checkpoint(args.checkpoint, args.device)
     tracer = Tracer(model, cfg, args.device)
     e = cfg.eval

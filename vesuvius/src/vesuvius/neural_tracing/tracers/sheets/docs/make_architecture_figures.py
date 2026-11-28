@@ -406,8 +406,11 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--checkpoint', help='for the real-data figures (skipped without it)')
     ap.add_argument('--path-map', action='append', default=[], metavar='OLD=NEW')
-    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--device', default=None, help='torch device (default: cuda, else mps, else cpu)')
     args = ap.parse_args(argv)
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import default_device
+    if args.device is None:
+        args.device = default_device()
     OUT.mkdir(parents=True, exist_ok=True)
     dataflow()
     layout_top()
