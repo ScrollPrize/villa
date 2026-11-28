@@ -87,9 +87,14 @@ public:
     void setMesh(std::vector<cv::Vec3f> vertices, std::vector<cv::Vec2f> uvs, std::vector<UvFace> faces);
 
     void determineGridDimensions(float stretch_factor = 1.0f);
-    QuadSurface* createQuadSurface(float mesh_units = 1.0f);
+    // A matching tifxyz export at source density can recover samples excluded
+    // by the rasterizer's fill rule.
+    QuadSurface* createQuadSurface(float mesh_units = 1.0f,
+                                   const cv::Mat_<cv::Vec3f>& sourcePoints = {});
 
 private:
+    void restoreSourceGridSamples(cv::Mat_<cv::Vec3f>& points,
+                                  const cv::Mat_<cv::Vec3f>& sourcePoints) const;
     void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f);
     void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const UvFace& face);
 
@@ -106,6 +111,7 @@ private:
     // UV decimation / capping
     float uv_downsample = 1.0f;            // user-specified uniform decimation
     uint64_t grid_cap_pixels = 0;          // cap total pixel count (0=off)
+    bool at_source_density = false;
     cv::Vec2f src_scale = cv::Vec2f(0.f, 0.f);  // <=0 = unset
     std::optional<cv::Vec2f> grid_min, grid_max;
 };
