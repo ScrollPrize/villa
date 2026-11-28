@@ -416,5 +416,14 @@ namespace volume_overlay {
     constexpr int COMPOSITE_LAYERS_BEHIND_DEFAULT = 0;
 }
 
+// -----------------------------------------------------------------------------
+// Live ink preview (Ink Detection dock)
+// -----------------------------------------------------------------------------
+namespace ink_preview {
+    // The address of the ink preview server the user starts (docs/ink_preview.md).
+    constexpr auto SERVER_URL = "ink_preview/server_url";
+    constexpr auto SERVER_URL_DEFAULT = "http://127.0.0.1:8765";
+}
+
 } // namespace settings
 } // namespace vc3d
