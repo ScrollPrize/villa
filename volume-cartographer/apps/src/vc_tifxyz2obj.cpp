@@ -10,12 +10,15 @@
 
 #include <nlohmann/json.hpp>
 
+#include <charconv>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <string>
 #include <vc_object_store/Uuid.hpp>
 #include <limits>
 
@@ -48,9 +51,33 @@ static inline cv::Vec3f fd_fallback_normal(const cv::Mat_<cv::Vec3f>& P, int y, 
 }
 // ---------------------------------------------------------------------------
 
+// The OBJ text is built in a string with to_chars: the same text as an ofstream
+// with std::fixed and setprecision(6) ("%.6f"), without the per-value stream cost.
+static void append_float(std::string& out, float value)
+{
+    char text[64];
+    out.append(text, std::to_chars(text, text + sizeof text, double(value), std::chars_format::fixed, 6).ptr);
+}
+
+static void append_index(std::string& out, int value)
+{
+    char text[16];
+    out.append(text, std::to_chars(text, text + sizeof text, value).ptr);
+}
+
+static void append_line(std::string& out, const char* tag, std::initializer_list<float> values)
+{
+    out += tag;
+    for (const float value : values) {
+        out += ' ';
+        append_float(out, value);
+    }
+    out += '\n';
+}
+
 // Writes the OBJ lines of one mesh vertex: v, vt (grid position scaled, or
 // normalized) and vn.
-static void write_vertex(std::ofstream& out,
+static void write_vertex(std::string& out,
                          const cv::Mat_<cv::Vec3f>& points,
                          const cv::Mat_<cv::Vec3f>& normals,
                          cv::Vec2i loc,
@@ -59,12 +86,12 @@ static void write_vertex(std::ofstream& out,
                          float uv_fac_y)
 {
     const cv::Vec3f p = points(loc);
-    out << "v " << p[0] << " " << p[1] << " " << p[2] << '\n';
+    append_line(out, "v", {p[0], p[1], p[2]});
 
     // UVs: scaled by SCALE = 20
     const float u = normalize_uv ? float(loc[1]) / float(points.cols - 1) : float(loc[1]) * uv_fac_x;
     const float v = normalize_uv ? float(loc[0]) / float(points.rows - 1) : float(loc[0]) * uv_fac_y;
-    out << "vt " << u << " " << v << '\n';
+    append_line(out, "vt", {u, v});
 
     // Prefer precomputed per-vertex normal; validate; then fallback.
     cv::Vec3f n = normals(loc);
@@ -74,7 +101,7 @@ static void write_vertex(std::ofstream& out,
     if (!ok || (n[0] == 0.f && n[1] == 0.f && n[2] == 0.f)) {
         n = fd_fallback_normal(points, loc[0], loc[1]);
     }
-    out << "vn " << n[0] << " " << n[1] << " " << n[2] << '\n';
+    append_line(out, "vn", {n[0], n[1], n[2]});
 }
 
 static cv::Mat_<cv::Vec3f> build_vertex_normals_from_faces(
@@ -193,7 +220,6 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
         std::cerr << "Failed to open for write: " << out_fn << "\n";
         return;
     }
-    out << std::fixed << std::setprecision(6);
 
     cv::Mat_<cv::Vec3f> normals = build_vertex_normals_from_faces(points);
 
@@ -222,22 +248,34 @@ static void surf_write_obj(QuadSurface *surf, const std::filesystem::path &out_f
 
     // Each quad's new vertices precede its two faces.
     const auto mesh = vc::meshing::meshGrid(points);
+    std::string text;
+    const auto write_face = [&text](const cv::Vec3i& face) {
+        // same index for v/vt/vn (1-based)
+        text += 'f';
+        for (int corner = 0; corner < 3; ++corner) {
+            text += ' ';
+            for (int part = 0; part < 3; ++part) {
+                if (part) text += '/';
+                append_index(text, face[corner] + 1);
+            }
+        }
+        text += '\n';
+    };
     std::size_t written = 0;
     for (std::size_t f = 0; f + 1 < mesh.faces.size(); f += 2) {
         const cv::Vec3i& a = mesh.faces[f];
         const cv::Vec3i& b = mesh.faces[f + 1];
         const std::size_t last = std::max({a[0], a[1], a[2], b[2]});
         for (; written <= last; ++written)
-            write_vertex(out, points, normals, mesh.cells[written], normalize_uv, uv_fac_x, uv_fac_y);
-        // faces unchanged: use same index for v/vt/vn (1-based)
-        out << "f " << a[0] + 1 << "/" << a[0] + 1 << "/" << a[0] + 1 << " "
-                   << a[1] + 1 << "/" << a[1] + 1 << "/" << a[1] + 1 << " "
-                   << a[2] + 1 << "/" << a[2] + 1 << "/" << a[2] + 1 << '\n';
-
-        out << "f " << b[0] + 1 << "/" << b[0] + 1 << "/" << b[0] + 1 << " "
-                   << b[1] + 1 << "/" << b[1] + 1 << "/" << b[1] + 1 << " "
-                   << b[2] + 1 << "/" << b[2] + 1 << "/" << b[2] + 1 << '\n';
+            write_vertex(text, points, normals, mesh.cells[written], normalize_uv, uv_fac_x, uv_fac_y);
+        write_face(a);
+        write_face(b);
+        if (text.size() >= (std::size_t(1) << 20)) {
+            out.write(text.data(), std::streamsize(text.size()));
+            text.clear();
+        }
     }
+    out.write(text.data(), std::streamsize(text.size()));
 }
 
 int main(int argc, char *argv[])

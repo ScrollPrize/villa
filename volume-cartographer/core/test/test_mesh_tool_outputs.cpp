@@ -8,6 +8,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceMeshing.hpp"
 #include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/core.hpp>
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -191,6 +193,66 @@ TEST_CASE("vc_tifxyz2obj --keep writes the decimated grid")
           "v 116.000000 120.000000 80.800003\nvt 16.000000 0.000000\nvn 0.107703 0.000000 0.994183\n"
           "v 108.000000 128.000000 81.800003\nvt 8.000000 8.000000\nvn 0.143499 0.000000 0.989651\n"
           "v 116.000000 128.000000 80.800003\nvt 16.000000 8.000000\nvn 0.099504 0.000000 0.995037");
+}
+
+TEST_CASE("vc_tifxyz2obj writes a multi-megabyte OBJ as a stream formats it")
+{
+    // A 170 x 170 plane with a hole: about 5 MB of OBJ, so the exporter writes
+    // several 1 MiB blocks and a partial last one.
+    Dir dir;
+    cv::Mat_<cv::Vec3f> points(170, 170);
+    for (int r = 0; r < points.rows; ++r)
+        for (int c = 0; c < points.cols; ++c)
+            points(r, c) = {10.f + 2.f * c + 0.125f * r + float(r % 7) / 3e4f,
+                            20.f + 2.f * r + 0.0625f * c + float(c % 5) / 7e3f, 30.123457f};
+    for (int r = 50; r < 53; ++r)
+        for (int c = 70; c < 74; ++c) points(r, c) = {-1.f, -1.f, -1.f};
+    QuadSurface(points, {0.5f, 0.5f}).save(dir.path / "plane", true);
+    run(tool("VC_TIFXYZ2OBJ_BIN") + " " + quoted(dir.path / "plane") + " " + quoted(dir.path / "plane.obj"), dir.path / "obj.log");
+
+    // The reference: meshGrid's vertex and face order, formatted by an ostream
+    // with std::fixed and setprecision(6). Normals are checked separately, as
+    // unit +z, and stand in as "vn" here.
+    const auto mesh = vc::meshing::meshGrid(points);
+    std::ostringstream expected;
+    expected << std::fixed << std::setprecision(6);
+    std::size_t written = 0;
+    for (std::size_t f = 0; f + 1 < mesh.faces.size(); f += 2) {
+        const cv::Vec3i& a = mesh.faces[f];
+        const cv::Vec3i& b = mesh.faces[f + 1];
+        for (const std::size_t last = std::max({a[0], a[1], a[2], b[2]}); written <= last; ++written) {
+            const cv::Vec2i loc = mesh.cells[written];
+            const cv::Vec3f p = points(loc[0], loc[1]);
+            expected << "v " << p[0] << " " << p[1] << " " << p[2] << "\n"
+                     << "vt " << float(loc[1]) * 2.f << " " << float(loc[0]) * 2.f << "\n"
+                     << "vn\n";
+        }
+        for (const cv::Vec3i& face : {a, b})
+            expected << "f " << face[0] + 1 << "/" << face[0] + 1 << "/" << face[0] + 1 << " "
+                     << face[1] + 1 << "/" << face[1] + 1 << "/" << face[1] + 1 << " "
+                     << face[2] + 1 << "/" << face[2] + 1 << "/" << face[2] + 1 << "\n";
+    }
+
+    const std::string obj = readFile(dir.path / "plane.obj");
+    CHECK(obj.size() > 3 * (std::size_t(1) << 20));
+    std::ostringstream masked;
+    std::istringstream lines(obj);
+    int normals = 0, badNormals = 0;
+    for (std::string line; std::getline(lines, line);) {
+        // A text-mode stream writes CRLF on Windows; the reference uses LF.
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("vn ", 0) == 0) {
+            cv::Vec3f n;
+            std::istringstream(line.substr(3)) >> n[0] >> n[1] >> n[2];
+            badNormals += std::abs(n[0]) > 1e-6f || std::abs(n[1]) > 1e-6f || std::abs(n[2] - 1.f) > 1e-6f;
+            ++normals;
+            line = "vn";
+        }
+        masked << line << "\n";
+    }
+    CHECK(normals == int(mesh.cells.size()));
+    CHECK(badNormals == 0);
+    CHECK(masked.str() == expected.str());
 }
 
 TEST_CASE("vc_obj2tifxyz and vc_obj2tifxyz_legacy rasterize an OBJ")
