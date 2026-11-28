@@ -78,7 +78,7 @@ def test_native_input_regression_can_be_run_first(tmp_path,monkeypatch):
 def test_usage_examples_do_not_depend_on_local_experiments():
     root=Path(__file__).parents[1]/'docs/examples/fiber_workflows'
     for path in root.glob('*.json'):
-        text=path.read_text();json.loads(text)
+        text=path.read_text(encoding='utf-8');json.loads(text)
         assert '/home/' not in text and '/ephemeral/' not in text,path
 
 
@@ -92,7 +92,7 @@ def test_shared_workflows_and_docs_have_no_embedded_run_identity():
     paths+=list((docs/'examples/fiber_workflows').glob('*.json'))
     forbidden=re.compile(r'/(?:home|ephemeral)/[^\s\x27\x22]+|\b20\d{6}[_T]\d{6}\b|\b[a-f0-9]{40,64}\b')
     for path in paths:
-        assert not forbidden.search(path.read_text()),path
+        assert not forbidden.search(path.read_text(encoding='utf-8')),path
 
 
 def test_reviewed_json_requires_explicit_scan_identity(tmp_path):

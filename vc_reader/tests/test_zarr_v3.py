@@ -41,7 +41,11 @@ def fork_read(reader, connection):
 
 
 def blosc(data):
-    library = ctypes.CDLL(ctypes.util.find_library('blosc'))
+    # MinGW/UCRT installs the DLL as libblosc.dll, which find_library('blosc') does not match on Windows.
+    path = ctypes.util.find_library('blosc') or ctypes.util.find_library('libblosc')
+    if path is None:
+        raise RuntimeError('fixture Blosc library not found')
+    library = ctypes.CDLL(path)
     library.blosc_compress_ctx.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int]
     output = ctypes.create_string_buffer(len(data)+16)

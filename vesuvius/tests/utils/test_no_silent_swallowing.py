@@ -50,7 +50,7 @@ def _swallowers():
             continue
         for path in sorted(base.rglob("*.py")):
             try:
-                tree = ast.parse(path.read_text())
+                tree = ast.parse(path.read_text(encoding="utf-8"))
             except SyntaxError:
                 continue
             for node in ast.walk(tree):

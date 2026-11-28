@@ -322,8 +322,8 @@ def test_training_hang_diagnostics_disabled_has_no_side_effects(
     def record(name):
         return lambda *args, **kwargs: calls.append((name, args, kwargs))
 
-    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.register", record("register"))
-    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.unregister", record("unregister"))
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.register", record("register"), raising=False)
+    monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.unregister", record("unregister"), raising=False)
     monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.dump_traceback_later", record("dump"))
     monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.faulthandler.cancel_dump_traceback_later", record("cancel"))
     monkeypatch.setattr("vesuvius.neural_tracing.fiber_trace_3d.train.torch.cuda.synchronize", record("sync"))
