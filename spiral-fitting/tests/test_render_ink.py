@@ -209,6 +209,37 @@ class RenderInkPathTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertNotIn("--scale-segmentation", commands[0])
 
+    def test_max_composite_by_bands_matches_whole_slices(self):
+        rng = np.random.default_rng(0)
+        for dtype in (np.uint8, np.uint16):
+            slices = [rng.integers(0, 60000, size=(9, 3)).astype(dtype) for _ in range(3)]
+            with CliRunner().isolated_filesystem():
+                paths = []
+                for i, array in enumerate(slices):
+                    Image.fromarray(array).save(f"{i:02d}.tif")
+                    paths.append(f"{i:02d}.tif")
+                with patch.object(render_ink, "BLOCK_PIXELS", 7):
+                    composite = render_ink.max_composite(paths)
+            self.assertEqual(composite.dtype, dtype)
+            np.testing.assert_array_equal(composite, np.maximum.reduce(slices))
+
+    def test_scale_to_uint8_matches_float_normalisation(self):
+        rng = np.random.default_rng(0)
+        strips = [
+            rng.integers(0, 256, size=(37, 41)).astype(np.uint8),
+            rng.integers(0, 65536, size=(37, 41)).astype(np.uint16),
+            np.where(rng.random((37, 41)) < 0.03, 200, 0).astype(np.uint16),  # p95 == 0
+            np.arange(20, dtype=np.uint8).reshape(4, 5),  # p95 between two values
+        ]
+        with patch.object(render_ink, "BLOCK_PIXELS", 7):
+            for comp in strips:
+                strip = comp.astype(np.float32)
+                p95 = np.percentile(strip, 95)
+                strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
+                strip8, actual_p95 = render_ink.scale_to_uint8(comp)
+                np.testing.assert_array_equal(strip8, strip.astype(np.uint8))
+                self.assertEqual(actual_p95.tobytes(), p95.tobytes())
+
 
 if __name__ == "__main__":
     unittest.main()
