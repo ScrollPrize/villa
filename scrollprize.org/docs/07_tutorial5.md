@@ -249,7 +249,7 @@ If you run out of GPU memory, reduce `batch_size` to 1, or reduce the `patch_siz
 :::
 
 :::tip
-To log metrics and previews to Weights & Biases, add `"wandb_project": "ink-detection"` and `"wandb_entity": "your-username"` to the config and run `uv run wandb login` once.
+To log metrics and previews to Weights & Biases, add `"wandb_project": "ink-detection"` and `"wandb_entity": "your-username"` to the config and run `uv run wandb login` once. The locked `wandb` (0.28) logs to `api.wandb.ai` by default. If your account is on W&B's Forge host, set `WANDB_BASE_URL=https://api.forge.coreweave.com` before logging in; otherwise `wandb.init` stops with `No API key configured` even though you are logged in.
 :::
 
 ### Inference
