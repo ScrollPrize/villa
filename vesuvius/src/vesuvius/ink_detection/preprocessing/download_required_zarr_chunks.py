@@ -27,7 +27,12 @@ from vesuvius.ink_detection.data.patch_finding_default import (
 from vesuvius.ink_detection.data.patch_finding_subtiling import build_patch_index
 from vesuvius.ink_detection.data.segment import discover_segment_labels
 from vesuvius.ink_detection.types import Segment
-from vesuvius.ink_detection.volume_io import normalized_source_path, open_volume, open_volume_root
+from vesuvius.ink_detection.volume_io import (
+    normalized_source_path,
+    open_volume,
+    open_volume_root,
+    require_pyramid_depth_scale,
+)
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
@@ -479,8 +484,9 @@ def _missing_chunk_ids_for_scale(
 
 def _init_chunk_copy_worker(volume_path: str, volume_scale: int, volume_auth_json: str | None, output_path: str):
     global _WORKER_SOURCE, _WORKER_DEST, _WORKER_CHUNK_SHAPE, _WORKER_ARRAY_SHAPE
+    # Chunks are mirrored verbatim, so an ancillary level's depth is never interpreted.
     _WORKER_SOURCE = open_volume(
-        volume_path, volume_scale, auth_json_path=volume_auth_json
+        volume_path, volume_scale, auth_json_path=volume_auth_json, check_depth_scale=False
     )
     _WORKER_DEST = ZarrWriter.open(f"{output_path}/{int(volume_scale)}", auth=None)
     _WORKER_CHUNK_SHAPE = tuple(int(v) for v in _WORKER_SOURCE.chunks)
@@ -527,6 +533,7 @@ def copy_chunks_to_output(
     source_group = open_volume_root(
         volume_path, auth_json_path=volume_auth_json
     )
+    require_pyramid_depth_scale(source_group, volume_scale, source=str(volume_path))
     plan = _build_download_plan(
         source_group,
         volume_path=volume_path,
@@ -920,6 +927,9 @@ def build_dataset_chunk_plan(
         raise KeyError(
             f"Requested scale {source_spec.volume_scale} is missing from source group {source_spec.volume_path!r}."
         )
+    require_pyramid_depth_scale(
+        source_group, source_spec.volume_scale, source=str(source_spec.volume_path)
+    )
 
     patches, candidate_bbox_count = _build_dataset_download_patches(
         dataset_dir=dataset_dir,
