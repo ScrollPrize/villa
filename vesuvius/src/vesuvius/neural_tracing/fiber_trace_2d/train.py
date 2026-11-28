@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 import vc_reader.transforms as A
+from vc_reader import cuda as vc_cuda
 
 from vesuvius.neural_tracing.fiber_trace_2d.augmentation import (
     apply_value_augmentation_batch,
@@ -297,7 +298,14 @@ def _prepare_images(images_np: np.ndarray, valid_np: np.ndarray, *, device: torc
 def _normalize_image_tensor(images: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     if valid.ndim == 3:
         valid = valid.unsqueeze(1)
-    normalized = _MASKED_ZSCORE.batch({"image": images, "valid": valid}, targets=_MASKED_TARGETS)["image"]
+    device = images.device
+    if device.type == "mps" or (device.type == "cuda" and not vc_cuda.is_available()):
+        # vc_reader takes CPU tensors, and CUDA tensors only with its CUDA build.
+        normalized = _MASKED_ZSCORE.batch(
+            {"image": images.cpu(), "valid": valid.cpu()}, targets=_MASKED_TARGETS
+        )["image"].to(device)
+    else:
+        normalized = _MASKED_ZSCORE.batch({"image": images, "valid": valid}, targets=_MASKED_TARGETS)["image"]
     return torch.where(valid, normalized, torch.zeros_like(images))
 
 
